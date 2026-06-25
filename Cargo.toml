@@ -18,4 +18,5 @@ members = [
     "crabport-editor",
     "crabport-ui",
     "crabport-terminal",
+    "crabport-tunnel",
 ]

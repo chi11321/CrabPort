@@ -38,16 +38,26 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let cols: usize = 80;
+        let rows: usize = 24;
+        let backend = Arc::new(
+            PtyBackend::new(cols as u16, rows as u16).expect("failed to create pty backend"),
+        );
+        Self::with_backend(backend, cols, rows, cx)
+    }
+
+    /// Create a TerminalView with a pre-built backend (e.g. SSH).
+    pub fn with_backend(
+        backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+        cols: usize,
+        rows: usize,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let font_size = px(13.0);
         let line_height = px(20.0);
         let cell_width = px(7.8);
-        let cols: usize = 80;
-        let rows: usize = 24;
 
-        let backend = Arc::new(
-            PtyBackend::new(cols as u16, rows as u16).expect("failed to create pty backend"),
-        );
         let session = Arc::new(TerminalSession::new(backend, cols, rows));
         session.start();
 

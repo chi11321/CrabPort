@@ -2,19 +2,28 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::*;
+use gpui_component::input::InputState;
 
-use crate::app::{SidebarItem, Tab, TabKind};
+use crate::app::{CrabportApp, SidebarItem, Tab, TabKind};
 use crate::color::*;
+use crate::layouts::connection_form::{ConnectionFormState, ConnectionKind};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::views;
+use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
 
 pub fn render_content(
     selected: SidebarItem,
-    handle: &Entity<crate::app::CrabportApp>,
+    handle: &Entity<CrabportApp>,
     tabs: &[Tab],
     active_tab_id: u64,
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
+    hosts: &[ConnectionHost],
+    form_state: &ConnectionFormState,
+    form_host: &Option<Entity<InputState>>,
+    form_port: &Option<Entity<InputState>>,
+    form_user: &Option<Entity<InputState>>,
+    form_pass: &Option<Entity<InputState>>,
     window: &mut Window,
     cx: &App,
 ) -> Div {
@@ -26,9 +35,73 @@ pub fn render_content(
         });
     });
 
+    let handle_form = handle.clone();
+    let on_close_form = move |_: &mut Window, cx: &mut App| {
+        handle_form.update(cx, |app, cx| {
+            app.connection_form.active = false;
+            cx.notify();
+        });
+    };
+
+    let handle_connect = handle.clone();
+    let on_connect = move |_kind: ConnectionKind, _: &mut Window, cx: &mut App| {
+        handle_connect.update(cx, |app, cx| {
+            let host = app
+                .form_host_input
+                .as_ref()
+                .map(|s| s.read(cx).text().to_string())
+                .unwrap_or_default();
+            let port = app
+                .form_port_input
+                .as_ref()
+                .map(|s| s.read(cx).text().to_string())
+                .unwrap_or_else(|| "22".into());
+            let username = app
+                .form_user_input
+                .as_ref()
+                .map(|s| s.read(cx).text().to_string())
+                .unwrap_or_default();
+            let password = app
+                .form_pass_input
+                .as_ref()
+                .map(|s| s.read(cx).text().to_string())
+                .unwrap_or_default();
+            let port_num: u16 = port.parse().unwrap_or(22);
+            let name = format!("{}@{}", username, host);
+            app.hosts.push(ConnectionHost {
+                name,
+                host: host.to_string(),
+                port: port_num,
+                username: username.to_string(),
+            });
+            app.connection_form.active = false;
+            app.add_ssh_tab(&host, port_num, &username, &password, cx);
+            cx.notify();
+        });
+    };
+
+    let handle_new = handle.clone();
+    let on_new = move |_: &mut Window, cx: &mut App| {
+        handle_new.update(cx, |app, cx| {
+            app.connection_form.active = true;
+            cx.notify();
+        });
+    };
+
     let view: AnyElement = match active_tab.map(|t| t.kind) {
         Some(TabKind::Home) => match selected {
-            SidebarItem::Hosts => views::hosts::render_hosts_view().into_any_element(),
+            SidebarItem::Hosts => views::hosts::render_hosts_view(
+                hosts,
+                form_state,
+                form_host,
+                form_port,
+                form_user,
+                form_pass,
+                on_close_form,
+                on_connect,
+                on_new,
+            )
+            .into_any_element(),
             SidebarItem::Credentials => {
                 views::credentials::render_credentials_view().into_any_element()
             }
@@ -47,7 +120,6 @@ pub fn render_content(
         },
         Some(TabKind::Terminal) => {
             if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-                // Auto-focus the terminal view for keyboard input
                 terminal_entity.read_with(cx, |view, cx| {
                     window.focus(&view.focus_handle(cx));
                 });

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
@@ -6,10 +7,14 @@ use gpui_component::input::InputState;
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::layouts::command_palette::{Command, ConnectionType};
+use crate::layouts::connection_form::ConnectionFormState;
 use crate::layouts::content::render_content;
-use crate::layouts::new_connection::Command;
 use crate::layouts::sidebar::render_sidebar;
+use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
+use crabport_ssh::SshBackend;
+use crabport_ssh::session::SshConnectionInfo;
 
 // ---- CrabPortTab trait ----
 
@@ -43,7 +48,13 @@ pub struct CrabportApp {
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
     pub show_command: bool,
+    pub hosts: Vec<ConnectionHost>,
+    pub connection_form: ConnectionFormState,
     command_search_state: Option<Entity<InputState>>,
+    pub form_host_input: Option<Entity<InputState>>,
+    pub form_port_input: Option<Entity<InputState>>,
+    pub form_user_input: Option<Entity<InputState>>,
+    pub form_pass_input: Option<Entity<InputState>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,7 +110,13 @@ impl CrabportApp {
             next_tab_id: 1,
             terminal_views: HashMap::new(),
             show_command: false,
+            hosts: Vec::new(),
+            connection_form: ConnectionFormState::new(),
             command_search_state: None,
+            form_host_input: None,
+            form_port_input: None,
+            form_user_input: None,
+            form_pass_input: None,
         }
     }
 
@@ -121,6 +138,34 @@ impl CrabportApp {
         });
 
         let terminal_view = cx.new(|cx| TerminalView::new(cx));
+        self.terminal_views.insert(id, terminal_view);
+
+        self.active_tab_id = id;
+        id
+    }
+
+    pub fn add_ssh_tab(
+        &mut self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let title = format!("{}@{}", username, host);
+        self.tabs.push(Tab {
+            id,
+            title,
+            kind: TabKind::Terminal,
+        });
+
+        let info = SshConnectionInfo::new(host, username, password).with_port(port);
+        let cols: usize = 80;
+        let rows: usize = 24;
+        let backend = Arc::new(SshBackend::new(info, cols as u16, rows as u16));
+        let terminal_view = cx.new(|cx| TerminalView::with_backend(backend, cols, rows, cx));
         self.terminal_views.insert(id, terminal_view);
 
         self.active_tab_id = id;
@@ -179,6 +224,44 @@ impl Render for CrabportApp {
             self.command_search_state = Some(cx.new(|cx| InputState::new(_window, cx)));
         }
 
+        // Lazy-init form InputState entities when the form opens.
+        if self.connection_form.active {
+            if self.form_host_input.is_none() {
+                self.form_host_input = Some(cx.new(|cx| InputState::new(_window, cx)));
+                // Auto-focus host field when form opens
+                if let Some(ref host) = self.form_host_input {
+                    host.update(cx, |state, cx| {
+                        state.focus(_window, cx);
+                    });
+                }
+            }
+            if self.form_port_input.is_none() {
+                self.form_port_input = Some(cx.new(|cx| InputState::new(_window, cx)));
+                // Pre-fill default port
+                if let Some(ref port) = self.form_port_input {
+                    port.update(cx, |state, cx| {
+                        state.set_value("22", _window, cx);
+                    });
+                }
+            }
+            if self.form_user_input.is_none() {
+                self.form_user_input = Some(cx.new(|cx| InputState::new(_window, cx)));
+            }
+            if self.form_pass_input.is_none() {
+                self.form_pass_input = Some(cx.new(|cx| {
+                    let mut state = InputState::new(_window, cx);
+                    state.set_masked(true, _window, cx);
+                    state
+                }));
+            }
+        } else {
+            // Reset inputs when form closes
+            self.form_host_input = None;
+            self.form_port_input = None;
+            self.form_user_input = None;
+            self.form_pass_input = None;
+        }
+
         // Collect host names (placeholder – wire up real data later).
         let host_names: Vec<String> = Vec::new();
 
@@ -216,6 +299,12 @@ impl Render for CrabportApp {
                 &self.tabs,
                 self.active_tab_id,
                 &self.terminal_views,
+                &self.hosts,
+                &self.connection_form,
+                &self.form_host_input,
+                &self.form_port_input,
+                &self.form_user_input,
+                &self.form_pass_input,
                 _window,
                 &*cx,
             ))
@@ -236,9 +325,23 @@ impl Render for CrabportApp {
                     })
                     .on_new_connection({
                         let handle = handle.clone();
-                        move |_ct, _, cx| {
+                        move |ct, _, cx| {
                             handle.update(cx, |app, cx| {
-                                app.add_tab(cx);
+                                match ct {
+                                    ConnectionType::LocalTerminal => {
+                                        // Directly open a local terminal
+                                        app.add_tab(cx);
+                                    }
+                                    ConnectionType::SSH
+                                    | ConnectionType::SFTP
+                                    | ConnectionType::Telnet
+                                    | ConnectionType::Serial => {
+                                        // Switch to Home tab and open the hosts form
+                                        app.activate_tab(0);
+                                        app.sidebar_item = SidebarItem::Hosts;
+                                        app.connection_form.active = true;
+                                    }
+                                }
                                 app.show_command = false;
                                 app.command_search_state = None;
                                 cx.notify();

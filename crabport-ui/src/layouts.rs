@@ -1,4 +1,5 @@
+pub mod command_palette;
+pub mod connection_form;
 pub mod content;
-pub mod new_connection;
 pub mod sidebar;
 pub mod tabbar;

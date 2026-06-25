@@ -21,3 +21,16 @@ new_connection:
   telnet_desc: "Telnet remote connection"
   serial: "Serial"
   serial_desc: "Serial port connection"
+connection_form:
+  title: "New Connection"
+  host: "Host"
+  port: "Port"
+  username: "Username"
+  password: "Password"
+  cancel: "Cancel"
+  connect: "Connect"
+  currently_supported: "Currently supported"
+  coming_soon: "Coming soon"
+hosts:
+  new_button: "+ New"
+  empty: "No saved hosts. Click '+ New' to create one."
