@@ -32,7 +32,7 @@ pub const INPUT_PLACEHOLDER: u32 = 0x585b70;
 pub const INPUT_SELECTION: u32 = 0x89b4fa33;
 
 // Command
-pub const COMMAND_OVERLAY: u32 = 0x00000080;
+pub const COMMAND_OVERLAY: u32 = 0x00000050;
 pub const COMMAND_BG: u32 = 0x1e1e2e;
 pub const COMMAND_BORDER: u32 = 0x313244;
 pub const COMMAND_ITEM_HOVER: u32 = 0x24273a;

@@ -1,0 +1,16 @@
+[package]
+name = "crabport-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
+parking_lot = "0.12"
+futures = "0.3"
+bytes = "1.12.0"
+tracing = "0.1.44"
+libc = "0.2.186"
+crossbeam-channel = "0.5.15"
+smol = "2.0.2"
+async-channel = "2.5.0"
+async-broadcast = "0.7.2"

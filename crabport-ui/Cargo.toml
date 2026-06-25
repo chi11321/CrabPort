@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crabport-core = { path = "../crabport-core" }
+crabport-terminal = { path = "../crabport-terminal" }
 gpui = { version = "0.2", default-features = false, features = ["font-kit"] }
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
+tracing = "0.1.44"
+parking_lot = "0.12"
+futures = "0.3"
+smol = "2.0.2"
 gpui-animation = "0.2"
 gpui-component = "0.5"
 rust-i18n = "4"

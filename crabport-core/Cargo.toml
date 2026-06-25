@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+smol = "2.0.2"
+async-channel = "2.5.0"
+async-broadcast = "0.7.2"
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "ansi", "registry"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+gpui = { version = "0.2", default-features = false }

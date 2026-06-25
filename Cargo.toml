@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crabport-ui = { path = "crabport-ui" }
+crabport-core = {path = "crabport-core"}
 gpui = { version = "0.2", default-features = false, features = ["font-kit"] }
 gpui-component = "0.5"
 
@@ -16,4 +17,5 @@ members = [
     "crabport-forward",
     "crabport-editor",
     "crabport-ui",
+    "crabport-terminal",
 ]
