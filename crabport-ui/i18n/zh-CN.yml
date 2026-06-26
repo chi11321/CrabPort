@@ -1,5 +1,6 @@
 sidebar:
   hosts: "主机"
+  tunnels: "隧道"
   credentials: "凭证"
   snippets: "代码片段"
   history: "历史记录"
@@ -51,3 +52,6 @@ credential_form:
 credentials:
   new_button: "新建"
   empty: "暂无保存的凭证，点击「+ 新建」创建"
+tunnels:
+  new_button: "新建"
+  empty: "暂无活跃隧道，点击「+ 新建」创建"

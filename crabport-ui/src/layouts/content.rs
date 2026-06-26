@@ -44,6 +44,7 @@ pub fn render_content(
             SidebarItem::Hosts => {
                 views::hosts::render_hosts_view(hosts, form_entity, on_new).into_any_element()
             }
+            SidebarItem::Tunnels => views::tunnels::render_tunnels_view(on_new).into_any_element(),
             SidebarItem::Credentials => {
                 let app_handle = handle.clone();
                 let on_new_cred = move |w: &mut Window, cx: &mut App| {

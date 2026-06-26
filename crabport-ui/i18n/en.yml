@@ -1,5 +1,6 @@
 sidebar:
   hosts: "Hosts"
+  tunnels: "Tunnels"
   credentials: "Credentials"
   snippets: "Snippets"
   history: "History"
@@ -51,3 +52,6 @@ credential_form:
 credentials:
   new_button: "New"
   empty: "No saved credentials. Click '+ New' to create one."
+tunnels:
+  new_button: "New"
+  empty: "No active tunnels. Click '+ New' to create one."

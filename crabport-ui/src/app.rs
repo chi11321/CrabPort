@@ -58,6 +58,7 @@ pub struct CrabportApp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarItem {
     Hosts,
+    Tunnels,
     Credentials,
     Snippets,
     History,
@@ -68,6 +69,7 @@ impl SidebarItem {
         match self {
             SidebarItem::Hosts => t!("sidebar.hosts").into(),
             SidebarItem::Credentials => t!("sidebar.credentials").into(),
+            SidebarItem::Tunnels => t!("sidebar.tunnels").into(),
             SidebarItem::Snippets => t!("sidebar.snippets").into(),
             SidebarItem::History => t!("sidebar.history").into(),
         }
@@ -77,15 +79,17 @@ impl SidebarItem {
         match self {
             SidebarItem::Hosts => "icons/server.svg",
             SidebarItem::Credentials => "icons/key.svg",
+            SidebarItem::Tunnels => "icons/waypoints.svg",
             SidebarItem::Snippets => "icons/braces.svg",
             SidebarItem::History => "icons/clock.svg",
         }
     }
 
-    pub fn all() -> [SidebarItem; 4] {
+    pub fn all() -> [SidebarItem; 5] {
         [
             SidebarItem::Hosts,
             SidebarItem::Credentials,
+            SidebarItem::Tunnels,
             SidebarItem::Snippets,
             SidebarItem::History,
         ]
@@ -459,6 +463,9 @@ impl Render for CrabportApp {
                         on_new_cred,
                     )
                     .into_any_element()
+                }
+                SidebarItem::Tunnels => {
+                    views::tunnels::render_tunnels_view(on_new).into_any_element()
                 }
                 SidebarItem::Snippets => views::snippets::render_snippets_view().into_any_element(),
                 SidebarItem::History => div()
