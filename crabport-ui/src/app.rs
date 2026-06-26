@@ -451,7 +451,7 @@ impl CrabportApp {
             is_remote: false,
         });
 
-        let terminal_view = cx.new(|cx| TerminalView::new(cx));
+        let terminal_view = cx.new(|cx| TerminalView::new(id, cx));
         self.terminal_views.insert(id, terminal_view);
 
         self.active_tab_id = id;
@@ -477,6 +477,7 @@ impl CrabportApp {
         });
 
         let info = SshConnectionInfo::new(host, username, password).with_port(port);
+        let info_for_view = info.clone();
         let cols: usize = 80;
         let rows: usize = 24;
 
@@ -505,6 +506,8 @@ impl CrabportApp {
                 rows,
                 format!("{}@{}", username, host),
                 overlay,
+                Some(info_for_view),
+                id,
                 cx,
             )
         });

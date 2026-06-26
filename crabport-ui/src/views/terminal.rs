@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::Arc;
 
 use alacritty_terminal::{
@@ -6,6 +7,7 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, NamedColor},
 };
 use crabport_core::keybind::{self, KeyAction, TerminalAction};
+use crabport_ssh::session::SshConnectionInfo;
 use crabport_terminal::pty::PtyBackend;
 use crabport_terminal::terminal::{CrabPortMonitor, RemoteStatus, TerminalSession};
 
@@ -15,6 +17,7 @@ use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCub
 use parking_lot::Mutex;
 
 use crate::app::{CrabPortTab, TerminalShiftTab, TerminalTab};
+use crate::components::button::Button;
 
 pub mod connection_overlay;
 
@@ -44,25 +47,31 @@ pub struct TerminalView {
     overlay: SharedOverlayState,
     /// Host label for the remote session (empty for local).
     remote_host: String,
+    /// Unique count for this terminal, used to generate unique element ids.
+    count: u64,
+    /// SSH connection info, saved for reconnect (only for remote sessions).
+    ssh_info: Option<SshConnectionInfo>,
 }
 
 impl TerminalView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
         let backend = Arc::new(
             PtyBackend::new(cols as u16, rows as u16).expect("failed to create pty backend"),
         );
-        Self::with_backend(backend, cols, rows, cx)
+        Self::with_backend(backend, cols, rows, None, count, cx)
     }
 
     pub fn with_backend(
         backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
         cols: usize,
         rows: usize,
+        ssh_info: Option<SshConnectionInfo>,
+        count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_backend_and_host(backend, cols, rows, String::new(), cx)
+        Self::with_backend_and_host(backend, cols, rows, String::new(), ssh_info, count, cx)
     }
 
     pub fn with_backend_and_host(
@@ -70,10 +79,14 @@ impl TerminalView {
         cols: usize,
         rows: usize,
         host: String,
+        ssh_info: Option<SshConnectionInfo>,
+        count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let overlay = Arc::new(Mutex::new(ConnectionOverlayState::new()));
-        Self::with_backend_and_host_and_overlay(backend, cols, rows, host, overlay, cx)
+        Self::with_backend_and_host_and_overlay(
+            backend, cols, rows, host, overlay, ssh_info, count, cx,
+        )
     }
 
     pub fn with_backend_and_host_and_overlay(
@@ -82,6 +95,8 @@ impl TerminalView {
         rows: usize,
         host: String,
         overlay: SharedOverlayState,
+        ssh_info: Option<SshConnectionInfo>,
+        count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -190,11 +205,108 @@ impl TerminalView {
             scroll_accumulator: 0.0,
             overlay,
             remote_host: host,
+            count,
+            ssh_info,
         }
     }
 
     pub fn monitor(&self) -> Option<&dyn CrabPortMonitor> {
         self.session.monitor()
+    }
+
+    /// Reconnect a disconnected SSH session by creating a new backend and session.
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        let info = match self.ssh_info.clone() {
+            Some(i) => i,
+            None => return,
+        };
+
+        // Close the old session
+        self.session.close();
+
+        // Reset overlay state for the new connection attempt
+        {
+            let mut ov = self.overlay.lock();
+            ov.update_status(RemoteStatus::Connecting, &self.remote_host);
+        }
+
+        let cols: usize = 80;
+        let rows: usize = 24;
+
+        let overlay_cb = self.overlay.clone();
+        let backend = Arc::new(crabport_ssh::SshBackend::new(
+            info,
+            cols as u16,
+            rows as u16,
+            Arc::new(move |msg: String| {
+                overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
+            }),
+        ));
+
+        let session = Arc::new(TerminalSession::new(backend, cols, rows));
+        session.start();
+        session.feed_escape(b"\x1b[6 q");
+
+        // Re-subscribe to backend events
+        let mut event_rx = session.subscribe_backend();
+        let overlay_c = self.overlay.clone();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            while let Ok(event) = event_rx.recv().await {
+                match event {
+                    crabport_terminal::terminal::BackendEvent::Error(err) => {
+                        overlay_c.lock().log(ConnectionLogLevel::Error, err);
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
+                    crabport_terminal::terminal::BackendEvent::Closed => {
+                        overlay_c
+                            .lock()
+                            .log(ConnectionLogLevel::Warning, "Connection closed");
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
+                    crabport_terminal::terminal::BackendEvent::Data(_) => {}
+                }
+            }
+        })
+        .detach();
+
+        // Re-subscribe to wakeup signals
+        let mut wakeup_rx = session.subscribe_wakeup();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            while let Ok(()) = wakeup_rx.recv().await {
+                let _ = entity.update(cx, |this, cx| {
+                    if let Some(m) = this.session.monitor() {
+                        let new_status = m.status();
+                        let mut ov = this.overlay.lock();
+                        if new_status != ov.status {
+                            ov.update_status(new_status, &this.remote_host);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        // Restart fade-out watcher for the new connection
+        let overlay_fade = self.overlay.clone();
+        let fade_entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            loop {
+                smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                if overlay_fade.lock().fade_out_started {
+                    break;
+                }
+            }
+            smol::Timer::after(std::time::Duration::from_millis(600)).await;
+            overlay_fade.lock().mark_hidden();
+            let _ = fade_entity.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+
+        self.session = session;
+        cx.notify();
     }
 
     fn resolve_keystroke(
@@ -352,7 +464,9 @@ impl Render for TerminalView {
         let is_remote = !self.remote_host.is_empty();
 
         div()
-            .id("terminal-view")
+            .id(ElementId::Name(
+                format!("terminal-view-{}", self.count).into(),
+            ))
             .relative()
             .size_full()
             .overflow_hidden()
@@ -826,11 +940,17 @@ impl Render for TerminalView {
             )
             // Connection overlay (remote sessions only)
             .when(is_remote, |el| {
+                let on_reconnect: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)> =
+                    Rc::new(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                        this.reconnect(cx);
+                    }));
                 el.child(render_connection_overlay(
                     overlay_visible,
                     is_fading_out,
                     current_status,
                     &log_entries,
+                    self.count,
+                    Some(on_reconnect),
                 ))
             })
     }
@@ -843,13 +963,17 @@ fn render_connection_overlay(
     is_fading_out: bool,
     status: RemoteStatus,
     logs: &[ConnectionLogEntry],
+    count: u64,
+    on_reconnect: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
 ) -> AnyElement {
     if !overlay_visible {
         return div().into_any_element();
     }
 
     div()
-        .id("connection-overlay")
+        .id(ElementId::Name(
+            format!("connection-overlay-{}", count).into(),
+        ))
         .absolute()
         .top_0()
         .left_0()
@@ -860,13 +984,12 @@ fn render_connection_overlay(
         .justify_center()
         .bg(rgb(TERM_BG))
         .opacity(1.0)
-        .with_transition("connection-overlay-opacity")
-        .transition_when_else(
+        .with_transition(("connection-overlay-opacity", count))
+        .transition_when(
             is_fading_out,
             std::time::Duration::from_millis(500),
             EaseInOutCubic,
             |el| el.opacity(0.0),
-            |el| el.opacity(1.0),
         )
         .child(
             div()
@@ -919,18 +1042,14 @@ fn render_connection_overlay(
                         })),
                 )
                 .when(status == RemoteStatus::Disconnected, |el| {
-                    el.child(
-                        div()
-                            .mt_4()
-                            .px_4()
-                            .py_1p5()
-                            .rounded_md()
-                            .bg(rgb(0x313244))
-                            .text_sm()
-                            .text_color(rgb(TERM_FG))
-                            .cursor_pointer()
-                            .child("Reconnect"),
-                    )
+                    let mut btn =
+                        Button::new(ElementId::Name(format!("reconnect-btn-{}", count).into()))
+                            .centered(true)
+                            .child("Reconnect");
+                    if let Some(cb) = on_reconnect {
+                        btn = btn.on_click(move |e, w, a| cb(e, w, a));
+                    }
+                    el.child(btn)
                 }),
         )
         .into_any_element()
