@@ -1,6 +1,9 @@
 use gpui::{prelude::FluentBuilder, *};
+use gpui_animation::{animation::TransitionExt, transition::general::Linear};
 use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
+use std::rc::Rc;
+use std::time::Duration;
 
 use crate::color::*;
 use crate::components::button::Button;
@@ -9,10 +12,13 @@ use crate::layouts::connection_form::ConnectionFormView;
 /// A saved connection host entry.
 #[derive(Clone)]
 pub struct ConnectionHost {
+    pub id: i64,
     pub name: String,
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub kind: crate::layouts::connection_form::ConnectionKind,
+    pub credential_id: Option<i64>,
 }
 
 /// Render the hosts sidebar view.
@@ -23,7 +29,9 @@ pub fn render_hosts_view(
     hosts: &[ConnectionHost],
     form_entity: Option<&Entity<ConnectionFormView>>,
     on_new: impl Fn(&mut Window, &mut App) + 'static,
+    on_connect: impl Fn(i64, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let on_connect_rc = Rc::new(on_connect);
     div()
         .size_full()
         .flex()
@@ -76,10 +84,11 @@ pub fn render_hosts_view(
                     )
                 })
                 .when(!hosts.is_empty(), |el| {
-                    el.flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(hosts.iter().map(|h| host_row(h)))
+                    el.flex().flex_col().gap_1().children(hosts.iter().map(|h| {
+                        let on_click = on_connect_rc.clone();
+                        let host_id = h.id;
+                        host_row(h, move |w, cx| on_click(host_id, w, cx)).into_any_element()
+                    }))
                 }),
         )
         // --- Connection form overlay ---
@@ -90,8 +99,12 @@ pub fn render_hosts_view(
 // Host row
 // ---------------------------------------------------------------------------
 
-fn host_row(host: &ConnectionHost) -> impl IntoElement {
+fn host_row(
+    host: &ConnectionHost,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
+        .id(ElementId::Name(format!("host-row-{}", host.id).into()))
         .flex()
         .flex_row()
         .items_center()
@@ -100,7 +113,16 @@ fn host_row(host: &ConnectionHost) -> impl IntoElement {
         .py_2()
         .rounded_md()
         .bg(rgb(BG_BASE))
-        .hover(|el| el.bg(rgb(SURFACE_ACTIVE)))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_e, w, cx| on_click(w, cx))
+        .with_transition(ElementId::Name(format!("host-row-{}", host.id).into()))
+        .transition_on_hover(Duration::from_millis(120), Linear, |hovered, s| {
+            if *hovered {
+                s.bg(rgb(SURFACE_ACTIVE))
+            } else {
+                s.bg(rgb(BG_BASE))
+            }
+        })
         .child(
             div()
                 .flex()

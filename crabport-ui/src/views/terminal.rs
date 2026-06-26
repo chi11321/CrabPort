@@ -7,7 +7,9 @@ use alacritty_terminal::{
 };
 use crabport_core::keybind::{self, KeyAction, TerminalAction};
 use crabport_terminal::pty::PtyBackend;
+use crabport_terminal::terminal::CrabPortMonitor;
 use crabport_terminal::terminal::TerminalSession;
+
 use gpui::*;
 use parking_lot::Mutex;
 
@@ -104,6 +106,11 @@ impl TerminalView {
             cursor_visible: true,
             scroll_accumulator: 0.0,
         }
+    }
+
+    /// Access the backend's `CrabPortMonitor` implementation, if available.
+    pub fn monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        self.session.monitor()
     }
 
     fn resolve_keystroke(

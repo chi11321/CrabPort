@@ -1,15 +1,23 @@
-use std::{io::Cursor, sync::Arc, sync::LazyLock};
+use std::{
+    io::Cursor,
+    sync::{Arc, LazyLock},
+};
 
 use async_broadcast::{
     InactiveReceiver, Receiver as BroadcastReceiver, Sender as BroadcastSender, broadcast,
 };
 use async_channel::{Sender as MpscSender, unbounded};
-use crabport_terminal::terminal::{BackendEvent, CrabPortTerminal};
+use crabport_terminal::terminal::{
+    BackendEvent, CrabPortMonitor, CrabPortTerminal, MemoryStats, NetworkStats, RemoteMetrics,
+    RemoteStatus,
+};
+use parking_lot::RwLock;
 use russh::{
     Channel, ChannelMsg,
     client::{self, Msg},
+    keys::key::KeyPair,
 };
-use tokio::{runtime::Runtime, select};
+use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 
 use crate::session::SshConnectionInfo;
@@ -29,6 +37,16 @@ enum Command {
     Write(Vec<u8>),
     Resize(u16, u16),
     Close,
+}
+
+// ---------------------------------------------------------------------------
+// Shared monitor state
+// ---------------------------------------------------------------------------
+
+/// State shared between the SSH event loop and the monitor task.
+struct MonitorState {
+    status: RemoteStatus,
+    metrics: RemoteMetrics,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +81,7 @@ pub struct SshBackend {
     command_tx: MpscSender<Command>,
     event_tx: BroadcastSender<BackendEvent>,
     _event_rx: InactiveReceiver<BackendEvent>,
+    monitor: Arc<RwLock<MonitorState>>,
 }
 
 impl SshBackend {
@@ -71,10 +90,22 @@ impl SshBackend {
         let _event_rx = event_rx.deactivate();
         let (command_tx, command_rx) = unbounded::<Command>();
 
+        let monitor = Arc::new(RwLock::new(MonitorState {
+            status: RemoteStatus::Connecting,
+            metrics: RemoteMetrics::default(),
+        }));
+
         let event_tx2 = event_tx.clone();
+        let monitor2 = monitor.clone();
+        let info_for_monitor = info.clone();
 
         TOKIO.spawn(async move {
             // ---- 1. Connect ----
+            #[cfg(debug_assertions)]
+            info!(
+                "SSH: connecting to {}@{}:{}",
+                info.username, info.host, info.port
+            );
             let config = Arc::new(client::Config::default());
             let addr = format!("{}:{}", info.host, info.port);
             let mut sh = match client::connect(config, &addr, SshHandler).await {
@@ -84,6 +115,10 @@ impl SshBackend {
                 }
                 Err(e) => {
                     error!("SSH: connect failed: {e}");
+                    {
+                        let mut m = monitor2.write();
+                        m.status = RemoteStatus::Disconnected;
+                    }
                     let _ = event_tx2
                         .broadcast(BackendEvent::Error(e.to_string()))
                         .await;
@@ -92,16 +127,69 @@ impl SshBackend {
             };
 
             // ---- 2. Authenticate ----
-            if let Err(e) = sh
-                .authenticate_password(&info.username, &info.password)
-                .await
-            {
-                error!("SSH: auth failed: {e}");
-                let _ = event_tx2
-                    .broadcast(BackendEvent::Error(format!("auth failed: {e}")))
+            if info.uses_key_auth() {
+                #[cfg(debug_assertions)]
+                info!("SSH: authenticating with private key");
+
+                let key_str = info.private_key.as_deref().unwrap_or("");
+                let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        error!("SSH: failed to decode private key: {e}");
+                        {
+                            let mut m = monitor2.write();
+                            m.status = RemoteStatus::Disconnected;
+                        }
+                        let _ = event_tx2
+                            .broadcast(BackendEvent::Error(format!(
+                                "private key decode failed: {e}"
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let auth_result = sh
+                    .authenticate_publickey(&info.username, Arc::new(key_pair))
                     .await;
-                return;
+
+                if let Err(e) = auth_result {
+                    error!("SSH: key auth failed: {e}");
+                    {
+                        let mut m = monitor2.write();
+                        m.status = RemoteStatus::Disconnected;
+                    }
+                    let _ = event_tx2
+                        .broadcast(BackendEvent::Error(format!("key auth failed: {e}")))
+                        .await;
+                    return;
+                }
+            } else {
+                #[cfg(debug_assertions)]
+                info!(
+                    "SSH: authenticating with password '{}'",
+                    if info.password.is_empty() {
+                        "(empty)"
+                    } else {
+                        "***"
+                    }
+                );
+                if let Err(e) = sh
+                    .authenticate_password(&info.username, &info.password)
+                    .await
+                {
+                    error!("SSH: auth failed: {e}");
+                    {
+                        let mut m = monitor2.write();
+                        m.status = RemoteStatus::Disconnected;
+                    }
+                    let _ = event_tx2
+                        .broadcast(BackendEvent::Error(format!("auth failed: {e}")))
+                        .await;
+                    return;
+                }
             }
+            #[cfg(debug_assertions)]
             debug!("SSH: authenticated as {}", info.username);
 
             // ---- 3. Open session channel ----
@@ -112,6 +200,10 @@ impl SshBackend {
                 }
                 Err(e) => {
                     error!("SSH: open session failed: {e}");
+                    {
+                        let mut m = monitor2.write();
+                        m.status = RemoteStatus::Disconnected;
+                    }
                     let _ = event_tx2
                         .broadcast(BackendEvent::Error(e.to_string()))
                         .await;
@@ -126,6 +218,10 @@ impl SshBackend {
                 .await
             {
                 error!("SSH: PTY request failed: {e}");
+                {
+                    let mut m = monitor2.write();
+                    m.status = RemoteStatus::Disconnected;
+                }
                 let _ = event_tx2
                     .broadcast(BackendEvent::Error(e.to_string()))
                     .await;
@@ -136,6 +232,10 @@ impl SshBackend {
             // ---- 5. Start shell ----
             if let Err(e) = channel.request_shell(true).await {
                 error!("SSH: shell request failed: {e}");
+                {
+                    let mut m = monitor2.write();
+                    m.status = RemoteStatus::Disconnected;
+                }
                 let _ = event_tx2
                     .broadcast(BackendEvent::Error(e.to_string()))
                     .await;
@@ -143,7 +243,23 @@ impl SshBackend {
             }
             debug!("SSH: shell started");
 
-            // ---- 6. Event loop (read + cmd via tokio::select!) ----
+            // Mark as connected
+            {
+                let mut m = monitor2.write();
+                m.status = RemoteStatus::Connected;
+            }
+
+            // ---- 6. Spawn monitor task ----
+            // Wrap the Handle in Arc<TokioMutex> so the monitor task can use it.
+            // Handle is not Clone, so we share it via Arc.
+            let handle_for_monitor = Arc::new(TokioMutex::new(sh));
+            let monitor_for_task = monitor2.clone();
+            let info_for_task = info_for_monitor;
+            TOKIO.spawn(async move {
+                monitor_loop(handle_for_monitor, info_for_task, monitor_for_task).await;
+            });
+
+            // ---- 7. Event loop (read + cmd via tokio::select!) ----
             loop {
                 select! {
                     msg = channel.wait() => {
@@ -154,7 +270,12 @@ impl SshBackend {
                                     .await;
                             }
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                #[cfg(debug_assertions)]
                                 info!("SSH: channel closed by remote");
+                                {
+                                    let mut m = monitor2.write();
+                                    m.status = RemoteStatus::Disconnected;
+                                }
                                 let _ = event_tx2.broadcast(BackendEvent::Closed).await;
                                 return;
                             }
@@ -178,6 +299,10 @@ impl SshBackend {
                             }
                             Ok(Command::Close) | Err(_) => {
                                 let _ = channel.eof().await;
+                                {
+                                    let mut m = monitor2.write();
+                                    m.status = RemoteStatus::Disconnected;
+                                }
                                 let _ = event_tx2.broadcast(BackendEvent::Closed).await;
                                 return;
                             }
@@ -191,8 +316,214 @@ impl SshBackend {
             command_tx,
             event_tx,
             _event_rx,
+            monitor,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Monitor loop — periodically collects latency / memory / network via SSH exec
+// ---------------------------------------------------------------------------
+
+async fn monitor_loop(
+    handle: Arc<TokioMutex<client::Handle<SshHandler>>>,
+    _info: SshConnectionInfo,
+    monitor: Arc<RwLock<MonitorState>>,
+) {
+    let mut prev_net_sent: u64 = 0;
+    let mut prev_net_recv: u64 = 0;
+
+    // ---- First collection immediately on connection ----
+    {
+        let h = handle.lock().await;
+        let latency_ms = measure_latency(&h).await;
+        let memory = collect_memory(&h).await;
+        let network = collect_network(&h).await;
+
+        if let Some(net) = network {
+            prev_net_sent = net.bytes_sent;
+            prev_net_recv = net.bytes_recv;
+        }
+
+        let mut m = monitor.write();
+        m.metrics = RemoteMetrics {
+            latency_ms,
+            memory,
+            network: None, // No rate on first tick
+        };
+    }
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Skip if disconnected
+        {
+            let m = monitor.read();
+            if m.status == RemoteStatus::Disconnected {
+                return;
+            }
+        }
+
+        let h = handle.lock().await;
+
+        // ---- Latency: measure RTT of a small exec command ----
+        let latency_ms = measure_latency(&h).await;
+
+        // ---- Memory: parse /proc/meminfo ----
+        let memory = collect_memory(&h).await;
+
+        // ---- Network: parse /proc/net/dev ----
+        let raw_network = collect_network(&h).await;
+        let network = raw_network.map(|net| {
+            let rate_sent = net.bytes_sent.saturating_sub(prev_net_sent);
+            let rate_recv = net.bytes_recv.saturating_sub(prev_net_recv);
+            prev_net_sent = net.bytes_sent;
+            prev_net_recv = net.bytes_recv;
+            NetworkStats {
+                bytes_sent: rate_sent,
+                bytes_recv: rate_recv,
+            }
+        });
+
+        // ---- Update shared state ----
+        {
+            let mut m = monitor.write();
+            m.metrics = RemoteMetrics {
+                latency_ms,
+                memory,
+                network,
+            };
+        }
+    }
+}
+
+/// Measure round-trip latency by executing `echo ping` over SSH.
+async fn measure_latency(handle: &client::Handle<SshHandler>) -> Option<u32> {
+    let start = std::time::Instant::now();
+    match handle.channel_open_session().await {
+        Ok(mut ch) => {
+            if ch.exec(true, "echo ping").await.is_err() {
+                return None;
+            }
+            // Drain output until channel closes
+            loop {
+                match ch.wait().await {
+                    Some(ChannelMsg::Data { .. }) => {}
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+            }
+            let elapsed = start.elapsed().as_millis() as u32;
+            Some(elapsed)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Collect remote memory stats via `cat /proc/meminfo`.
+async fn collect_memory(handle: &client::Handle<SshHandler>) -> Option<MemoryStats> {
+    let output = exec_and_read(handle, "cat /proc/meminfo").await?;
+    let mut total: u64 = 0;
+    let mut available: u64 = 0;
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let value = parts[1].parse::<u64>().unwrap_or(0);
+        // /proc/meminfo values are in kB
+        if parts[0].starts_with("MemTotal") {
+            total = value * 1024;
+        } else if parts[0].starts_with("MemAvailable") {
+            available = value * 1024;
+        }
+    }
+
+    if total == 0 {
+        return None;
+    }
+
+    Some(MemoryStats {
+        total,
+        used: total.saturating_sub(available),
+    })
+}
+
+/// Collect remote network stats via `cat /proc/net/dev`.
+/// Sums across all interfaces.
+async fn collect_network(handle: &client::Handle<SshHandler>) -> Option<NetworkStats> {
+    let output = exec_and_read(handle, "cat /proc/net/dev").await?;
+    let mut bytes_recv: u64 = 0;
+    let mut bytes_sent: u64 = 0;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // Skip header lines
+        if !trimmed.contains(':') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let fields: Vec<&str> = parts[1].split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        // Fields: receive bytes (0) | ... | transmit bytes (8) | ...
+        bytes_recv += fields[0].parse::<u64>().unwrap_or(0);
+        bytes_sent += fields[8].parse::<u64>().unwrap_or(0);
+    }
+
+    Some(NetworkStats {
+        bytes_sent,
+        bytes_recv,
+    })
+}
+
+/// Execute a command over SSH and read all its stdout output.
+async fn exec_and_read(handle: &client::Handle<SshHandler>, cmd: &str) -> Option<String> {
+    let mut ch = handle.channel_open_session().await.ok()?;
+    if ch.exec(true, cmd).await.is_err() {
+        return None;
+    }
+
+    let mut output = Vec::new();
+    loop {
+        match ch.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                output.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+
+    String::from_utf8(output).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Private key decoding
+// ---------------------------------------------------------------------------
+
+fn decode_private_key(
+    key_str: &str,
+    passphrase: Option<&str>,
+) -> Result<KeyPair, Box<dyn std::error::Error + Send + Sync>> {
+    // Try PEM-encoded key first (OpenSSH format: "-----BEGIN OPENSSH PRIVATE KEY-----")
+    if key_str.contains("BEGIN") {
+        let pair = russh::keys::decode_secret_key(key_str, passphrase)?;
+        return Ok(pair);
+    }
+
+    // Otherwise treat as a raw key file path or content — try as file path first
+    if let Ok(content) = std::fs::read_to_string(key_str) {
+        let pair = russh::keys::decode_secret_key(&content, passphrase)?;
+        return Ok(pair);
+    }
+
+    Err("cannot decode private key: not a valid PEM key or file path".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +545,24 @@ impl CrabPortTerminal for SshBackend {
 
     fn subscribe(&self) -> BroadcastReceiver<BackendEvent> {
         self.event_tx.new_receiver()
+    }
+
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        Some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CrabPortMonitor impl
+// ---------------------------------------------------------------------------
+
+impl CrabPortMonitor for SshBackend {
+    fn status(&self) -> RemoteStatus {
+        self.monitor.read().status
+    }
+
+    fn metrics(&self) -> RemoteMetrics {
+        self.monitor.read().metrics
     }
 }
 

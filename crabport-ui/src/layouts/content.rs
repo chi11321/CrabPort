@@ -8,9 +8,12 @@ use crate::color::*;
 use crate::layouts::connection_form::ConnectionFormView;
 use crate::layouts::credential_form::CredentialFormView;
 use crate::layouts::tabbar::render_tab_bar;
+use crate::layouts::terminal_toolbar::render_terminal_toolbar;
 use crate::views;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
+
+use crabport_core::credential::CredentialEntry;
 
 pub fn render_content(
     selected: SidebarItem,
@@ -19,6 +22,7 @@ pub fn render_content(
     active_tab_id: u64,
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
+    credentials: &[CredentialEntry],
     form_entity: Option<&Entity<ConnectionFormView>>,
     cred_form_entity: Option<&Entity<CredentialFormView>>,
     window: &mut Window,
@@ -42,7 +46,14 @@ pub fn render_content(
     let view: AnyElement = match active_tab.map(|t| t.kind) {
         Some(TabKind::Home) => match selected {
             SidebarItem::Hosts => {
-                views::hosts::render_hosts_view(hosts, form_entity, on_new).into_any_element()
+                let app_handle = handle.clone();
+                let on_connect = move |host_id: i64, _w: &mut Window, cx: &mut App| {
+                    app_handle.update(cx, |app, cx| {
+                        app.connect_to_host(host_id, cx);
+                    });
+                };
+                views::hosts::render_hosts_view(hosts, form_entity, on_new, on_connect)
+                    .into_any_element()
             }
             SidebarItem::Tunnels => views::tunnels::render_tunnels_view(on_new).into_any_element(),
             SidebarItem::Credentials => {
@@ -52,8 +63,12 @@ pub fn render_content(
                         app.open_credential_form(w, cx);
                     });
                 };
-                views::credentials::render_credentials_view(cred_form_entity, on_new_cred)
-                    .into_any_element()
+                views::credentials::render_credentials_view(
+                    credentials,
+                    cred_form_entity,
+                    on_new_cred,
+                )
+                .into_any_element()
             }
             SidebarItem::Snippets => views::snippets::render_snippets_view().into_any_element(),
             SidebarItem::History => div()
@@ -99,6 +114,36 @@ pub fn render_content(
             .into_any_element(),
     };
 
+    let is_terminal = active_tab
+        .map(|t| t.kind == TabKind::Terminal)
+        .unwrap_or(false);
+
+    // Read monitor status & metrics from the active TerminalView's backend
+    let (status, metrics) = if is_terminal {
+        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
+            terminal_entity.read_with(cx, |view, _cx| {
+                if let Some(m) = view.monitor() {
+                    (m.status(), m.metrics())
+                } else {
+                    (
+                        crabport_terminal::terminal::RemoteStatus::Local,
+                        crabport_terminal::terminal::RemoteMetrics::default(),
+                    )
+                }
+            })
+        } else {
+            (
+                crabport_terminal::terminal::RemoteStatus::Local,
+                crabport_terminal::terminal::RemoteMetrics::default(),
+            )
+        }
+    } else {
+        (
+            crabport_terminal::terminal::RemoteStatus::Local,
+            crabport_terminal::terminal::RemoteMetrics::default(),
+        )
+    };
+
     div()
         .flex_1()
         .h_full()
@@ -113,4 +158,5 @@ pub fn render_content(
             on_close,
         ))
         .child(view)
+        .child(render_terminal_toolbar(is_terminal, status, metrics))
 }

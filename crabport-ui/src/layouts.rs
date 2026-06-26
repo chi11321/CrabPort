@@ -4,3 +4,4 @@ pub mod content;
 pub mod credential_form;
 pub mod sidebar;
 pub mod tabbar;
+pub mod terminal_toolbar;

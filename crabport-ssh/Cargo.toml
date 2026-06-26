@@ -8,8 +8,9 @@ crabport-terminal = { path = "../crabport-terminal" }
 russh = "0.45"
 async-broadcast = "0.7"
 async-channel = "2.5"
-tokio = { version = "1", features = ["rt", "net", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util"] }
 async-trait = "0.1"
 smol = "2.0"
 anyhow = "1"
 tracing = "0.1"
+parking_lot = "0.12"

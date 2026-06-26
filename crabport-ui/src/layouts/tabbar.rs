@@ -33,16 +33,11 @@ pub fn render_tab_bar(
             }
         })
         .with_transition("tabbar")
-        .transition_when(
+        .transition_when_else(
             is_home,
             std::time::Duration::from_millis(150),
             Linear,
             |el| el.pl_1(),
-        )
-        .transition_when(
-            !is_home,
-            std::time::Duration::from_millis(150),
-            Linear,
             |el| el.pl_20(),
         )
         .children(tabs.iter().map(|tab| {
@@ -57,16 +52,11 @@ pub fn render_tab_bar(
                 .flex()
                 .items_center()
                 .with_transition(wrapper_id)
-                .transition_when(
+                .transition_when_else(
                     is_active,
                     std::time::Duration::from_millis(150),
                     Linear,
                     |el| el.w_48(),
-                )
-                .transition_when(
-                    !is_active,
-                    std::time::Duration::from_millis(150),
-                    Linear,
                     |el| el.w_24(),
                 )
                 .child({

@@ -9,10 +9,14 @@ pub struct SshConnectionInfo {
     pub username: String,
     /// Password for password authentication.
     pub password: String,
+    /// Private key for certificate/key-based authentication.
+    pub private_key: Option<String>,
+    /// Passphrase for the private key (if encrypted).
+    pub passphrase: Option<String>,
 }
 
 impl SshConnectionInfo {
-    /// Create a new connection info with defaults.
+    /// Create a new connection info with password authentication.
     pub fn new(
         host: impl Into<String>,
         username: impl Into<String>,
@@ -23,6 +27,8 @@ impl SshConnectionInfo {
             port: 22,
             username: username.into(),
             password: password.into(),
+            private_key: None,
+            passphrase: None,
         }
     }
 
@@ -30,5 +36,21 @@ impl SshConnectionInfo {
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
+    }
+
+    /// Use key-based authentication with an optional passphrase.
+    pub fn with_private_key(
+        mut self,
+        private_key: impl Into<String>,
+        passphrase: Option<String>,
+    ) -> Self {
+        self.private_key = Some(private_key.into());
+        self.passphrase = passphrase;
+        self
+    }
+
+    /// Returns true if this connection should use key-based auth.
+    pub fn uses_key_auth(&self) -> bool {
+        self.private_key.is_some()
     }
 }

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::*;
@@ -11,10 +10,12 @@ use crate::layouts::command_palette::{CommandView, ConnectionType};
 use crate::layouts::connection_form::ConnectionFormView;
 use crate::layouts::credential_form::CredentialFormView;
 use crate::layouts::sidebar::render_sidebar;
-use crate::layouts::tabbar::render_tab_bar;
-use crate::views;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
+use crabport_core::credential::{
+    CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
+};
+use crabport_core::store::Store;
 use crabport_ssh::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
 
@@ -33,6 +34,7 @@ pub struct Tab {
     pub id: u64,
     pub title: String,
     pub kind: TabKind,
+    pub is_remote: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,9 +51,11 @@ pub struct CrabportApp {
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
     pub hosts: Vec<ConnectionHost>,
+    pub credentials: Vec<CredentialEntry>,
     pub connection_form: Option<Entity<ConnectionFormView>>,
     pub credential_form: Option<Entity<CredentialFormView>>,
     pub command_palette: Entity<CommandView>,
+    store: Store,
     wired: bool,
 }
 
@@ -103,9 +107,32 @@ impl CrabportApp {
             id: 0,
             title: "Home".into(),
             kind: TabKind::Home,
+            is_remote: false,
         };
 
         let command_palette = cx.new(|cx| CommandView::new(window, cx));
+
+        // Open store and load persisted data
+        let store = Store::open().expect("failed to open store");
+        let hosts: Vec<ConnectionHost> = store
+            .hosts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| ConnectionHost {
+                id: h.id,
+                name: h.name,
+                host: h.host,
+                port: h.port,
+                username: h.username,
+                kind: match h.kind {
+                    CoreHostKind::Ssh => crate::layouts::connection_form::ConnectionKind::SSH,
+                    CoreHostKind::Telnet => crate::layouts::connection_form::ConnectionKind::Telnet,
+                    CoreHostKind::Serial => crate::layouts::connection_form::ConnectionKind::Serial,
+                },
+                credential_id: h.credential_id,
+            })
+            .collect();
+        let credentials = store.credentials().unwrap_or_default();
 
         Self {
             sidebar_item: SidebarItem::Hosts,
@@ -114,10 +141,12 @@ impl CrabportApp {
             hovered_tab_id: None,
             next_tab_id: 1,
             terminal_views: HashMap::new(),
-            hosts: Vec::new(),
+            hosts,
+            credentials,
             connection_form: None,
             credential_form: None,
             command_palette,
+            store,
             wired: false,
         }
     }
@@ -166,6 +195,19 @@ impl CrabportApp {
                     c.update(cx, |cmd, cx| cmd.close(cx));
                 }
             });
+            cmd.set_on_select_host({
+                let c = cmd_for_new.clone();
+                let a = app_for_cmd.clone();
+                move |idx, _w, cx| {
+                    a.update(cx, |app, cx| {
+                        let host_id = app.hosts.get(idx).map(|h| h.id).unwrap_or(-1);
+                        if host_id >= 0 {
+                            app.connect_to_host(host_id, cx);
+                        }
+                    });
+                    c.update(cx, |cmd, cx| cmd.close(cx));
+                }
+            });
         });
     }
 
@@ -199,22 +241,56 @@ impl CrabportApp {
                 let f = form_for_connect.clone();
                 let a = app.clone();
                 move |_kind, _, cx| {
-                    let (host, port_num, username, password) = {
+                    let (name, host, port_num, username, password) = {
                         let ff = f.read(cx);
+                        let n = ff.name_text(cx);
                         let h = ff.host_text(cx);
                         let p: u16 = ff.port_text(cx).parse().unwrap_or(22);
                         let u = ff.user_text(cx);
                         let pw = ff.pass_text(cx);
-                        (h, p, u, pw)
+                        (n, h, p, u, pw)
                     };
                     a.update(cx, |app, cx| {
                         app.close_connection_form(cx);
-                        let name = format!("{}@{}", username, host);
+
+                        // Persist anonymous credential (password) for this host
+                        let cred = CredentialEntry {
+                            id: 0,
+                            name: name.clone(),
+                            kind: CoreCredentialKind::Password,
+                            anonymous: true,
+                            secret: password.clone(),
+                            private_key: String::new(),
+                            public_key: String::new(),
+                            certificate: String::new(),
+                        };
+                        let cred_id = app.store.add_credential(&cred).unwrap_or(0);
+
+                        // Persist host with linked credential
+                        let entry = HostEntry {
+                            id: 0,
+                            name: name.clone(),
+                            host: host.clone(),
+                            port: port_num,
+                            username: username.clone(),
+                            credential_id: Some(cred_id),
+                            kind: CoreHostKind::Ssh,
+                        };
+                        let row_id = app.store.add_host(&entry).unwrap_or(0);
+
+                        // Keep credentials list in sync
+                        let mut saved_cred = cred.clone();
+                        saved_cred.id = cred_id;
+                        app.credentials.push(saved_cred);
+
                         app.hosts.push(ConnectionHost {
+                            id: row_id,
                             name,
                             host: host.to_string(),
                             port: port_num,
                             username: username.to_string(),
+                            kind: crate::layouts::connection_form::ConnectionKind::SSH,
+                            credential_id: Some(cred_id),
                         });
                         app.add_ssh_tab(&host, port_num, &username, &password, cx);
                         cx.notify();
@@ -282,9 +358,46 @@ impl CrabportApp {
             });
 
             form.set_on_save({
-                let app = app.clone();
-                move |_kind, _w, cx| {
-                    app.update(cx, |app, cx| {
+                let form_clone = form_clone.clone();
+                let a = app.clone();
+                move |kind, _w, cx| {
+                    a.update(cx, |app, cx| {
+                        // Read form values
+                        let (name, secret, private_key, public_key, certificate) = {
+                            let f = form_clone.read(cx);
+                            (
+                                f.name_text(cx),
+                                f.secret_text(cx),
+                                f.private_key_text(cx),
+                                f.public_key_text(cx),
+                                f.certificate_text(cx),
+                            )
+                        };
+
+                        // Persist to store
+                        let core_kind = match kind {
+                            crate::layouts::credential_form::CredentialKind::Password => {
+                                CoreCredentialKind::Password
+                            }
+                            crate::layouts::credential_form::CredentialKind::Certificate => {
+                                CoreCredentialKind::Certificate
+                            }
+                        };
+                        let entry = CredentialEntry {
+                            id: 0, // auto-generated
+                            name: name.clone(),
+                            kind: core_kind,
+                            anonymous: false,
+                            secret,
+                            private_key,
+                            public_key,
+                            certificate,
+                        };
+                        let row_id = app.store.add_credential(&entry).unwrap_or(0);
+                        let mut saved = entry.clone();
+                        saved.id = row_id;
+                        app.credentials.push(saved);
+
                         app.close_credential_form(cx);
                         cx.notify();
                     });
@@ -335,6 +448,7 @@ impl CrabportApp {
             id,
             title: format!("Terminal-{}", id),
             kind: TabKind::Terminal,
+            is_remote: false,
         });
 
         let terminal_view = cx.new(|cx| TerminalView::new(cx));
@@ -359,6 +473,7 @@ impl CrabportApp {
             id,
             title,
             kind: TabKind::Terminal,
+            is_remote: true,
         });
 
         let info = SshConnectionInfo::new(host, username, password).with_port(port);
@@ -376,6 +491,23 @@ impl CrabportApp {
         if self.tabs.iter().any(|t| t.id == id) {
             self.active_tab_id = id;
         }
+    }
+
+    /// Connect to a saved host by ID. Resolves the linked credential password.
+    pub fn connect_to_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
+        let host = match self.hosts.iter().find(|h| h.id == host_id) {
+            Some(h) => h.clone(),
+            None => return,
+        };
+
+        // Try to resolve password from linked credential
+        let password = host
+            .credential_id
+            .and_then(|cid| self.store.find_credential(cid).ok().flatten())
+            .map(|c| c.secret)
+            .unwrap_or_default();
+
+        self.add_ssh_tab(&host.host, host.port, &host.username, &password, cx);
     }
 
     pub fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -412,20 +544,12 @@ impl CrabportApp {
     }
 
     // -- Helpers --
-
-    fn close_tab_fn(handle: Entity<Self>) -> Rc<dyn Fn(u64, &mut Window, &mut App)> {
-        Rc::new(move |id, _, cx| {
-            handle.update(cx, |app, cx| app.close_tab(id, cx));
-        })
-    }
 }
 
 impl Render for CrabportApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let handle = cx.entity().clone();
         let show_sidebar = self.is_home_active();
-        let active_tab = self.tabs.iter().find(|t| t.id == self.active_tab_id);
-        let is_home_tab = active_tab.map(|t| t.kind == TabKind::Home).unwrap_or(false);
 
         // Host names for command palette
         let host_names: Vec<String> = self.hosts.iter().map(|h| h.name.clone()).collect();
@@ -433,83 +557,20 @@ impl Render for CrabportApp {
             cmd.set_hosts(host_names);
         });
 
-        // ---- Content view (inlined from render_content) ----
-        let app_handle = cx.entity().clone();
-        let on_new = move |w: &mut Window, cx: &mut App| {
-            app_handle.update(cx, |app, cx| {
-                app.open_connection_form(w, cx);
-            });
-        };
-
-        let content_view: AnyElement = match active_tab.map(|t| t.kind) {
-            Some(TabKind::Home) => match self.sidebar_item {
-                SidebarItem::Hosts => views::hosts::render_hosts_view(
-                    &self.hosts,
-                    self.connection_form.as_ref(),
-                    on_new,
-                )
-                .into_any_element(),
-                SidebarItem::Credentials => {
-                    let on_new_cred = {
-                        let app = cx.entity().clone();
-                        move |_w: &mut Window, cx: &mut App| {
-                            app.update(cx, |app, cx| {
-                                app.open_credential_form(_w, cx);
-                            });
-                        }
-                    };
-                    views::credentials::render_credentials_view(
-                        self.credential_form.as_ref(),
-                        on_new_cred,
-                    )
-                    .into_any_element()
-                }
-                SidebarItem::Tunnels => {
-                    views::tunnels::render_tunnels_view(on_new).into_any_element()
-                }
-                SidebarItem::Snippets => views::snippets::render_snippets_view().into_any_element(),
-                SidebarItem::History => div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(self.sidebar_item.label()),
-                    )
-                    .into_any_element(),
-            },
-            Some(TabKind::Terminal) => {
-                if let Some(terminal_entity) =
-                    active_tab.and_then(|tab| self.terminal_views.get(&tab.id))
-                {
-                    terminal_entity.read_with(cx, |view, cx| {
-                        _window.focus(&view.focus_handle(cx));
-                    });
-                    div()
-                        .size_full()
-                        .m_2()
-                        .child(terminal_entity.clone())
-                        .into_any_element()
-                } else {
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(div().text_color(rgb(TEXT_MUTED)).child("Terminal"))
-                        .into_any_element()
-                }
-            }
-            None => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().text_color(rgb(TEXT_MUTED)).child("No tab"))
-                .into_any_element(),
-        };
+        // ---- Content view ----
+        let content = crate::layouts::content::render_content(
+            self.sidebar_item,
+            &handle,
+            &self.tabs,
+            self.active_tab_id,
+            &self.terminal_views,
+            &self.hosts,
+            &self.credentials,
+            self.connection_form.as_ref(),
+            self.credential_form.as_ref(),
+            _window,
+            cx,
+        );
 
         // ---- Root ----
         div()
@@ -527,37 +588,16 @@ impl Render for CrabportApp {
                     .bg(rgb(BG_SIDEBAR))
                     .overflow_x_hidden()
                     .with_transition("sidebar-container")
-                    .transition_when(
+                    .transition_when_else(
                         show_sidebar,
                         std::time::Duration::from_millis(300),
                         gpui_animation::transition::general::EaseInOutCubic,
                         |el| el.w(px(200.0)),
-                    )
-                    .transition_when(
-                        !show_sidebar,
-                        std::time::Duration::from_millis(300),
-                        gpui_animation::transition::general::EaseInOutCubic,
                         |el| el.w_0(),
                     )
                     .child(render_sidebar(self.sidebar_item, &handle)),
             )
-            // -- Tab bar + content --
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .bg(rgb(BG_BASE))
-                    .flex()
-                    .flex_col()
-                    .child(render_tab_bar(
-                        &handle,
-                        &self.tabs,
-                        self.active_tab_id,
-                        is_home_tab,
-                        Self::close_tab_fn(handle.clone()),
-                    ))
-                    .child(content_view),
-            )
+            .child(content)
             // -- Command palette --
             .child(self.command_palette.clone())
     }

@@ -26,6 +26,71 @@ pub trait CrabPortTerminal: Send + Sync {
     fn resize(&self, cols: u16, rows: u16);
     fn close(&self);
     fn subscribe(&self) -> BroadcastReceiver<BackendEvent>;
+
+    /// Try to obtain a `CrabPortMonitor` implementation.
+    /// Backends that also implement `CrabPortMonitor` should return `Some(self)`.
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote performance monitoring
+// ---------------------------------------------------------------------------
+
+/// Connection state of a backend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteStatus {
+    /// Local session (no network connection).
+    Local,
+    /// Actively connected and operational.
+    Connected,
+    /// Connection is being established.
+    Connecting,
+    /// Connection has been lost or closed.
+    Disconnected,
+}
+
+/// Snapshot of network I/O counters (bytes).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetworkStats {
+    /// Total bytes sent since connection start.
+    pub bytes_sent: u64,
+    /// Total bytes received since connection start.
+    pub bytes_recv: u64,
+}
+
+/// Snapshot of remote host memory usage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryStats {
+    /// Total physical memory in bytes.
+    pub total: u64,
+    /// Used physical memory in bytes.
+    pub used: u64,
+}
+
+/// A full performance snapshot from a remote backend.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemoteMetrics {
+    /// Round-trip latency in milliseconds.
+    pub latency_ms: Option<u32>,
+    /// Remote host memory usage.
+    pub memory: Option<MemoryStats>,
+    /// Network I/O counters.
+    pub network: Option<NetworkStats>,
+}
+
+/// Trait for backends that can report performance metrics.
+///
+/// Implement this on `CrabPortTerminal` for any backend (local or remote)
+/// to expose latency, memory, and network monitoring data to the UI.
+/// Local backends should return `latency_ms = None` and `RemoteStatus::Local`.
+pub trait CrabPortMonitor: Send + Sync {
+    /// Current connection status.
+    fn status(&self) -> RemoteStatus;
+
+    /// Latest performance metrics snapshot.
+    fn metrics(&self) -> RemoteMetrics;
 }
 
 #[derive(Clone)]
@@ -161,6 +226,19 @@ impl TerminalSession {
 
     pub fn subscribe_wakeup(&self) -> BroadcastReceiver<()> {
         self.wakeup_tx.new_receiver()
+    }
+
+    /// Try to obtain a reference to the `CrabPortMonitor` implementation.
+    /// Returns `None` if the backend doesn't implement `CrabPortMonitor`.
+    pub fn monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        // Both CrabPortTerminal and CrabPortMonitor are object-safe,
+        // but we can't downcast `dyn CrabPortTerminal` to `dyn CrabPortMonitor`
+        // without a helper. Instead, we store both traits when available.
+        //
+        // For now, we use a simple approach: since the concrete types that
+        // implement CrabPortTerminal also implement CrabPortMonitor, we ask
+        // the backend for its monitor via a method on CrabPortTerminal.
+        self.backend.as_monitor()
     }
 
     pub fn scroll(&self, delta: i32) {

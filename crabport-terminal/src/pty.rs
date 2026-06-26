@@ -2,6 +2,7 @@ use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     thread,
     time::Duration,
 };
@@ -15,15 +16,27 @@ use async_broadcast::{
 };
 use async_channel::{Sender as MpscSender, unbounded};
 use libc::{TIOCSWINSZ, ioctl, winsize};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
-use crate::terminal::{BackendEvent, CrabPortTerminal};
+use crate::terminal::{
+    BackendEvent, CrabPortMonitor, CrabPortTerminal, MemoryStats, NetworkStats, RemoteMetrics,
+    RemoteStatus,
+};
 
 pub struct PtyBackend {
     _pty: Arc<Mutex<Pty>>,
     command_tx: MpscSender<Command>,
     event_tx: BroadcastSender<BackendEvent>,
     _event_rx: InactiveReceiver<BackendEvent>,
+    sys: RwLock<sysinfo::System>,
+    networks: RwLock<sysinfo::Networks>,
+    /// Monotonic millis of the last sysinfo refresh.
+    last_refresh_ms: AtomicU64,
+    /// Cached metrics snapshot.
+    cached_metrics: RwLock<RemoteMetrics>,
+    /// Previous cumulative network bytes (for computing per-second rate).
+    prev_net_sent: AtomicU64,
+    prev_net_recv: AtomicU64,
 }
 
 enum Command {
@@ -151,6 +164,12 @@ impl PtyBackend {
             command_tx,
             event_tx,
             _event_rx,
+            sys: RwLock::new(sysinfo::System::new()),
+            networks: RwLock::new(sysinfo::Networks::new_with_refreshed_list()),
+            last_refresh_ms: AtomicU64::new(0),
+            cached_metrics: RwLock::new(RemoteMetrics::default()),
+            prev_net_sent: AtomicU64::new(0),
+            prev_net_recv: AtomicU64::new(0),
         })
     }
 }
@@ -170,6 +189,78 @@ impl CrabPortTerminal for PtyBackend {
 
     fn subscribe(&self) -> BroadcastReceiver<BackendEvent> {
         self.event_tx.new_receiver()
+    }
+
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        Some(self)
+    }
+}
+
+impl CrabPortMonitor for PtyBackend {
+    fn status(&self) -> RemoteStatus {
+        RemoteStatus::Local
+    }
+
+    fn metrics(&self) -> RemoteMetrics {
+        // Refresh at most once per second; first call always refreshes
+        // because last_refresh_ms starts at 0.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self.last_refresh_ms.load(AtomicOrdering::Relaxed);
+        if now.saturating_sub(last) >= 1000 {
+            // Only one writer wins the race
+            if self
+                .last_refresh_ms
+                .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                {
+                    let mut sys = self.sys.write();
+                    sys.refresh_memory();
+                }
+                {
+                    let mut networks = self.networks.write();
+                    networks.refresh(true);
+                }
+
+                let sys = self.sys.read();
+                let memory = MemoryStats {
+                    total: sys.total_memory(),
+                    used: sys.used_memory(),
+                };
+                drop(sys);
+
+                let networks = self.networks.read();
+                let mut bytes_sent: u64 = 0;
+                let mut bytes_recv: u64 = 0;
+                for (_name, network) in networks.iter() {
+                    bytes_sent += network.transmitted();
+                    bytes_recv += network.received();
+                }
+
+                // Compute per-second rate from cumulative delta
+                let prev_sent = self.prev_net_sent.swap(bytes_sent, AtomicOrdering::Relaxed);
+                let prev_recv = self.prev_net_recv.swap(bytes_recv, AtomicOrdering::Relaxed);
+                let rate_sent = bytes_sent.saturating_sub(prev_sent);
+                let rate_recv = bytes_recv.saturating_sub(prev_recv);
+
+                let network = NetworkStats {
+                    bytes_sent: rate_sent,
+                    bytes_recv: rate_recv,
+                };
+
+                let mut cached = self.cached_metrics.write();
+                *cached = RemoteMetrics {
+                    latency_ms: None,
+                    memory: Some(memory),
+                    network: Some(network),
+                };
+            }
+        }
+
+        self.cached_metrics.read().clone()
     }
 }
 
