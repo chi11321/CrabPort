@@ -5,8 +5,8 @@ use gpui::*;
 
 use crate::app::{CrabportApp, SidebarItem, Tab, TabKind};
 use crate::color::*;
-use crate::layouts::connection_form::ConnectionFormView;
-use crate::layouts::credential_form::CredentialFormView;
+use crate::layouts::connection_form::ConnectionFormState;
+use crate::layouts::credential_form::CredentialFormState;
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
 use crate::views;
@@ -23,8 +23,8 @@ pub fn render_content(
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
     credentials: &[CredentialEntry],
-    form_entity: Option<&Entity<ConnectionFormView>>,
-    cred_form_entity: Option<&Entity<CredentialFormView>>,
+    form_entity: Option<&ConnectionFormState>,
+    cred_form_entity: Option<&CredentialFormState>,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {

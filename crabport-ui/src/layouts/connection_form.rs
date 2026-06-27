@@ -22,28 +22,30 @@ pub enum ConnectionKind {
 }
 
 // ---------------------------------------------------------------------------
-// ConnectionFormView
+// ConnectionFormState — owned by CrabportApp
 // ---------------------------------------------------------------------------
 
-pub struct ConnectionFormView {
+/// Holds all mutable state for the connection form overlay so that
+/// `ConnectionFormView` can be a pure `RenderOnce` renderer.
+pub struct ConnectionFormState {
     pub active: bool,
-    kind: ConnectionKind,
-    name_input: Entity<InputState>,
-    host_input: Entity<InputState>,
-    port_input: Entity<InputState>,
-    user_input: Entity<InputState>,
-    pass_input: Entity<InputState>,
-    name_focused: bool,
-    host_focused: bool,
-    port_focused: bool,
-    user_focused: bool,
-    pass_focused: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+    pub kind: ConnectionKind,
+    pub name_input: Entity<InputState>,
+    pub host_input: Entity<InputState>,
+    pub port_input: Entity<InputState>,
+    pub user_input: Entity<InputState>,
+    pub pass_input: Entity<InputState>,
+    pub name_focused: bool,
+    pub host_focused: bool,
+    pub port_focused: bool,
+    pub user_focused: bool,
+    pub pass_focused: bool,
+    pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    pub on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 }
 
-impl ConnectionFormView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl ConnectionFormState {
+    pub fn new(window: &mut Window, cx: &mut App) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx));
         let host_input = cx.new(|cx| InputState::new(window, cx));
         let port_input = cx.new(|cx| InputState::new(window, cx));
@@ -72,7 +74,7 @@ impl ConnectionFormView {
         }
     }
 
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open(&mut self, window: &mut Window, cx: &mut App) {
         self.active = true;
         self.name_input.update(cx, |state, cx| {
             state.focus(window, cx);
@@ -80,22 +82,10 @@ impl ConnectionFormView {
         self.port_input.update(cx, |state, cx| {
             state.set_value("22", window, cx);
         });
-        cx.notify();
     }
 
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.active {
-            self.active = false;
-            cx.notify();
-        }
-    }
-
-    pub fn set_on_close(&mut self, f: impl Fn(&mut Window, &mut App) + 'static) {
-        self.on_close = Some(Rc::new(f));
-    }
-
-    pub fn set_on_connect(&mut self, f: impl Fn(ConnectionKind, &mut Window, &mut App) + 'static) {
-        self.on_connect = Some(Rc::new(f));
+    pub fn close(&mut self) {
+        self.active = false;
     }
 
     pub fn name_text(&self, cx: &App) -> String {
@@ -119,40 +109,70 @@ impl ConnectionFormView {
     }
 }
 
-impl Render for ConnectionFormView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active;
-        let kind = self.kind;
-        let name_focused = self.name_focused;
-        let host_focused = self.host_focused;
-        let port_focused = self.port_focused;
-        let user_focused = self.user_focused;
-        let pass_focused = self.pass_focused;
+// ---------------------------------------------------------------------------
+// ConnectionFormView — pure RenderOnce renderer
+// ---------------------------------------------------------------------------
 
-        let name_input = self.name_input.clone();
-        let host_input = self.host_input.clone();
-        let port_input = self.port_input.clone();
-        let user_input = self.user_input.clone();
-        let pass_input = self.pass_input.clone();
+#[derive(IntoElement)]
+pub struct ConnectionFormView {
+    active: bool,
+    kind: ConnectionKind,
+    name_input: Entity<InputState>,
+    host_input: Entity<InputState>,
+    port_input: Entity<InputState>,
+    user_input: Entity<InputState>,
+    pass_input: Entity<InputState>,
+    name_focused: bool,
+    host_focused: bool,
+    port_focused: bool,
+    user_focused: bool,
+    pass_focused: bool,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+}
 
+impl ConnectionFormView {
+    pub fn new(state: &ConnectionFormState) -> Self {
+        Self {
+            active: state.active,
+            kind: state.kind,
+            name_input: state.name_input.clone(),
+            host_input: state.host_input.clone(),
+            port_input: state.port_input.clone(),
+            user_input: state.user_input.clone(),
+            pass_input: state.pass_input.clone(),
+            name_focused: state.name_focused,
+            host_focused: state.host_focused,
+            port_focused: state.port_focused,
+            user_focused: state.user_focused,
+            pass_focused: state.pass_focused,
+            on_close: state.on_close.clone(),
+            on_connect: state.on_connect.clone(),
+        }
+    }
+}
+
+impl RenderOnce for ConnectionFormView {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let on_close_for_dialog = self.on_close.clone();
         render_overlay(
-            active,
-            &self.on_close,
+            self.active,
+            self.on_close,
             render_dialog(
-                active,
-                kind,
-                name_input,
-                host_input,
-                port_input,
-                user_input,
-                pass_input,
-                name_focused,
-                host_focused,
-                port_focused,
-                user_focused,
-                pass_focused,
-                &self.on_close,
-                &self.on_connect,
+                self.active,
+                self.kind,
+                self.name_input,
+                self.host_input,
+                self.port_input,
+                self.user_input,
+                self.pass_input,
+                self.name_focused,
+                self.host_focused,
+                self.port_focused,
+                self.user_focused,
+                self.pass_focused,
+                on_close_for_dialog,
+                self.on_connect,
             ),
         )
     }
@@ -164,7 +184,7 @@ impl Render for ConnectionFormView {
 
 fn render_overlay(
     active: bool,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     child: impl IntoElement,
 ) -> impl IntoElement {
     let overlay_id = ElementId::Name("conn-form-overlay".into());
@@ -181,7 +201,6 @@ fn render_overlay(
         .bg(rgba(0x00000000))
         .when(active, |el| {
             el.occlude().on_mouse_down(MouseButton::Left, {
-                let on_close = on_close.clone();
                 move |_e, w, cx| {
                     if let Some(ref cb) = on_close {
                         cb(w, cx);
@@ -213,8 +232,8 @@ fn render_dialog(
     port_focused: bool,
     user_focused: bool,
     pass_focused: bool,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_connect: &Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let dialog_id = ElementId::Name("conn-form-dialog".into());
 
@@ -333,11 +352,11 @@ fn render_host_port_row(
 
 fn render_buttons(
     kind: ConnectionKind,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_connect: &Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
-    let on_close_btn = on_close.clone();
-    let on_connect_btn = on_connect.clone();
+    let overlay_id = ElementId::Name("conn-form-overlay".into());
+    let dialog_id = ElementId::Name("conn-form-dialog".into());
     div()
         .flex()
         .flex_row()
@@ -348,7 +367,7 @@ fn render_buttons(
                 .centered(true)
                 .child(t!("connection_form.cancel").to_string())
                 .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_close_btn {
+                    if let Some(ref cb) = on_close {
                         cb(w, cx);
                     }
                 }),
@@ -359,7 +378,9 @@ fn render_buttons(
                 .centered(true)
                 .child(t!("connection_form.connect").to_string())
                 .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_connect_btn {
+                    gpui_animation::reset_transition(&overlay_id);
+                    gpui_animation::reset_transition(&dialog_id);
+                    if let Some(ref cb) = on_connect {
                         cb(kind, w, cx);
                     }
                 }),

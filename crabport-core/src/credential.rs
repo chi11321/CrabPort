@@ -13,6 +13,10 @@ pub struct HostEntry {
     pub username: String,
     pub credential_id: Option<i64>,
     pub kind: HostKind,
+    #[serde(default)]
+    pub last_login: Option<i64>,
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

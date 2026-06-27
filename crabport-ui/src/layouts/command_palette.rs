@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::color::*;
+use crate::views::hosts::ConnectionHost;
 
 // ---------------------------------------------------------------------------
 // Connection type
@@ -66,7 +67,7 @@ impl ConnectionType {
 pub struct CommandView {
     pub open: bool,
     search_state: Option<Entity<InputState>>,
-    hosts: Vec<String>,
+    hosts: Vec<ConnectionHost>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_select_host: Option<Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     on_new_connection: Option<Rc<dyn Fn(ConnectionType, &mut Window, &mut App) + 'static>>,
@@ -98,7 +99,7 @@ impl CommandView {
         cx.notify();
     }
 
-    pub fn set_hosts(&mut self, hosts: Vec<String>) {
+    pub fn set_hosts(&mut self, hosts: Vec<ConnectionHost>) {
         self.hosts = hosts;
     }
 
@@ -125,13 +126,11 @@ impl Render for CommandView {
         let on_close = self.on_close.clone();
         let on_select_host = self.on_select_host.clone();
         let on_new_connection = self.on_new_connection.clone();
-        let has_hosts = !self.hosts.is_empty();
         let hosts = self.hosts.clone();
 
         render_overlay(is_open, on_close).child(render_dialog(
             is_open,
             search,
-            has_hosts,
             hosts,
             on_select_host,
             on_new_connection,
@@ -217,8 +216,7 @@ fn render_overlay(
 fn render_dialog(
     is_open: bool,
     search: AnyElement,
-    has_hosts: bool,
-    hosts: Vec<String>,
+    hosts: Vec<ConnectionHost>,
     on_select_host: Option<Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     on_new_connection: Option<Rc<dyn Fn(ConnectionType, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
@@ -264,32 +262,33 @@ fn render_dialog(
         .child(
             div()
                 .flex_1()
+                .min_h_0()
                 .overflow_y_scrollbar()
                 .p_2()
                 .flex()
                 .flex_col()
-                .child(render_hosts_list(has_hosts, hosts, is_open, on_select_host))
+                .child(render_hosts_list(hosts, is_open, on_select_host))
                 .child(render_connection_list(is_open, on_new_connection)),
         )
 }
 
 fn render_hosts_list(
-    has_hosts: bool,
-    hosts: Vec<String>,
+    hosts: Vec<ConnectionHost>,
     is_open: bool,
     on_select_host: Option<Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
-    div().when(has_hosts, |el| {
+    div().when(!hosts.is_empty(), |el| {
         el.child(group_label(t!("new_connection.hosts")))
-            .children(hosts.iter().enumerate().map(|(i, host)| {
-                let host = host.clone();
+            .children(hosts.into_iter().take(5).enumerate().map(|(i, host)| {
                 let on_select = on_select_host.clone();
+                let is_favorite = host.favorite;
                 command_item(
                     ElementId::Name(format!("cmd-host-{i}").into()),
                     "icons/server.svg",
-                    host.clone(),
-                    None::<SharedString>,
+                    host.name.clone(),
+                    Some(format!("{}@{}:{}", host.username, host.host, host.port)),
                     is_open,
+                    is_favorite,
                     move |w, cx| {
                         if let Some(ref cb) = on_select {
                             cb(i, w, cx);
@@ -315,6 +314,7 @@ fn render_connection_list(
                 ct.label(),
                 Some(ct.description()),
                 is_open,
+                false,
                 move |w, cx| {
                     if let Some(ref cb) = on_new {
                         cb(ct, w, cx);
@@ -334,11 +334,13 @@ fn command_item(
     label: impl Into<SharedString>,
     description: Option<impl Into<SharedString>>,
     enabled: bool,
+    is_favorite: bool,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let label = label.into();
     let desc = description.map(|d| d.into());
 
+    let id_for_reset = id.clone();
     div()
         .id(id.clone())
         .flex()
@@ -350,9 +352,19 @@ fn command_item(
         .bg(rgb(COMMAND_BG))
         .when(enabled, |el| {
             el.cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_e, w, cx| on_click(w, cx))
+                .on_mouse_down(MouseButton::Left, move |_e, w, cx| {
+                    gpui_animation::reset_transition(&id_for_reset);
+                    on_click(w, cx);
+                })
         })
-        .hover(|el| el.bg(rgb(COMMAND_ITEM_HOVER)))
+        .with_transition(id.clone())
+        .transition_on_hover(Duration::from_millis(120), Linear, |hovered, el| {
+            if *hovered {
+                el.bg(rgb(COMMAND_ITEM_HOVER))
+            } else {
+                el.bg(rgb(COMMAND_BG))
+            }
+        })
         .child(
             svg()
                 .path(icon_path)
@@ -368,9 +380,23 @@ fn command_item(
                 .min_w_0()
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(TEXT_PRIMARY))
-                        .child(label.clone()),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_PRIMARY))
+                                .child(label.clone()),
+                        )
+                        .when(is_favorite, |el| {
+                            el.child(
+                                svg()
+                                    .path("icons/star.svg")
+                                    .size_3()
+                                    .text_color(rgb(0xf9e2af)), // TERM_YELLOW
+                            )
+                        }),
                 )
                 .when_some(desc, |el, desc| {
                     el.child(

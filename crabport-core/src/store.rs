@@ -98,32 +98,73 @@ impl Store {
     // -------------------------------------------------------------------
 
     fn migrate(&self) -> Result<(), StoreError> {
+        // Ensure the schema_version tracking table exists
         self.db
-            .execute_batch(
-                "
-                CREATE TABLE IF NOT EXISTS hosts (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name        TEXT    NOT NULL,
-                    host        TEXT    NOT NULL,
-                    port        INTEGER NOT NULL DEFAULT 22,
-                    username    TEXT    NOT NULL DEFAULT '',
-                    credential_id INTEGER,
-                    kind        TEXT    NOT NULL DEFAULT 'Ssh'
-                );
-
-                CREATE TABLE IF NOT EXISTS credentials (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name        TEXT    NOT NULL,
-                    kind        TEXT    NOT NULL DEFAULT 'Password',
-                    anonymous   INTEGER NOT NULL DEFAULT 0,
-                    secret      BLOB    NOT NULL,
-                    private_key BLOB    NOT NULL DEFAULT '',
-                    public_key  BLOB    NOT NULL DEFAULT '',
-                    certificate BLOB    NOT NULL DEFAULT ''
-                );
-                ",
-            )
+            .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
             .map_err(|e| StoreError::Db(e.to_string()))?;
+
+        let current: i64 = self
+            .db
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Migration 1: initial schema
+        if current < 1 {
+            self.db
+                .execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS hosts (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name          TEXT    NOT NULL,
+                        host          TEXT    NOT NULL,
+                        port          INTEGER NOT NULL DEFAULT 22,
+                        username      TEXT    NOT NULL DEFAULT '',
+                        credential_id INTEGER,
+                        kind          TEXT    NOT NULL DEFAULT 'Ssh'
+                    );
+
+                    CREATE TABLE IF NOT EXISTS credentials (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name         TEXT    NOT NULL,
+                        kind         TEXT    NOT NULL DEFAULT 'Password',
+                        anonymous    INTEGER NOT NULL DEFAULT 0,
+                        secret       BLOB    NOT NULL,
+                        private_key  BLOB    NOT NULL DEFAULT '',
+                        public_key   BLOB    NOT NULL DEFAULT '',
+                        certificate  BLOB    NOT NULL DEFAULT ''
+                    );
+                    ",
+                )
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+
+        // Migration 2: add last_login and favorite to hosts
+        if current < 2 {
+            self.db
+                .execute_batch(
+                    "
+                    ALTER TABLE hosts ADD COLUMN last_login INTEGER;
+                    ALTER TABLE hosts ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+                    ",
+                )
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+
+        // Record the latest migration version
+        let latest = 2;
+        if current < latest {
+            self.db
+                .execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    params![latest],
+                )
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -172,13 +213,15 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind FROM hosts ORDER BY id",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite FROM hosts ORDER BY favorite DESC, last_login DESC, id",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         let rows = stmt
             .query_map([], |row| {
                 let kind_str: String = row.get(6)?;
+                let last_login: Option<i64> = row.get(7)?;
+                let favorite: i64 = row.get(8)?;
                 Ok(HostEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -187,6 +230,8 @@ impl Store {
                     username: row.get(4)?,
                     credential_id: row.get(5)?,
                     kind: parse_host_kind(&kind_str),
+                    last_login,
+                    favorite: favorite != 0,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -201,7 +246,7 @@ impl Store {
     pub fn add_host(&self, host: &HostEntry) -> Result<i64, StoreError> {
         self.db
             .execute(
-                "INSERT INTO hosts (name, host, port, username, credential_id, kind) VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     host.name,
                     host.host,
@@ -209,6 +254,8 @@ impl Store {
                     host.username,
                     host.credential_id,
                     host_kind_str(host.kind),
+                    host.last_login,
+                    host.favorite as i64,
                 ],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -225,7 +272,7 @@ impl Store {
     pub fn update_host(&self, host: &HostEntry) -> Result<(), StoreError> {
         self.db
             .execute(
-                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6 WHERE id=?7",
+                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8 WHERE id=?9",
                 params![
                     host.name,
                     host.host,
@@ -233,6 +280,8 @@ impl Store {
                     host.username,
                     host.credential_id,
                     host_kind_str(host.kind),
+                    host.last_login,
+                    host.favorite as i64,
                     host.id,
                 ],
             )
@@ -244,12 +293,14 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind FROM hosts WHERE id=?1",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite FROM hosts WHERE id=?1",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         stmt.query_row(params![id], |row| {
             let kind_str: String = row.get(6)?;
+            let last_login: Option<i64> = row.get(7)?;
+            let favorite: i64 = row.get(8)?;
             Ok(HostEntry {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -258,10 +309,43 @@ impl Store {
                 username: row.get(4)?,
                 credential_id: row.get(5)?,
                 kind: parse_host_kind(&kind_str),
+                last_login,
+                favorite: favorite != 0,
             })
         })
         .optional()
         .map_err(|e| StoreError::Db(e.to_string()))
+    }
+
+    // -------------------------------------------------------------------
+    // Credentials CRUD
+    // -------------------------------------------------------------------
+
+    /// Update the last_login timestamp for a host to the current time (unix epoch seconds).
+    pub fn touch_host_login(&self, id: i64) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().timestamp();
+        self.db
+            .execute(
+                "UPDATE hosts SET last_login = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Toggle the favorite flag for a host.
+    pub fn toggle_host_favorite(&self, id: i64) -> Result<bool, StoreError> {
+        let host = self
+            .find_host(id)?
+            .ok_or_else(|| StoreError::Db("host not found".into()))?;
+        let new_val = !host.favorite;
+        self.db
+            .execute(
+                "UPDATE hosts SET favorite = ?1 WHERE id = ?2",
+                params![new_val as i64, id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(new_val)
     }
 
     // -------------------------------------------------------------------

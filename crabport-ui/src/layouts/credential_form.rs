@@ -22,31 +22,33 @@ pub enum CredentialKind {
 }
 
 // ---------------------------------------------------------------------------
-// CredentialFormView
+// CredentialFormState — owned by CrabportApp
 // ---------------------------------------------------------------------------
 
-pub struct CredentialFormView {
+/// Holds all mutable state for the credential form overlay so that
+/// `CredentialFormView` can be a pure `RenderOnce` renderer.
+pub struct CredentialFormState {
     pub active: bool,
     pub kind: CredentialKind,
-    name_input: Entity<InputState>,
-    username_input: Entity<InputState>,
-    password_input: Entity<InputState>,
-    private_key_input: Entity<InputState>,
-    public_key_input: Entity<InputState>,
-    certificate_input: Entity<InputState>,
-    name_focused: bool,
-    username_focused: bool,
-    password_focused: bool,
-    private_key_focused: bool,
-    public_key_focused: bool,
-    certificate_focused: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
-    on_kind_change: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    pub name_input: Entity<InputState>,
+    pub username_input: Entity<InputState>,
+    pub password_input: Entity<InputState>,
+    pub private_key_input: Entity<InputState>,
+    pub public_key_input: Entity<InputState>,
+    pub certificate_input: Entity<InputState>,
+    pub name_focused: bool,
+    pub username_focused: bool,
+    pub password_focused: bool,
+    pub private_key_focused: bool,
+    pub public_key_focused: bool,
+    pub certificate_focused: bool,
+    pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    pub on_save: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    pub on_kind_change: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
 }
 
-impl CredentialFormView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl CredentialFormState {
+    pub fn new(window: &mut Window, cx: &mut App) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx));
         let username_input = cx.new(|cx| InputState::new(window, cx));
         let password_input = cx.new(|cx| {
@@ -79,34 +81,15 @@ impl CredentialFormView {
         }
     }
 
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open(&mut self, window: &mut Window, cx: &mut App) {
         self.active = true;
         self.name_input.update(cx, |state, cx| {
             state.focus(window, cx);
         });
-        cx.notify();
     }
 
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.active {
-            self.active = false;
-            cx.notify();
-        }
-    }
-
-    pub fn set_on_close(&mut self, f: impl Fn(&mut Window, &mut App) + 'static) {
-        self.on_close = Some(Rc::new(f));
-    }
-
-    pub fn set_on_save(&mut self, f: impl Fn(CredentialKind, &mut Window, &mut App) + 'static) {
-        self.on_save = Some(Rc::new(f));
-    }
-
-    pub fn set_on_kind_change(
-        &mut self,
-        f: impl Fn(CredentialKind, &mut Window, &mut App) + 'static,
-    ) {
-        self.on_kind_change = Some(Rc::new(f));
+    pub fn close(&mut self) {
+        self.active = false;
     }
 
     pub fn name_text(&self, cx: &App) -> String {
@@ -135,45 +118,79 @@ impl CredentialFormView {
     }
 }
 
-impl Render for CredentialFormView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active;
-        let kind = self.kind;
-        let name_focused = self.name_focused;
-        let username_focused = self.username_focused;
-        let password_focused = self.password_focused;
-        let private_key_focused = self.private_key_focused;
-        let public_key_focused = self.public_key_focused;
-        let certificate_focused = self.certificate_focused;
+// ---------------------------------------------------------------------------
+// CredentialFormView — pure RenderOnce renderer
+// ---------------------------------------------------------------------------
 
-        let name_input = self.name_input.clone();
-        let username_input = self.username_input.clone();
-        let password_input = self.password_input.clone();
-        let private_key_input = self.private_key_input.clone();
-        let public_key_input = self.public_key_input.clone();
-        let certificate_input = self.certificate_input.clone();
+#[derive(IntoElement)]
+pub struct CredentialFormView {
+    active: bool,
+    kind: CredentialKind,
+    name_input: Entity<InputState>,
+    username_input: Entity<InputState>,
+    password_input: Entity<InputState>,
+    private_key_input: Entity<InputState>,
+    public_key_input: Entity<InputState>,
+    certificate_input: Entity<InputState>,
+    name_focused: bool,
+    username_focused: bool,
+    password_focused: bool,
+    private_key_focused: bool,
+    public_key_focused: bool,
+    certificate_focused: bool,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_save: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    on_kind_change: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+}
 
+impl CredentialFormView {
+    pub fn new(state: &CredentialFormState) -> Self {
+        Self {
+            active: state.active,
+            kind: state.kind,
+            name_input: state.name_input.clone(),
+            username_input: state.username_input.clone(),
+            password_input: state.password_input.clone(),
+            private_key_input: state.private_key_input.clone(),
+            public_key_input: state.public_key_input.clone(),
+            certificate_input: state.certificate_input.clone(),
+            name_focused: state.name_focused,
+            username_focused: state.username_focused,
+            password_focused: state.password_focused,
+            private_key_focused: state.private_key_focused,
+            public_key_focused: state.public_key_focused,
+            certificate_focused: state.certificate_focused,
+            on_close: state.on_close.clone(),
+            on_save: state.on_save.clone(),
+            on_kind_change: state.on_kind_change.clone(),
+        }
+    }
+}
+
+impl RenderOnce for CredentialFormView {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let on_close_for_dialog = self.on_close.clone();
         render_overlay(
-            active,
-            &self.on_close,
+            self.active,
+            self.on_close,
             render_dialog(
-                active,
-                kind,
-                name_input,
-                username_input,
-                password_input,
-                private_key_input,
-                public_key_input,
-                certificate_input,
-                name_focused,
-                username_focused,
-                password_focused,
-                private_key_focused,
-                public_key_focused,
-                certificate_focused,
-                &self.on_close,
-                &self.on_save,
-                &self.on_kind_change,
+                self.active,
+                self.kind,
+                self.name_input,
+                self.username_input,
+                self.password_input,
+                self.private_key_input,
+                self.public_key_input,
+                self.certificate_input,
+                self.name_focused,
+                self.username_focused,
+                self.password_focused,
+                self.private_key_focused,
+                self.public_key_focused,
+                self.certificate_focused,
+                on_close_for_dialog,
+                self.on_save,
+                self.on_kind_change,
             ),
         )
     }
@@ -185,7 +202,7 @@ impl Render for CredentialFormView {
 
 fn render_overlay(
     active: bool,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     child: impl IntoElement,
 ) -> impl IntoElement {
     let overlay_id = ElementId::Name("cred-form-overlay".into());
@@ -202,7 +219,6 @@ fn render_overlay(
         .bg(rgba(0x00000000))
         .when(active, |el| {
             el.occlude().on_mouse_down(MouseButton::Left, {
-                let on_close = on_close.clone();
                 move |_e, w, cx| {
                     if let Some(ref cb) = on_close {
                         cb(w, cx);
@@ -237,9 +253,9 @@ fn render_dialog(
     private_key_focused: bool,
     public_key_focused: bool,
     certificate_focused: bool,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: &Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
-    on_kind_change: &Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_save: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    on_kind_change: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let dialog_id = ElementId::Name("cred-form-dialog".into());
 
@@ -312,7 +328,7 @@ fn render_dialog(
 
 fn render_type_selector(
     kind: CredentialKind,
-    on_kind_change: &Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    on_kind_change: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let on_change_pw = on_kind_change.clone();
     let on_change_cert = on_kind_change.clone();
@@ -440,11 +456,9 @@ fn render_fields(
 
 fn render_buttons(
     kind: CredentialKind,
-    on_close: &Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: &Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_save: Option<Rc<dyn Fn(CredentialKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
-    let on_close_btn = on_close.clone();
-    let on_save_btn = on_save.clone();
     div()
         .flex()
         .flex_row()
@@ -455,7 +469,7 @@ fn render_buttons(
                 .centered(true)
                 .child(t!("credential_form.cancel").to_string())
                 .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_close_btn {
+                    if let Some(ref cb) = on_close {
                         cb(w, cx);
                     }
                 }),
@@ -466,7 +480,7 @@ fn render_buttons(
                 .centered(true)
                 .child(t!("credential_form.save").to_string())
                 .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_save_btn {
+                    if let Some(ref cb) = on_save {
                         cb(kind, w, cx);
                     }
                 }),

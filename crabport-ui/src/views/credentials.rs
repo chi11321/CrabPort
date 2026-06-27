@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use crate::color::*;
 use crate::components::button::Button;
-use crate::layouts::credential_form::CredentialFormView;
+use crate::layouts::credential_form::{CredentialFormState, CredentialFormView};
 use crabport_core::credential::CredentialEntry;
 
 /// Render the credentials sidebar view.
 pub fn render_credentials_view(
     credentials: &[CredentialEntry],
-    form_entity: Option<&Entity<CredentialFormView>>,
+    form_state: Option<&CredentialFormState>,
     on_new: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     // Hide anonymous credentials (auto-created from connection form)
@@ -76,7 +76,9 @@ pub fn render_credentials_view(
                 }),
         )
         // --- Credential form overlay ---
-        .when_some(form_entity.cloned(), |el, form| el.child(form))
+        .when_some(form_state, |el, state| {
+            el.child(CredentialFormView::new(state))
+        })
 }
 
 fn credential_row(cred: &CredentialEntry) -> impl IntoElement {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::color::*;
 use crate::components::button::Button;
-use crate::layouts::connection_form::ConnectionFormView;
+use crate::layouts::connection_form::{ConnectionFormState, ConnectionFormView};
 
 /// A saved connection host entry.
 #[derive(Clone)]
@@ -19,6 +19,8 @@ pub struct ConnectionHost {
     pub username: String,
     pub kind: crate::layouts::connection_form::ConnectionKind,
     pub credential_id: Option<i64>,
+    pub last_login: Option<i64>,
+    pub favorite: bool,
 }
 
 /// Render the hosts sidebar view.
@@ -27,7 +29,7 @@ pub struct ConnectionHost {
 /// the connection creation form.
 pub fn render_hosts_view(
     hosts: &[ConnectionHost],
-    form_entity: Option<&Entity<ConnectionFormView>>,
+    form_state: Option<&ConnectionFormState>,
     on_new: impl Fn(&mut Window, &mut App) + 'static,
     on_connect: impl Fn(i64, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -92,7 +94,9 @@ pub fn render_hosts_view(
                 }),
         )
         // --- Connection form overlay ---
-        .when_some(form_entity.cloned(), |el, form| el.child(form))
+        .when_some(form_state, |el, state| {
+            el.child(ConnectionFormView::new(state))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +107,11 @@ fn host_row(
     host: &ConnectionHost,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let row_id = ElementId::Name(format!("host-row-{}", host.id).into());
+    let row_id_clone = row_id.clone();
+
     div()
-        .id(ElementId::Name(format!("host-row-{}", host.id).into()))
+        .id(row_id.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -114,8 +121,11 @@ fn host_row(
         .rounded_md()
         .bg(rgb(BG_BASE))
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |_e, w, cx| on_click(w, cx))
-        .with_transition(ElementId::Name(format!("host-row-{}", host.id).into()))
+        .on_mouse_down(MouseButton::Left, move |_e, w, cx| {
+            gpui_animation::reset_transition(&row_id_clone);
+            on_click(w, cx);
+        })
+        .with_transition(row_id)
         .transition_on_hover(Duration::from_millis(120), Linear, |hovered, s| {
             if *hovered {
                 s.bg(rgb(SURFACE_ACTIVE))

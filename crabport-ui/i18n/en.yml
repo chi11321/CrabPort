@@ -55,3 +55,5 @@ credentials:
 tunnels:
   new_button: "New"
   empty: "No active tunnels. Click '+ New' to create one."
+terminal:
+  reconnect: "Reconnect"

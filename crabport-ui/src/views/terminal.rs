@@ -15,6 +15,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
 use parking_lot::Mutex;
+use rust_i18n::t;
 
 use crate::app::{CrabPortTab, TerminalShiftTab, TerminalTab};
 use crate::components::button::Button;
@@ -51,6 +52,9 @@ pub struct TerminalView {
     count: u64,
     /// SSH connection info, saved for reconnect (only for remote sessions).
     ssh_info: Option<SshConnectionInfo>,
+    /// Callback invoked when the backend closes (e.g. local PTY child exits).
+    /// For remote sessions this is `None` — they show a disconnect overlay instead.
+    on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
 }
 
 impl TerminalView {
@@ -124,10 +128,21 @@ impl TerminalView {
                         let _ = entity.update(cx, |_, cx| cx.notify());
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
-                        overlay_c
-                            .lock()
-                            .log(ConnectionLogLevel::Warning, "Connection closed");
-                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        let _ = entity.update(cx, |this, cx| {
+                            // For local PTY: invoke on_backend_closed to remove the tab.
+                            // For remote sessions: just update overlay, the user can reconnect.
+                            if let Some(ref cb) = this.on_backend_closed {
+                                // Defer the close to avoid mutating the entity
+                                // graph during an active update.
+                                let cb = cb.clone();
+                                cx.defer(move |cx| cb(cx));
+                            } else {
+                                this.overlay
+                                    .lock()
+                                    .log(ConnectionLogLevel::Warning, "Connection closed");
+                            }
+                            cx.notify();
+                        });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
                 }
@@ -207,11 +222,18 @@ impl TerminalView {
             remote_host: host,
             count,
             ssh_info,
+            on_backend_closed: None,
         }
     }
 
     pub fn monitor(&self) -> Option<&dyn CrabPortMonitor> {
         self.session.monitor()
+    }
+
+    /// Set a callback to be invoked when the backend closes.
+    /// Used by the app to remove the tab when a local PTY child exits.
+    pub fn set_on_backend_closed(&mut self, f: impl Fn(&mut App) + 'static) {
+        self.on_backend_closed = Some(Rc::new(f));
     }
 
     /// Reconnect a disconnected SSH session by creating a new backend and session.
@@ -223,6 +245,11 @@ impl TerminalView {
 
         // Close the old session
         self.session.close();
+
+        // Reset transition state so the overlay starts fresh
+        gpui_animation::reset_transition(&ElementId::Name(
+            format!("connection-overlay-{}", self.count).into(),
+        ));
 
         // Reset overlay state for the new connection attempt
         {
@@ -259,10 +286,17 @@ impl TerminalView {
                         let _ = entity.update(cx, |_, cx| cx.notify());
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
-                        overlay_c
-                            .lock()
-                            .log(ConnectionLogLevel::Warning, "Connection closed");
-                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        let _ = entity.update(cx, |this, cx| {
+                            if let Some(ref cb) = this.on_backend_closed {
+                                let cb = cb.clone();
+                                cx.defer(move |cx| cb(cx));
+                            } else {
+                                this.overlay
+                                    .lock()
+                                    .log(ConnectionLogLevel::Warning, "Connection closed");
+                            }
+                            cx.notify();
+                        });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
                 }
@@ -1045,7 +1079,7 @@ fn render_connection_overlay(
                     let mut btn =
                         Button::new(ElementId::Name(format!("reconnect-btn-{}", count).into()))
                             .centered(true)
-                            .child("Reconnect");
+                            .child(t!("terminal.reconnect").to_string());
                     if let Some(cb) = on_reconnect {
                         btn = btn.on_click(move |e, w, a| cb(e, w, a));
                     }

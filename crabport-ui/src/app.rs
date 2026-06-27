@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::*;
@@ -7,8 +8,8 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::layouts::command_palette::{CommandView, ConnectionType};
-use crate::layouts::connection_form::ConnectionFormView;
-use crate::layouts::credential_form::CredentialFormView;
+use crate::layouts::connection_form::{ConnectionFormState, ConnectionKind};
+use crate::layouts::credential_form::{CredentialFormState, CredentialKind};
 use crate::layouts::sidebar::render_sidebar;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
@@ -52,8 +53,8 @@ pub struct CrabportApp {
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
     pub hosts: Vec<ConnectionHost>,
     pub credentials: Vec<CredentialEntry>,
-    pub connection_form: Option<Entity<ConnectionFormView>>,
-    pub credential_form: Option<Entity<CredentialFormView>>,
+    pub connection_form: Option<ConnectionFormState>,
+    pub credential_form: Option<CredentialFormState>,
     pub command_palette: Entity<CommandView>,
     store: Store,
     wired: bool,
@@ -130,6 +131,8 @@ impl CrabportApp {
                     CoreHostKind::Serial => crate::layouts::connection_form::ConnectionKind::Serial,
                 },
                 credential_id: h.credential_id,
+                last_login: h.last_login,
+                favorite: h.favorite,
             })
             .collect();
         let credentials = store.credentials().unwrap_or_default();
@@ -218,102 +221,103 @@ impl CrabportApp {
     /// Create a new ConnectionFormView entity, wire its callbacks, and open it.
     pub fn open_connection_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // If one is already open, just bring it to front
-        if let Some(ref form) = self.connection_form {
-            form.update(cx, |form, cx| form.open(window, cx));
+        if let Some(ref mut form) = self.connection_form {
+            form.open(window, cx);
             cx.notify();
             return;
         }
 
-        let form = cx.new(|cx| ConnectionFormView::new(window, cx));
-        let form_for_connect = form.clone();
+        let mut form = ConnectionFormState::new(window, cx);
         let app = cx.entity().clone();
 
-        form.update(cx, |form, _cx| {
-            form.set_on_close({
-                let a = app.clone();
-                move |_, cx| {
-                    a.update(cx, |app, cx| {
-                        app.close_connection_form(cx);
-                    });
-                }
-            });
-            form.set_on_connect({
-                let f = form_for_connect.clone();
-                let a = app.clone();
-                move |_kind, _, cx| {
+        form.on_close = Some(Rc::new({
+            let a = app.clone();
+            move |_: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    app.close_connection_form(cx);
+                });
+            }
+        }));
+
+        form.on_connect = Some(Rc::new({
+            let a = app.clone();
+            move |_kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    // Read form values directly from state
                     let (name, host, port_num, username, password) = {
-                        let ff = f.read(cx);
-                        let n = ff.name_text(cx);
-                        let h = ff.host_text(cx);
-                        let p: u16 = ff.port_text(cx).parse().unwrap_or(22);
-                        let u = ff.user_text(cx);
-                        let pw = ff.pass_text(cx);
+                        let f = app.connection_form.as_ref().unwrap();
+                        let n = f.name_text(cx);
+                        let h = f.host_text(cx);
+                        let p: u16 = f.port_text(cx).parse().unwrap_or(22);
+                        let u = f.user_text(cx);
+                        let pw = f.pass_text(cx);
                         (n, h, p, u, pw)
                     };
-                    a.update(cx, |app, cx| {
-                        app.close_connection_form(cx);
+                    app.close_connection_form(cx);
 
-                        // Persist anonymous credential (password) for this host
-                        let cred = CredentialEntry {
-                            id: 0,
-                            name: name.clone(),
-                            kind: CoreCredentialKind::Password,
-                            anonymous: true,
-                            secret: password.clone(),
-                            private_key: String::new(),
-                            public_key: String::new(),
-                            certificate: String::new(),
-                        };
-                        let cred_id = app.store.add_credential(&cred).unwrap_or(0);
+                    // Persist anonymous credential (password) for this host
+                    let cred = CredentialEntry {
+                        id: 0,
+                        name: name.clone(),
+                        kind: CoreCredentialKind::Password,
+                        anonymous: true,
+                        secret: password.clone(),
+                        private_key: String::new(),
+                        public_key: String::new(),
+                        certificate: String::new(),
+                    };
+                    let cred_id = app.store.add_credential(&cred).unwrap_or(0);
 
-                        // Persist host with linked credential
-                        let entry = HostEntry {
-                            id: 0,
-                            name: name.clone(),
-                            host: host.clone(),
-                            port: port_num,
-                            username: username.clone(),
-                            credential_id: Some(cred_id),
-                            kind: CoreHostKind::Ssh,
-                        };
-                        let row_id = app.store.add_host(&entry).unwrap_or(0);
+                    // Persist host with linked credential
+                    let entry = HostEntry {
+                        id: 0,
+                        name: name.clone(),
+                        host: host.clone(),
+                        port: port_num,
+                        username: username.clone(),
+                        credential_id: Some(cred_id),
+                        kind: CoreHostKind::Ssh,
+                        last_login: None,
+                        favorite: false,
+                    };
+                    let row_id = app.store.add_host(&entry).unwrap_or(0);
 
-                        // Keep credentials list in sync
-                        let mut saved_cred = cred.clone();
-                        saved_cred.id = cred_id;
-                        app.credentials.push(saved_cred);
+                    // Keep credentials list in sync
+                    let mut saved_cred = cred.clone();
+                    saved_cred.id = cred_id;
+                    app.credentials.push(saved_cred);
 
-                        app.hosts.push(ConnectionHost {
-                            id: row_id,
-                            name,
-                            host: host.to_string(),
-                            port: port_num,
-                            username: username.to_string(),
-                            kind: crate::layouts::connection_form::ConnectionKind::SSH,
-                            credential_id: Some(cred_id),
-                        });
-                        app.add_ssh_tab(&host, port_num, &username, &password, cx);
-                        cx.notify();
+                    app.hosts.push(ConnectionHost {
+                        id: row_id,
+                        name: name.clone(),
+                        host: host.to_string(),
+                        port: port_num,
+                        username: username.to_string(),
+                        kind: crate::layouts::connection_form::ConnectionKind::SSH,
+                        credential_id: Some(cred_id),
+                        last_login: None,
+                        favorite: false,
                     });
-                }
-            });
-        });
+                    app.add_ssh_tab(&name, &host, port_num, &username, &password, cx);
+                    cx.notify();
+                });
+            }
+        }));
 
-        form.update(cx, |form, cx| form.open(window, cx));
+        form.open(window, cx);
         self.connection_form = Some(form);
         cx.notify();
     }
 
-    /// Close the connection form. The entity stays alive for the exit animation,
+    /// Close the connection form. The state stays alive for the exit animation,
     /// then is destroyed by a timer.
     pub fn close_connection_form(&mut self, cx: &mut Context<Self>) {
-        let form = match self.connection_form.as_ref() {
-            Some(f) => f.clone(),
-            None => return,
-        };
-        // Trigger the close animation inside the form
-        form.update(cx, |form, cx| form.close(cx));
-        // After animation finishes, destroy the entity
+        if let Some(ref mut form) = self.connection_form {
+            form.close();
+        } else {
+            return;
+        }
+        // After animation finishes, destroy the state
         let app = cx.entity().clone();
         cx.spawn(async move |_this, cx| {
             smol::Timer::after(std::time::Duration::from_millis(200)).await;
@@ -323,101 +327,100 @@ impl CrabportApp {
             });
         })
         .detach();
+        cx.notify();
     }
 
-    /// Create a new CredentialFormView entity, wire its callbacks, and open it.
+    /// Create a new CredentialFormState, wire its callbacks, and open it.
     pub fn open_credential_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ref form) = self.credential_form {
-            form.update(cx, |form, cx| form.open(window, cx));
+        if let Some(ref mut form) = self.credential_form {
+            form.open(window, cx);
             cx.notify();
             return;
         }
 
-        let form = cx.new(|cx| CredentialFormView::new(window, cx));
-        let form_clone = form.clone();
+        let mut form = CredentialFormState::new(window, cx);
         let app = cx.entity().clone();
 
-        form.update(cx, |form, _cx| {
-            form.set_on_close({
-                let app = app.clone();
-                move |_w, cx| {
-                    app.update(cx, |app, cx| {
-                        app.close_credential_form(cx);
-                    });
-                }
-            });
+        form.on_close = Some(Rc::new({
+            let app = app.clone();
+            move |_w: &mut Window, cx: &mut App| {
+                app.update(cx, |app, cx| {
+                    app.close_credential_form(cx);
+                });
+            }
+        }));
 
-            form.set_on_kind_change({
-                let form = form_clone.clone();
-                move |kind, _w, cx| {
-                    form.update(cx, |f, cx| {
+        form.on_kind_change = Some(Rc::new({
+            let app = app.clone();
+            move |kind: CredentialKind, _w: &mut Window, cx: &mut App| {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut f) = app.credential_form {
                         f.kind = kind;
-                        cx.notify();
-                    });
-                }
-            });
+                    }
+                    cx.notify();
+                });
+            }
+        }));
 
-            form.set_on_save({
-                let form_clone = form_clone.clone();
-                let a = app.clone();
-                move |kind, _w, cx| {
-                    a.update(cx, |app, cx| {
-                        // Read form values
-                        let (name, secret, private_key, public_key, certificate) = {
-                            let f = form_clone.read(cx);
-                            (
-                                f.name_text(cx),
-                                f.secret_text(cx),
-                                f.private_key_text(cx),
-                                f.public_key_text(cx),
-                                f.certificate_text(cx),
-                            )
-                        };
+        form.on_save = Some(Rc::new({
+            let a = app.clone();
+            move |kind: CredentialKind, _w: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    // Read form values directly from state
+                    let (name, secret, private_key, public_key, certificate) = {
+                        let f = app.credential_form.as_ref().unwrap();
+                        (
+                            f.name_text(cx),
+                            f.secret_text(cx),
+                            f.private_key_text(cx),
+                            f.public_key_text(cx),
+                            f.certificate_text(cx),
+                        )
+                    };
 
-                        // Persist to store
-                        let core_kind = match kind {
-                            crate::layouts::credential_form::CredentialKind::Password => {
-                                CoreCredentialKind::Password
-                            }
-                            crate::layouts::credential_form::CredentialKind::Certificate => {
-                                CoreCredentialKind::Certificate
-                            }
-                        };
-                        let entry = CredentialEntry {
-                            id: 0, // auto-generated
-                            name: name.clone(),
-                            kind: core_kind,
-                            anonymous: false,
-                            secret,
-                            private_key,
-                            public_key,
-                            certificate,
-                        };
-                        let row_id = app.store.add_credential(&entry).unwrap_or(0);
-                        let mut saved = entry.clone();
-                        saved.id = row_id;
-                        app.credentials.push(saved);
+                    // Persist to store
+                    let core_kind = match kind {
+                        crate::layouts::credential_form::CredentialKind::Password => {
+                            CoreCredentialKind::Password
+                        }
+                        crate::layouts::credential_form::CredentialKind::Certificate => {
+                            CoreCredentialKind::Certificate
+                        }
+                    };
+                    let entry = CredentialEntry {
+                        id: 0, // auto-generated
+                        name: name.clone(),
+                        kind: core_kind,
+                        anonymous: false,
+                        secret,
+                        private_key,
+                        public_key,
+                        certificate,
+                    };
+                    let row_id = app.store.add_credential(&entry).unwrap_or(0);
+                    let mut saved = entry.clone();
+                    saved.id = row_id;
+                    app.credentials.push(saved);
 
-                        app.close_credential_form(cx);
-                        cx.notify();
-                    });
-                }
-            });
-        });
+                    app.close_credential_form(cx);
+                    cx.notify();
+                });
+            }
+        }));
 
-        form.update(cx, |form, cx| form.open(window, cx));
+        form.open(window, cx);
         self.credential_form = Some(form);
         cx.notify();
     }
 
-    /// Close the credential form. The entity stays alive for the exit animation,
+    /// Close the credential form. The state stays alive for the exit animation,
     /// then is destroyed by a timer.
     pub fn close_credential_form(&mut self, cx: &mut Context<Self>) {
-        let form = match self.credential_form.as_ref() {
-            Some(f) => f.clone(),
-            None => return,
-        };
-        form.update(cx, |form, cx| form.close(cx));
+        if let Some(ref mut form) = self.credential_form {
+            form.close();
+        } else {
+            return;
+        }
         let app = cx.entity().clone();
         cx.spawn(async move |_this, cx| {
             smol::Timer::after(std::time::Duration::from_millis(200)).await;
@@ -427,6 +430,7 @@ impl CrabportApp {
             });
         })
         .detach();
+        cx.notify();
     }
 
     // -----------------------------------------------------------------------
@@ -452,6 +456,17 @@ impl CrabportApp {
         });
 
         let terminal_view = cx.new(|cx| TerminalView::new(id, cx));
+
+        // When the local PTY child exits, automatically close the tab
+        let app_handle = cx.entity().clone();
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_backend_closed(move |cx| {
+                app_handle.update(cx, |app, cx| {
+                    app.close_tab(id, cx);
+                });
+            });
+        });
+
         self.terminal_views.insert(id, terminal_view);
 
         self.active_tab_id = id;
@@ -460,6 +475,7 @@ impl CrabportApp {
 
     pub fn add_ssh_tab(
         &mut self,
+        name: &str,
         host: &str,
         port: u16,
         username: &str,
@@ -468,10 +484,9 @@ impl CrabportApp {
     ) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let title = format!("{}@{}", username, host);
         self.tabs.push(Tab {
             id,
-            title,
+            title: name.to_string(),
             kind: TabKind::Terminal,
             is_remote: true,
         });
@@ -530,6 +545,33 @@ impl CrabportApp {
             None => return,
         };
 
+        // Update last_login timestamp
+        let _ = self.store.touch_host_login(host_id);
+        if let Ok(all) = self.store.hosts() {
+            self.hosts = all
+                .into_iter()
+                .map(|h| ConnectionHost {
+                    id: h.id,
+                    name: h.name,
+                    host: h.host,
+                    port: h.port,
+                    username: h.username,
+                    kind: match h.kind {
+                        CoreHostKind::Ssh => crate::layouts::connection_form::ConnectionKind::SSH,
+                        CoreHostKind::Telnet => {
+                            crate::layouts::connection_form::ConnectionKind::Telnet
+                        }
+                        CoreHostKind::Serial => {
+                            crate::layouts::connection_form::ConnectionKind::Serial
+                        }
+                    },
+                    credential_id: h.credential_id,
+                    last_login: h.last_login,
+                    favorite: h.favorite,
+                })
+                .collect();
+        }
+
         // Try to resolve password from linked credential
         let password = host
             .credential_id
@@ -537,7 +579,14 @@ impl CrabportApp {
             .map(|c| c.secret)
             .unwrap_or_default();
 
-        self.add_ssh_tab(&host.host, host.port, &host.username, &password, cx);
+        self.add_ssh_tab(
+            &host.name,
+            &host.host,
+            host.port,
+            &host.username,
+            &password,
+            cx,
+        );
     }
 
     pub fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -581,10 +630,15 @@ impl Render for CrabportApp {
         let handle = cx.entity().clone();
         let show_sidebar = self.is_home_active();
 
-        // Host names for command palette
-        let host_names: Vec<String> = self.hosts.iter().map(|h| h.name.clone()).collect();
+        // Host data for command palette (sorted by favorite desc, last_login desc, limited to 5)
+        let mut sorted_hosts: Vec<ConnectionHost> = self.hosts.clone();
+        sorted_hosts.sort_by(|a, b| {
+            b.favorite
+                .cmp(&a.favorite)
+                .then_with(|| b.last_login.cmp(&a.last_login))
+        });
         self.command_palette.update(cx, |cmd, _cx| {
-            cmd.set_hosts(host_names);
+            cmd.set_hosts(sorted_hosts);
         });
 
         // ---- Content view ----
