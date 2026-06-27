@@ -195,11 +195,9 @@ fn render_overlay(
         .pt_16()
         .bg(rgba(0x00000000))
         .when(is_open, |el| {
-            el.occlude().on_mouse_down(MouseButton::Left, {
-                move |_e, w, cx| {
-                    if let Some(ref cb) = on_close {
-                        cb(w, cx);
-                    }
+            el.occlude().on_click(move |_e, w, cx| {
+                if let Some(ref cb) = on_close {
+                    cb(w, cx);
                 }
             })
         })
@@ -237,7 +235,7 @@ fn render_dialog(
         .opacity(0.0)
         .mt(px(-16.0))
         .when(is_open, |el| {
-            el.on_mouse_down(MouseButton::Left, |_, _, cx| {
+            el.on_click(|_, _, cx| {
                 cx.stop_propagation();
             })
         })
@@ -351,11 +349,10 @@ fn command_item(
         .rounded_sm()
         .bg(rgb(COMMAND_BG))
         .when(enabled, |el| {
-            el.cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_e, w, cx| {
-                    gpui_animation::reset_transition(&id_for_reset);
-                    on_click(w, cx);
-                })
+            el.cursor_pointer().on_click(move |_e, w, cx| {
+                gpui_animation::reset_transition(&id_for_reset);
+                on_click(w, cx);
+            })
         })
         .with_transition(id.clone())
         .transition_on_hover(Duration::from_millis(120), Linear, |hovered, el| {

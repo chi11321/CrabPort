@@ -218,11 +218,9 @@ fn render_overlay(
         .justify_center()
         .bg(rgba(0x00000000))
         .when(active, |el| {
-            el.occlude().on_mouse_down(MouseButton::Left, {
-                move |_e, w, cx| {
-                    if let Some(ref cb) = on_close {
-                        cb(w, cx);
-                    }
+            el.occlude().on_click(move |_e, w, cx| {
+                if let Some(ref cb) = on_close {
+                    cb(w, cx);
                 }
             })
         })
@@ -274,7 +272,7 @@ fn render_dialog(
         .opacity(0.0)
         .mt(px(-16.0))
         .when(active, |el| {
-            el.on_mouse_down(MouseButton::Left, |_, _, cx| {
+            el.on_click(|_, _, cx| {
                 cx.stop_propagation();
             })
         })

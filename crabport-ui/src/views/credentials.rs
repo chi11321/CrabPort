@@ -60,20 +60,23 @@ pub fn render_credentials_view(
                 .overflow_y_scrollbar()
                 .px_4()
                 .py_2()
-                .when(visible.is_empty(), |el| {
-                    el.flex().items_center().justify_center().child(
-                        div()
-                            .text_color(rgb(TEXT_MUTED))
-                            .text_sm()
-                            .child(t!("credentials.empty").to_string()),
-                    )
-                })
-                .when(!visible.is_empty(), |el| {
-                    el.flex()
-                        .flex_col()
-                        .gap_1()
-                        .children(visible.iter().map(|c| credential_row(c)))
-                }),
+                .when_else(
+                    visible.is_empty(),
+                    |el| {
+                        el.flex().items_center().justify_center().child(
+                            div()
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_sm()
+                                .child(t!("credentials.empty").to_string()),
+                        )
+                    },
+                    |el| {
+                        el.flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(visible.iter().map(|c| credential_row(c)))
+                    },
+                ),
         )
         // --- Credential form overlay ---
         .when_some(form_state, |el, state| {

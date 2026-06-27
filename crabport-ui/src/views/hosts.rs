@@ -77,21 +77,24 @@ pub fn render_hosts_view(
                 .overflow_y_scrollbar()
                 .px_4()
                 .py_2()
-                .when(hosts.is_empty(), |el| {
-                    el.flex().items_center().justify_center().child(
-                        div()
-                            .text_color(rgb(TEXT_MUTED))
-                            .text_sm()
-                            .child(t!("hosts.empty").to_string()),
-                    )
-                })
-                .when(!hosts.is_empty(), |el| {
-                    el.flex().flex_col().gap_1().children(hosts.iter().map(|h| {
-                        let on_click = on_connect_rc.clone();
-                        let host_id = h.id;
-                        host_row(h, move |w, cx| on_click(host_id, w, cx)).into_any_element()
-                    }))
-                }),
+                .when_else(
+                    hosts.is_empty(),
+                    |el| {
+                        el.flex().items_center().justify_center().child(
+                            div()
+                                .text_color(rgb(TEXT_MUTED))
+                                .text_sm()
+                                .child(t!("hosts.empty").to_string()),
+                        )
+                    },
+                    |el| {
+                        el.flex().flex_col().gap_1().children(hosts.iter().map(|h| {
+                            let on_click = on_connect_rc.clone();
+                            let host_id = h.id;
+                            host_row(h, move |w, cx| on_click(host_id, w, cx)).into_any_element()
+                        }))
+                    },
+                ),
         )
         // --- Connection form overlay ---
         .when_some(form_state, |el, state| {
@@ -121,7 +124,7 @@ fn host_row(
         .rounded_md()
         .bg(rgb(BG_BASE))
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |_e, w, cx| {
+        .on_click(move |_e, w, cx| {
             gpui_animation::reset_transition(&row_id_clone);
             on_click(w, cx);
         })
