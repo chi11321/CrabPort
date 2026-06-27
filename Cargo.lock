@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "CrabPort"
+version = "0.1.0"
+dependencies = [
+ "crabport-core",
+ "crabport-ui",
+ "gpui",
+ "gpui-component",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1262,16 +1272,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "crabport"
-version = "0.1.0"
-dependencies = [
- "crabport-core",
- "crabport-ui",
- "gpui",
- "gpui-component",
 ]
 
 [[package]]

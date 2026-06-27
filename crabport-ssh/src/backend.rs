@@ -155,39 +155,71 @@ impl SshBackend {
                     .authenticate_publickey(&info.username, Arc::new(key_pair))
                     .await;
 
-                if let Err(e) = auth_result {
-                    tracing::error!("SSH: key auth failed: {e}");
-                    {
-                        let mut m = monitor2.write();
-                        m.status = RemoteStatus::Disconnected;
+                match auth_result {
+                    Ok(true) => {
+                        on_status2("Public key authentication succeeded".into());
                     }
-                    let _ = event_tx2
-                        .broadcast(BackendEvent::Error(format!(
-                            "Public key authentication failed: {e}"
-                        )))
-                        .await;
-                    return;
+                    Ok(false) => {
+                        tracing::error!("SSH: key auth rejected");
+                        {
+                            let mut m = monitor2.write();
+                            m.status = RemoteStatus::Disconnected;
+                        }
+                        let _ = event_tx2
+                            .broadcast(BackendEvent::Error(
+                                "Public key authentication failed".into(),
+                            ))
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("SSH: key auth failed: {e}");
+                        {
+                            let mut m = monitor2.write();
+                            m.status = RemoteStatus::Disconnected;
+                        }
+                        let _ = event_tx2
+                            .broadcast(BackendEvent::Error(format!(
+                                "Public key authentication failed: {e}"
+                            )))
+                            .await;
+                        return;
+                    }
                 }
-                on_status2("Public key authentication succeeded".into());
             } else {
                 on_status2("Authenticating with password...".into());
-                if let Err(e) = sh
+                match sh
                     .authenticate_password(&info.username, &info.password)
                     .await
                 {
-                    tracing::error!("SSH: auth failed: {e}");
-                    {
-                        let mut m = monitor2.write();
-                        m.status = RemoteStatus::Disconnected;
+                    Ok(true) => {
+                        on_status2("Password authentication succeeded".into());
                     }
-                    let _ = event_tx2
-                        .broadcast(BackendEvent::Error(format!(
-                            "Password authentication failed: {e}"
-                        )))
-                        .await;
-                    return;
+                    Ok(false) => {
+                        tracing::error!("SSH: password auth rejected");
+                        {
+                            let mut m = monitor2.write();
+                            m.status = RemoteStatus::Disconnected;
+                        }
+                        let _ = event_tx2
+                            .broadcast(BackendEvent::Error("Password authentication failed".into()))
+                            .await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("SSH: auth failed: {e}");
+                        {
+                            let mut m = monitor2.write();
+                            m.status = RemoteStatus::Disconnected;
+                        }
+                        let _ = event_tx2
+                            .broadcast(BackendEvent::Error(format!(
+                                "Password authentication failed: {e}"
+                            )))
+                            .await;
+                        return;
+                    }
                 }
-                on_status2("Password authentication succeeded".into());
             }
 
             // ---- 3. Open session channel ----
