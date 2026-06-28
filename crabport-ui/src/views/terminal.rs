@@ -238,7 +238,6 @@ impl TerminalView {
 
         let session = Arc::new(TerminalSession::new(backend, cols, rows));
         session.start();
-        session.feed_escape(b"\x1b[6 q");
 
         let needs_repaint = Arc::new(AtomicBool::new(true));
         let is_remote = !host.is_empty();
@@ -398,7 +397,7 @@ impl TerminalView {
         let rows: usize = 24;
 
         let overlay_cb = self.overlay.clone();
-        let backend = Arc::new(crabport_ssh::SshBackend::new(
+        let backend = Arc::new(crabport_ssh::backend::SshBackend::new(
             info,
             cols as u16,
             rows as u16,
@@ -409,7 +408,6 @@ impl TerminalView {
 
         let session = Arc::new(TerminalSession::new(backend, cols, rows));
         session.start();
-        session.feed_escape(b"\x1b[6 q");
 
         self.render_cache.lock().clear_all();
 
@@ -707,6 +705,7 @@ impl Render for TerminalView {
         let last_bounds_c = self.last_bounds.clone();
         let last_bounds = last_bounds_c.clone();
         let selection = self.selection.clone();
+        let selection_prepaint = selection.clone();
         let selection_c = selection.clone();
         let render_cache = self.render_cache.clone();
         let render_cache_paint = render_cache.clone();
@@ -783,10 +782,12 @@ impl Render for TerminalView {
                             if lc != cols || lr != rows {
                                 session.resize(cols as u16, rows as u16);
                                 resized = true;
+                                *selection_prepaint.lock() = None;
                             }
                         } else {
                             session.resize(cols as u16, rows as u16);
                             resized = true;
+                            *selection_prepaint.lock() = None;
                         }
                         *last = Some(bounds);
 
@@ -1005,7 +1006,7 @@ impl Render for TerminalView {
                             let cx_x = bounds.origin.x + cursor.point.column.0 as f32 * cell_width;
                             let cx_y = bounds.origin.y + cursor.point.line.0 as f32 * line_height;
                             match cursor.shape {
-                                CursorShape::Block | CursorShape::HollowBlock => {
+                                CursorShape::Block => {
                                     let c: Hsla = rgb(TERM_CURSOR).into();
                                     window.paint_quad(fill(
                                         Bounds::new(
@@ -1013,6 +1014,16 @@ impl Render for TerminalView {
                                             size(cell_width, line_height),
                                         ),
                                         c.opacity(0.5),
+                                    ));
+                                }
+                                CursorShape::HollowBlock => {
+                                    window.paint_quad(outline(
+                                        Bounds::new(
+                                            point(cx_x, cx_y),
+                                            size(cell_width, line_height),
+                                        ),
+                                        rgb(TERM_CURSOR),
+                                        BorderStyle::Solid,
                                     ));
                                 }
                                 CursorShape::Underline => {

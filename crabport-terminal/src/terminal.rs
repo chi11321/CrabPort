@@ -177,9 +177,9 @@ impl TerminalSession {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                     },
-                    Err(e) => {
+                    Err(_e) => {
                         #[cfg(debug_assertions)]
-                        tracing::warn!("session: recv error: {:?}", e);
+                        tracing::warn!("session: recv error: {:?}", _e);
                         let _ = wakeup_tx.try_broadcast(());
                         break;
                     }

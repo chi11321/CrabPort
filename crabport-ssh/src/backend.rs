@@ -52,7 +52,7 @@ struct MonitorState {
 // SSH client handler
 // ---------------------------------------------------------------------------
 
-struct SshHandler;
+pub struct SshHandler;
 
 #[async_trait::async_trait]
 impl client::Handler for SshHandler {
@@ -337,18 +337,18 @@ impl SshBackend {
                     cmd = command_rx.recv() => {
                         match cmd {
                             Ok(Command::Write(data)) => {
-                                if let Err(e) = channel.data(Cursor::new(data)).await {
+                                if let Err(_e) = channel.data(Cursor::new(data)).await {
                                     #[cfg(debug_assertions)]
-                                    tracing::warn!("SSH: write error: {e}");
+                                    tracing::warn!("SSH: write error: {_e}");
                                 }
                             }
                             Ok(Command::Resize(cols, rows)) => {
-                                if let Err(e) = channel
+                                if let Err(_e) = channel
                                     .window_change(cols as u32, rows as u32, 0, 0)
                                     .await
                                 {
                                     #[cfg(debug_assertions)]
-                                    tracing::warn!("SSH: window change error: {e}");
+                                    tracing::warn!("SSH: window change error: {_e}");
                                 }
                             }
                             Ok(Command::Close) | Err(_) => {

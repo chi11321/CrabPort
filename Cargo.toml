@@ -3,6 +3,13 @@ name = "CrabPort"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.bundle]
+name = "CrabPort"
+identifier = "org.eu.tachibana-kanade.crabport"
+version = "0.1.0"
+copyright = "Copyright © 2026 ch1ll321"
+# icon = ["icon.png"]
+
 [dependencies]
 crabport-ui = { path = "crabport-ui" }
 crabport-core = {path = "crabport-core"}

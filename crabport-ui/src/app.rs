@@ -16,7 +16,7 @@ use crabport_core::credential::{
     CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
 };
 use crabport_core::store::Store;
-use crabport_ssh::SshBackend;
+use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
 
 // ---- CrabPortTab trait ----
