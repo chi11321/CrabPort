@@ -6,16 +6,10 @@ use crate::components::input::{StyledInput, StyledPasswordInput};
 
 #[derive(IntoElement)]
 pub struct WithCertificateForm {
-    pub user_input: Entity<InputState>,
-    pub pass_input: Entity<InputState>,
+    pub passphrase_input: Entity<InputState>,
     pub private_key_input: Entity<InputState>,
-    pub public_key_input: Entity<InputState>,
-    pub certificate_input: Entity<InputState>,
-    pub user_focused: bool,
-    pub pass_focused: bool,
+    pub passphrase_focused: bool,
     pub private_key_focused: bool,
-    pub public_key_focused: bool,
-    pub certificate_focused: bool,
 }
 
 impl RenderOnce for WithCertificateForm {
@@ -24,20 +18,12 @@ impl RenderOnce for WithCertificateForm {
             .flex()
             .flex_col()
             .gap_4()
-            // Username
-            .child(
-                div().child(
-                    StyledInput::new("username", self.user_input)
-                        .label(t!("connection_form.username").to_string())
-                        .focused(self.user_focused),
-                ),
-            )
             // Passphrase
             .child(
                 div().child(
-                    StyledPasswordInput::new("password", self.pass_input)
-                        .label(t!("credential_form.passphrase").to_string())
-                        .focused(self.pass_focused)
+                    StyledPasswordInput::new("passphrase", self.passphrase_input)
+                        .label(t!("connection_form.passphrase").to_string())
+                        .focused(self.passphrase_focused)
                         .on_toggle(|_, _| {}),
                 ),
             )
@@ -45,24 +31,10 @@ impl RenderOnce for WithCertificateForm {
             .child(
                 div().child(
                     StyledInput::new("conn-private-key", self.private_key_input)
-                        .label(t!("credential_form.private_key").to_string())
-                        .focused(self.private_key_focused),
-                ),
-            )
-            // Public Key
-            .child(
-                div().child(
-                    StyledInput::new("conn-public-key", self.public_key_input)
-                        .label(t!("credential_form.public_key").to_string())
-                        .focused(self.public_key_focused),
-                ),
-            )
-            // Certificate
-            .child(
-                div().child(
-                    StyledInput::new("conn-certificate", self.certificate_input)
-                        .label(t!("credential_form.certificate").to_string())
-                        .focused(self.certificate_focused),
+                        .label(t!("connection_form.private_key").to_string())
+                        .focused(self.private_key_focused)
+                        .multi_line(true)
+                        .rows(5),
                 ),
             )
     }

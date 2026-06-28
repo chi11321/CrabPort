@@ -6,14 +6,11 @@ use gpui::*;
 use crate::app::{CrabportApp, SidebarItem, Tab, TabKind};
 use crate::color::*;
 use crate::layouts::connection_form::ConnectionFormState;
-use crate::layouts::credential_form::CredentialFormState;
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
 use crate::views;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
-
-use crabport_core::credential::CredentialEntry;
 
 pub fn render_content(
     selected: SidebarItem,
@@ -22,9 +19,7 @@ pub fn render_content(
     active_tab_id: u64,
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
-    credentials: &[CredentialEntry],
     form_entity: Option<&ConnectionFormState>,
-    cred_form_entity: Option<&CredentialFormState>,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
@@ -45,37 +40,38 @@ pub fn render_content(
 
     let view: AnyElement = match active_tab.map(|t| t.kind) {
         Some(TabKind::Home) => match selected {
-            SidebarItem::Hosts => {
+            SidebarItem::Sessions => {
                 let app_handle = handle.clone();
                 let on_connect = move |host_id: i64, _w: &mut Window, cx: &mut App| {
                     app_handle.update(cx, |app, cx| {
                         app.connect_to_host(host_id, cx);
                     });
                 };
+                let app_handle_edit = handle.clone();
+                let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
+                    app_handle_edit.update(cx, |app, cx| {
+                        app.edit_host(host_id, w, cx);
+                    });
+                };
+                let app_handle_remove = handle.clone();
+                let on_remove = move |host_id: i64, _w: &mut Window, cx: &mut App| {
+                    app_handle_remove.update(cx, |app, cx| {
+                        app.remove_host(host_id, cx);
+                    });
+                };
                 views::hosts::render_hosts_view(
                     hosts,
                     form_entity,
-                    credentials.to_vec(),
                     handle.clone(),
                     on_new,
                     on_connect,
+                    on_edit,
+                    on_remove,
                 )
                 .into_any_element()
             }
-            SidebarItem::Tunnels => views::tunnels::render_tunnels_view(on_new).into_any_element(),
-            SidebarItem::Credentials => {
-                let app_handle = handle.clone();
-                let on_new_cred = move |w: &mut Window, cx: &mut App| {
-                    app_handle.update(cx, |app, cx| {
-                        app.open_credential_form(w, cx);
-                    });
-                };
-                views::credentials::render_credentials_view(
-                    credentials,
-                    cred_form_entity,
-                    on_new_cred,
-                )
-                .into_any_element()
+            SidebarItem::Tunnels => {
+                views::tunnels::render_tunnels_view(|_, _| {}).into_any_element()
             }
             SidebarItem::Snippets => views::snippets::render_snippets_view().into_any_element(),
             SidebarItem::History => div()

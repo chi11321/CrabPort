@@ -349,7 +349,7 @@ fn command_item(
         .rounded_sm()
         .bg(rgb(COMMAND_BG))
         .when(enabled, |el| {
-            el.cursor_pointer().on_click(move |_e, w, cx| {
+            el.on_click(move |_e, w, cx| {
                 gpui_animation::reset_transition(&id_for_reset);
                 on_click(w, cx);
             })

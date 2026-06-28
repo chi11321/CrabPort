@@ -1,5 +1,4 @@
 pub mod with_certificate;
-pub mod with_password;
 
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::{animation::TransitionExt, transition::general::Linear};
@@ -11,13 +10,10 @@ use std::time::Duration;
 use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::button::Button;
-use crate::components::input::StyledInput;
+use crate::components::input::{StyledInput, StyledPasswordInput};
 use crate::components::segmented_control::{Segment, SegmentedControl};
 use crate::components::tabs::{TabPane, Tabs};
-use crabport_core::credential::CredentialEntry;
 use with_certificate::WithCertificateForm;
-
-use with_password::WithPasswordForm;
 
 // ---------------------------------------------------------------------------
 // Connection type
@@ -46,34 +42,24 @@ pub struct ConnectionFormState {
     pub active: bool,
     pub kind: ConnectionKind,
     pub auth_kind: AuthKind,
-    // Sub-kind for Password mode (Temporary / Saved) — owned by WithPasswordForm
-    pub password_sub_kind: with_password::PasswordSubKind,
-    // Selected credential id for Saved sub-mode
-    pub selected_credential_id: Option<i64>,
     // Basic fields
     pub name_input: Entity<InputState>,
     pub host_input: Entity<InputState>,
     pub port_input: Entity<InputState>,
     pub user_input: Entity<InputState>,
     pub pass_input: Entity<InputState>,
-    // Saved sub-mode fields
-    pub saved_user_input: Entity<InputState>,
-    pub saved_pass_input: Entity<InputState>,
-    // Certificate-mode fields
+    // Certificate-mode: passphrase + private key
+    pub passphrase_input: Entity<InputState>,
     pub private_key_input: Entity<InputState>,
-    pub public_key_input: Entity<InputState>,
-    pub certificate_input: Entity<InputState>,
     // Focus states
     pub name_focused: bool,
     pub host_focused: bool,
     pub port_focused: bool,
     pub user_focused: bool,
     pub pass_focused: bool,
-    pub saved_user_focused: bool,
-    pub saved_pass_focused: bool,
+    pub passphrase_focused: bool,
     pub private_key_focused: bool,
-    pub public_key_focused: bool,
-    pub certificate_focused: bool,
+    pub editing: bool,
     pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     pub on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 }
@@ -89,42 +75,32 @@ impl ConnectionFormState {
             state.set_masked(true, window, cx);
             state
         });
-        let saved_user_input = cx.new(|cx| InputState::new(window, cx));
-        let saved_pass_input = cx.new(|cx| {
+        let passphrase_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx);
             state.set_masked(true, window, cx);
             state
         });
-        let private_key_input = cx.new(|cx| InputState::new(window, cx));
-        let public_key_input = cx.new(|cx| InputState::new(window, cx));
-        let certificate_input = cx.new(|cx| InputState::new(window, cx));
+        let private_key_input = cx.new(|cx| InputState::new(window, cx).multi_line(true).rows(5));
 
         Self {
             active: false,
             kind: ConnectionKind::SSH,
             auth_kind: AuthKind::Password,
-            password_sub_kind: with_password::PasswordSubKind::Temporary,
-            selected_credential_id: None,
             name_input,
             host_input,
             port_input,
             user_input,
             pass_input,
-            saved_user_input,
-            saved_pass_input,
+            passphrase_input,
             private_key_input,
-            public_key_input,
-            certificate_input,
             name_focused: false,
             host_focused: false,
             port_focused: false,
             user_focused: false,
             pass_focused: false,
-            saved_user_focused: false,
-            saved_pass_focused: false,
+            passphrase_focused: false,
             private_key_focused: false,
-            public_key_focused: false,
-            certificate_focused: false,
+            editing: false,
             on_close: None,
             on_connect: None,
         }
@@ -163,6 +139,14 @@ impl ConnectionFormState {
     pub fn pass_text(&self, cx: &App) -> String {
         self.pass_input.read(cx).text().to_string()
     }
+
+    pub fn passphrase_text(&self, cx: &App) -> String {
+        self.passphrase_input.read(cx).text().to_string()
+    }
+
+    pub fn private_key_text(&self, cx: &App) -> String {
+        self.private_key_input.read(cx).text().to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,29 +158,21 @@ pub struct ConnectionFormView {
     active: bool,
     kind: ConnectionKind,
     auth_kind: AuthKind,
-    password_sub_kind: with_password::PasswordSubKind,
-    selected_credential_id: Option<i64>,
     name_input: Entity<InputState>,
     host_input: Entity<InputState>,
     port_input: Entity<InputState>,
     user_input: Entity<InputState>,
     pass_input: Entity<InputState>,
-    saved_user_input: Entity<InputState>,
-    saved_pass_input: Entity<InputState>,
+    passphrase_input: Entity<InputState>,
     private_key_input: Entity<InputState>,
-    public_key_input: Entity<InputState>,
-    certificate_input: Entity<InputState>,
     name_focused: bool,
     host_focused: bool,
     port_focused: bool,
     user_focused: bool,
     pass_focused: bool,
-    saved_user_focused: bool,
-    saved_pass_focused: bool,
+    passphrase_focused: bool,
     private_key_focused: bool,
-    public_key_focused: bool,
-    certificate_focused: bool,
-    credentials: Vec<CredentialEntry>,
+    editing: bool,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
@@ -208,38 +184,25 @@ impl ConnectionFormView {
             active: state.active,
             kind: state.kind,
             auth_kind: state.auth_kind,
-            password_sub_kind: state.password_sub_kind,
-            selected_credential_id: state.selected_credential_id,
             name_input: state.name_input.clone(),
             host_input: state.host_input.clone(),
             port_input: state.port_input.clone(),
             user_input: state.user_input.clone(),
             pass_input: state.pass_input.clone(),
-            saved_user_input: state.saved_user_input.clone(),
-            saved_pass_input: state.saved_pass_input.clone(),
+            passphrase_input: state.passphrase_input.clone(),
             private_key_input: state.private_key_input.clone(),
-            public_key_input: state.public_key_input.clone(),
-            certificate_input: state.certificate_input.clone(),
             name_focused: state.name_focused,
             host_focused: state.host_focused,
             port_focused: state.port_focused,
             user_focused: state.user_focused,
             pass_focused: state.pass_focused,
-            saved_user_focused: state.saved_user_focused,
-            saved_pass_focused: state.saved_pass_focused,
+            passphrase_focused: state.passphrase_focused,
             private_key_focused: state.private_key_focused,
-            public_key_focused: state.public_key_focused,
-            certificate_focused: state.certificate_focused,
-            credentials: Vec::new(),
+            editing: state.editing,
             app,
             on_close: state.on_close.clone(),
             on_connect: state.on_connect.clone(),
         }
-    }
-
-    pub fn with_credentials(mut self, credentials: Vec<CredentialEntry>) -> Self {
-        self.credentials = credentials;
-        self
     }
 }
 
@@ -252,31 +215,23 @@ impl RenderOnce for ConnectionFormView {
             self.on_close,
             render_dialog(
                 self.active,
+                self.editing,
                 self.kind,
                 self.auth_kind,
-                self.password_sub_kind,
-                self.selected_credential_id,
                 self.name_input,
                 self.host_input,
                 self.port_input,
                 self.user_input,
                 self.pass_input,
-                self.saved_user_input,
-                self.saved_pass_input,
+                self.passphrase_input,
                 self.private_key_input,
-                self.public_key_input,
-                self.certificate_input,
                 self.name_focused,
                 self.host_focused,
                 self.port_focused,
                 self.user_focused,
                 self.pass_focused,
-                self.saved_user_focused,
-                self.saved_pass_focused,
+                self.passphrase_focused,
                 self.private_key_focused,
-                self.public_key_focused,
-                self.certificate_focused,
-                self.credentials,
                 self.app,
                 on_close_for_dialog,
                 self.on_connect,
@@ -327,38 +282,30 @@ fn render_overlay(
 #[allow(clippy::too_many_arguments)]
 fn render_dialog(
     active: bool,
+    editing: bool,
     kind: ConnectionKind,
     auth_kind: AuthKind,
-    password_sub_kind: with_password::PasswordSubKind,
-    selected_credential_id: Option<i64>,
     name_input: Entity<InputState>,
     host_input: Entity<InputState>,
     port_input: Entity<InputState>,
     user_input: Entity<InputState>,
     pass_input: Entity<InputState>,
-    saved_user_input: Entity<InputState>,
-    saved_pass_input: Entity<InputState>,
+    passphrase_input: Entity<InputState>,
     private_key_input: Entity<InputState>,
-    public_key_input: Entity<InputState>,
-    certificate_input: Entity<InputState>,
     name_focused: bool,
     host_focused: bool,
     port_focused: bool,
     user_focused: bool,
     pass_focused: bool,
-    saved_user_focused: bool,
-    saved_pass_focused: bool,
+    passphrase_focused: bool,
     private_key_focused: bool,
-    public_key_focused: bool,
-    certificate_focused: bool,
-    credentials: Vec<CredentialEntry>,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let dialog_id = ElementId::Name("conn-form-dialog".into());
 
-    let active_index = match auth_kind {
+    let auth_active_index = match auth_kind {
         AuthKind::Password => 0,
         AuthKind::Certificate => 1,
     };
@@ -415,41 +362,35 @@ fn render_dialog(
             host_focused,
             port_focused,
         ))
+        // Username (shared across auth types)
+        .child(
+            div().child(
+                StyledInput::new("username", user_input)
+                    .label(t!("connection_form.username").to_string())
+                    .focused(user_focused),
+            ),
+        )
         // Auth tabs (Password / Certificate)
         .child(
             Tabs::new("conn-auth-tabs")
-                .h(px(300.0))
-                .active(active_index)
+                .h(px(240.0))
+                .active(auth_active_index)
                 .pane(TabPane::new(
                     t!("connection_form.auth_password").to_string(),
-                    WithPasswordForm {
-                        sub_kind: password_sub_kind,
-                        user_input: user_input.clone(),
-                        pass_input: pass_input.clone(),
-                        saved_user_input: saved_user_input.clone(),
-                        saved_pass_input: saved_pass_input.clone(),
-                        user_focused,
-                        pass_focused,
-                        saved_user_focused,
-                        saved_pass_focused,
-                        credentials,
-                        selected_credential_id,
-                        app: app.clone(),
-                    },
+                    div().flex().flex_col().gap_4().child(
+                        StyledPasswordInput::new("password", pass_input.clone())
+                            .label(t!("connection_form.password").to_string())
+                            .focused(pass_focused)
+                            .on_toggle(|_, _| {}),
+                    ),
                 ))
                 .pane(TabPane::new(
                     t!("connection_form.auth_certificate").to_string(),
                     WithCertificateForm {
-                        user_input: user_input.clone(),
-                        pass_input: pass_input.clone(),
-                        private_key_input: private_key_input.clone(),
-                        public_key_input: public_key_input.clone(),
-                        certificate_input: certificate_input.clone(),
-                        user_focused,
-                        pass_focused,
+                        passphrase_input,
+                        private_key_input,
+                        passphrase_focused,
                         private_key_focused,
-                        public_key_focused,
-                        certificate_focused,
                     },
                 ))
                 .on_change({
@@ -468,7 +409,7 @@ fn render_dialog(
                 }),
         )
         // Buttons
-        .child(render_buttons(kind, on_close, on_connect))
+        .child(render_buttons(editing, kind, on_close, on_connect))
 }
 
 fn render_type_selector(kind: ConnectionKind, app: Entity<CrabportApp>) -> impl IntoElement {
@@ -542,12 +483,18 @@ fn render_host_port_row(
 }
 
 fn render_buttons(
+    editing: bool,
     kind: ConnectionKind,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let overlay_id = ElementId::Name("conn-form-overlay".into());
     let dialog_id = ElementId::Name("conn-form-dialog".into());
+    let confirm_label = if editing {
+        t!("connection_form.save").to_string()
+    } else {
+        t!("connection_form.connect").to_string()
+    };
     div()
         .flex()
         .flex_row()
@@ -567,10 +514,12 @@ fn render_buttons(
             Button::new("conn-connect")
                 .primary()
                 .centered(true)
-                .child(t!("connection_form.connect").to_string())
+                .child(confirm_label)
                 .on_click(move |_e, w, cx| {
-                    gpui_animation::reset_transition(&overlay_id);
-                    gpui_animation::reset_transition(&dialog_id);
+                    if !editing {
+                        gpui_animation::reset_transition(&overlay_id);
+                        gpui_animation::reset_transition(&dialog_id);
+                    }
                     if let Some(ref cb) = on_connect {
                         cb(kind, w, cx);
                     }

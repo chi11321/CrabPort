@@ -96,7 +96,6 @@ impl PtyBackend {
                         }
 
                         Err(err) => {
-                            #[cfg(debug_assertions)]
                             tracing::error!("pty reader error: {}", err);
                             let _ = smol::block_on(
                                 event_tx.broadcast(BackendEvent::Error(err.to_string())),

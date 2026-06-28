@@ -108,6 +108,8 @@ impl SshBackend {
         TOKIO.spawn(async move {
             // ---- 1. Connect ----
             let addr = format!("{}:{}", info.host, info.port);
+            #[cfg(debug_assertions)]
+            tracing::info!("SSH: connecting to {}", addr);
             on_status2(format!("Connecting to {}", addr));
 
             let config = Arc::new(client::Config::default());
@@ -129,11 +131,20 @@ impl SshBackend {
                 }
             };
 
-            // ---- 2. Authenticate ----
+            #[cfg(debug_assertions)]
+            tracing::info!(
+                "SSH: auth decision — uses_key_auth={}, private_key={}, has_passphrase={}, username={}",
+                info.uses_key_auth(),
+                info.private_key.is_some(),
+                info.passphrase.is_some(),
+                info.username,
+            );
             if info.uses_key_auth() {
                 on_status2("Authenticating with public key...".into());
 
                 let key_str = info.private_key.as_deref().unwrap_or("");
+                #[cfg(debug_assertions)]
+                tracing::info!("SSH: private key length={}, starts_with_BEGIN={}", key_str.len(), key_str.contains("BEGIN"));
                 let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
                     Ok(kp) => kp,
                     Err(e) => {
@@ -155,6 +166,8 @@ impl SshBackend {
                     .authenticate_publickey(&info.username, Arc::new(key_pair))
                     .await;
 
+                #[cfg(debug_assertions)]
+                tracing::info!("SSH: publickey auth result = {:?}", auth_result);
                 match auth_result {
                     Ok(true) => {
                         on_status2("Public key authentication succeeded".into());
@@ -187,12 +200,16 @@ impl SshBackend {
                     }
                 }
             } else {
+                #[cfg(debug_assertions)]
+                tracing::info!("SSH: using password auth (private_key is None)");
                 on_status2("Authenticating with password...".into());
                 match sh
                     .authenticate_password(&info.username, &info.password)
                     .await
                 {
                     Ok(true) => {
+                        #[cfg(debug_assertions)]
+                        tracing::info!("SSH: password auth succeeded");
                         on_status2("Password authentication succeeded".into());
                     }
                     Ok(false) => {

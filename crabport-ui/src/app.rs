@@ -8,8 +8,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::layouts::command_palette::{CommandView, ConnectionType};
-use crate::layouts::connection_form::{ConnectionFormState, ConnectionKind};
-use crate::layouts::credential_form::{CredentialFormState, CredentialKind};
+use crate::layouts::connection_form::{AuthKind, ConnectionFormState, ConnectionKind};
 use crate::layouts::sidebar::render_sidebar;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
@@ -52,9 +51,7 @@ pub struct CrabportApp {
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
     pub hosts: Vec<ConnectionHost>,
-    pub credentials: Vec<CredentialEntry>,
     pub connection_form: Option<ConnectionFormState>,
-    pub credential_form: Option<CredentialFormState>,
     pub command_palette: Entity<CommandView>,
     store: Store,
     wired: bool,
@@ -62,9 +59,8 @@ pub struct CrabportApp {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarItem {
-    Hosts,
+    Sessions,
     Tunnels,
-    Credentials,
     Snippets,
     History,
 }
@@ -72,8 +68,7 @@ pub enum SidebarItem {
 impl SidebarItem {
     pub fn label(&self) -> SharedString {
         match self {
-            SidebarItem::Hosts => t!("sidebar.hosts").into(),
-            SidebarItem::Credentials => t!("sidebar.credentials").into(),
+            SidebarItem::Sessions => t!("sidebar.sessions").into(),
             SidebarItem::Tunnels => t!("sidebar.tunnels").into(),
             SidebarItem::Snippets => t!("sidebar.snippets").into(),
             SidebarItem::History => t!("sidebar.history").into(),
@@ -82,18 +77,16 @@ impl SidebarItem {
 
     pub fn icon(&self) -> &'static str {
         match self {
-            SidebarItem::Hosts => "icons/server.svg",
-            SidebarItem::Credentials => "icons/key.svg",
+            SidebarItem::Sessions => "icons/monitor-cloud.svg",
             SidebarItem::Tunnels => "icons/waypoints.svg",
             SidebarItem::Snippets => "icons/braces.svg",
             SidebarItem::History => "icons/clock.svg",
         }
     }
 
-    pub fn all() -> [SidebarItem; 5] {
+    pub fn all() -> [SidebarItem; 4] {
         [
-            SidebarItem::Hosts,
-            SidebarItem::Credentials,
+            SidebarItem::Sessions,
             SidebarItem::Tunnels,
             SidebarItem::Snippets,
             SidebarItem::History,
@@ -135,19 +128,16 @@ impl CrabportApp {
                 favorite: h.favorite,
             })
             .collect();
-        let credentials = store.credentials().unwrap_or_default();
 
         Self {
-            sidebar_item: SidebarItem::Hosts,
+            sidebar_item: SidebarItem::Sessions,
             tabs: vec![home_tab],
             active_tab_id: 0,
             hovered_tab_id: None,
             next_tab_id: 1,
             terminal_views: HashMap::new(),
             hosts,
-            credentials,
             connection_form: None,
-            credential_form: None,
             command_palette,
             store,
             wired: false,
@@ -188,7 +178,7 @@ impl CrabportApp {
                         _ => {
                             a.update(cx, |app, _cx| {
                                 app.activate_tab(0);
-                                app.sidebar_item = SidebarItem::Hosts;
+                                app.sidebar_item = SidebarItem::Sessions;
                             });
                             a.update(cx, |app, cx| {
                                 app.open_connection_form(w, cx);
@@ -244,25 +234,49 @@ impl CrabportApp {
             move |_kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
                 a.update(cx, |app, cx| {
                     // Read form values directly from state
-                    let (name, host, port_num, username, password) = {
+                    let (
+                        name,
+                        host,
+                        port_num,
+                        username,
+                        password,
+                        passphrase,
+                        auth_kind,
+                        private_key,
+                    ) = {
                         let f = app.connection_form.as_ref().unwrap();
                         let n = f.name_text(cx);
                         let h = f.host_text(cx);
                         let p: u16 = f.port_text(cx).parse().unwrap_or(22);
                         let u = f.user_text(cx);
                         let pw = f.pass_text(cx);
-                        (n, h, p, u, pw)
+                        let pp = f.passphrase_text(cx);
+                        let ak = f.auth_kind;
+                        let pk = f.private_key_text(cx);
+                        (n, h, p, u, pw, pp, ak, pk)
                     };
                     app.close_connection_form(cx);
 
-                    // Persist anonymous credential (password) for this host
+                    // Persist credential for this host
+                    let (cred_kind, secret, pk) = match auth_kind {
+                        AuthKind::Password => (
+                            CoreCredentialKind::Password,
+                            password.clone(),
+                            String::new(),
+                        ),
+                        AuthKind::Certificate => (
+                            CoreCredentialKind::Certificate,
+                            passphrase.clone(),
+                            private_key.clone(),
+                        ),
+                    };
                     let cred = CredentialEntry {
                         id: 0,
                         name: name.clone(),
-                        kind: CoreCredentialKind::Password,
+                        kind: cred_kind,
                         anonymous: true,
-                        secret: password.clone(),
-                        private_key: String::new(),
+                        secret,
+                        private_key: pk,
                         public_key: String::new(),
                         certificate: String::new(),
                     };
@@ -282,11 +296,6 @@ impl CrabportApp {
                     };
                     let row_id = app.store.add_host(&entry).unwrap_or(0);
 
-                    // Keep credentials list in sync
-                    let mut saved_cred = cred.clone();
-                    saved_cred.id = cred_id;
-                    app.credentials.push(saved_cred);
-
                     app.hosts.push(ConnectionHost {
                         id: row_id,
                         name: name.clone(),
@@ -298,7 +307,34 @@ impl CrabportApp {
                         last_login: None,
                         favorite: false,
                     });
-                    app.add_ssh_tab(&name, &host, port_num, &username, &password, cx);
+                    let (private_key_arg, passphrase_arg) = match auth_kind {
+                        AuthKind::Password => (None, None),
+                        AuthKind::Certificate => (
+                            if private_key.is_empty() {
+                                None
+                            } else {
+                                Some(private_key.as_str())
+                            },
+                            if passphrase.is_empty() {
+                                None
+                            } else {
+                                Some(passphrase.as_str())
+                            },
+                        ),
+                    };
+                    app.add_ssh_tab(
+                        &name,
+                        &host,
+                        port_num,
+                        &username,
+                        match auth_kind {
+                            AuthKind::Password => &password,
+                            AuthKind::Certificate => "",
+                        },
+                        private_key_arg,
+                        passphrase_arg,
+                        cx,
+                    );
                     cx.notify();
                 });
             }
@@ -323,109 +359,6 @@ impl CrabportApp {
             smol::Timer::after(std::time::Duration::from_millis(200)).await;
             let _ = app.update(cx, |app, cx| {
                 app.connection_form = None;
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// Create a new CredentialFormState, wire its callbacks, and open it.
-    pub fn open_credential_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ref mut form) = self.credential_form {
-            form.open(window, cx);
-            cx.notify();
-            return;
-        }
-
-        let mut form = CredentialFormState::new(window, cx);
-        let app = cx.entity().clone();
-
-        form.on_close = Some(Rc::new({
-            let app = app.clone();
-            move |_w: &mut Window, cx: &mut App| {
-                app.update(cx, |app, cx| {
-                    app.close_credential_form(cx);
-                });
-            }
-        }));
-
-        form.on_kind_change = Some(Rc::new({
-            let app = app.clone();
-            move |kind: CredentialKind, _w: &mut Window, cx: &mut App| {
-                app.update(cx, |app, cx| {
-                    if let Some(ref mut f) = app.credential_form {
-                        f.kind = kind;
-                    }
-                    cx.notify();
-                });
-            }
-        }));
-
-        form.on_save = Some(Rc::new({
-            let a = app.clone();
-            move |kind: CredentialKind, _w: &mut Window, cx: &mut App| {
-                a.update(cx, |app, cx| {
-                    // Read form values directly from state
-                    let (name, secret, private_key, public_key, certificate) = {
-                        let f = app.credential_form.as_ref().unwrap();
-                        (
-                            f.name_text(cx),
-                            f.secret_text(cx),
-                            f.private_key_text(cx),
-                            f.public_key_text(cx),
-                            f.certificate_text(cx),
-                        )
-                    };
-
-                    // Persist to store
-                    let core_kind = match kind {
-                        crate::layouts::credential_form::CredentialKind::Password => {
-                            CoreCredentialKind::Password
-                        }
-                        crate::layouts::credential_form::CredentialKind::Certificate => {
-                            CoreCredentialKind::Certificate
-                        }
-                    };
-                    let entry = CredentialEntry {
-                        id: 0, // auto-generated
-                        name: name.clone(),
-                        kind: core_kind,
-                        anonymous: false,
-                        secret,
-                        private_key,
-                        public_key,
-                        certificate,
-                    };
-                    let row_id = app.store.add_credential(&entry).unwrap_or(0);
-                    let mut saved = entry.clone();
-                    saved.id = row_id;
-                    app.credentials.push(saved);
-
-                    app.close_credential_form(cx);
-                    cx.notify();
-                });
-            }
-        }));
-
-        form.open(window, cx);
-        self.credential_form = Some(form);
-        cx.notify();
-    }
-
-    /// Close the credential form. The state stays alive for the exit animation,
-    /// then is destroyed by a timer.
-    pub fn close_credential_form(&mut self, cx: &mut Context<Self>) {
-        if let Some(ref mut form) = self.credential_form {
-            form.close();
-        } else {
-            return;
-        }
-        let app = cx.entity().clone();
-        cx.spawn(async move |_this, cx| {
-            smol::Timer::after(std::time::Duration::from_millis(200)).await;
-            let _ = app.update(cx, |app, cx| {
-                app.credential_form = None;
                 cx.notify();
             });
         })
@@ -480,6 +413,8 @@ impl CrabportApp {
         port: u16,
         username: &str,
         password: &str,
+        private_key: Option<&str>,
+        passphrase: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -491,7 +426,10 @@ impl CrabportApp {
             is_remote: true,
         });
 
-        let info = SshConnectionInfo::new(host, username, password).with_port(port);
+        let mut info = SshConnectionInfo::new(host, username, password).with_port(port);
+        if let Some(pk) = private_key {
+            info = info.with_private_key(pk, passphrase.map(|s| s.to_string()));
+        }
         let info_for_view = info.clone();
         let cols: usize = 80;
         let rows: usize = 24;
@@ -582,12 +520,29 @@ impl CrabportApp {
                 .collect();
         }
 
-        // Try to resolve password from linked credential
-        let password = host
+        // Try to resolve password and private key from linked credential
+        let cred = host
             .credential_id
-            .and_then(|cid| self.store.find_credential(cid).ok().flatten())
-            .map(|c| c.secret)
-            .unwrap_or_default();
+            .and_then(|cid| self.store.find_credential(cid).ok().flatten());
+
+        // Resolve password / passphrase based on credential kind
+        let (password, private_key, passphrase) = match cred.as_ref() {
+            Some(c) if c.kind == CoreCredentialKind::Certificate => (
+                String::new(),
+                if c.private_key.is_empty() {
+                    None
+                } else {
+                    Some(c.private_key.as_str())
+                },
+                if c.secret.is_empty() {
+                    None
+                } else {
+                    Some(c.secret.as_str())
+                },
+            ),
+            Some(c) => (c.secret.clone(), None, None),
+            None => (String::new(), None, None),
+        };
 
         self.add_ssh_tab(
             &host.name,
@@ -595,8 +550,175 @@ impl CrabportApp {
             host.port,
             &host.username,
             &password,
+            private_key,
+            passphrase,
             cx,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Host management
+    // -----------------------------------------------------------------------
+
+    pub fn remove_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
+        let host = self.hosts.iter().find(|h| h.id == host_id);
+        if let Some(h) = host {
+            if let Some(cred_id) = h.credential_id {
+                let _ = self.store.remove_credential(cred_id);
+            }
+        }
+        let _ = self.store.remove_host(host_id);
+        self.hosts.retain(|h| h.id != host_id);
+        cx.notify();
+    }
+
+    pub fn edit_host(&mut self, host_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_connection_form(cx);
+
+        let host = self.hosts.iter().find(|h| h.id == host_id).cloned();
+        if host.is_none() {
+            return;
+        }
+        let h = host.unwrap();
+
+        let cred = h
+            .credential_id
+            .and_then(|cid| self.store.find_credential(cid).ok().flatten());
+
+        let mut form = ConnectionFormState::new(window, cx);
+
+        form.name_input.update(cx, |state, cx| {
+            state.set_value(&h.name, window, cx);
+        });
+        form.host_input.update(cx, |state, cx| {
+            state.set_value(&h.host, window, cx);
+        });
+        form.port_input.update(cx, |state, cx| {
+            state.set_value(&h.port.to_string(), window, cx);
+        });
+        form.user_input.update(cx, |state, cx| {
+            state.set_value(&h.username, window, cx);
+        });
+
+        if let Some(c) = cred.as_ref() {
+            match c.kind {
+                CoreCredentialKind::Password => {
+                    form.pass_input.update(cx, |state, cx| {
+                        state.set_value(&c.secret, window, cx);
+                    });
+                }
+                CoreCredentialKind::Certificate => {
+                    form.auth_kind = AuthKind::Certificate;
+                    form.passphrase_input.update(cx, |state, cx| {
+                        state.set_value(&c.secret, window, cx);
+                    });
+                    form.private_key_input.update(cx, |state, cx| {
+                        state.set_value(&c.private_key, window, cx);
+                    });
+                }
+            }
+        }
+
+        let app = cx.entity().clone();
+        let editing_host_id = h.id;
+        let editing_cred_id = h.credential_id;
+
+        form.editing = true;
+
+        form.on_connect = Some(Rc::new({
+            let app = app.clone();
+            move |_kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                app.update(cx, |app, cx| {
+                    let (
+                        name,
+                        host,
+                        port_num,
+                        username,
+                        password,
+                        passphrase,
+                        auth_kind,
+                        private_key,
+                    ) = {
+                        let f = app.connection_form.as_ref().unwrap();
+                        let n = f.name_text(cx);
+                        let h = f.host_text(cx);
+                        let p: u16 = f.port_text(cx).parse().unwrap_or(22);
+                        let u = f.user_text(cx);
+                        let pw = f.pass_text(cx);
+                        let pp = f.passphrase_text(cx);
+                        let ak = f.auth_kind;
+                        let pk = f.private_key_text(cx);
+                        (n, h, p, u, pw, pp, ak, pk)
+                    };
+                    app.close_connection_form(cx);
+
+                    let (cred_kind, secret, pk) = match auth_kind {
+                        AuthKind::Password => (
+                            CoreCredentialKind::Password,
+                            password.clone(),
+                            String::new(),
+                        ),
+                        AuthKind::Certificate => (
+                            CoreCredentialKind::Certificate,
+                            passphrase.clone(),
+                            private_key.clone(),
+                        ),
+                    };
+
+                    if let Some(old_cred_id) = editing_cred_id {
+                        let _ = app.store.remove_credential(old_cred_id);
+                    }
+
+                    let cred = CredentialEntry {
+                        id: 0,
+                        name: name.clone(),
+                        kind: cred_kind,
+                        anonymous: true,
+                        secret,
+                        private_key: pk,
+                        public_key: String::new(),
+                        certificate: String::new(),
+                    };
+                    let new_cred_id = app.store.add_credential(&cred).unwrap_or(0);
+
+                    let entry = HostEntry {
+                        id: editing_host_id,
+                        name: name.clone(),
+                        host: host.clone(),
+                        port: port_num,
+                        username: username.clone(),
+                        credential_id: Some(new_cred_id),
+                        kind: CoreHostKind::Ssh,
+                        last_login: None,
+                        favorite: false,
+                    };
+                    let _ = app.store.update_host(&entry);
+
+                    if let Some(h) = app.hosts.iter_mut().find(|h| h.id == editing_host_id) {
+                        h.name = name.clone();
+                        h.host = host.clone();
+                        h.port = port_num;
+                        h.username = username.clone();
+                        h.credential_id = Some(new_cred_id);
+                    }
+
+                    cx.notify();
+                });
+            }
+        }));
+
+        form.on_close = Some(Rc::new({
+            let app = app.clone();
+            move |_w, cx| {
+                app.update(cx, |app, cx| {
+                    app.close_connection_form(cx);
+                });
+            }
+        }));
+
+        form.open(window, cx);
+        self.connection_form = Some(form);
+        cx.notify();
     }
 
     pub fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -659,9 +781,7 @@ impl Render for CrabportApp {
             self.active_tab_id,
             &self.terminal_views,
             &self.hosts,
-            &self.credentials,
             self.connection_form.as_ref(),
-            self.credential_form.as_ref(),
             _window,
             cx,
         );

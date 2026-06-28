@@ -158,7 +158,6 @@ impl TerminalSession {
                                         return;
                                     }
                                     Ok(BackendEvent::Error(err)) => {
-                                        #[cfg(debug_assertions)]
                                         tracing::error!("terminal backend error: {}", err);
                                     }
                                     Err(_) => break, // queue drained
@@ -174,7 +173,6 @@ impl TerminalSession {
                             break;
                         }
                         BackendEvent::Error(err) => {
-                            #[cfg(debug_assertions)]
                             tracing::error!("terminal backend error: {}", err);
                             let _ = wakeup_tx.try_broadcast(());
                         }

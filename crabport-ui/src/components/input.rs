@@ -66,6 +66,7 @@ pub struct StyledInput {
     focused: bool,
     disabled: bool,
     height: Pixels,
+    multi_line: bool,
 }
 
 impl StyledInput {
@@ -80,6 +81,7 @@ impl StyledInput {
             focused: false,
             disabled: false,
             height: px(32.0),
+            multi_line: false,
         }
     }
 
@@ -122,6 +124,19 @@ impl StyledInput {
         self.height = h;
         self
     }
+
+    /// Enable multi-line mode (textarea-like input).
+    pub fn multi_line(mut self, v: bool) -> Self {
+        self.multi_line = v;
+        self
+    }
+
+    /// Set the number of visible rows for multi-line input.
+    /// Each row is roughly one line-height (~20px).
+    pub fn rows(mut self, rows: usize) -> Self {
+        self.height = px(rows as f32 * 20.0);
+        self
+    }
 }
 
 impl RenderOnce for StyledInput {
@@ -130,6 +145,7 @@ impl RenderOnce for StyledInput {
         let focused = self.focused;
         let height = self.height;
         let disabled = self.disabled;
+        let multi_line = self.multi_line;
 
         // Background priority: disabled > focus > rest.
         let base_bg: u32 = if disabled {
@@ -189,10 +205,13 @@ impl RenderOnce for StyledInput {
             .id(shell_id.clone())
             .flex()
             .flex_row()
-            .items_center()
-            .h(height)
+            .when_else(
+                multi_line,
+                |el| el.items_start().h(height),
+                |el| el.items_center().h(height),
+            )
             .w_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
             .rounded_md()
             .bg(rgb(base_bg))
             .border_1()
@@ -209,11 +228,12 @@ impl RenderOnce for StyledInput {
             })
             .when_some(prefix_el, |el, p| el.child(p))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(Input::new(&state).appearance(false).bordered(false)),
+                div().flex_1().min_w_0().h_full().child(
+                    Input::new(&state)
+                        .appearance(false)
+                        .bordered(false)
+                        .when(multi_line, |input| input.h_full()),
+                ),
             )
             .when_some(suffix_el, |el, s| el.child(s));
 
