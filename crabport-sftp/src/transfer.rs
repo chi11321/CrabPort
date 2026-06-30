@@ -36,7 +36,9 @@ impl SftpBackend {
 
         // Stat first — we need the size to split into segments, and we want
         // to reject directories / unknown-size files early.
+        #[cfg(debug_assertions)]
         let meta = session.metadata(remote_path).await?;
+        #[cfg(debug_assertions)]
         let size = meta
             .size
             .ok_or_else(|| anyhow!("remote file size unknown; cannot segmented-download"))?;

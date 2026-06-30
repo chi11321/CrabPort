@@ -257,7 +257,10 @@ impl AboutWindow {
                             .right_0()
                             .bottom_0()
                             .w(px(12.0))
-                            .child(Scrollbar::vertical(&deps_scroll)),
+                            .child(
+                                Scrollbar::vertical(&deps_scroll)
+                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
+                            ),
                     ),
             )
     }

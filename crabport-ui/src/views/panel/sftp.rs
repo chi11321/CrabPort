@@ -797,8 +797,11 @@ impl Render for SftpPanel {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(12.0))
-                            .child(Scrollbar::vertical(&scroll_handle)),
+                            .w(px(10.0))
+                            .child(
+                                Scrollbar::vertical(&scroll_handle)
+                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
+                            ),
                     ),
             )
     }
