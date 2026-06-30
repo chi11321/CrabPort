@@ -46,12 +46,12 @@ CrabPort 旨在实现一个简单易用的跨平台 SSH 客户端，集终端与
 
 | 平台 | 下载文件 | 说明 |
 |------|----------|------|
-| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.dmg` | 打开后拖入 `/Applications` |
-| macOS (Intel) | `CrabPort-v*-macos-x86_64.dmg` | 打开后拖入 `/Applications` |
-| Linux (x64) | `CrabPort-v*-linux-x86_64.AppImage` | `chmod +x` 后双击运行，无需安装依赖 |
-| Linux (arm64) | `CrabPort-v*-linux-aarch64.AppImage` | `chmod +x` 后双击运行，无需安装依赖 |
-| Windows (x64) | `CrabPort-v*-windows-x86_64.msi` | 双击安装 |
-| Windows (arm64) | `CrabPort-v*-windows-aarch64.msi` | 双击安装 |
+| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.zip` | 解压后拖入 `/Applications` |
+| macOS (Intel) | `CrabPort-v*-macos-x86_64.zip` | 解压后拖入 `/Applications` |
+| Linux (x64) | `CrabPort-v*-linux-x86_64.tar.gz` | 解压后运行，或下载 `.AppImage` 双击运行 |
+| Linux (arm64) | `CrabPort-v*-linux-aarch64.tar.gz` | 解压后运行 |
+| Windows (x64) | `CrabPort-v*-windows-x86_64.zip` | 解压后双击 `CrabPort.exe`，或下载 `.msi` 安装 |
+| Windows (arm64) | `CrabPort-v*-windows-aarch64.zip` | 解压后双击 `CrabPort.exe` |
 
 **macOS 提示**：首次打开可能会提示"无法验证开发者"。右键点击应用 → 选择"打开"即可绕过限制，或在终端执行：
 ```bash

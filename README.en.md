@@ -46,12 +46,12 @@ Download the latest version for your platform from the [Releases page](https://g
 
 | Platform | Download | Notes |
 |----------|----------|-------|
-| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.dmg` | Open and drag to `/Applications` |
-| macOS (Intel) | `CrabPort-v*-macos-x86_64.dmg` | Open and drag to `/Applications` |
-| Linux (x64) | `CrabPort-v*-linux-x86_64.AppImage` | `chmod +x` then double-click — no deps to install |
-| Linux (arm64) | `CrabPort-v*-linux-aarch64.AppImage` | `chmod +x` then double-click — no deps to install |
-| Windows (x64) | `CrabPort-v*-windows-x86_64.msi` | Double-click to install |
-| Windows (arm64) | `CrabPort-v*-windows-aarch64.msi` | Double-click to install |
+| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.zip` | Unzip and drag to `/Applications` |
+| macOS (Intel) | `CrabPort-v*-macos-x86_64.zip` | Unzip and drag to `/Applications` |
+| Linux (x64) | `CrabPort-v*-linux-x86_64.tar.gz` | Extract and run, or grab the `.AppImage` |
+| Linux (arm64) | `CrabPort-v*-linux-aarch64.tar.gz` | Extract and run |
+| Windows (x64) | `CrabPort-v*-windows-x86_64.zip` | Extract and run `CrabPort.exe`, or grab the `.msi` installer |
+| Windows (arm64) | `CrabPort-v*-windows-aarch64.zip` | Extract and run `CrabPort.exe` |
 
 **macOS note**: On first launch you may see "cannot verify developer". Right-click the app → select "Open" to bypass, or run in Terminal:
 ```bash
