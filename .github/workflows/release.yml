@@ -1,0 +1,175 @@
+name: release
+
+# Release workflow.
+#
+# Triggers:
+#   - `v*` tag push            → full build + publish to GitHub Release
+#   - manual `workflow_dispatch` → full build + publish for an existing tag
+#
+# How to cut a release:
+#   git checkout main && git pull
+#   git tag v0.2.0
+#   git push origin v0.2.0
+# Pushing the tag triggers this workflow; the resulting GitHub Release is
+# attached to that tag.
+#
+# Same build matrix as `dev.yml`. Packaging:
+#   - macOS  → `cargo bundle --format osx`  → zipped `.app` bundle
+#   - Linux   → `cargo build --release`      → raw executable
+#   - Windows → `cargo build --release`      → raw `.exe`
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (must already exist)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_TOOLCHAIN: 1.91.1
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-13
+            bundle: "true"
+          - os: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+            bundle: "true"
+          - os: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            bundle: "false"
+          - os: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            bundle: "false"
+          - os: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            bundle: "false"
+          - os: windows
+            arch: aarch64
+            target: aarch64-pc-windows-msvc
+            runner: windows-2022
+            bundle: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-bundle (macOS only)
+        if: matrix.bundle == 'true'
+        run: cargo install cargo-bundle --locked
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev \
+            libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-cursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libwayland-protocols \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libssl-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-
+
+      # ---- Build --------------------------------------------------------
+
+      - name: Build macOS .app bundle
+        if: matrix.bundle == 'true'
+        run: cargo bundle --release --target ${{ matrix.target }} --format osx
+
+      - name: Build binary (Linux / Windows)
+        if: matrix.bundle == 'false'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ---- Stage artifacts to a predictable path ------------------------
+
+      - name: Stage macOS artifact
+        if: matrix.bundle == 'true'
+        run: |
+          set -e
+          app_path="$(find target/${{ matrix.target }}/release/bundle/osx -maxdepth 1 -name '*.app' | head -n1)"
+          tag="${{ steps.tag.outputs.name }}"
+          name="CrabPort-${tag}-macos-${{ matrix.arch }}.app"
+          (cd "$(dirname "$app_path")" && ditto -c -k --keepParent "$(basename "$app_path")" "$RUNNER_TEMP/${name}.zip")
+          echo "artifact=$RUNNER_TEMP/${name}.zip" >> $GITHUB_ENV
+
+      - name: Stage Linux artifact
+        if: runner.os == 'Linux' && matrix.bundle == 'false'
+        run: |
+          set -e
+          tag="${{ steps.tag.outputs.name }}"
+          name="CrabPort-${tag}-linux-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/CrabPort" "$RUNNER_TEMP/${name}"
+          echo "artifact=$RUNNER_TEMP/${name}" >> $GITHUB_ENV
+
+      - name: Stage Windows artifact
+        if: runner.os == 'Windows' && matrix.bundle == 'false'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.tag.outputs.name }}"
+          $name = "CrabPort-$tag-windows-${{ matrix.arch }}.exe"
+          Copy-Item "target\${{ matrix.target }}\release\CrabPort.exe" "$env:RUNNER_TEMP\$name"
+          "artifact=$env:RUNNER_TEMP\$name" >> $env:GITHUB_ENV
+
+      # ---- Publish to the GitHub Release for this tag ------------------
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: ${{ env.artifact }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

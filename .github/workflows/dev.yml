@@ -1,0 +1,173 @@
+name: dev
+
+# Continuous-integration workflow that runs on every push to `main` and on
+# pull requests. Compiles the `CrabPort` binary for all six platform × arch
+# combinations and uploads each artifact to the workflow run so it can be
+# downloaded for smoke testing without cutting a release.
+#
+# Packaging strategy:
+#   - macOS  → `cargo bundle --format osx`  → zipped `.app` bundle
+#   - Linux   → `cargo build --release`      → raw executable
+#   - Windows → `cargo build --release`      → raw `.exe`
+#
+# Only macOS is bundled (to get a proper `.app` with the right metadata);
+# the other platforms ship the plain binary that cargo produces under
+# `target/<triple>/release/`.
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pin the toolchain so CI failures don't silently come from a rolling
+  # rustup. Bump deliberately when upgrading the project's MSRV.
+  RUST_TOOLCHAIN: 1.91.1
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS — Intel runner for x86_64, Apple Silicon for aarch64.
+          # Both produce a `.app` via `cargo bundle --format osx`.
+          - os: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-13
+            bundle: "true"
+          - os: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+            bundle: "true"
+          # Linux — x64 runs on a standard Ubuntu runner; aarch64 runs on
+          # GitHub's native ARM Ubuntu runner so we avoid the painful
+          # cross-compilation of gpui's native (X11/Wayland/Vulkan/font)
+          # dependencies. If the `-arm` label is unavailable in your repo,
+          # swap `runner` for `ubuntu-22.04` and add a cross toolchain step.
+          - os: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            bundle: "false"
+          - os: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            bundle: "false"
+          # Windows — both arches run on the windows runner; aarch64
+          # cross-compiles via the MSVC arm64 toolchain (shipped with the
+          # image, no extra setup needed beyond the rust target).
+          - os: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            bundle: "false"
+          - os: windows
+            arch: aarch64
+            target: aarch64-pc-windows-msvc
+            runner: windows-2022
+            bundle: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-bundle (macOS only)
+        if: matrix.bundle == 'true'
+        run: cargo install cargo-bundle --locked
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # gpui on Linux links against X11 / Wayland / Vulkan / fontconfig
+          # / freetype / alsa / pulseaudio / dbus / openssl at build time.
+          sudo apt-get install -y \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev \
+            libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-cursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libwayland-protocols \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libssl-dev pkg-config
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-
+
+      # ---- Build --------------------------------------------------------
+
+      - name: Build macOS .app bundle
+        if: matrix.bundle == 'true'
+        run: cargo bundle --release --target ${{ matrix.target }} --format osx
+
+      - name: Build binary (Linux / Windows)
+        if: matrix.bundle == 'false'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ---- Stage artifacts to a predictable path ------------------------
+
+      - name: Stage macOS artifact
+        if: matrix.bundle == 'true'
+        run: |
+          set -e
+          # The .app lands under target/<triple>/release/bundle/osx/.
+          app_path="$(find target/${{ matrix.target }}/release/bundle/osx -maxdepth 1 -name '*.app' | head -n1)"
+          ref="${GITHUB_REF_NAME//\//-}"
+          sha="${GITHUB_SHA::7}"
+          name="CrabPort-${ref}-${sha}-macos-${{ matrix.arch }}.app"
+          # ditto preserves executable bits + bundle structure when zipping.
+          (cd "$(dirname "$app_path")" && ditto -c -k --keepParent "$(basename "$app_path")" "$RUNNER_TEMP/${name}.zip")
+          echo "artifact=$RUNNER_TEMP/${name}.zip" >> $GITHUB_ENV
+
+      - name: Stage Linux artifact
+        if: runner.os == 'Linux' && matrix.bundle == 'false'
+        run: |
+          set -e
+          ref="${GITHUB_REF_NAME//\//-}"
+          sha="${GITHUB_SHA::7}"
+          name="CrabPort-${ref}-${sha}-linux-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/CrabPort" "$RUNNER_TEMP/${name}"
+          echo "artifact=$RUNNER_TEMP/${name}" >> $GITHUB_ENV
+
+      - name: Stage Windows artifact
+        if: runner.os == 'Windows' && matrix.bundle == 'false'
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}" -replace '/', '-'
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $name = "CrabPort-$ref-$sha-windows-${{ matrix.arch }}.exe"
+          Copy-Item "target\${{ matrix.target }}\release\CrabPort.exe" "$env:RUNNER_TEMP\$name"
+          "artifact=$env:RUNNER_TEMP\$name" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrabPort-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.artifact }}
+          if-no-files-found: error
+          retention-days: 14
