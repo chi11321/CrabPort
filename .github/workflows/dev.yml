@@ -1,6 +1,6 @@
 name: dev
 
-# Continuous-integration workflow that runs on every push to `main` and on
+# Continuous-integration workflow that runs on every push to `dev` and on
 # pull requests. Compiles the `CrabPort` binary for all six platform × arch
 # combinations and uploads each artifact to the workflow run so it can be
 # downloaded for smoke testing without cutting a release.
@@ -94,6 +94,10 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
+          # Enable universe (libxcb-cursor-dev lives there) — GitHub's
+          # ubuntu runners enable it by default, but be explicit so a future
+          # image change can't silently break us.
+          sudo add-apt-repository -y universe || true
           sudo apt-get update
           # gpui on Linux links against X11 / Wayland / Vulkan / fontconfig
           # / freetype / alsa / pulseaudio / dbus / openssl at build time.
@@ -102,7 +106,7 @@ jobs:
             libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-cursor-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libwayland-protocols \
+            libwayland-dev wayland-protocols \
             libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
             libfontconfig1-dev libfreetype6-dev \
             libasound2-dev libpulse-dev libdbus-1-dev \
