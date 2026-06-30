@@ -37,12 +37,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS — Intel runner for x86_64, Apple Silicon for aarch64.
-          # `dmg` format uses hdiutil (macOS built-in, no extra setup).
+          # macOS — both arches run on Apple Silicon runners. The legacy
+          # Intel `macos-13` pool queues for ages / times out; `macos-14`
+          # cross-compiles x86_64 via `--target x86_64-apple-darwin` with no
+          # extra setup (Apple's toolchain supports it out of the box).
+          # `dmg` format uses hdiutil (macOS built-in).
           - os: macos
             arch: x86_64
             target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             bundle_format: dmg
             artifact_ext: dmg
           - os: macos

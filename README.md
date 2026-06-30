@@ -19,7 +19,7 @@
 
 ## 简介
 
-CrabPort 是一个原生跨平台的 SSH 终端与 SFTP 文件管理客户端，使用 Rust 编写，UI 基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 编辑器的 GPU 渲染框架）。所有密钥、密码等敏感凭据通过 AES-256-GCM 加密后存入本地 SQLite 数据库，确保数据安全。
+CrabPort 旨在实现一个简单易用的跨平台 SSH 客户端，集终端与 SFTP 文件管理于一体。使用 Rust 编写，UI 基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 编辑器的 GPU 渲染框架）。
 
 ### 核心特性
 

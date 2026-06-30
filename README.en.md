@@ -19,7 +19,7 @@
 
 ## Overview
 
-CrabPort is a native cross-platform SSH terminal and SFTP file-management client written in Rust, with a UI built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the GPU-accelerated rendering framework powering the Zed editor). All sensitive credentials — keys, passwords — are encrypted with AES-256-GCM before being stored in a local SQLite database, keeping your data safe at rest.
+CrabPort aims to be a simple and easy-to-use cross-platform SSH client, integrating terminal and SFTP file management in one app. It is written in Rust, with a UI built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) (the GPU-accelerated rendering framework powering the Zed editor).
 
 ### Key Features
 
