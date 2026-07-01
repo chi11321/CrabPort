@@ -31,4 +31,5 @@ members = [
     "crabport-ui",
     "crabport-terminal",
     "crabport-tunnel",
+    "crabport-proxy",
 ]

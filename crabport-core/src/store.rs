@@ -4,16 +4,29 @@
 //!
 //! ```text
 //! {data_dir}/crabport/
-//!   crabport.db       — SQLite database (hosts + credentials)
+//!   crabport.db       — SQLite database (hosts + credentials + proxies + ...)
 //!   .key              — AES-256 encryption key for credential secrets
 //! ```
+//!
+//! The store is split across several files, each covering one domain:
+//!
+//! - [`hosts`] — host CRUD + login/favorite helpers
+//! - [`proxies`] — proxy CRUD
+//! - [`credentials`] — credential CRUD + secret resolution
+//! - [`commands`] — per-host command history (LRU-capped)
+//! - [`snippets`] — global command-snippet library
+
+mod commands;
+mod credentials;
+mod hosts;
+mod proxies;
+mod snippets;
 
 use std::fs;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
-use crate::credential::{CredentialEntry, CredentialKind, HostEntry, HostKind, SnippetEntry};
 use crate::crypto;
 
 // ---------------------------------------------------------------------------
@@ -21,10 +34,10 @@ use crate::crypto;
 // ---------------------------------------------------------------------------
 
 pub struct Store {
-    db: Connection,
+    pub(crate) db: Connection,
     #[allow(dead_code)]
-    key_path: PathBuf,
-    enc_key: Vec<u8>,
+    pub(crate) key_path: PathBuf,
+    pub(crate) enc_key: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +74,7 @@ impl From<crypto::CryptoError> for StoreError {
 }
 
 // ---------------------------------------------------------------------------
-// Impl
+// Impl: open + migrate + encryption helpers
 // ---------------------------------------------------------------------------
 
 impl Store {
@@ -210,8 +223,32 @@ impl Store {
             );
         }
 
+        // Migration 6: add `proxies` table + `proxy_id` FK on `hosts`.
+        // Proxy configs live in their own table so they can be shared
+        // across hosts and managed independently (list / edit / delete
+        // without touching host rows).
+        if current < 6 {
+            self.db
+                .execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS proxies (
+                        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name      TEXT    NOT NULL,
+                        kind      TEXT    NOT NULL DEFAULT 'none',
+                        host      TEXT    NOT NULL DEFAULT '',
+                        port      INTEGER NOT NULL DEFAULT 0,
+                        username  TEXT    NOT NULL DEFAULT '',
+                        password  BLOB,
+                        created_at INTEGER NOT NULL DEFAULT 0
+                    );
+                    ALTER TABLE hosts ADD COLUMN proxy_id INTEGER REFERENCES proxies(id);
+                    ",
+                )
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+
         // Record the latest migration version
-        let latest = 5;
+        let latest = 6;
         if current < latest {
             self.db
                 .execute(
@@ -245,7 +282,7 @@ impl Store {
         }
     }
 
-    fn encrypt_field(&self, plaintext: &str) -> Result<Vec<u8>, StoreError> {
+    pub(crate) fn encrypt_field(&self, plaintext: &str) -> Result<Vec<u8>, StoreError> {
         if plaintext.is_empty() {
             return Ok(Vec::new());
         }
@@ -253,534 +290,12 @@ impl Store {
     }
 
     #[allow(dead_code)]
-    fn decrypt_field(&self, blob: &[u8]) -> Result<String, StoreError> {
+    pub(crate) fn decrypt_field(&self, blob: &[u8]) -> Result<String, StoreError> {
         if blob.is_empty() {
             return Ok(String::new());
         }
         let plain = crypto::decrypt(blob, &self.enc_key)?;
         String::from_utf8(plain).map_err(|e| StoreError::Crypto(e.to_string()))
-    }
-
-    // -------------------------------------------------------------------
-    // Hosts CRUD
-    // -------------------------------------------------------------------
-
-    pub fn hosts(&self) -> Result<Vec<HostEntry>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite FROM hosts ORDER BY favorite DESC, last_login DESC, id",
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let kind_str: String = row.get(6)?;
-                let last_login: Option<i64> = row.get(7)?;
-                let favorite: i64 = row.get(8)?;
-                Ok(HostEntry {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    host: row.get(2)?,
-                    port: row.get(3)?,
-                    username: row.get(4)?,
-                    credential_id: row.get(5)?,
-                    kind: parse_host_kind(&kind_str),
-                    last_login,
-                    favorite: favorite != 0,
-                })
-            })
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| StoreError::Db(e.to_string()))?);
-        }
-        Ok(out)
-    }
-
-    pub fn add_host(&self, host: &HostEntry) -> Result<i64, StoreError> {
-        self.db
-            .execute(
-                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    host.name,
-                    host.host,
-                    host.port,
-                    host.username,
-                    host.credential_id,
-                    host_kind_str(host.kind),
-                    host.last_login,
-                    host.favorite as i64,
-                ],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(self.db.last_insert_rowid())
-    }
-
-    pub fn remove_host(&self, id: i64) -> Result<(), StoreError> {
-        self.db
-            .execute("DELETE FROM hosts WHERE id = ?1", params![id])
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    pub fn update_host(&self, host: &HostEntry) -> Result<(), StoreError> {
-        self.db
-            .execute(
-                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8 WHERE id=?9",
-                params![
-                    host.name,
-                    host.host,
-                    host.port,
-                    host.username,
-                    host.credential_id,
-                    host_kind_str(host.kind),
-                    host.last_login,
-                    host.favorite as i64,
-                    host.id,
-                ],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    pub fn find_host(&self, id: i64) -> Result<Option<HostEntry>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite FROM hosts WHERE id=?1",
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        stmt.query_row(params![id], |row| {
-            let kind_str: String = row.get(6)?;
-            let last_login: Option<i64> = row.get(7)?;
-            let favorite: i64 = row.get(8)?;
-            Ok(HostEntry {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                host: row.get(2)?,
-                port: row.get(3)?,
-                username: row.get(4)?,
-                credential_id: row.get(5)?,
-                kind: parse_host_kind(&kind_str),
-                last_login,
-                favorite: favorite != 0,
-            })
-        })
-        .optional()
-        .map_err(|e| StoreError::Db(e.to_string()))
-    }
-
-    // -------------------------------------------------------------------
-    // Credentials CRUD
-    // -------------------------------------------------------------------
-
-    /// Update the last_login timestamp for a host to the current time (unix epoch seconds).
-    pub fn touch_host_login(&self, id: i64) -> Result<(), StoreError> {
-        let now = chrono::Utc::now().timestamp();
-        self.db
-            .execute(
-                "UPDATE hosts SET last_login = ?1 WHERE id = ?2",
-                params![now, id],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Toggle the favorite flag for a host.
-    pub fn toggle_host_favorite(&self, id: i64) -> Result<bool, StoreError> {
-        let host = self
-            .find_host(id)?
-            .ok_or_else(|| StoreError::Db("host not found".into()))?;
-        let new_val = !host.favorite;
-        self.db
-            .execute(
-                "UPDATE hosts SET favorite = ?1 WHERE id = ?2",
-                params![new_val as i64, id],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(new_val)
-    }
-
-    // -------------------------------------------------------------------
-    // Credentials CRUD
-    // -------------------------------------------------------------------
-
-    pub fn credentials(&self) -> Result<Vec<CredentialEntry>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT id, name, kind, anonymous, secret, private_key, public_key, certificate FROM credentials ORDER BY id")
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let key = self.enc_key.clone();
-        let rows = stmt
-            .query_map([], |row| {
-                let kind_str: String = row.get(2)?;
-                let anon: bool = row.get::<_, i64>(3)? != 0;
-                let secret_blob: Vec<u8> = row.get(4)?;
-                let pk_blob: Vec<u8> = row.get(5)?;
-                let pubk_blob: Vec<u8> = row.get(6)?;
-                let cert_blob: Vec<u8> = row.get(7)?;
-
-                // Decrypt outside query_map to avoid capturing self
-                let secret = if secret_blob.is_empty() {
-                    String::new()
-                } else {
-                    crypto::decrypt(&secret_blob, &key)
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default()
-                };
-                let private_key = if pk_blob.is_empty() {
-                    String::new()
-                } else {
-                    crypto::decrypt(&pk_blob, &key)
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default()
-                };
-                let public_key = if pubk_blob.is_empty() {
-                    String::new()
-                } else {
-                    crypto::decrypt(&pubk_blob, &key)
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default()
-                };
-                let certificate = if cert_blob.is_empty() {
-                    String::new()
-                } else {
-                    crypto::decrypt(&cert_blob, &key)
-                        .map(|b| String::from_utf8_lossy(&b).into_owned())
-                        .unwrap_or_default()
-                };
-
-                Ok(CredentialEntry {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    kind: parse_cred_kind(&kind_str),
-                    anonymous: anon,
-                    secret,
-                    private_key,
-                    public_key,
-                    certificate,
-                })
-            })
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| StoreError::Db(e.to_string()))?);
-        }
-        Ok(out)
-    }
-
-    pub fn add_credential(&self, cred: &CredentialEntry) -> Result<i64, StoreError> {
-        let secret_enc = self.encrypt_field(&cred.secret)?;
-        let pk_enc = self.encrypt_field(&cred.private_key)?;
-        let pubk_enc = self.encrypt_field(&cred.public_key)?;
-        let cert_enc = self.encrypt_field(&cred.certificate)?;
-
-        self.db
-            .execute(
-                "INSERT INTO credentials (name, kind, anonymous, secret, private_key, public_key, certificate) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    cred.name,
-                    cred_kind_str(cred.kind),
-                    cred.anonymous as i64,
-                    secret_enc,
-                    pk_enc,
-                    pubk_enc,
-                    cert_enc,
-                ],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(self.db.last_insert_rowid())
-    }
-
-    pub fn remove_credential(&self, id: i64) -> Result<(), StoreError> {
-        self.db
-            .execute("DELETE FROM credentials WHERE id = ?1", params![id])
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    pub fn update_credential(&self, cred: &CredentialEntry) -> Result<(), StoreError> {
-        let secret_enc = self.encrypt_field(&cred.secret)?;
-        let pk_enc = self.encrypt_field(&cred.private_key)?;
-        let pubk_enc = self.encrypt_field(&cred.public_key)?;
-        let cert_enc = self.encrypt_field(&cred.certificate)?;
-
-        self.db
-            .execute(
-                "UPDATE credentials SET name=?1, kind=?2, anonymous=?3, secret=?4, private_key=?5, public_key=?6, certificate=?7 WHERE id=?8",
-                params![
-                    cred.name,
-                    cred_kind_str(cred.kind),
-                    cred.anonymous as i64,
-                    secret_enc,
-                    pk_enc,
-                    pubk_enc,
-                    cert_enc,
-                    cred.id,
-                ],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    pub fn find_credential(&self, id: i64) -> Result<Option<CredentialEntry>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT id, name, kind, anonymous, secret, private_key, public_key, certificate FROM credentials WHERE id=?1")
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let key = self.enc_key.clone();
-        stmt.query_row(params![id], |row| {
-            let kind_str: String = row.get(2)?;
-            let anon: bool = row.get::<_, i64>(3)? != 0;
-            let secret_blob: Vec<u8> = row.get(4)?;
-            let pk_blob: Vec<u8> = row.get(5)?;
-            let pubk_blob: Vec<u8> = row.get(6)?;
-            let cert_blob: Vec<u8> = row.get(7)?;
-
-            let secret = if secret_blob.is_empty() {
-                String::new()
-            } else {
-                crypto::decrypt(&secret_blob, &key)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default()
-            };
-            let private_key = if pk_blob.is_empty() {
-                String::new()
-            } else {
-                crypto::decrypt(&pk_blob, &key)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default()
-            };
-            let public_key = if pubk_blob.is_empty() {
-                String::new()
-            } else {
-                crypto::decrypt(&pubk_blob, &key)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default()
-            };
-            let certificate = if cert_blob.is_empty() {
-                String::new()
-            } else {
-                crypto::decrypt(&cert_blob, &key)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default()
-            };
-
-            Ok(CredentialEntry {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: parse_cred_kind(&kind_str),
-                anonymous: anon,
-                secret,
-                private_key,
-                public_key,
-                certificate,
-            })
-        })
-        .optional()
-        .map_err(|e| StoreError::Db(e.to_string()))
-    }
-
-    /// Resolve the decrypted secret for a host by looking up its linked credential.
-    pub fn resolve_secret(&self, host: &HostEntry) -> Result<Option<String>, StoreError> {
-        let cred_id = match host.credential_id {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-        let cred = self.find_credential(cred_id)?;
-        Ok(cred.map(|c| c.secret))
-    }
-
-    // -----------------------------------------------------------------
-    // Command history
-    // -----------------------------------------------------------------
-
-    /// Maximum number of commands retained per host. When the limit is
-    /// exceeded the entries with the oldest `updated_at` (LRU) are evicted.
-    const MAX_COMMAND_HISTORY: usize = 300;
-
-    /// Append a command to the persistent history for `host_id`.
-    ///
-    /// - **Duplicate command exists**: bump that row's `updated_at` to now
-    ///   so it stays alive under LRU eviction and floats to the top of the
-    ///   "most-recently-used" ordering. No new row is inserted.
-    /// - **New command**: insert with `created_at = updated_at = now`.
-    /// - **Over limit**: delete the oldest-by-`updated_at` rows beyond
-    ///   [`MAX_COMMAND_HISTORY`].
-    ///
-    /// The in-memory dedup in `TerminalSession` only skips consecutive
-    /// duplicates; this Store-level dedup handles the non-consecutive case
-    /// (re-running an older command) by promoting it instead of re-inserting.
-    pub fn add_command(&self, host_id: i64, command: &str) -> Result<(), StoreError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // If this exact command already exists for this host, bump its
-        // `updated_at` (LRU promotion) instead of inserting a duplicate.
-        let updated = self
-            .db
-            .execute(
-                "UPDATE command_history SET updated_at = ?1 WHERE host_id = ?2 AND command = ?3",
-                params![now, host_id, command],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        if updated > 0 {
-            return Ok(());
-        }
-
-        // New command — insert.
-        self.db
-            .execute(
-                "INSERT INTO command_history (host_id, command, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![host_id, command, now, now],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        // LRU eviction: keep the `MAX_COMMAND_HISTORY` most-recently-updated
-        // rows per host, delete the rest.
-        self.db
-            .execute(
-                "DELETE FROM command_history WHERE host_id = ?1 AND id NOT IN (
-                    SELECT id FROM command_history WHERE host_id = ?1
-                    ORDER BY updated_at DESC LIMIT ?2
-                 )",
-                params![host_id, Self::MAX_COMMAND_HISTORY as i64],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Load the command history for `host_id`, most-recently-used first
-    /// (ordered by `updated_at` DESC so re-run commands float to the top).
-    pub fn commands_for_host(&self, host_id: i64) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare(
-                "SELECT command FROM command_history WHERE host_id = ?1 ORDER BY updated_at DESC",
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        let rows = stmt
-            .query_map(params![host_id], |row| row.get::<_, String>(0))
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| StoreError::Db(e.to_string()))?);
-        }
-        Ok(out)
-    }
-
-    // -----------------------------------------------------------------
-    // Snippets
-    // -----------------------------------------------------------------
-
-    /// Insert a new snippet. `name` defaults to the command text when empty.
-    pub fn add_snippet(&self, name: &str, command: &str) -> Result<i64, StoreError> {
-        let name = if name.trim().is_empty() {
-            command
-        } else {
-            name
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.db
-            .execute(
-                "INSERT INTO snippets (name, command, created_at) VALUES (?1, ?2, ?3)",
-                params![name, command, now],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(self.db.last_insert_rowid())
-    }
-
-    /// Load all snippets, most-recently-created first.
-    pub fn snippets(&self) -> Result<Vec<SnippetEntry>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT id, name, command, created_at FROM snippets ORDER BY id DESC")
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(SnippetEntry {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    command: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(|e| StoreError::Db(e.to_string()))?);
-        }
-        Ok(out)
-    }
-
-    /// Delete a snippet by id.
-    pub fn remove_snippet(&self, id: i64) -> Result<(), StoreError> {
-        self.db
-            .execute("DELETE FROM snippets WHERE id = ?1", params![id])
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Update an existing snippet's name + command.
-    pub fn update_snippet(&self, id: i64, name: &str, command: &str) -> Result<(), StoreError> {
-        let name = if name.trim().is_empty() {
-            command
-        } else {
-            name
-        };
-        self.db
-            .execute(
-                "UPDATE snippets SET name = ?1, command = ?2 WHERE id = ?3",
-                params![name, command, id],
-            )
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn host_kind_str(k: HostKind) -> &'static str {
-    match k {
-        HostKind::Ssh => "Ssh",
-        HostKind::Telnet => "Telnet",
-        HostKind::Serial => "Serial",
-    }
-}
-
-fn parse_host_kind(s: &str) -> HostKind {
-    match s {
-        "Telnet" => HostKind::Telnet,
-        "Serial" => HostKind::Serial,
-        _ => HostKind::Ssh,
-    }
-}
-
-fn cred_kind_str(k: CredentialKind) -> &'static str {
-    match k {
-        CredentialKind::Password => "Password",
-        CredentialKind::Certificate => "Certificate",
-    }
-}
-
-fn parse_cred_kind(s: &str) -> CredentialKind {
-    match s {
-        "Certificate" => CredentialKind::Certificate,
-        _ => CredentialKind::Password,
     }
 }
 

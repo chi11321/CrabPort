@@ -1,0 +1,17 @@
+[package]
+name = "crabport-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crabport-core = { path = "../crabport-core" }
+tokio = { version = "1", features = ["net", "io-util"] }
+tokio-socks = "0.5"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# TLS support for HTTPS proxies — wraps the proxy stream in rustls.
+# This is for the proxy connection only; the protocol on top (SSH, telnet)
+# does its own crypto.
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+rustls-platform-verifier = "0.5"

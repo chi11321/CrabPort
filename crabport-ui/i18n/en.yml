@@ -37,6 +37,11 @@ connection_form:
   coming_soon: "Coming soon"
   auth_password: "Password"
   auth_certificate: "Certificate"
+  proxy: "Proxy"
+  proxy_none: "None"
+  proxy_system: "System"
+  proxy_custom: "Custom"
+  proxy_url: "Proxy URL"
 sessions:
   new_button: "New"
   empty: "No saved sessions. Click '+ New' to create one."

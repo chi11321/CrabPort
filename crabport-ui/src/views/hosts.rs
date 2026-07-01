@@ -27,6 +27,8 @@ pub struct ConnectionHost {
     pub credential_id: Option<i64>,
     pub last_login: Option<i64>,
     pub favorite: bool,
+    /// FK into the `proxies` table. `None` means no proxy.
+    pub proxy_id: Option<i64>,
 }
 
 /// Hosts sidebar view.

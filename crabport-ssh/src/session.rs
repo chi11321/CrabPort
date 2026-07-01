@@ -1,3 +1,5 @@
+use crabport_core::credential::ProxyConfig;
+
 /// Connection parameters for an SSH session.
 #[derive(Debug, Clone)]
 pub struct SshConnectionInfo {
@@ -13,6 +15,11 @@ pub struct SshConnectionInfo {
     pub private_key: Option<String>,
     /// Passphrase for the private key (if encrypted).
     pub passphrase: Option<String>,
+    /// Optional proxy to tunnel the TCP connection through. When set, the
+    /// SSH client connects to the proxy first, then the proxy establishes
+    /// a tunnel to `host:port`, and the SSH handshake runs over that
+    /// tunnelled stream.
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl SshConnectionInfo {
@@ -29,6 +36,7 @@ impl SshConnectionInfo {
             password: password.into(),
             private_key: None,
             passphrase: None,
+            proxy: None,
         }
     }
 
@@ -46,6 +54,12 @@ impl SshConnectionInfo {
     ) -> Self {
         self.private_key = Some(private_key.into());
         self.passphrase = passphrase;
+        self
+    }
+
+    /// Tunnel the TCP connection through a proxy (SOCKS5 / HTTP / HTTPS).
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 

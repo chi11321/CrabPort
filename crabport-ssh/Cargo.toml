@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 crabport-terminal = { path = "../crabport-terminal" }
 crabport-sftp = { version = "0.1.0", path = "../crabport-sftp" }
+crabport-core = { path = "../crabport-core" }
+crabport-proxy = { path = "../crabport-proxy" }
 russh = "0.45"
 async-broadcast = "0.7"
 async-channel = "2.5"

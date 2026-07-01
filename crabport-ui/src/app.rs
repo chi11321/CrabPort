@@ -16,6 +16,7 @@ use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::{
     CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
+    ProxyConfig, ProxyEntry,
 };
 use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
@@ -159,6 +160,7 @@ impl CrabportApp {
                 credential_id: h.credential_id,
                 last_login: h.last_login,
                 favorite: h.favorite,
+                proxy_id: h.proxy_id,
             })
             .collect();
 
@@ -284,6 +286,7 @@ impl CrabportApp {
                         passphrase,
                         auth_kind,
                         private_key,
+                        proxy_config,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
                         let n = f.name_text(cx);
@@ -294,7 +297,8 @@ impl CrabportApp {
                         let pp = f.passphrase_text(cx);
                         let ak = f.auth_kind;
                         let pk = f.private_key_text(cx);
-                        (n, h, p, u, pw, pp, ak, pk)
+                        let pc = f.proxy_config(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pc)
                     };
                     app.close_connection_form(cx);
 
@@ -327,6 +331,7 @@ impl CrabportApp {
                         .unwrap_or(0);
 
                     // Persist host with linked credential
+                    let proxy_id = upsert_proxy_for_host(&proxy_config, None, cx);
                     let entry = HostEntry {
                         id: 0,
                         name: name.clone(),
@@ -337,6 +342,7 @@ impl CrabportApp {
                         kind: CoreHostKind::Ssh,
                         last_login: None,
                         favorite: false,
+                        proxy_id,
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -350,6 +356,7 @@ impl CrabportApp {
                         credential_id: Some(cred_id),
                         last_login: None,
                         favorite: false,
+                        proxy_id,
                     });
                     let (private_key_arg, passphrase_arg) = match auth_kind {
                         AuthKind::Password => (None, None),
@@ -378,6 +385,7 @@ impl CrabportApp {
                         },
                         private_key_arg,
                         passphrase_arg,
+                        proxy_config,
                         cx,
                     );
                     cx.notify();
@@ -478,6 +486,7 @@ impl CrabportApp {
         password: &str,
         private_key: Option<&str>,
         passphrase: Option<&str>,
+        proxy: Option<crabport_core::credential::ProxyConfig>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -492,6 +501,9 @@ impl CrabportApp {
         let mut info = SshConnectionInfo::new(host, username, password).with_port(port);
         if let Some(pk) = private_key {
             info = info.with_private_key(pk, passphrase.map(|s| s.to_string()));
+        }
+        if let Some(p) = proxy {
+            info = info.with_proxy(p);
         }
         let info_for_view = info.clone();
         let cols: usize = 80;
@@ -597,6 +609,7 @@ impl CrabportApp {
                     credential_id: h.credential_id,
                     last_login: h.last_login,
                     favorite: h.favorite,
+                    proxy_id: h.proxy_id,
                 })
                 .collect();
         }
@@ -629,6 +642,15 @@ impl CrabportApp {
             None => (String::new(), None, None),
         };
 
+        // Resolve the saved proxy (if any) into a ready-to-use config.
+        let proxy_config = host.proxy_id.and_then(|pid| {
+            AppState::store(cx)
+                .lock()
+                .find_proxy_config(pid)
+                .ok()
+                .flatten()
+        });
+
         self.add_ssh_tab(
             &host.name,
             Some(host_id),
@@ -638,6 +660,7 @@ impl CrabportApp {
             &password,
             private_key,
             passphrase,
+            proxy_config,
             cx,
         );
     }
@@ -709,15 +732,44 @@ impl CrabportApp {
             }
         }
 
+        // Load the saved proxy (if any) so the user can edit / clear it.
+        // System proxies aren't persisted, so we only resolve a config for a
+        // real `proxy_id`.
+        let saved_proxy = h.proxy_id.and_then(|pid| {
+            AppState::store(cx)
+                .lock()
+                .find_proxy_config(pid)
+                .ok()
+                .flatten()
+                .map(|cfg| (pid, cfg))
+        });
+        #[cfg(debug_assertions)]
+        tracing::info!(
+            "edit_host: host_id={}, host.proxy_id={:?}, resolved_saved_proxy={}",
+            h.id,
+            h.proxy_id,
+            saved_proxy.is_some()
+        );
+        match saved_proxy {
+            Some((pid, cfg)) => form.load_proxy(Some(pid), Some(&cfg), window, cx),
+            None => form.load_proxy(None, None, window, cx),
+        }
+
         let app = cx.entity().clone();
         let editing_host_id = h.id;
         let editing_cred_id = h.credential_id;
+        let editing_proxy_id = h.proxy_id;
 
         form.editing = true;
 
         form.on_connect = Some(Rc::new({
             let app = app.clone();
             move |_kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                #[cfg(debug_assertions)]
+                tracing::info!(
+                    "edit_host: on_connect fired — editing_proxy_id={:?}",
+                    editing_proxy_id
+                );
                 app.update(cx, |app, cx| {
                     let (
                         name,
@@ -728,8 +780,16 @@ impl CrabportApp {
                         passphrase,
                         auth_kind,
                         private_key,
+                        proxy_config,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
+                        #[cfg(debug_assertions)]
+                        tracing::info!(
+                            "edit_host: reading form — proxy_kind={:?}, form.proxy_id={:?}, proxy_url={:?}",
+                            f.proxy_kind,
+                            f.proxy_id,
+                            f.proxy_url_text(cx)
+                        );
                         let n = f.name_text(cx);
                         let h = f.host_text(cx);
                         let p: u16 = f.port_text(cx).parse().unwrap_or(22);
@@ -738,7 +798,8 @@ impl CrabportApp {
                         let pp = f.passphrase_text(cx);
                         let ak = f.auth_kind;
                         let pk = f.private_key_text(cx);
-                        (n, h, p, u, pw, pp, ak, pk)
+                        let pc = f.proxy_config(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pc)
                     };
                     app.close_connection_form(cx);
 
@@ -784,7 +845,14 @@ impl CrabportApp {
                         kind: CoreHostKind::Ssh,
                         last_login: None,
                         favorite: false,
+                        proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),
                     };
+                    #[cfg(debug_assertions)]
+                    tracing::info!(
+                        "edit_host: on_connect — editing_proxy_id={:?}, resolved_entry.proxy_id={:?}",
+                        editing_proxy_id,
+                        entry.proxy_id
+                    );
                     let _ = AppState::store(cx).lock().update_host(&entry);
 
                     if let Some(h) = app.hosts.iter_mut().find(|h| h.id == editing_host_id) {
@@ -793,6 +861,7 @@ impl CrabportApp {
                         h.port = port_num;
                         h.username = username.clone();
                         h.credential_id = Some(new_cred_id);
+                        h.proxy_id = entry.proxy_id;
                     }
 
                     cx.notify();
@@ -936,6 +1005,93 @@ impl Render for CrabportApp {
 // ---------------------------------------------------------------------------
 // Main window construction
 // ---------------------------------------------------------------------------
+
+/// Persist (or update, or remove) the proxy row linked to a host.
+///
+/// - `proxy_config = None` → if `existing_id` was set, delete that proxy row
+///   and return `None` (host becomes direct).
+/// - `proxy_config = Some(cfg)` → if `existing_id` is set, update that row;
+///   otherwise insert a new one. Returns the row id to store on the host.
+///
+/// The proxy is stored as an anonymous row (name = `"<host>"`) so it
+/// doesn't clutter a future proxies-management UI.
+fn upsert_proxy_for_host(
+    proxy_config: &Option<ProxyConfig>,
+    existing_id: Option<i64>,
+    cx: &mut App,
+) -> Option<i64> {
+    #[cfg(debug_assertions)]
+    tracing::info!(
+        "upsert_proxy_for_host: existing_id={:?}, has_config={}",
+        existing_id,
+        proxy_config.is_some()
+    );
+    let store = AppState::store(cx);
+    let proxy_config = proxy_config.as_ref()?;
+    // Only persist enabled proxies (kind != None and host non-empty).
+    if !proxy_config.is_enabled() {
+        #[cfg(debug_assertions)]
+        tracing::info!(
+            "upsert_proxy_for_host: config not enabled (kind={:?}, host={:?}) — removing if set",
+            proxy_config.kind,
+            proxy_config.host
+        );
+        if let Some(id) = existing_id {
+            let _ = store.lock().remove_proxy(id);
+        }
+        return None;
+    }
+
+    #[cfg(debug_assertions)]
+    tracing::info!(
+        "upsert_proxy_for_host: persisting kind={:?} {}:{} has_user={} has_pass={}",
+        proxy_config.kind,
+        proxy_config.host,
+        proxy_config.port,
+        proxy_config.username.is_some(),
+        proxy_config.password.is_some()
+    );
+
+    let password_bytes = proxy_config
+        .password
+        .as_ref()
+        .map(|p| p.as_bytes().to_vec());
+
+    let entry = ProxyEntry {
+        id: existing_id.unwrap_or(0),
+        name: String::new(), // anonymous — tied to the host
+        kind: proxy_config.kind,
+        host: proxy_config.host.clone(),
+        port: proxy_config.port,
+        username: proxy_config.username.clone(),
+        password: password_bytes,
+        created_at: 0,
+    };
+
+    let store = store.lock();
+    match existing_id {
+        Some(id) => {
+            let res = store.update_proxy(&entry);
+            #[cfg(debug_assertions)]
+            tracing::info!(
+                "upsert_proxy_for_host: update_proxy({}) result={:?}",
+                id,
+                res.as_ref().err()
+            );
+            let _ = res;
+            Some(id)
+        }
+        None => {
+            let res = store.add_proxy(&entry);
+            #[cfg(debug_assertions)]
+            tracing::info!(
+                "upsert_proxy_for_host: add_proxy result={:?}",
+                res.as_ref().err()
+            );
+            res.ok()
+        }
+    }
+}
 
 /// Open the main terminal window.
 ///

@@ -37,6 +37,11 @@ connection_form:
   coming_soon: "即将推出"
   auth_password: "密码"
   auth_certificate: "证书"
+  proxy: "代理"
+  proxy_none: "无"
+  proxy_system: "系统"
+  proxy_custom: "自定义"
+  proxy_url: "代理地址"
 sessions:
   new_button: "新建"
   empty: "暂无保存的会话，点击「+ 新建」创建"

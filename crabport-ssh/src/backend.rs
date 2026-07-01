@@ -11,6 +11,7 @@ use russh::{
 use tokio::task::AbortHandle;
 use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
 
+use crabport_core::credential::ProxyConfig;
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{BackendEvent, RemoteMetrics, RemoteStatus};
 
@@ -20,6 +21,27 @@ use crate::known_hosts::KnownHosts;
 use crate::monitor::monitor_loop;
 use crate::session::SshConnectionInfo;
 use crate::transfer::SftpTransferHandle;
+
+/// Connect a russh session over a (possibly proxied) stream.
+///
+/// Thin bridge: builds the stream via `crabport_proxy::connect` (direct,
+/// SOCKS5, or HTTP/HTTPS CONNECT), then hands it to
+/// `russh::client::connect_stream`.
+async fn connect_russh<H>(
+    config: Arc<client::Config>,
+    proxy: &Option<ProxyConfig>,
+    target_host: &str,
+    target_port: u16,
+    handler: H,
+) -> Result<client::Handle<H>, H::Error>
+where
+    H: russh::client::Handler + Send + 'static,
+{
+    let stream = crabport_proxy::connect(proxy, target_host, target_port)
+        .await
+        .map_err(|e| <H::Error as From<russh::Error>>::from(russh::Error::from(e)))?;
+    client::connect_stream(config, stream, handler).await
+}
 
 // Re-export the public handler-API types so existing callers using
 // `crabport_ssh::backend::HostKeyInfo` / `HostKeyVerifier` keep working after
@@ -155,7 +177,7 @@ impl SshBackend {
             };
 
             let config = Arc::new(client::Config::default());
-            let mut sh = match client::connect(config, &addr, handler).await {
+            let mut sh = match connect_russh(config, &info.proxy, &info.host, info.port, handler).await {
                 Ok(sh) => {
                     on_status2("TCP connection established".into());
                     sh

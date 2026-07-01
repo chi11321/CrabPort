@@ -10,8 +10,8 @@ use std::time::Duration;
 //         this.active_tab = *idx;
 //         cx.notify();
 //     }))
-//     .pane(TabPane::new("Overview", my_overview_component()))
-//     .pane(TabPane::new("Settings", my_settings_component()))
+//     .pane(TabPane::new("Overview", my_overview_component()).height(px(400.)))
+//     .pane(TabPane::new("Settings", my_settings_component()).height(px(300.)))
 //     .pane(TabPane::new("History",  my_history_component()))
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,11 @@ pub struct TabPane {
     /// can drive the svg's color transition itself.
     pub icon: Option<SharedString>,
     pub content: AnyElement,
+    /// Optional height for this pane's content area. When set on every pane,
+    /// the Tabs component animates `max_height` to the active pane's height
+    /// on tab switch (ease in/out). When `None` on any pane, the content
+    /// area falls back to `flex_1` (fill remaining space, no height anim).
+    pub height: Option<DefiniteLength>,
 }
 
 impl TabPane {
@@ -36,12 +41,21 @@ impl TabPane {
             label: label.into_any_element(),
             icon: None,
             content: content.into_any_element(),
+            height: None,
         }
     }
 
     /// Attach an icon to this pane's tab. See [`Segment::icon`].
     pub fn icon(mut self, path: impl Into<SharedString>) -> Self {
         self.icon = Some(path.into());
+        self
+    }
+
+    /// Set the content area height for this pane. When all panes specify a
+    /// height, the Tabs component eases `max_height` between values on tab
+    /// switch. Use `px(...)` for a fixed pixel height.
+    pub fn height(mut self, h: impl Into<DefiniteLength>) -> Self {
+        self.height = Some(h.into());
         self
     }
 }
@@ -99,7 +113,7 @@ impl Tabs {
     }
 
     /// Clean up all gpui-animation state associated with this Tabs component,
-    /// including its internal SegmentedControl, track, and panels.
+    /// including its internal SegmentedControl, track, panels, and content area.
     /// Call this when the component is removed from the render tree.
     pub fn cleanup_animation(id: &ElementId, pane_count: usize) {
         gpui_animation::reset_transition(id);
@@ -111,6 +125,10 @@ impl Tabs {
         // Track
         let track_id = ElementId::Name(format!("{}-slide-track", id).into());
         gpui_animation::reset_transition(&track_id);
+
+        // Content area (height transition)
+        let content_id = ElementId::Name(format!("{}-content", id).into());
+        gpui_animation::reset_transition(&content_id);
 
         // Panels
         for i in 0..pane_count {
@@ -124,6 +142,18 @@ impl RenderOnce for Tabs {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let count = self.panes.len().max(1);
         let active = self.active.min(count - 1);
+
+        // If every pane specifies a height, drive the content area's
+        // `max_height` via a transition (eases between heights on switch).
+        // Otherwise fall back to flex_1 (fill remaining space, original
+        // behavior) so callers who don't care about height aren't affected.
+        let height_driven = !self.panes.is_empty() && self.panes.iter().all(|p| p.height.is_some());
+        // Snapshot the per-pane heights before we move `panes` below.
+        let pane_heights: Vec<DefiniteLength> = if height_driven {
+            self.panes.iter().map(|p| p.height.unwrap()).collect()
+        } else {
+            Vec::new()
+        };
 
         // -----------------------------------------------------------------------
         // SegmentedControl
@@ -204,25 +234,78 @@ impl RenderOnce for Tabs {
             );
         }
 
-        let content_area = div()
-            .relative()
-            .w_full()
-            .flex_1()
-            .overflow_hidden()
-            .child(track);
+        // -----------------------------------------------------------------------
+        // Content area
+        //
+        // height-driven mode: a sizing div (whose height transitions to the
+        // active pane's height) occupies layout space and sizes the content
+        // area. The absolute track floats on top. `max_h` on the content
+        // area clamps during the ease so content never overflows mid-
+        // transition.
+        // flex-fill mode: `flex_1` fills remaining space (original behavior).
+        // -----------------------------------------------------------------------
+        let content_id = ElementId::Name(format!("{}-content", self.id).into());
+
+        let content: AnyElement = if height_driven {
+            let sizing_id = ElementId::Name(format!("{}-content-sizing", self.id).into());
+            let mut sizing = div()
+                .id(sizing_id.clone())
+                .w_full()
+                .with_transition(sizing_id);
+            let sizing_heights = pane_heights.clone();
+            for (i, h) in sizing_heights.into_iter().enumerate() {
+                sizing = sizing.transition_when_else(
+                    active == i,
+                    Duration::from_millis(320),
+                    EaseInOutQuad,
+                    move |state| state.h(h).max_h(h),
+                    |state| state,
+                );
+            }
+
+            let mut area = div()
+                .id(content_id.clone())
+                .relative()
+                .w_full()
+                .overflow_hidden()
+                .with_transition(content_id);
+            for (i, h) in pane_heights.into_iter().enumerate() {
+                area = area.transition_when_else(
+                    active == i,
+                    Duration::from_millis(320),
+                    EaseInOutQuad,
+                    move |state| state.max_h(h),
+                    |state| state,
+                );
+            }
+            area.child(track).child(sizing).into_any_element()
+        } else {
+            div()
+                .id(content_id)
+                .relative()
+                .w_full()
+                .flex_1()
+                .overflow_hidden()
+                .child(track)
+                .into_any_element()
+        };
 
         // -----------------------------------------------------------------------
         // Root
+        //
+        // height-driven mode: root has no `h_full` — it sizes to the ctrl
+        //   bar + the content area's animated `max_h`, so the whole
+        //   component grows/shrinks with the active pane's height.
+        // flex-fill mode: `h_full` so the content area's `flex_1` can fill
+        //   the remaining vertical space.
         // -----------------------------------------------------------------------
-        let mut root = div()
-            .id(self.id)
-            .flex()
-            .flex_col()
-            .w_full()
-            .h_full()
-            .gap_2()
-            .child(ctrl)
-            .child(content_area);
+        let mut root = div().id(self.id).flex().flex_col().w_full().gap_2();
+
+        if !height_driven {
+            root = root.h_full();
+        }
+
+        root = root.child(ctrl).child(content);
 
         root.style().refine(&self.style);
         root
