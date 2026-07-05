@@ -101,7 +101,7 @@ pub fn render_tab_bar(
                 .text_sm()
                 .on_click(move |_e, w, cx| {
                     h.update(cx, |app, cx| {
-                        let cmd = app.command_palette.clone();
+                        let cmd = app.app_ctx.command_palette.clone();
                         cmd.update(cx, |cmd, cx| {
                             cmd.open(w, cx);
                         });

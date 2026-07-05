@@ -4,15 +4,14 @@ use std::rc::Rc;
 use gpui::*;
 use rust_i18n::t;
 
+use crate::app::AppCtx;
 use crate::app::{CrabportApp, SidebarItem, Tab, TabKind};
 use crate::color::*;
-use crate::components::context_menu::ContextMenuController;
-use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
+use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::render_panel;
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
-use crate::views::hosts::{ConnectionFormState, ConnectionHost, HostsView};
-use crate::views::panel::sftp::SftpPanel;
+use crate::views::hosts::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 
 pub fn render_content(
@@ -23,31 +22,30 @@ pub fn render_content(
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
     form_entity: Option<&ConnectionFormState>,
-    sftp_panel: &Entity<SftpPanel>,
-    snippets_panel: &Entity<crate::views::panel::snippets_panel::SnippetsPanel>,
-    history_panel: &Entity<crate::views::panel::history_command_panel::HistoryCommandPanel>,
-    tunnels_panel: &Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
     // Active index of the right-hand panel tab strip (SFTP / History /
     // Snippets). Read by the caller (which owns the `CrabportApp` borrow)
     // and passed in to avoid a nested `handle.read_with` during render.
     panel_active_tab: usize,
-    hosts_view: &Entity<HostsView>,
-    snippets_view: &Entity<crate::views::snippets::SnippetsView>,
-    tunnels_view: &Entity<crate::views::tunnels::TunnelsView>,
     // Pre-read by the caller (which owns the `CrabportApp` borrow) to avoid
     // a nested `handle.read_with` during render — same reason as
     // `panel_active_tab`.
     tunnel_list: Vec<crate::views::tunnels::TunnelView>,
     tunnel_form_state: Option<crate::views::tunnels::TunnelFormState>,
     snippet_form_state: Option<crate::views::snippets::SnippetFormState>,
-    alert_controller: &Entity<AlertController>,
-    context_menu: &Entity<ContextMenuController>,
-    // Pre-read by the caller (which owns the `CrabportApp` borrow) to avoid
-    // a nested `handle.read_with` during render — same reason as
-    // `tunnel_list` / `panel_active_tab`.
+    ctx: &AppCtx,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
+    // Unpack the shared context once — every field is a cheap handle/Arc.
+    let sftp_panel = &ctx.sftp_panel;
+    let snippets_panel = &ctx.snippets_panel;
+    let history_panel = &ctx.history_panel;
+    let tunnels_panel = &ctx.tunnels_panel;
+    let hosts_view = &ctx.hosts_view;
+    let snippets_view = &ctx.snippets_view;
+    let tunnels_view = &ctx.tunnels_view;
+    let context_menu = &ctx.context_menu;
+    let alert_controller = &ctx.alert;
     let active_tab = tabs.iter().find(|t| t.id == active_tab_id);
     // Clone the tunnel list for the panel — the full-page TunnelsView
     // (SidebarItem::Tunnels arm below) consumes the original `tunnel_list`.

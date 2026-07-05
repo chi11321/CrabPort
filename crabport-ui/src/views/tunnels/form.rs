@@ -891,7 +891,7 @@ fn render_buttons(
                             .map(|form| form.validate(cx))
                             .unwrap_or(true);
                         if !valid {
-                            app.notification_controller.update(cx, |c, cx| {
+                            app.app_ctx.notifications.update(cx, |c, cx| {
                                 c.show(
                                     crate::components::notification::Notification::new(
                                         t!("tunnel_form.validation_title").to_string(),
