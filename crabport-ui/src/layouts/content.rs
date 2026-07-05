@@ -40,6 +40,12 @@ pub fn render_content(
     tunnel_form_state: Option<crate::views::tunnels::TunnelFormState>,
     alert_controller: &Entity<AlertController>,
     context_menu: &Entity<ContextMenuController>,
+    // Pre-read by the caller (which owns the `CrabportApp` borrow) to avoid
+    // a nested `handle.read_with` during render — same reason as
+    // `tunnel_list` / `panel_active_tab`. Used to fire toast notifications
+    // from views that don't route their actions through `CrabportApp`
+    // methods (e.g. `SnippetsView::save_edit`).
+    notification_controller: &Entity<crate::components::notification::NotificationController>,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
@@ -59,136 +65,144 @@ pub fn render_content(
     };
 
     let view: AnyElement = match active_tab.map(|t| t.kind) {
-        Some(TabKind::Home) => match selected {
-            SidebarItem::Sessions => {
-                let app_handle = handle.clone();
-                let on_connect = move |host_id: i64, _w: &mut Window, cx: &mut App| {
-                    app_handle.update(cx, |app, cx| {
-                        app.connect_to_host(host_id, cx);
-                    });
-                };
-                let app_handle_edit = handle.clone();
-                let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
-                    app_handle_edit.update(cx, |app, cx| {
-                        app.edit_host(host_id, w, cx);
-                    });
-                };
-                let app_handle_remove = handle.clone();
-                let on_remove = move |host_id: i64, _w: &mut Window, cx: &mut App| {
-                    app_handle_remove.update(cx, |app, cx| {
-                        app.remove_host(host_id, cx);
-                    });
-                };
+        Some(TabKind::Home) => {
+            match selected {
+                SidebarItem::Sessions => {
+                    let app_handle = handle.clone();
+                    let on_connect = move |host_id: i64, _w: &mut Window, cx: &mut App| {
+                        app_handle.update(cx, |app, cx| {
+                            app.connect_to_host(host_id, cx);
+                        });
+                    };
+                    let app_handle_edit = handle.clone();
+                    let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
+                        app_handle_edit.update(cx, |app, cx| {
+                            app.edit_host(host_id, w, cx);
+                        });
+                    };
+                    let app_handle_remove = handle.clone();
+                    let on_remove = move |host_id: i64, _w: &mut Window, cx: &mut App| {
+                        app_handle_remove.update(cx, |app, cx| {
+                            app.remove_host(host_id, cx);
+                        });
+                    };
 
-                let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
-                let on_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_connect);
-                let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
-                let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
+                    let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
+                    let on_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_connect);
+                    let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
+                    let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
 
-                hosts_view.update(cx, |view, cx| {
-                    view.set_state(
-                        hosts.to_vec(),
-                        form_entity.cloned(),
-                        Some(on_new_rc),
-                        Some(on_connect_rc),
-                        Some(on_edit_rc),
-                        Some(on_remove_rc),
-                        context_menu.clone(),
-                        alert_controller.clone(),
-                        cx,
-                    );
-                });
+                    hosts_view.update(cx, |view, cx| {
+                        view.set_state(
+                            hosts.to_vec(),
+                            form_entity.cloned(),
+                            Some(on_new_rc),
+                            Some(on_connect_rc),
+                            Some(on_edit_rc),
+                            Some(on_remove_rc),
+                            context_menu.clone(),
+                            alert_controller.clone(),
+                            cx,
+                        );
+                    });
 
-                hosts_view.clone().into_any_element()
+                    hosts_view.clone().into_any_element()
+                }
+                SidebarItem::Tunnels => {
+                    let app_handle = handle.clone();
+                    let on_new = move |w: &mut Window, cx: &mut App| {
+                        app_handle.update(cx, |app, cx| {
+                            app.open_tunnel_form_for_create(w, cx);
+                        });
+                    };
+                    let app_handle_start = handle.clone();
+                    let on_start = move |id: i64, w: &mut Window, cx: &mut App| {
+                        app_handle_start.update(cx, |app, cx| {
+                            app.start_tunnel_owned(id, w, cx);
+                        });
+                    };
+                    let app_handle_stop = handle.clone();
+                    let on_stop = move |id: i64, _w: &mut Window, cx: &mut App| {
+                        app_handle_stop.update(cx, |app, cx| {
+                            app.stop_tunnel(id, cx);
+                        });
+                    };
+                    let app_handle_edit = handle.clone();
+                    let on_edit = move |id: i64, w: &mut Window, cx: &mut App| {
+                        app_handle_edit.update(cx, |app, cx| {
+                            app.open_tunnel_form_for_edit(id, w, cx);
+                        });
+                    };
+                    let app_handle_remove = handle.clone();
+                    let on_remove = move |id: i64, _w: &mut Window, cx: &mut App| {
+                        app_handle_remove.update(cx, |app, cx| {
+                            app.remove_tunnel(id, cx);
+                        });
+                    };
+
+                    let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
+                    let on_start_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_start);
+                    let on_stop_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_stop);
+                    let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
+                    let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
+
+                    tunnels_view.update(cx, |view, cx| {
+                        view.set_state(
+                            tunnel_list,
+                            hosts.to_vec(),
+                            Some(on_new_rc),
+                            Some(on_start_rc),
+                            Some(on_stop_rc),
+                            Some(on_edit_rc),
+                            Some(on_remove_rc),
+                            context_menu.clone(),
+                            alert_controller.clone(),
+                            tunnel_form_state,
+                            cx,
+                        );
+                    });
+
+                    tunnels_view.clone().into_any_element()
+                }
+                SidebarItem::Snippets => {
+                    // Load snippets from the Store and push into the view.
+                    let store = crate::app_state::AppState::store(cx);
+                    let rows = if let Ok(snippets) = store.lock().snippets() {
+                        snippets
+                            .into_iter()
+                            .map(|s| crate::views::snippets::SnippetRow {
+                                id: s.id,
+                                name: s.name,
+                                command: s.command,
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    snippets_view.update(cx, |view, cx| {
+                        view.set_state(
+                            rows,
+                            context_menu.clone(),
+                            alert_controller.clone(),
+                            notification_controller.clone(),
+                            cx,
+                        );
+                    });
+                    snippets_view.clone().into_any_element()
+                }
+                SidebarItem::History => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(selected.label().to_string()),
+                    )
+                    .into_any_element(),
             }
-            SidebarItem::Tunnels => {
-                let app_handle = handle.clone();
-                let on_new = move |w: &mut Window, cx: &mut App| {
-                    app_handle.update(cx, |app, cx| {
-                        app.open_tunnel_form_for_create(w, cx);
-                    });
-                };
-                let app_handle_start = handle.clone();
-                let on_start = move |id: i64, w: &mut Window, cx: &mut App| {
-                    app_handle_start.update(cx, |app, cx| {
-                        app.start_tunnel_owned(id, w, cx);
-                    });
-                };
-                let app_handle_stop = handle.clone();
-                let on_stop = move |id: i64, _w: &mut Window, cx: &mut App| {
-                    app_handle_stop.update(cx, |app, cx| {
-                        app.stop_tunnel(id, cx);
-                    });
-                };
-                let app_handle_edit = handle.clone();
-                let on_edit = move |id: i64, w: &mut Window, cx: &mut App| {
-                    app_handle_edit.update(cx, |app, cx| {
-                        app.open_tunnel_form_for_edit(id, w, cx);
-                    });
-                };
-                let app_handle_remove = handle.clone();
-                let on_remove = move |id: i64, _w: &mut Window, cx: &mut App| {
-                    app_handle_remove.update(cx, |app, cx| {
-                        app.remove_tunnel(id, cx);
-                    });
-                };
-
-                let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
-                let on_start_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_start);
-                let on_stop_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_stop);
-                let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
-                let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
-
-                tunnels_view.update(cx, |view, cx| {
-                    view.set_state(
-                        tunnel_list,
-                        hosts.to_vec(),
-                        Some(on_new_rc),
-                        Some(on_start_rc),
-                        Some(on_stop_rc),
-                        Some(on_edit_rc),
-                        Some(on_remove_rc),
-                        context_menu.clone(),
-                        alert_controller.clone(),
-                        tunnel_form_state,
-                        cx,
-                    );
-                });
-
-                tunnels_view.clone().into_any_element()
-            }
-            SidebarItem::Snippets => {
-                // Load snippets from the Store and push into the view.
-                let store = crate::app_state::AppState::store(cx);
-                let rows = if let Ok(snippets) = store.lock().snippets() {
-                    snippets
-                        .into_iter()
-                        .map(|s| crate::views::snippets::SnippetRow {
-                            id: s.id,
-                            name: s.name,
-                            command: s.command,
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                snippets_view.update(cx, |view, cx| {
-                    view.set_state(rows, context_menu.clone(), alert_controller.clone(), cx);
-                });
-                snippets_view.clone().into_any_element()
-            }
-            SidebarItem::History => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(selected.label().to_string()),
-                )
-                .into_any_element(),
-        },
+        }
         Some(TabKind::Terminal) => {
             if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
                 div()

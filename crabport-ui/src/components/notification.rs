@@ -69,10 +69,9 @@ impl NotificationLevel {
 
     fn icon(self) -> &'static str {
         match self {
-            // No dedicated per-level icons in the asset set; reuse the
-            // existing circle-alert for everything so the accent color
-            // carries the semantic meaning, matching AlertDialog.
-            Self::Info | Self::Success | Self::Warning | Self::Danger => "icons/circle-alert.svg",
+            Self::Info | Self::Warning => "icons/circle-alert.svg",
+            Self::Success => "icons/circle-check.svg",
+            Self::Danger => "icons/circle-x.svg",
         }
     }
 }

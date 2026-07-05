@@ -117,6 +117,10 @@ pub struct TerminalView {
     /// the toolbar) can re-render without observing every terminal repaint.
     /// Mirrors the `on_backend_closed` callback pattern.
     on_sftp_progress_changed: Option<Rc<dyn Fn(&mut App)>>,
+    /// Invoked when an SFTP transfer finishes (success or failure), so the
+    /// app can surface a toast notification. Mirrors the
+    /// `on_sftp_progress_changed` / `on_backend_closed` callback pattern.
+    on_sftp_transfer_finished: Option<Rc<dyn Fn(SftpTransferKind, bool, String, &mut App)>>,
 }
 
 impl TerminalView {
@@ -271,9 +275,16 @@ impl TerminalView {
                                 }
                             }
                             let cb = this.on_sftp_progress_changed.clone();
+                            let cb_kind = kind;
+                            let cb_success = success;
+                            let cb_message = message.clone();
+                            let finished_cb = this.on_sftp_transfer_finished.clone();
                             cx.notify();
                             if let Some(cb) = cb {
                                 cx.defer(move |cx| cb(cx));
+                            }
+                            if let Some(cb) = finished_cb {
+                                cx.defer(move |cx| cb(cb_kind, cb_success, cb_message, cx));
                             }
                         });
                     }
@@ -439,6 +450,7 @@ impl TerminalView {
             on_backend_closed: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
+            on_sftp_transfer_finished: None,
         }
     }
 
@@ -505,6 +517,15 @@ impl TerminalView {
     /// progress snapshot) without observing every terminal repaint.
     pub fn set_on_sftp_progress_changed(&mut self, f: impl Fn(&mut App) + 'static) {
         self.on_sftp_progress_changed = Some(Rc::new(f));
+    }
+
+    /// Sets the callback invoked when an SFTP transfer finishes. The app uses
+    /// this to show a success/failure toast notification.
+    pub fn set_on_sftp_transfer_finished(
+        &mut self,
+        f: impl Fn(SftpTransferKind, bool, String, &mut App) + 'static,
+    ) {
+        self.on_sftp_transfer_finished = Some(Rc::new(f));
     }
 
     /// Returns the host-key info for a currently-pending host-key prompt,
@@ -629,9 +650,16 @@ impl TerminalView {
                                 }
                             }
                             let cb = this.on_sftp_progress_changed.clone();
+                            let cb_kind = kind;
+                            let cb_success = success;
+                            let cb_message = message.clone();
+                            let finished_cb = this.on_sftp_transfer_finished.clone();
                             cx.notify();
                             if let Some(cb) = cb {
                                 cx.defer(move |cx| cb(cx));
+                            }
+                            if let Some(cb) = finished_cb {
+                                cx.defer(move |cx| cb(cb_kind, cb_success, cb_message, cx));
                             }
                         });
                     }

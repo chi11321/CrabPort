@@ -24,6 +24,7 @@ use crabport_core::credential::{
 use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_ssh::{CrabPortTunnel, OwnedSession, TunnelManager};
+use crabport_terminal::terminal::SftpTransferKind;
 
 use crate::app_state::AppState;
 
@@ -599,6 +600,7 @@ impl CrabportApp {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let name = out.name.clone();
         let entry = TunnelEntry {
             id: out.editing_id.unwrap_or(0),
             name: out.name,
@@ -619,21 +621,73 @@ impl CrabportApp {
             Some(_id) => {
                 if let Err(e) = store.lock().update_tunnel(&entry) {
                     tracing::error!("update_tunnel failed: {e}");
+                    self.notification_controller.update(cx, |c, cx| {
+                        c.show(
+                            Notification::new(t!("tunnels.notif_save_failed_title").to_string())
+                                .level(NotificationLevel::Danger)
+                                .message(
+                                    t!("tunnels.notif_save_failed_msg", name = name.as_str())
+                                        .to_string(),
+                                )
+                                .duration(std::time::Duration::from_secs(5)),
+                            cx,
+                        );
+                    });
+                    cx.notify();
                     return;
                 }
                 self.tunnels.update_config(entry);
+                self.notification_controller.update(cx, |c, cx| {
+                    c.show(
+                        Notification::new(t!("tunnels.notif_save_updated_title").to_string())
+                            .level(NotificationLevel::Success)
+                            .message(
+                                t!("tunnels.notif_save_updated_msg", name = name.as_str())
+                                    .to_string(),
+                            )
+                            .duration(std::time::Duration::from_secs(3)),
+                        cx,
+                    );
+                });
             }
             None => {
                 let id = match store.lock().add_tunnel(&entry) {
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!("add_tunnel failed: {e}");
+                        self.notification_controller.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(
+                                    t!("tunnels.notif_save_failed_title").to_string(),
+                                )
+                                .level(NotificationLevel::Danger)
+                                .message(
+                                    t!("tunnels.notif_save_failed_msg", name = name.as_str())
+                                        .to_string(),
+                                )
+                                .duration(std::time::Duration::from_secs(5)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
                         return;
                     }
                 };
                 let mut entry = entry;
                 entry.id = id;
                 self.tunnels.add(entry);
+                self.notification_controller.update(cx, |c, cx| {
+                    c.show(
+                        Notification::new(t!("tunnels.notif_save_created_title").to_string())
+                            .level(NotificationLevel::Success)
+                            .message(
+                                t!("tunnels.notif_save_created_msg", name = name.as_str())
+                                    .to_string(),
+                            )
+                            .duration(std::time::Duration::from_secs(3)),
+                        cx,
+                    );
+                });
             }
         }
         self.close_tunnel_form(cx);
@@ -658,6 +712,7 @@ impl CrabportApp {
             Ok(Some(e)) => e,
             _ => return,
         };
+        let tunnel_name = entry.name.clone();
         let host = match store.lock().hosts() {
             Ok(hosts) => hosts.into_iter().find(|h| h.id == entry.host_id),
             Err(_) => None,
@@ -765,15 +820,49 @@ impl CrabportApp {
             });
         });
 
-        cx.spawn(async move |this, cx| match rx.await {
-            Ok(Some((session, manager))) => {
-                let _ = this.update(cx, |app, cx| {
-                    app.tunnels.set_owned(tunnel_id_for_set, session, manager);
-                    cx.notify();
-                });
-            }
-            _ => {
-                let _ = this.update(cx, |_, cx| cx.notify());
+        cx.spawn(async move |this, cx| {
+            let tunnel_name = tunnel_name.clone();
+            match rx.await {
+                Ok(Some((session, manager))) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.tunnels.set_owned(tunnel_id_for_set, session, manager);
+                        app.notification_controller.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(t!("tunnels.notif_start_title").to_string())
+                                    .level(NotificationLevel::Success)
+                                    .message(
+                                        t!("tunnels.notif_start_msg", name = tunnel_name.as_str())
+                                            .to_string(),
+                                    )
+                                    .duration(std::time::Duration::from_secs(3)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
+                _ => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.notification_controller.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(
+                                    t!("tunnels.notif_start_failed_title").to_string(),
+                                )
+                                .level(NotificationLevel::Danger)
+                                .message(
+                                    t!(
+                                        "tunnels.notif_start_failed_msg",
+                                        name = tunnel_name.as_str()
+                                    )
+                                    .to_string(),
+                                )
+                                .duration(std::time::Duration::from_secs(5)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
             }
         })
         .detach();
@@ -786,6 +875,13 @@ impl CrabportApp {
         let Some(manager) = manager else {
             return;
         };
+        let tunnel_name = AppState::store(cx)
+            .lock()
+            .find_tunnel(tunnel_id)
+            .ok()
+            .flatten()
+            .map(|e| e.name)
+            .unwrap_or_else(|| tunnel_id.to_string());
         let id = tunnel_id;
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         crabport_ssh::TOKIO.spawn(async move {
@@ -796,6 +892,18 @@ impl CrabportApp {
             let _ = rx.await;
             let _ = this.update(cx, |app, cx| {
                 app.tunnels.clear_runtime(id);
+                app.notification_controller.update(cx, |c, cx| {
+                    c.show(
+                        Notification::new(t!("tunnels.notif_stop_title").to_string())
+                            .level(NotificationLevel::Success)
+                            .message(
+                                t!("tunnels.notif_stop_msg", name = tunnel_name.as_str())
+                                    .to_string(),
+                            )
+                            .duration(std::time::Duration::from_secs(3)),
+                        cx,
+                    );
+                });
                 cx.notify();
             });
         })
@@ -866,6 +974,57 @@ impl CrabportApp {
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_progress_changed(move |cx| {
                 let _ = app_handle.update(cx, |_, cx| cx.notify());
+            });
+        });
+
+        // Surface a toast notification when an SFTP transfer finishes so the
+        // user gets clear success/failure feedback even if the SFTP panel is
+        // closed or scrolled out of view.
+        let app_handle = cx.entity().downgrade();
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
+                let _ = app_handle.update(cx, |app, cx| {
+                    let (title, message_notif, level, duration) = match (kind, success) {
+                        (SftpTransferKind::Download, true) => (
+                            t!("sftp.notif_download_done_title").to_string(),
+                            t!("sftp.notif_download_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Download, false) => (
+                            t!("sftp.notif_download_failed_title").to_string(),
+                            t!("sftp.notif_download_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        (SftpTransferKind::Upload, true) => (
+                            t!("sftp.notif_upload_done_title").to_string(),
+                            t!("sftp.notif_upload_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Upload, false) => (
+                            t!("sftp.notif_upload_failed_title").to_string(),
+                            t!("sftp.notif_upload_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                    };
+                    app.notification_controller.update(cx, |c, cx| {
+                        c.show(
+                            Notification::new(title)
+                                .level(level)
+                                .message(message_notif)
+                                .duration(duration),
+                            cx,
+                        );
+                    });
+                    cx.notify();
+                });
             });
         });
 
@@ -963,6 +1122,57 @@ impl CrabportApp {
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_progress_changed(move |cx| {
                 let _ = app_handle.update(cx, |_, cx| cx.notify());
+            });
+        });
+
+        // Surface a toast notification when an SFTP transfer finishes so the
+        // user gets clear success/failure feedback even if the SFTP panel is
+        // closed or scrolled out of view.
+        let app_handle = cx.entity().downgrade();
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
+                let _ = app_handle.update(cx, |app, cx| {
+                    let (title, message_notif, level, duration) = match (kind, success) {
+                        (SftpTransferKind::Download, true) => (
+                            t!("sftp.notif_download_done_title").to_string(),
+                            t!("sftp.notif_download_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Download, false) => (
+                            t!("sftp.notif_download_failed_title").to_string(),
+                            t!("sftp.notif_download_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        (SftpTransferKind::Upload, true) => (
+                            t!("sftp.notif_upload_done_title").to_string(),
+                            t!("sftp.notif_upload_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Upload, false) => (
+                            t!("sftp.notif_upload_failed_title").to_string(),
+                            t!("sftp.notif_upload_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                    };
+                    app.notification_controller.update(cx, |c, cx| {
+                        c.show(
+                            Notification::new(title)
+                                .level(level)
+                                .message(message_notif)
+                                .duration(duration),
+                            cx,
+                        );
+                    });
+                    cx.notify();
+                });
             });
         });
 
@@ -1375,6 +1585,7 @@ impl Render for CrabportApp {
             tunnel_form_state,
             &self.alert_controller,
             &self.context_menu,
+            &self.notification_controller,
             _window,
             cx,
         );

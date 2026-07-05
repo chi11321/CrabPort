@@ -68,6 +68,21 @@ tunnels:
   kind_dynamic: "Dynamic"
   delete_confirm_title: "Delete Tunnel"
   delete_confirm_msg: "Delete this tunnel configuration? This cannot be undone."
+  # --- Notifications (start/stop/edit/save incl. failure) ---
+  notif_start_title: "Tunnel started"
+  notif_start_msg: 'Tunnel "%{name}" is now running.'
+  notif_start_failed_title: "Tunnel start failed"
+  notif_start_failed_msg: 'Failed to start tunnel "%{name}". Check the host and credentials.'
+  notif_stop_title: "Tunnel stopped"
+  notif_stop_msg: 'Tunnel "%{name}" was stopped.'
+  notif_stop_failed_title: "Tunnel stop failed"
+  notif_stop_failed_msg: 'Failed to stop tunnel "%{name}".'
+  notif_save_created_title: "Tunnel created"
+  notif_save_created_msg: 'Tunnel "%{name}" was saved.'
+  notif_save_updated_title: "Tunnel updated"
+  notif_save_updated_msg: 'Tunnel "%{name}" was updated.'
+  notif_save_failed_title: "Tunnel save failed"
+  notif_save_failed_msg: 'Saving tunnel "%{name}" failed.'
 tunnel_form:
   title_new: "New Tunnel"
   title_edit: "Edit Tunnel"
@@ -114,6 +129,15 @@ sftp:
   delete_title: "Delete"
   delete_prompt: 'Are you sure you want to delete "%{name}"? This cannot be undone.'
   delete_confirm: "Delete"
+  # --- Notifications (download/upload complete, incl. failure) ---
+  notif_download_done_title: "Download complete"
+  notif_download_done_msg: "%{message}"
+  notif_download_failed_title: "Download failed"
+  notif_download_failed_msg: "%{message}"
+  notif_upload_done_title: "Upload complete"
+  notif_upload_done_msg: "%{message}"
+  notif_upload_failed_title: "Upload failed"
+  notif_upload_failed_msg: "%{message}"
   progress:
     download: "Download"
     upload: "Upload"
@@ -142,6 +166,13 @@ snippets:
   cancel: "Cancel"
   error_name_required: "Name is required"
   error_command_required: "Command is required"
+  # --- Notifications (create/save success, incl. failure) ---
+  notif_created_title: "Snippet created"
+  notif_created_msg: 'Snippet "%{name}" was saved.'
+  notif_updated_title: "Snippet updated"
+  notif_updated_msg: 'Snippet "%{name}" was updated.'
+  notif_save_failed_title: "Snippet save failed"
+  notif_save_failed_msg: 'Saving snippet "%{name}" failed.'
 window:
   about:
     title: "About CrabPort"

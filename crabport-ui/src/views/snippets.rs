@@ -34,6 +34,7 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::input::StyledInput;
+use crate::components::notification::{Notification, NotificationController, NotificationLevel};
 
 /// A snippet row shown in the management list.
 #[derive(Clone)]
@@ -74,6 +75,8 @@ pub struct SnippetsView {
     context_menu: Option<Entity<ContextMenuController>>,
     /// Global alert dialog host (delete confirmation).
     alert_controller: Option<Entity<AlertController>>,
+    /// Global toast notification host (create/save success + failure).
+    notification_controller: Option<Entity<NotificationController>>,
 }
 
 impl SnippetsView {
@@ -85,6 +88,7 @@ impl SnippetsView {
             editing: None,
             context_menu: None,
             alert_controller: None,
+            notification_controller: None,
         }
     }
 
@@ -95,6 +99,7 @@ impl SnippetsView {
         snippets: Vec<SnippetRow>,
         context_menu: Entity<ContextMenuController>,
         alert_controller: Entity<AlertController>,
+        notification_controller: Entity<NotificationController>,
         cx: &mut Context<Self>,
     ) {
         // Clear stale hover if the snippet disappeared.
@@ -106,6 +111,7 @@ impl SnippetsView {
         self.snippets = snippets;
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
+        self.notification_controller = Some(notification_controller);
         let _ = cx;
     }
 
@@ -199,13 +205,87 @@ impl SnippetsView {
         }
 
         let store = crate::app_state::AppState::store(cx);
+        let name_for_notif = name.clone();
         if id == 0 {
-            let _ = store.lock().add_snippet(&name, &command);
+            match store.lock().add_snippet(&name, &command) {
+                Ok(_) => {
+                    self.show_notification(
+                        NotificationLevel::Success,
+                        t!("snippets.notif_created_title").to_string(),
+                        t!("snippets.notif_created_msg", name = name_for_notif.as_str())
+                            .to_string(),
+                        Duration::from_secs(3),
+                        cx,
+                    );
+                    self.cancel_edit(cx);
+                }
+                Err(e) => {
+                    tracing::error!("add_snippet failed: {e}");
+                    self.show_notification(
+                        NotificationLevel::Danger,
+                        t!("snippets.notif_save_failed_title").to_string(),
+                        t!(
+                            "snippets.notif_save_failed_msg",
+                            name = name_for_notif.as_str()
+                        )
+                        .to_string(),
+                        Duration::from_secs(5),
+                        cx,
+                    );
+                    cx.notify();
+                }
+            }
         } else {
-            let _ = store.lock().update_snippet(id, &name, &command);
+            match store.lock().update_snippet(id, &name, &command) {
+                Ok(_) => {
+                    self.show_notification(
+                        NotificationLevel::Success,
+                        t!("snippets.notif_updated_title").to_string(),
+                        t!("snippets.notif_updated_msg", name = name_for_notif.as_str())
+                            .to_string(),
+                        Duration::from_secs(3),
+                        cx,
+                    );
+                    self.cancel_edit(cx);
+                }
+                Err(e) => {
+                    tracing::error!("update_snippet failed: {e}");
+                    self.show_notification(
+                        NotificationLevel::Danger,
+                        t!("snippets.notif_save_failed_title").to_string(),
+                        t!(
+                            "snippets.notif_save_failed_msg",
+                            name = name_for_notif.as_str()
+                        )
+                        .to_string(),
+                        Duration::from_secs(5),
+                        cx,
+                    );
+                    cx.notify();
+                }
+            }
         }
-        // Trigger dismiss animation, then clear.
-        self.cancel_edit(cx);
+    }
+
+    fn show_notification(
+        &self,
+        level: NotificationLevel,
+        title: String,
+        message: String,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref nc) = self.notification_controller {
+            nc.update(cx, |c, cx| {
+                c.show(
+                    Notification::new(title)
+                        .level(level)
+                        .message(message)
+                        .duration(duration),
+                    cx,
+                );
+            });
+        }
     }
 
     /// Delete a snippet by id (after confirmation).

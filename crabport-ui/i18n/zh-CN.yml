@@ -68,6 +68,21 @@ tunnels:
   kind_dynamic: "动态"
   delete_confirm_title: "删除隧道"
   delete_confirm_msg: "删除此隧道配置？此操作无法撤销。"
+  # --- 通知（启动/停止/编辑/保存，含失败）---
+  notif_start_title: "隧道已启动"
+  notif_start_msg: "隧道「%{name}」已开始运行。"
+  notif_start_failed_title: "隧道启动失败"
+  notif_start_failed_msg: "启动隧道「%{name}」失败，请检查主机与凭据。"
+  notif_stop_title: "隧道已停止"
+  notif_stop_msg: "隧道「%{name}」已停止。"
+  notif_stop_failed_title: "隧道停止失败"
+  notif_stop_failed_msg: "停止隧道「%{name}」失败。"
+  notif_save_created_title: "隧道已创建"
+  notif_save_created_msg: "隧道「%{name}」已保存。"
+  notif_save_updated_title: "隧道已更新"
+  notif_save_updated_msg: "隧道「%{name}」已更新。"
+  notif_save_failed_title: "隧道保存失败"
+  notif_save_failed_msg: "保存隧道「%{name}」失败。"
 tunnel_form:
   title_new: "新建隧道"
   title_edit: "编辑隧道"
@@ -114,6 +129,15 @@ sftp:
   delete_title: "删除"
   delete_prompt: "确定要删除「%{name}」吗？此操作无法撤销。"
   delete_confirm: "删除"
+  # --- 通知（下载/上传完成，含失败）---
+  notif_download_done_title: "下载完成"
+  notif_download_done_msg: "%{message}"
+  notif_download_failed_title: "下载失败"
+  notif_download_failed_msg: "%{message}"
+  notif_upload_done_title: "上传完成"
+  notif_upload_done_msg: "%{message}"
+  notif_upload_failed_title: "上传失败"
+  notif_upload_failed_msg: "%{message}"
   progress:
     download: "下载"
     upload: "上传"
@@ -142,6 +166,13 @@ snippets:
   cancel: "取消"
   error_name_required: "名称不能为空"
   error_command_required: "命令不能为空"
+  # --- 通知（创建/保存成功，含失败）---
+  notif_created_title: "代码片段已创建"
+  notif_created_msg: "代码片段「%{name}」已保存。"
+  notif_updated_title: "代码片段已更新"
+  notif_updated_msg: "代码片段「%{name}」已更新。"
+  notif_save_failed_title: "代码片段保存失败"
+  notif_save_failed_msg: "保存代码片段「%{name}」失败。"
 window:
   about:
     title: "关于 CrabPort"
