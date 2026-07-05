@@ -7,6 +7,8 @@ tab_bar:
   title: "Crabport"
 command:
   placeholder: "Type a command or search..."
+panel:
+  search: "Search"
 new_connection:
   title: "New Connection"
   search: "Search..."
@@ -83,6 +85,13 @@ tunnels:
   notif_save_updated_msg: 'Tunnel "%{name}" was updated.'
   notif_save_failed_title: "Tunnel save failed"
   notif_save_failed_msg: 'Saving tunnel "%{name}" failed.'
+  notif_already_running_title: "Tunnel already running"
+  notif_already_running_msg: "That tunnel is already running. Stop it first to restart from a different session."
+  notif_borrow_no_session_title: "No SSH session"
+  notif_borrow_no_session_msg: "Connect to a host first — panel tunnels reuse the active terminal's SSH session."
+  # --- Panel (borrowed tunnels) ---
+  panel_empty: "No tunnels. Double-click a row to start."
+  panel_hint: "Double-click to start · right-click to stop"
 tunnel_form:
   title_new: "New Tunnel"
   title_edit: "Edit Tunnel"

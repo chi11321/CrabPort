@@ -12,6 +12,7 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, NamedColor},
 };
 use crabport_core::keybind::{self, KeyAction, TerminalAction};
+use crabport_ssh::CrabPortTunnel;
 use crabport_ssh::backend::HostKeyInfo;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_terminal::pty::PtyBackend;
@@ -121,6 +122,11 @@ pub struct TerminalView {
     /// app can surface a toast notification. Mirrors the
     /// `on_sftp_progress_changed` / `on_backend_closed` callback pattern.
     on_sftp_transfer_finished: Option<Rc<dyn Fn(SftpTransferKind, bool, String, &mut App)>>,
+    /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
+    /// session. Used by the Tunnels panel to start "borrowed" tunnels that
+    /// reuse this tab's SSH connection instead of opening a dedicated owned
+    /// session. `None` for local PTY backends.
+    tunnel_source: Option<Arc<dyn crabport_ssh::CrabPortTunnel>>,
 }
 
 impl TerminalView {
@@ -451,6 +457,7 @@ impl TerminalView {
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
+            tunnel_source: None,
         }
     }
 
@@ -526,6 +533,19 @@ impl TerminalView {
         f: impl Fn(SftpTransferKind, bool, String, &mut App) + 'static,
     ) {
         self.on_sftp_transfer_finished = Some(Rc::new(f));
+    }
+
+    /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
+    /// panel can start "borrowed" tunnels reusing this SSH connection.
+    /// Only set for SSH tabs (local PTY backends have no tunnel source).
+    pub fn set_tunnel_source(&mut self, source: Arc<dyn CrabPortTunnel>) {
+        self.tunnel_source = Some(source);
+    }
+
+    /// The tunnel source backing this tab, if it's an SSH session. Used by
+    /// the Tunnels panel to start borrowed tunnels.
+    pub fn tunnel_source(&self) -> Option<&Arc<dyn CrabPortTunnel>> {
+        self.tunnel_source.as_ref()
     }
 
     /// Returns the host-key info for a currently-pending host-key prompt,

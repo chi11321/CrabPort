@@ -26,6 +26,7 @@ pub fn render_content(
     sftp_panel: &Entity<SftpPanel>,
     snippets_panel: &Entity<crate::views::panel::snippets_panel::SnippetsPanel>,
     history_panel: &Entity<crate::views::panel::history_command_panel::HistoryCommandPanel>,
+    tunnels_panel: &Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
     // Active index of the right-hand panel tab strip (SFTP / History /
     // Snippets). Read by the caller (which owns the `CrabportApp` borrow)
     // and passed in to avoid a nested `handle.read_with` during render.
@@ -50,6 +51,9 @@ pub fn render_content(
     cx: &mut App,
 ) -> Div {
     let active_tab = tabs.iter().find(|t| t.id == active_tab_id);
+    // Clone the tunnel list for the panel — the full-page TunnelsView
+    // (SidebarItem::Tunnels arm below) consumes the original `tunnel_list`.
+    let tunnel_list_for_panel = tunnel_list.clone();
     let handle_c = handle.clone();
     let on_close: Rc<dyn Fn(u64, &mut Window, &mut App)> = Rc::new(move |id, _w, cx| {
         handle_c.update(cx, |app, cx| {
@@ -364,6 +368,7 @@ pub fn render_content(
     };
 
     let has_sftp = !sftp_entries.is_empty();
+    let is_remote = active_tab.map(|t| t.is_remote).unwrap_or(false);
     sftp_panel.update(cx, |panel, cx| {
         panel.set_state(
             sftp_entries,
@@ -375,6 +380,45 @@ pub fn render_content(
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),
+            window,
+            cx,
+        );
+    });
+
+    // ---- Tunnels panel ----
+    //
+    // Wire the tunnel list + start/stop callbacks. Start routes to
+    // `app.start_tunnel_borrowed(tunnel_id, tab_id, cx)` so the tunnel
+    // reuses the active tab's SSH connection. Stop routes to
+    // `app.stop_tunnel`. Only wire for remote (SSH) tabs — local PTY
+    // backends expose no tunnel source, so borrowed tunnels can't start.
+    let tunnels_on_start: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal && is_remote {
+        let handle_for_start = handle.clone();
+        let tab_id = active_tab_id;
+        Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
+            handle_for_start.update(cx, |app, cx| {
+                app.start_tunnel_borrowed(tunnel_id, tab_id, cx);
+            });
+        }) as Rc<dyn Fn(i64, &mut App)>)
+    } else {
+        None
+    };
+    let tunnels_on_stop: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal {
+        let handle_for_stop = handle.clone();
+        Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
+            handle_for_stop.update(cx, |app, cx| {
+                app.stop_tunnel(tunnel_id, cx);
+            });
+        }) as Rc<dyn Fn(i64, &mut App)>)
+    } else {
+        None
+    };
+    tunnels_panel.update(cx, |panel, cx| {
+        panel.set_state(
+            tunnel_list_for_panel,
+            tunnels_on_start,
+            tunnels_on_stop,
+            context_menu.clone(),
             window,
             cx,
         );
@@ -548,10 +592,11 @@ pub fn render_content(
                     render_panel(
                         is_terminal,
                         panel_active_tab,
-                        has_sftp,
+                        has_sftp || is_remote,
                         sftp_panel.clone(),
                         snippets_panel.clone(),
                         history_panel.clone(),
+                        tunnels_panel.clone(),
                         Some(std::rc::Rc::new(move |idx, _w, cx| {
                             handle_for_panel.update(cx, |app, cx| {
                                 app.panel_active_tab = idx;

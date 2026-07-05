@@ -17,6 +17,7 @@ pub fn render_panel(
     sftp_panel: Entity<SftpPanel>,
     snippets_panel: Entity<SnippetsPanel>,
     history_panel: Entity<HistoryCommandPanel>,
+    tunnels_panel: Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
     on_change: Option<std::rc::Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let visible = show && has_sftp;
@@ -63,6 +64,7 @@ pub fn render_panel(
                         .pane(TabPane::new("", sftp_panel).icon("icons/folder.svg"))
                         .pane(TabPane::new("", history_panel).icon("icons/clock.svg"))
                         .pane(TabPane::new("", snippets_panel).icon("icons/braces.svg"))
+                        .pane(TabPane::new("", tunnels_panel).icon("icons/waypoints.svg"))
                         .h_full(),
                 ),
         )

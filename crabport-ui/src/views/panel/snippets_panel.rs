@@ -92,9 +92,8 @@ impl SnippetsPanel {
     ) {
         // Lazily init the search InputState on the first call.
         if self.search_input.is_none() {
-            let entity = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(t!("command.placeholder").to_string())
-            });
+            let entity = cx
+                .new(|cx| InputState::new(window, cx).placeholder(t!("panel.search").to_string()));
             cx.subscribe(
                 &entity,
                 |this, input, event: &gpui_component::input::InputEvent, cx| {

@@ -97,9 +97,8 @@ impl HistoryCommandPanel {
         // Window). Subsequent calls just refresh the history + callback.
         let history_changed = !Arc::ptr_eq(&self.history, &history);
         if self.search_input.is_none() {
-            let entity = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(t!("command.placeholder").to_string())
-            });
+            let entity = cx
+                .new(|cx| InputState::new(window, cx).placeholder(t!("panel.search").to_string()));
             // Re-filter on every keystroke.
             cx.subscribe(
                 &entity,

@@ -7,6 +7,8 @@ tab_bar:
   title: "Crabport"
 command:
   placeholder: "输入命令或搜索..."
+panel:
+  search: "搜索"
 new_connection:
   title: "新建连接"
   search: "搜索..."
@@ -83,6 +85,13 @@ tunnels:
   notif_save_updated_msg: "隧道「%{name}」已更新。"
   notif_save_failed_title: "隧道保存失败"
   notif_save_failed_msg: "保存隧道「%{name}」失败。"
+  notif_already_running_title: "隧道已在运行"
+  notif_already_running_msg: "该隧道已在运行，请先停止再从其他会话启动。"
+  notif_borrow_no_session_title: "无 SSH 会话"
+  notif_borrow_no_session_msg: "请先连接主机——面板隧道复用当前终端的 SSH 会话。"
+  # --- 面板（借用隧道）---
+  panel_empty: "暂无隧道，双击行即可启动。"
+  panel_hint: "双击启动 · 右键停止"
 tunnel_form:
   title_new: "新建隧道"
   title_edit: "编辑隧道"

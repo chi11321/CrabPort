@@ -65,6 +65,9 @@ pub struct CrabportApp {
     pub sftp_panel: Entity<crate::views::panel::sftp::SftpPanel>,
     pub snippets_panel: Entity<crate::views::panel::snippets_panel::SnippetsPanel>,
     pub history_panel: Entity<crate::views::panel::history_command_panel::HistoryCommandPanel>,
+    /// Tunnels side panel (borrowed tunnels reusing the active tab's SSH
+    /// connection). Only useful for SSH tabs.
+    pub tunnels_panel: Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
     /// Active index of the right-hand panel's tab strip (SFTP / History /
     /// Snippets). Driven by `Tabs::on_change` in `render_panel`.
     pub panel_active_tab: usize,
@@ -151,6 +154,7 @@ impl CrabportApp {
             cx.new(|_cx| crate::views::panel::snippets_panel::SnippetsPanel::new());
         let history_panel =
             cx.new(|_cx| crate::views::panel::history_command_panel::HistoryCommandPanel::new());
+        let tunnels_panel = cx.new(|_cx| crate::views::panel::tunnels_panel::TunnelsPanel::new());
         let app_entity = cx.entity();
         let hosts_view = cx.new(|_cx| crate::views::hosts::HostsView::new(app_entity.clone()));
         let snippets_view = cx.new(|_cx| crate::views::snippets::SnippetsView::new());
@@ -211,6 +215,7 @@ impl CrabportApp {
             sftp_panel,
             snippets_panel,
             history_panel,
+            tunnels_panel,
             panel_active_tab: 0,
             hosts_view,
             snippets_view,
@@ -911,7 +916,159 @@ impl CrabportApp {
         cx.notify();
     }
 
-    /// Delete a tunnel config (after alert confirmation). Stops it first if running.
+    /// Start a tunnel by borrowing the active terminal tab's SSH connection
+    /// (started from the Tunnels panel). Unlike [`start_tunnel_owned`], no
+    /// dedicated SSH session is opened — the tunnel reuses the active tab's
+    /// backend, so the host must already be connected. The tunnel is torn
+    /// down automatically when that tab closes (see `TunnelRegistry::teardown_for_tab`).
+    ///
+    /// Mutual exclusion: a tunnel can only run from one source at a time.
+    /// If the tunnel is already running (owned or borrowed) the start is
+    /// rejected with a warning toast.
+    pub fn start_tunnel_borrowed(&mut self, tunnel_id: i64, tab_id: u64, cx: &mut Context<Self>) {
+        if self.tunnels.is_running(tunnel_id) {
+            self.notification_controller.update(cx, |c, cx| {
+                c.show(
+                    Notification::new(t!("tunnels.notif_already_running_title").to_string())
+                        .level(NotificationLevel::Warning)
+                        .message(t!("tunnels.notif_already_running_msg").to_string())
+                        .duration(std::time::Duration::from_secs(3)),
+                    cx,
+                );
+            });
+            tracing::warn!("tunnel {tunnel_id} already running");
+            return;
+        }
+        // Resolve the tunnel config.
+        let store = AppState::store(cx);
+        let entry = match store.lock().find_tunnel(tunnel_id) {
+            Ok(Some(e)) => e,
+            _ => return,
+        };
+        let tunnel_name = entry.name.clone();
+
+        // Borrow the active terminal's tunnel source. The terminal must be an
+        // SSH session (local PTY backends expose no tunnel source).
+        let Some(term_entity) = self.terminal_views.get(&tab_id).cloned() else {
+            tracing::warn!("start_tunnel_borrowed: tab {tab_id} not found");
+            return;
+        };
+        let source = term_entity.read_with(cx, |v, _| v.tunnel_source().cloned());
+        let Some(source) = source else {
+            self.notification_controller.update(cx, |c, cx| {
+                c.show(
+                    Notification::new(t!("tunnels.notif_borrow_no_session_title").to_string())
+                        .level(NotificationLevel::Warning)
+                        .message(t!("tunnels.notif_borrow_no_session_msg").to_string())
+                        .duration(std::time::Duration::from_secs(4)),
+                    cx,
+                );
+            });
+            return;
+        };
+
+        // Build a TunnelManager backed by the borrowed source. The
+        // `on_change` callback is a no-op (matching `start_tunnel_owned`):
+        // tunnel state is surfaced via the `cx.notify()` calls in the
+        // start/stop completion handlers, and the `TunnelManager`'s
+        // `on_change` is `Send + Sync` which doesn't compose with GPUI's
+        // thread-local entity handles.
+        let manager = Arc::new(TunnelManager::new(source, Arc::new(|| {})));
+
+        // Register the borrowed runtime up front so the panel immediately
+        // reflects the "running" state and `stop_tunnel` can find the manager.
+        // The manager is `Arc`-backed, so the clone held by the registry keeps
+        // the tunnels alive even after the spawn task below drops its clone.
+        self.tunnels
+            .set_borrowed(tunnel_id, tab_id, manager.clone());
+
+        let tunnel_id_for_set = tunnel_id;
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        crabport_ssh::TOKIO.spawn(async move {
+            let start_result = match entry.kind {
+                TunnelKind::Local => {
+                    manager
+                        .start_local(
+                            entry.name.clone(),
+                            entry.bind_addr.clone(),
+                            entry.bind_port,
+                            entry.target_host.clone(),
+                            entry.target_port,
+                        )
+                        .await
+                }
+                TunnelKind::Remote => {
+                    manager
+                        .start_remote(
+                            entry.name.clone(),
+                            entry.bind_addr.clone(),
+                            entry.bind_port,
+                            entry.target_host.clone(),
+                            entry.target_port,
+                        )
+                        .await
+                }
+                TunnelKind::Dynamic => {
+                    manager
+                        .start_dynamic(entry.name.clone(), entry.bind_addr.clone(), entry.bind_port)
+                        .await
+                }
+            };
+            let _ = tx.send(start_result.is_ok());
+            // `manager` (the spawn's clone) drops here — the registry's clone
+            // keeps the live tunnels alive.
+        });
+
+        cx.spawn(async move |this, cx| {
+            let tunnel_name = tunnel_name.clone();
+            match rx.await {
+                Ok(true) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.notification_controller.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(t!("tunnels.notif_start_title").to_string())
+                                    .level(NotificationLevel::Success)
+                                    .message(
+                                        t!("tunnels.notif_start_msg", name = tunnel_name.as_str())
+                                            .to_string(),
+                                    )
+                                    .duration(std::time::Duration::from_secs(3)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
+                _ => {
+                    let _ = this.update(cx, |app, cx| {
+                        // Start failed — tear down the borrowed runtime we
+                        // optimistically registered above.
+                        app.tunnels.clear_runtime(tunnel_id_for_set);
+                        app.notification_controller.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(
+                                    t!("tunnels.notif_start_failed_title").to_string(),
+                                )
+                                .level(NotificationLevel::Danger)
+                                .message(
+                                    t!(
+                                        "tunnels.notif_start_failed_msg",
+                                        name = tunnel_name.as_str()
+                                    )
+                                    .to_string(),
+                                )
+                                .duration(std::time::Duration::from_secs(5)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
     pub fn remove_tunnel(&mut self, tunnel_id: i64, cx: &mut Context<Self>) {
         let store = AppState::store(cx);
         let tunnels = self.tunnels.clone();
@@ -1093,6 +1250,11 @@ impl CrabportApp {
             }),
             Some(verifier),
         ));
+        // Clone the backend as a `CrabPortTunnel` source before it's moved
+        // into the `TerminalView` (coerced to `Arc<dyn CrabPortTerminal>`).
+        // `SshBackend` implements `CrabPortTunnel`, so the panel can reuse
+        // this tab's SSH connection for borrowed tunnels.
+        let tunnel_source: Arc<dyn crabport_ssh::CrabPortTunnel> = backend.clone();
         let terminal_view = cx.new(|cx| {
             TerminalView::with_backend_and_host_and_overlay(
                 backend,
@@ -1174,6 +1336,13 @@ impl CrabportApp {
                     cx.notify();
                 });
             });
+        });
+
+        // Wire the `CrabPortTunnel` source captured above into the view so
+        // the Tunnels panel can start borrowed tunnels reusing this tab's
+        // SSH connection.
+        terminal_view.update(cx, |view, _cx| {
+            view.set_tunnel_source(tunnel_source);
         });
 
         self.terminal_views.insert(id, terminal_view);
@@ -1577,6 +1746,7 @@ impl Render for CrabportApp {
             &self.sftp_panel,
             &self.snippets_panel,
             &self.history_panel,
+            &self.tunnels_panel,
             self.panel_active_tab,
             &self.hosts_view,
             &self.snippets_view,
