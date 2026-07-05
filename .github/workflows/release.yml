@@ -3,80 +3,106 @@ name: release
 # Release workflow.
 #
 # Triggers:
-#   - `v*` tag push            → builds all platforms + publishes to GitHub Release
-#   - manual `workflow_dispatch` → builds all platforms + uploads as workflow artifacts
-#     (no release created — useful for testing the build matrix)
+#   - `v*` tag push            → full build + publish to GitHub Release
+#   - manual `workflow_dispatch` → full build + publish for an existing tag
 #
 # How to cut a release:
 #   git checkout main && git pull
-#   git tag v0.1.0
-#   git push origin v0.1.0
+#   git tag v0.2.0
+#   git push origin v0.2.0
+# Pushing the tag triggers this workflow; the resulting GitHub Release is
+# attached to that tag.
 #
-# Packaging strategy (manual packaging, no `cargo bundle`):
-#   - macOS  → `.app` bundle (codesigned) zipped via `ditto`
-#   - Linux   → `.tar.gz` (+ best-effort AppImage via linuxdeploy)
-#   - Windows → `.zip` (+ best-effort MSI via cargo-wix)
-#
-# Job structure:
-#   - `build`   matrix: compiles + packages each platform, uploads as workflow
-#     artifact. Never touches the GitHub Release.
-#   - `publish` runs after `build`: downloads every artifact, creates a single
-#     GitHub Release with all files attached + auto-generated notes. This
-#     avoids the duplicated "What's Changed" body that happens when multiple
-#     jobs each call action-gh-release in parallel.
-#
-# No app icon yet — bundles ship without one. When an icon exists, add it
-# to the macOS Info.plist / .icns, the Linux .desktop, and the Windows
-# .rc/.wx step.
+# Packaging strategy:
+#   - macOS  → `cargo bundle --format dmg`       → `.dmg` disk image
+#   - Linux   → `cargo bundle --format appimage` → `.AppImage`
+#   - Windows → `cargo build` + `Compress-Archive` → `.zip`
+#     (cargo-bundle's MSI support has a bug in v0.11.0 where it inserts a
+#     string value into a binary column, so we ship a zipped .exe instead.)
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
-
-permissions:
-  contents: write
+    inputs:
+      tag:
+        description: "Tag to publish (must already exist)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RUST_TOOLCHAIN: 1.91.1
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: windows-x86_64
-            bin: CrabPort.exe
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            name: windows-aarch64
-            bin: CrabPort.exe
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            name: linux-x86_64
-            bin: CrabPort
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            name: linux-aarch64
-            bin: CrabPort
-          - os: macos-14
-            target: aarch64-apple-darwin
-            name: macos-aarch64
-            bin: CrabPort
-          - os: macos-14
+          - os: macos
+            arch: x86_64
             target: x86_64-apple-darwin
-            name: macos-x86_64
-            bin: CrabPort
+            runner: macos-14
+            bundle_format: dmg
+            artifact_ext: dmg
+          - os: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+            bundle_format: dmg
+            artifact_ext: dmg
+          - os: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            bundle_format: appimage
+            artifact_ext: AppImage
+          - os: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            bundle_format: appimage
+            artifact_ext: AppImage
+          - os: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            artifact_ext: zip
+          - os: windows
+            arch: aarch64
+            target: aarch64-pc-windows-msvc
+            runner: windows-2022
+            artifact_ext: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-bundle
+        if: runner.os != 'Windows'
+        run: cargo install cargo-bundle --locked
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -92,168 +118,56 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
             libfontconfig1-dev libfreetype6-dev \
             libasound2-dev libpulse-dev libdbus-1-dev \
-            libssl-dev pkg-config
+            libssl-dev pkg-config \
+            squashfs-tools
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
         with:
-          targets: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-
 
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      # ---- Build --------------------------------------------------------
 
-      - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build bundle (non-Windows)
+        if: runner.os != 'Windows'
+        run: cargo bundle --release --target ${{ matrix.target }} --format ${{ matrix.bundle_format }}
 
-      # ---- AppImage (Linux x86_64 only, best-effort) -------------------
-      - name: Build AppImage
-        if: matrix.name == 'linux-x86_64'
-        continue-on-error: true
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: |
-          set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          wget -q -O linuxdeploy \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          wget -q -O linuxdeploy-plugin-appimage \
-            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
-          chmod +x linuxdeploy linuxdeploy-plugin-appimage
-
-          install -Dm755 target/${{ matrix.target }}/release/${{ matrix.bin }} AppDir/usr/bin/${{ matrix.bin }}
-
-          mkdir -p AppDir/usr/share/applications
-          cat > AppDir/usr/share/applications/crabport.desktop <<EOF
-          [Desktop Entry]
-          Type=Application
-          Name=CrabPort
-          Exec=CrabPort
-          Categories=Network;TerminalEmulator;
-          EOF
-
-          ./linuxdeploy --appdir AppDir --output appimage
-
-          mv CrabPort*.AppImage "CrabPort-${VERSION}-linux-x86_64.AppImage"
-          echo "APPIMAGE=CrabPort-${VERSION}-linux-x86_64.AppImage" >> "$GITHUB_ENV"
-
-      # ---- Package primary archive --------------------------------------
-      - name: Package
-        shell: bash
-        run: |
-          set -eu
-          VERSION="${GITHUB_REF_NAME:-dev}"
-          STAGE="CrabPort-${VERSION}-${{ matrix.name }}"
-
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            APP="CrabPort.app"
-            CONTENTS="$APP/Contents"
-            mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
-
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$CONTENTS/MacOS/"
-
-            VERSION_NUM="${VERSION#v}"
-            cat > "$CONTENTS/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>CrabPort</string>
-            <key>CFBundleIdentifier</key><string>org.eu.tachibana-kanade.crabport</string>
-            <key>CFBundleVersion</key><string>${VERSION_NUM}</string>
-            <key>CFBundleShortVersionString</key><string>${VERSION_NUM}</string>
-            <key>CFBundleExecutable</key><string>CrabPort</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>NSHighResolutionCapable</key><true/>
-            <key>LSMinimumSystemVersion</key><string>10.15</string>
-          </dict>
-          </plist>
-          EOF
-
-            codesign --force --deep --sign - "$APP"
-            codesign --verify --verbose "$APP"
-
-            ditto -c -k --keepParent "$APP" "${STAGE}.zip"
-            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
-
-          elif [ "${{ runner.os }}" = "Windows" ]; then
-            mkdir "$STAGE"
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
-            cp README.md README.en.md "$STAGE/" 2>/dev/null || true
-            7z a "${STAGE}.zip" "$STAGE" >/dev/null
-            echo "ASSET=${STAGE}.zip" >> "$GITHUB_ENV"
-
-          else
-            mkdir "$STAGE"
-            cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGE/"
-            cp README.md README.en.md "$STAGE/" 2>/dev/null || true
-            tar -czf "${STAGE}.tar.gz" "$STAGE"
-            echo "ASSET=${STAGE}.tar.gz" >> "$GITHUB_ENV"
-          fi
-
-      # ---- MSI installer (Windows x86_64 only, best-effort) ------------
-      - name: Build MSI installer
-        if: matrix.name == 'windows-x86_64'
-        continue-on-error: true
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $VERSION = "$env:GITHUB_REF_NAME"; if (-not $VERSION) { $VERSION = "dev" }
-          choco install wixtoolset -y --no-progress
-          $candle = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*\bin\candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($candle) { $env:PATH = "$($candle.DirectoryName);$env:PATH" }
-          cargo install cargo-wix --locked
-          cargo wix --no-build --nocapture --target ${{ matrix.target }} --output "CrabPort-$VERSION-windows-x86_64.msi"
-          echo "MSI=CrabPort-$VERSION-windows-x86_64.msi" >> $env:GITHUB_ENV
+          cargo build --release --target ${{ matrix.target }}
+          $exePath = "target\${{ matrix.target }}\release\CrabPort.exe"
+          $tag = "${{ steps.tag.outputs.name }}"
+          $name = "CrabPort-$tag-windows-${{ matrix.arch }}.zip"
+          Compress-Archive -Path $exePath -DestinationPath "$env:RUNNER_TEMP\$name"
+          "artifact=$env:RUNNER_TEMP\$name" >> $env:GITHUB_ENV
 
-      # ---- Upload workflow artifacts (consumed by the publish job) -----
-      - name: Upload primary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ env.ASSET }}
+      # ---- Stage artifacts to a predictable path ------------------------
 
-      - name: Upload AppImage artifact
-        if: matrix.name == 'linux-x86_64' && env.APPIMAGE != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86_64-appimage
-          path: ${{ env.APPIMAGE }}
+      - name: Stage artifact (non-Windows)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          bundle_dir="target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_format }}"
+          tag="${{ steps.tag.outputs.name }}"
+          name="CrabPort-${tag}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.artifact_ext }}"
+          artifact_path="$(find "$bundle_dir" -maxdepth 2 -type f -name '*.${{ matrix.artifact_ext }}' | head -n1)"
+          cp "$artifact_path" "$RUNNER_TEMP/$name"
+          echo "artifact=$RUNNER_TEMP/$name" >> $GITHUB_ENV
 
-      - name: Upload MSI artifact
-        if: matrix.name == 'windows-x86_64' && env.MSI != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-x86_64-msi
-          path: ${{ env.MSI }}
+      # ---- Publish to the GitHub Release for this tag ------------------
 
-  # ---------------------------------------------------------------------
-  # publish: runs after all build jobs succeed. Downloads every artifact
-  # into one folder and creates a single GitHub Release with all files
-  # attached. This is the only step that calls action-gh-release, so the
-  # auto-generated "What's Changed" notes are produced exactly once.
-  # ---------------------------------------------------------------------
-  publish:
-    name: Publish Release
-    runs-on: ubuntu-latest
-    needs: build
-    # Only publish on tag push. On workflow_dispatch we just keep the
-    # workflow artifacts (already uploaded above) for inspection.
-    if: startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: List artifacts
-        run: find artifacts -type f -maxdepth 1 | sort
-
-      - name: Create GitHub Release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: ${{ env.artifact }}
           generate_release_notes: true
           fail_on_unmatched_files: true
