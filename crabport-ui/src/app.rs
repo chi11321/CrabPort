@@ -36,7 +36,17 @@ pub trait CrabPortTab: 'static {
 
 // ---- App ----
 
-actions!(app, [ToggleCommand, TerminalTab, TerminalShiftTab]);
+actions!(
+    app,
+    [
+        ToggleCommand,
+        TerminalTab,
+        TerminalShiftTab,
+        TerminalIncreaseFont,
+        TerminalDecreaseFont,
+        TerminalResetFont
+    ]
+);
 
 #[derive(Clone, Debug)]
 pub struct Tab {

@@ -27,11 +27,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
 
-use crate::app::{CrabPortTab, TerminalShiftTab, TerminalTab};
+use crate::app::{
+    CrabPortTab, TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab,
+    TerminalTab,
+};
 use crate::color::{selection_bg, term_bg, term_cursor, term_fg};
 use crate::views::terminal::color::*;
 use crate::views::terminal::connection_overlay::*;
-use crate::views::terminal::fonts::palette;
+use crate::views::terminal::fonts::{TerminalMetrics, palette};
 use crate::views::terminal::render_cache::{
     CellSnap, RenderCache, RowSnapshot, SharedRenderCache, hash_row,
 };
@@ -80,6 +83,11 @@ pub struct TerminalView {
     font_size: Pixels,
     line_height: Pixels,
     cell_width: Pixels,
+    /// Cached (family, size) we last applied, so the render entry point can
+    /// detect external config changes (e.g. from the Settings window) and
+    /// recompute metrics without each tab needing an explicit notification.
+    /// `None` until the first render finishes setup.
+    applied_font_signature: Option<(String, f32)>,
     last_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     selection: Arc<Mutex<Option<Selection>>>,
     render_cache: SharedRenderCache,
@@ -209,16 +217,15 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let font_size = px(13.0);
-        let line_height = px(20.0);
-        // Consolas (Windows) has slightly narrower glyphs than Menlo (macOS);
-        // a mismatch here causes character gaps and clipping, so pick the
-        // advance width that matches the platform's monospace font.
-        let cell_width = if cfg!(target_os = "windows") {
-            px(7.2)
-        } else {
-            px(7.8)
-        };
+        // Font size, line height, and cell width are derived from the
+        // persisted terminal font settings (`[appearance.terminal]`). The
+        // cell width is measured from the configured font so the monospace
+        // grid stays aligned across family/size changes. See
+        // [`TerminalMetrics::from_config`].
+        let metrics = TerminalMetrics::from_config(cx);
+        let font_size = metrics.font_size;
+        let line_height = metrics.line_height;
+        let cell_width = metrics.cell_width;
 
         let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
         session.start();
@@ -464,6 +471,7 @@ impl TerminalView {
             font_size,
             line_height,
             cell_width,
+            applied_font_signature: None,
             last_bounds: Arc::new(Mutex::new(None)),
             selection: Arc::new(Mutex::new(None)),
             render_cache: Arc::new(Mutex::new(RenderCache::default())),
@@ -883,6 +891,47 @@ impl TerminalView {
             result
         })
     }
+
+    // -----------------------------------------------------------------
+    // Font settings reload
+    // -----------------------------------------------------------------
+
+    /// Re-read the terminal font settings from `config.toml` and recompute
+    /// the cached `font_size` / `line_height` / `cell_width`. Clears the
+    /// shaped-glyph LRU so the next repaint reshapes every line with the new
+    /// metrics, and forces a PTY resize so the new cell size maps to the
+    /// right `cols`/`rows` for the current viewport.
+    ///
+    /// Call this after mutating `config.appearance.terminal` (e.g. from the
+    /// Settings window or the in-terminal zoom shortcuts).
+    pub fn reload_font_settings(&mut self, cx: &mut Context<Self>) {
+        let metrics = TerminalMetrics::from_config(cx);
+        let changed = self.font_size != metrics.font_size
+            || self.line_height != metrics.line_height
+            || self.cell_width != metrics.cell_width;
+        self.font_size = metrics.font_size;
+        self.line_height = metrics.line_height;
+        self.cell_width = metrics.cell_width;
+        // Record the config we just applied so the render-entry auto-check
+        // doesn't redundantly re-derive metrics on the next frame.
+        let family = crate::views::terminal::fonts::font_family();
+        let size = crabport_core::config::snapshot()
+            .appearance
+            .terminal
+            .effective_font_size();
+        self.applied_font_signature = Some((family, size));
+        if changed {
+            // Drop cached shaped lines — they were laid out for the old
+            // font/size and would render at the wrong width.
+            self.render_cache.lock().shaped.clear();
+            // Invalidate last_bounds so the prepaint step re-runs the
+            // cols/rows resize with the new cell metrics.
+            *self.last_bounds.lock() = None;
+            self.needs_repaint
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        cx.notify();
+    }
 }
 // ---- GPUI Render ----
 
@@ -925,6 +974,19 @@ impl Render for TerminalView {
                 })
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+
+        // Auto-detect font config changes made elsewhere (e.g. the Settings
+        // window). Comparing the cached signature against the live config is
+        // cheap, and lets every terminal tab pick up new font settings
+        // without requiring an explicit cross-window notification.
+        {
+            let cfg = crabport_core::config::snapshot().appearance.terminal;
+            let family = cfg.effective_font_family().to_string();
+            let size = cfg.effective_font_size();
+            if self.applied_font_signature != Some((family.clone(), size)) {
+                self.reload_font_settings(cx);
+            }
         }
 
         let session_c = self.session.clone();
@@ -1008,6 +1070,30 @@ impl Render for TerminalView {
                 this.session.write(b"\x1b[Z");
                 this.session.scroll_to_bottom();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TerminalIncreaseFont, _window, cx| {
+                // Bump the persisted font size by 1px (clamped inside the
+                // config accessor) and re-derive cell metrics. We go through
+                // `config::update` so the change survives restarts and is
+                // shared by every terminal tab in the app.
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size =
+                        (cfg.appearance.terminal.font_size + 1.0).clamp(8.0, 32.0);
+                });
+                this.reload_font_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalDecreaseFont, _window, cx| {
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size =
+                        (cfg.appearance.terminal.font_size - 1.0).clamp(8.0, 32.0);
+                });
+                this.reload_font_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResetFont, _window, cx| {
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size = 13.0;
+                });
+                this.reload_font_settings(cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {

@@ -227,6 +227,10 @@ window:
       theme_modern_dark: "Modern Dark"
       theme_mocha: "Catppuccin Mocha"
       theme_tokyo_night: "Tokyo Night"
+      section_terminal: "Terminal"
+      terminal_desc: "Choose the monospace font and size used by every terminal tab."
+      terminal_font_family: "Font family"
+      terminal_font_size: "Font size"
 menu:
   app_name: "CrabPort"
   about: "About CrabPort"
