@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use crabport_ui::app::{TerminalShiftTab, TerminalTab, open_main_window};
+use crabport_ui::app::{
+    TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab, TerminalTab,
+    open_main_window,
+};
 use crabport_ui::app_state::AppState;
 use crabport_ui::assets::CrabportAssets;
 use crabport_ui::menus::{Hide, Minimize, OpenAbout, OpenSettings, Quit, Zoom};
@@ -28,6 +31,21 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("tab", TerminalTab, Some("CrabPortTerminal")),
                 KeyBinding::new("shift-tab", TerminalShiftTab, Some("CrabPortTerminal")),
+                // Terminal font zoom shortcuts. macOS uses cmd; other
+                // platforms use ctrl. The actions clamp the persisted size
+                // into [8, 32] and re-derive cell metrics.
+                #[cfg(target_os = "macos")]
+                KeyBinding::new("cmd-=", TerminalIncreaseFont, Some("CrabPortTerminal")),
+                #[cfg(target_os = "macos")]
+                KeyBinding::new("cmd--", TerminalDecreaseFont, Some("CrabPortTerminal")),
+                #[cfg(target_os = "macos")]
+                KeyBinding::new("cmd-0", TerminalResetFont, Some("CrabPortTerminal")),
+                #[cfg(not(target_os = "macos"))]
+                KeyBinding::new("ctrl-=", TerminalIncreaseFont, Some("CrabPortTerminal")),
+                #[cfg(not(target_os = "macos"))]
+                KeyBinding::new("ctrl--", TerminalDecreaseFont, Some("CrabPortTerminal")),
+                #[cfg(not(target_os = "macos"))]
+                KeyBinding::new("ctrl-0", TerminalResetFont, Some("CrabPortTerminal")),
                 // macOS-standard shortcuts for the app menu items.
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-h", Hide, None),

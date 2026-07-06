@@ -226,6 +226,10 @@ window:
       theme_modern_dark: "Modern Dark"
       theme_mocha: "Catppuccin Mocha"
       theme_tokyo_night: "Tokyo Night"
+      section_terminal: "终端"
+      terminal_desc: "选择所有终端标签页使用的等宽字体和字号。"
+      terminal_font_family: "字体"
+      terminal_font_size: "字号"
 menu:
   app_name: "CrabPort"
   about: "关于 CrabPort"
