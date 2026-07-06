@@ -141,10 +141,20 @@ sftp:
   delete_title: "Delete"
   delete_prompt: 'Are you sure you want to delete "%{name}"? This cannot be undone.'
   delete_confirm: "Delete"
+  rename: "Rename"
+  edit: "Open in Editor"
+  rename_prompt: 'Enter new name for "%{name}"'
+  rename_title: "Rename"
+  rename_confirm: "Rename"
+  rename_exists: 'A file named "%{name}" already exists'
   notif_download_done_title: "Download complete"
   notif_download_done_msg: "%{message}"
   notif_download_failed_title: "Download failed"
   notif_download_failed_msg: "%{message}"
+  notif_rename_failed_title: "Rename failed"
+  notif_rename_failed_msg: "%{message}"
+  notif_edit_save_failed_title: "Save failed"
+  notif_edit_save_failed_msg: "%{message}"
   notif_upload_done_title: "Upload complete"
   notif_upload_done_msg: "%{message}"
   notif_upload_failed_title: "Upload failed"

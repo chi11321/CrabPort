@@ -89,6 +89,11 @@ impl CrabPortSftp for SftpBackend {
         Ok(resolved)
     }
 
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        self.session.rename(old_path, new_path).await?;
+        Ok(())
+    }
+
     async fn close(&self) -> Result<()> {
         self.session.close().await?;
         Ok(())

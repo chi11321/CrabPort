@@ -383,6 +383,42 @@ pub fn render_content(
         None
     };
 
+    // Build SFTP rename callback. Forwards `(old_remote_path, new_remote_path)`
+    // to the backend's `sftp_rename`. Completion is reported via
+    // `BackendEvent::SftpTransferFinished`, same as the other SFTP ops.
+    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
+        active_tab.and_then(|tab| {
+            terminal_views.get(&tab.id).map(|entity| {
+                let entity = entity.clone();
+                Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_rename(&old_path, &new_path);
+                    });
+                }) as Rc<dyn Fn(String, String, &mut App)>
+            })
+        })
+    } else {
+        None
+    };
+
+    // Build SFTP open-in-editor callback. Forwards the remote path to the
+    // backend's `sftp_open_in_editor`, which downloads to a local tmp path
+    // and launches the OS default editor.
+    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
+        active_tab.and_then(|tab| {
+            terminal_views.get(&tab.id).map(|entity| {
+                let entity = entity.clone();
+                Rc::new(move |remote_path: String, cx: &mut App| {
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_open_in_editor(&remote_path);
+                    });
+                }) as Rc<dyn Fn(String, &mut App)>
+            })
+        })
+    } else {
+        None
+    };
+
     // ---- Panel capability flags ----
     //
     // Each right-hand panel pane is shown only when the active terminal's
@@ -421,6 +457,8 @@ pub fn render_content(
             sftp_download,
             sftp_upload,
             sftp_delete,
+            sftp_rename,
+            sftp_edit,
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),

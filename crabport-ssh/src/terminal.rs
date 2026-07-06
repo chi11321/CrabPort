@@ -186,11 +186,57 @@ impl CrabPortTerminal for SshBackend {
                 .await;
         });
     }
-}
 
-// ---------------------------------------------------------------------------
-// CrabPortMonitor impl
-// ---------------------------------------------------------------------------
+    fn sftp_rename(&self, old_path: &str, new_path: &str) {
+        let backend = SftpTransferHandle {
+            handle: self.handle.clone(),
+            sftp_session: self.sftp_session.clone(),
+            event_tx: Some(self.event_tx.clone()),
+        };
+        let event_tx = self.event_tx.clone();
+        let old_path = old_path.to_string();
+        let new_path = new_path.to_string();
+        self.spawn_transfer(async move {
+            let result = crate::transfer::sftp_rename_impl(&backend, &old_path, &new_path).await;
+            let (success, message) = match result {
+                Ok(()) => (true, format!("renamed {old_path} → {new_path}")),
+                Err(e) => (false, format!("rename failed: {e}")),
+            };
+            let _ = event_tx
+                .broadcast(BackendEvent::SftpTransferFinished {
+                    kind: SftpTransferKind::Rename,
+                    success,
+                    message,
+                })
+                .await;
+        });
+    }
+
+    fn sftp_open_in_editor(&self, remote_path: &str) {
+        let backend = SftpTransferHandle {
+            handle: self.handle.clone(),
+            sftp_session: self.sftp_session.clone(),
+            event_tx: Some(self.event_tx.clone()),
+        };
+        let event_tx = self.event_tx.clone();
+        let remote_path = remote_path.to_string();
+        self.spawn_transfer(async move {
+            let result = crate::transfer::sftp_edit_impl(&backend, &remote_path).await;
+            // Only emit a Finished event on failure — success means the edit
+            // session ended normally (user closed the editor or the 30-min
+            // bound elapsed), which is silent per the product spec.
+            if let Err(e) = result {
+                let _ = event_tx
+                    .broadcast(BackendEvent::SftpTransferFinished {
+                        kind: SftpTransferKind::Edit,
+                        success: false,
+                        message: format!("edit failed: {e}"),
+                    })
+                    .await;
+            }
+        });
+    }
+}
 
 impl CrabPortMonitor for SshBackend {
     fn status(&self) -> RemoteStatus {

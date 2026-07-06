@@ -66,6 +66,12 @@ pub struct SftpTransferBytes {
 pub enum SftpTransferKind {
     Download,
     Upload,
+    /// A rename / move operation (no actual byte transfer, but we reuse the
+    /// finished event so the UI's existing plumbing applies).
+    Rename,
+    /// "Open in editor": download → local edit → re-upload on save. Success
+    /// is silent; only upload failures surface a notification.
+    Edit,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -160,6 +166,19 @@ pub trait CrabPortTerminal: Send + Sync {
     /// `kind = Delete` (a synthetic kind — there's no actual transfer, but
     /// we reuse the event so the UI's existing finish handling applies).
     fn sftp_delete(&self, _remote_path: &str) {}
+
+    /// Rename/move a remote file or directory from `old_path` to `new_path`.
+    /// The backend resolves `new_path` against the current cwd if it's
+    /// relative, and refuses if the destination already exists.
+    /// Completion is reported via [`BackendEvent::SftpTransferFinished`].
+    fn sftp_rename(&self, _old_path: &str, _new_path: &str) {}
+
+    /// Download a remote file to a local temp path, open it in the OS default
+    /// editor, watch for edits, and re-upload on every save until the file is
+    /// closed or the backend drops. Completion of the initial download is
+    /// reported via [`BackendEvent::SftpTransferFinished`]; subsequent uploads
+    /// triggered by saves each emit their own `SftpTransferFinished`.
+    fn sftp_open_in_editor(&self, _remote_path: &str) {}
 }
 
 // ---------------------------------------------------------------------------

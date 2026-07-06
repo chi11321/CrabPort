@@ -99,6 +99,26 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        // Rename: success is silent (no notification), only
+                        // surface a toast on failure.
+                        (SftpTransferKind::Rename, true) => return,
+                        (SftpTransferKind::Rename, false) => (
+                            t!("sftp.notif_rename_failed_title").to_string(),
+                            t!("sftp.notif_rename_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        // Edit: success is silent, only upload/save
+                        // failures surface a toast.
+                        (SftpTransferKind::Edit, true) => return,
+                        (SftpTransferKind::Edit, false) => (
+                            t!("sftp.notif_edit_save_failed_title").to_string(),
+                            t!("sftp.notif_edit_save_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -249,6 +269,26 @@ impl CrabportApp {
                         (SftpTransferKind::Upload, false) => (
                             t!("sftp.notif_upload_failed_title").to_string(),
                             t!("sftp.notif_upload_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        // Rename: success is silent (no notification), only
+                        // surface a toast on failure.
+                        (SftpTransferKind::Rename, true) => return,
+                        (SftpTransferKind::Rename, false) => (
+                            t!("sftp.notif_rename_failed_title").to_string(),
+                            t!("sftp.notif_rename_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        // Edit: success is silent, only upload/save
+                        // failures surface a toast.
+                        (SftpTransferKind::Edit, true) => return,
+                        (SftpTransferKind::Edit, false) => (
+                            t!("sftp.notif_edit_save_failed_title").to_string(),
+                            t!("sftp.notif_edit_save_failed_msg", message = message.as_str())
                                 .to_string(),
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),

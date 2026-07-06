@@ -4,6 +4,7 @@ mod handle;
 mod path;
 
 use crabport_sftp::CrabPortSftp;
+use crabport_terminal::terminal::{BackendEvent, SftpTransferKind, SftpTransferStage};
 
 pub(crate) use dir::{sftp_download_dir_impl, sftp_upload_dir_impl};
 pub(crate) use file::{sftp_download_file_impl, sftp_upload_file_impl};
@@ -112,6 +113,205 @@ pub(crate) async fn sftp_delete_impl(
     }
 
     sftp_delete_dir_recursive(backend, remote_path).await
+}
+
+/// Rename a remote file or directory. Thin wrapper around the SFTP
+/// `rename` primitive — no staging or transfer involved.
+pub(crate) async fn sftp_rename_impl(
+    backend: &SftpTransferHandle,
+    old_path: &str,
+    new_path: &str,
+) -> anyhow::Result<()> {
+    #[cfg(debug_assertions)]
+    tracing::info!("SFTP rename: old={old_path} new={new_path}");
+    let s = backend.take_or_open_sftp().await?;
+    let res = s.rename(old_path, new_path).await;
+    let res = res.map_err(|e| anyhow::anyhow!("rename '{old_path}' -> '{new_path}' failed: {e}"));
+    backend.return_sftp(s, res).await?;
+    Ok(())
+}
+
+/// Open a remote file in the local OS default editor and re-upload on save.
+///
+/// Downloads the file to a temp path (preserving the extension so the OS
+/// picks the right editor), launches the OS default app detached, then polls
+/// the file's mtime once per second. On each detected change the file is
+/// re-uploaded via [`sftp_upload_impl`]. The poll loop runs for a bounded
+/// duration (30 min) and also stops early if the temp file disappears.
+pub(crate) async fn sftp_edit_impl(
+    backend: &SftpTransferHandle,
+    remote_path: &str,
+) -> anyhow::Result<()> {
+    #[cfg(debug_assertions)]
+    tracing::info!("SFTP edit: remote={remote_path}");
+
+    // Derive a unique local temp path that preserves the file's extension so
+    // the OS picks the right editor.
+    let basename = std::path::Path::new(remote_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let token = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let local_path = std::env::temp_dir().join(format!("crabport-edit-{token}-{basename}"));
+    let local_str = local_path.to_string_lossy().into_owned();
+
+    // Download the file (gzip staging + decompression handled internally).
+    backend
+        .emit_progress(
+            SftpTransferKind::Download,
+            SftpTransferStage::Transfer,
+            remote_path,
+        )
+        .await;
+    let download_result = sftp_download_impl(backend, remote_path, &local_str).await;
+
+    // Emit a Finished event for the download phase so the UI's progress log
+    // clears immediately — the edit poll loop runs for up to 30 min, so
+    // without this the toolbar would show a stale "downloading" state the
+    // whole time. Uses the `Edit` kind so the UI stays silent on success
+    // (no "download complete" toast for an edit flow).
+    if let Some(tx) = backend.event_tx.as_ref() {
+        let (success, message) = match &download_result {
+            Ok(()) => (true, format!("opened {remote_path} in editor")),
+            Err(e) => (false, format!("edit download failed: {e}")),
+        };
+        let _ = tx
+            .broadcast(BackendEvent::SftpTransferFinished {
+                kind: SftpTransferKind::Edit,
+                success,
+                message,
+            })
+            .await;
+    }
+    download_result?;
+
+    // Record the initial mtime so we can detect saves.
+    let mut last_mtime = std::fs::metadata(&local_path)
+        .and_then(|m| m.modified())
+        .ok();
+
+    // Open in the OS default application, detached.
+    spawn_open(&local_str);
+
+    // Poll loop: detect mtime changes and re-upload. Bounded to 30 min.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Stop early if the file was moved/deleted by the editor.
+        let cur_mtime = match std::fs::metadata(&local_path) {
+            Ok(m) => m.modified().ok(),
+            Err(_) => break,
+        };
+        if cur_mtime != last_mtime {
+            last_mtime = cur_mtime;
+            #[cfg(debug_assertions)]
+            tracing::info!("SFTP edit: re-uploading {remote_path}");
+            // Emit a Transfer-stage progress event so the toolbar shows
+            // "uploading" while the save is in flight.
+            backend
+                .emit_progress(
+                    SftpTransferKind::Upload,
+                    SftpTransferStage::Transfer,
+                    remote_path,
+                )
+                .await;
+            let upload_result = sftp_upload_impl(backend, &local_str, remote_path).await;
+            // Emit a Finished event so the toolbar clears the progress chip.
+            // Uses the `Edit` kind: success is silent, failure surfaces a
+            // "save failed" toast.
+            if let Some(tx) = backend.event_tx.as_ref() {
+                let (success, message) = match &upload_result {
+                    Ok(()) => (true, format!("saved {remote_path}")),
+                    Err(e) => (false, format!("save failed: {e}")),
+                };
+                let _ = tx
+                    .broadcast(BackendEvent::SftpTransferFinished {
+                        kind: SftpTransferKind::Edit,
+                        success,
+                        message,
+                    })
+                    .await;
+            }
+            if let Err(e) = upload_result {
+                #[cfg(debug_assertions)]
+                tracing::warn!("SFTP edit: re-upload failed: {e}");
+            }
+        }
+    }
+
+    // Best-effort cleanup of the temp file.
+    let _ = std::fs::remove_file(&local_path);
+    Ok(())
+}
+
+/// Launch the OS default application for `path`, detached.
+///
+/// Some files (e.g. `.env`) have no associated application, in which case
+/// macOS `open` exits with `kLSApplicationNotFoundErr`. We handle this by
+/// falling back to `open -t` (open with the default text editor), then to
+/// TextEdit explicitly. On Linux/Windows `xdg-open` / `start` already fall
+/// back to a text editor for unknown types, so no extra handling is needed.
+fn spawn_open(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // 1. Try the default handler for the file type.
+        let default = std::process::Command::new("open").arg(path).status();
+        let opened = match default {
+            Ok(s) if s.success() => true,
+            _ => false,
+        };
+        if !opened {
+            #[cfg(debug_assertions)]
+            tracing::info!("SFTP edit: default open failed, trying text editor");
+            // 2. `open -t` opens the file in the default text editor.
+            let text = std::process::Command::new("open")
+                .args(["-t"])
+                .arg(path)
+                .status();
+            let opened = match text {
+                Ok(s) if s.success() => true,
+                _ => false,
+            };
+            if !opened {
+                #[cfg(debug_assertions)]
+                tracing::info!("SFTP edit: text editor open failed, trying TextEdit");
+                // 3. Last resort: explicitly use TextEdit.
+                let te = std::process::Command::new("open")
+                    .args(["-a", "TextEdit"])
+                    .arg(path)
+                    .status();
+                if let Err(e) = te {
+                    #[cfg(debug_assertions)]
+                    tracing::warn!("SFTP edit: failed to launch TextEdit: {e}");
+                }
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawn_result = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(windows)]
+    let spawn_result = std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(path)
+        .spawn();
+    #[cfg(not(any(target_os = "macos", unix, windows)))]
+    let spawn_result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no editor launcher for this platform",
+    ));
+
+    #[cfg(not(target_os = "macos"))]
+    if let Err(e) = spawn_result {
+        #[cfg(debug_assertions)]
+        tracing::warn!("SFTP edit: failed to launch editor: {e}");
+    }
 }
 
 /// Recursively delete a non-empty remote directory: list entries, delete

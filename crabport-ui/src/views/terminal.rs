@@ -70,6 +70,12 @@ pub struct SftpProgress {
 
 pub struct TerminalView {
     session: Arc<TerminalSession>,
+    /// Cloned `Arc` to the underlying backend, kept so this view can call
+    /// trait methods (`sftp_rename`, `sftp_open_in_editor`, …) that
+    /// `TerminalSession` doesn't yet forward. `TerminalSession` owns the
+    /// backend privately; this clone is cheap and stays in sync because the
+    /// only mutation point is `reconnect`, which reassigns both.
+    backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
     focus_handle: FocusHandle,
     font_size: Pixels,
     line_height: Pixels,
@@ -214,7 +220,7 @@ impl TerminalView {
             px(7.8)
         };
 
-        let session = Arc::new(TerminalSession::new(backend, cols, rows));
+        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
         session.start();
 
         // Wire command-history persistence: when the session captures a new
@@ -282,6 +288,8 @@ impl TerminalView {
                         let prefix = match kind {
                             crabport_terminal::terminal::SftpTransferKind::Download => "Download",
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
+                            crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
+                            crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -451,6 +459,7 @@ impl TerminalView {
 
         Self {
             session,
+            backend,
             focus_handle,
             font_size,
             line_height,
@@ -545,6 +554,21 @@ impl TerminalView {
     /// decide between `remove_file` and recursive `remove_dir`.
     pub fn sftp_delete(&self, remote_path: &str) {
         self.session.sftp_delete(remote_path);
+    }
+
+    /// Rename a remote file or directory. Forwards directly to the backend
+    /// (`TerminalSession` doesn't expose a wrapper yet) via the cloned
+    /// `backend` `Arc`. Completion is reported through the backend's event
+    /// stream as `BackendEvent::SftpTransferFinished`.
+    pub fn sftp_rename(&self, old_path: &str, new_path: &str) {
+        self.backend.sftp_rename(old_path, new_path);
+    }
+
+    /// Download a remote file to a local temp path and open it in the OS
+    /// default editor. Forwards directly to the backend. Completion is
+    /// reported through the backend's event stream.
+    pub fn sftp_open_in_editor(&self, remote_path: &str) {
+        self.backend.sftp_open_in_editor(remote_path);
     }
 
     /// Latest SFTP transfer progress, or `None` if no transfer is in flight.
@@ -662,7 +686,7 @@ impl TerminalView {
         let cols: usize = 80;
         let rows: usize = 24;
 
-        let session = Arc::new(TerminalSession::new(backend, cols, rows));
+        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
         session.start();
 
         self.render_cache.lock().clear_all();
@@ -704,6 +728,8 @@ impl TerminalView {
                         let prefix = match kind {
                             crabport_terminal::terminal::SftpTransferKind::Download => "Download",
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
+                            crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
+                            crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         let _ = entity.update(cx, |this, cx| {
@@ -797,6 +823,7 @@ impl TerminalView {
         .detach();
 
         self.session = session;
+        self.backend = backend;
         cx.notify();
     }
 
