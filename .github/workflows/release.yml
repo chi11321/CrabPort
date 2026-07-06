@@ -36,7 +36,37 @@ env:
   RUST_TOOLCHAIN: 1.91.1
 
 jobs:
+  # Create the GitHub Release (with auto-generated changelog) once,
+  # before any build job runs. Build jobs then only upload their
+  # artifacts to this release — they must NOT regenerate the notes,
+  # otherwise each concurrent upload overwrites the body.
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+
   build:
+    needs: create-release
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -169,5 +199,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           files: ${{ env.artifact }}
-          generate_release_notes: true
+          # Do NOT set generate_release_notes here — the release body was
+          # already generated once by the create-release job. Setting it
+          # again would overwrite the changelog on every upload.
           fail_on_unmatched_files: true
