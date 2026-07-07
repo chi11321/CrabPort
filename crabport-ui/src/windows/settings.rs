@@ -52,6 +52,9 @@ pub struct SettingsWindow {
     locale_dropdown_open: bool,
     theme_dropdown_open: bool,
     font_family_dropdown_open: bool,
+    /// Search input backing the terminal font-family dropdown. Lets the
+    /// user type to filter the (potentially long) list of installed fonts.
+    font_search_input: Entity<InputState>,
     /// `InputState` backing the terminal font-size stepper. Pre-filled with
     /// the persisted size on open and re-clamped on every edit via
     /// [`subscribe_number_filter`].
@@ -131,11 +134,17 @@ impl SettingsWindow {
             },
         )
         .detach();
+        // Search box for the font-family dropdown — filters the list of
+        // installed fonts by case-insensitive substring.
+        let font_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("groups.search_placeholder").to_string())
+        });
         Self {
             tab: SettingsTab::General,
             locale_dropdown_open: false,
             theme_dropdown_open: false,
             font_family_dropdown_open: false,
+            font_search_input,
             font_size_input,
             font_size_focused: false,
             mono_font_names: Vec::new(),
@@ -443,10 +452,20 @@ impl SettingsWindow {
                                 let mut dd = Dropdown::new("settings-term-font")
                                     .is_open(self.font_family_dropdown_open)
                                     .selected(font_idx)
+                                    .searchable(self.font_search_input.clone())
                                     .on_toggle({
                                         let h = handle.clone();
+                                        let search = self.font_search_input.clone();
                                         move |_w, cx| {
                                             h.update(cx, |view, cx| {
+                                                // Clear the search query on
+                                                // close so the next open shows
+                                                // the full font list.
+                                                if view.font_family_dropdown_open {
+                                                    search.update(cx, |s, cx| {
+                                                        s.set_value("", _w, cx);
+                                                    });
+                                                }
                                                 view.font_family_dropdown_open =
                                                     !view.font_family_dropdown_open;
                                                 cx.notify();
@@ -459,6 +478,7 @@ impl SettingsWindow {
                                 dd.on_change({
                                     let h = handle.clone();
                                     let names = mono_fonts.clone();
+                                    let search = self.font_search_input.clone();
                                     move |idx, _w, cx| {
                                         if let Some(name) = names.get(idx) {
                                             let _ = config::update(|cfg| {
@@ -471,6 +491,9 @@ impl SettingsWindow {
                                         }
                                         h.update(cx, |view, cx| {
                                             view.font_family_dropdown_open = false;
+                                            search.update(cx, |s, cx| {
+                                                s.set_value("", _w, cx);
+                                            });
                                             cx.notify();
                                         });
                                     }
