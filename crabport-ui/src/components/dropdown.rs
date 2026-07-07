@@ -2,6 +2,8 @@ use crate::color::*;
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutQuad};
 use gpui_component::scroll::ScrollableElement;
+use rust_i18n::t;
+use std::cell::Cell;
 use std::f32::consts::PI;
 use std::{rc::Rc, time::Duration};
 
@@ -59,6 +61,15 @@ impl DropdownItem {
 ///         cx.notify();
 ///     }))
 /// ```
+///
+/// ## Searchable + creatable
+///
+/// Pass a search `InputState` entity via `.searchable(...)` to render a
+/// search box at the top of the menu. Items are filtered (case-insensitive
+/// substring) against the query. Pass `.on_create(...)` to render a
+/// "Create \"<query>\"" button at the bottom that fires the callback with
+/// the query text — only shown when the query doesn't exactly match an
+/// existing item.
 #[derive(IntoElement)]
 pub struct Dropdown {
     id: ElementId,
@@ -71,6 +82,12 @@ pub struct Dropdown {
     disabled: bool,
     on_change: Option<Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     on_toggle: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    /// When `Some`, the menu renders a search box backed by this `InputState`
+    /// and filters items by the query.
+    search_input: Option<Entity<gpui_component::input::InputState>>,
+    /// When `Some`, the menu renders a "Create \"<query>\"" button at the
+    /// bottom when the search query doesn't match an existing item label.
+    on_create: Option<Rc<dyn Fn(String, &mut Window, &mut App) + 'static>>,
 }
 
 impl Styled for Dropdown {
@@ -94,6 +111,8 @@ impl Dropdown {
             disabled: false,
             on_change: None,
             on_toggle: None,
+            search_input: None,
+            on_create: None,
         }
     }
 
@@ -142,10 +161,27 @@ impl Dropdown {
         self.on_toggle = Some(Rc::new(f));
         self
     }
+
+    /// Enable a search box at the top of the menu, backed by the given
+    /// `InputState` entity. The caller owns the entity so the query survives
+    /// re-renders. Items are filtered (case-insensitive substring) against
+    /// the query text.
+    pub fn searchable(mut self, search_input: Entity<gpui_component::input::InputState>) -> Self {
+        self.search_input = Some(search_input);
+        self
+    }
+
+    /// Render a "Create \"<query>\"" button at the bottom of the menu when
+    /// the search query doesn't exactly match an existing item's label.
+    /// Fires the callback with the query text on click.
+    pub fn on_create(mut self, f: impl Fn(String, &mut Window, &mut App) + 'static) -> Self {
+        self.on_create = Some(Rc::new(f));
+        self
+    }
 }
 
 impl RenderOnce for Dropdown {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let Self {
             id,
             id_str,
@@ -157,12 +193,15 @@ impl RenderOnce for Dropdown {
             disabled,
             on_change,
             on_toggle,
+            search_input,
+            on_create,
         } = self;
 
         // A disabled dropdown never shows its menu, regardless of `is_open`.
         let is_open = is_open && !disabled;
 
-        let item_count = items.len();
+        let trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+
         let selected_label = selected
             .and_then(|i| items.get(i))
             .map(|it| it.label.clone())
@@ -172,22 +211,6 @@ impl RenderOnce for Dropdown {
         // Trigger
         // ------------------------------------------------------------------
         let trigger_id = ElementId::Name(format!("{id_str}-trigger").into());
-
-        // Chevron: rotate 180° when open. We animate via GPUI's built-in
-        // `with_animation` rather than `gpui-animation`'s `transition_when_else`,
-        // because the latter only interpolates `StyleRefinement` fields (bg,
-        // opacity, size…) and SVG `Transformation` is not part of the style.
-        //
-        // The animation ID encodes `is_open` so that flipping the toggle
-        // creates a fresh `AnimationState` (start = `Instant::now()`) and the
-        // rotation re-runs from the opposite end. Without this, the cached
-        // state would report `delta > 1` (animation already finished) and the
-        // chevron would snap instead of rotating.
-        //
-        // For the close animation we must animate *back* from PI to 0, so the
-        // rotation is `(1 - delta) * PI` (start = PI, end = 0). Computing it as
-        // `delta * 0` would leave the chevron at 0 the whole time — no visible
-        // reverse motion.
         let chevron_anim_id = ElementId::Name(format!("{id_str}-chevron-{}", is_open).into());
 
         let chevron = svg()
@@ -240,7 +263,20 @@ impl RenderOnce for Dropdown {
                     .child(selected_label),
             )
             .child(chevron)
-            .when_some(on_toggle, |this, cb| {
+            .child(
+                canvas(
+                    {
+                        let trigger_bounds = trigger_bounds.clone();
+                        move |bounds, _window, _cx| {
+                            trigger_bounds.set(Some(bounds));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(on_toggle.clone(), |this, cb| {
                 this.when(!disabled, |this| {
                     this.on_click(move |_e, w, cx| {
                         cb(w, cx);
@@ -252,36 +288,86 @@ impl RenderOnce for Dropdown {
         // Menu
         // ------------------------------------------------------------------
         let menu_id = ElementId::Name(format!("{id_str}-menu").into());
-        // Menu height = items + gap_1 between them. The inner p_1 padding
-        // is accounted for by NOT adding it — empirically the rendered
-        // padding is smaller than the theoretical 8px.
-        let gap_total = if item_count > 1 {
-            (item_count - 1) as f32 * 4.0
-        } else {
-            0.0
-        };
-        let natural_height = f32::from(ITEM_HEIGHT) * item_count as f32 + gap_total;
+
+        // Compute the search query (if searchable) and filter items.
+        let query: String = search_input
+            .as_ref()
+            .map(|s| s.read(_cx).value().to_lowercase())
+            .unwrap_or_default();
+        let has_search = search_input.is_some() && !query.is_empty();
+
+        // Filtered items: (original_index, item) pairs.
+        let filtered: Vec<(usize, &DropdownItem)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                if has_search {
+                    it.label.to_lowercase().contains(&query)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // Determine whether the create button should show: only when the
+        // query is non-empty and doesn't exactly match an existing label.
+        let can_create = on_create.is_some()
+            && has_search
+            && !items.iter().any(|it| it.label.to_lowercase() == query);
+
+        // Whether the empty-state hint shows: searchable + has query + no
+        // matches + no create button.
+        let _has_empty = search_input.is_some() && has_search && filtered.is_empty() && !can_create;
+
+        // Menu height for the open/close transition.
+        //
+        // We animate `h()` between 0 (closed) and a capped max (open).
+        // Rather than estimating the exact content height (which is fragile
+        // due to sub-pixel rounding of gaps/padding/border), we set the
+        // open height to `MAX_MENU_HEIGHT` and let `overflow_hidden` on
+        // the outer div clip any excess. The inner content div has
+        // `max_h(MAX_MENU_HEIGHT)` + `overflow_y_scrollbar` so it scrolls
+        // when content exceeds the cap. When content is shorter than the
+        // cap, the outer div still renders at `MAX_MENU_HEIGHT` but the
+        // inner content only fills what it needs — the extra space is
+        // just empty background, which is fine since the menu has a
+        // solid `bg(bg_base())`.
+        //
+        // To avoid the empty space when content is short, we DO compute
+        // the natural height — but only use it if it's less than the cap.
+        // The computation accounts for: ITEM_HEIGHT per child, gap_1 (4px)
+        // between children, p_1 (8px) padding on the inner div, and
+        // border_1 (2px) on the outer div.
+        let content_item_count = filtered.len();
+        let has_search_el = search_input.is_some();
+        let has_create_el = can_create;
+        let has_empty_el = _has_empty;
+        let child_count = content_item_count
+            + has_search_el as usize
+            + has_empty_el as usize
+            + has_create_el as usize;
+        // Each child is ITEM_HEIGHT. Gaps between adjacent children = 4px
+        // each (gap_1 = rems(0.25) = 4px). Inner padding p_1 = 8px total.
+        // Outer border_1 = 2px total (included in h()).
+        let gap_total = child_count.saturating_sub(1) as f32 * 4.0;
+        let natural_height = f32::from(ITEM_HEIGHT) * child_count as f32
+            + gap_total
+            + 8.0  // p_1 padding (top + bottom)
+            + 2.0; // border_1 (top + bottom, included in h())
         let menu_h = if natural_height > f32::from(MAX_MENU_HEIGHT) {
             MAX_MENU_HEIGHT
         } else {
             px(natural_height)
         };
 
-        let item_els: Vec<AnyElement> = items
+        // Build the item elements from the filtered list.
+        let item_els: Vec<AnyElement> = filtered
             .into_iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_selected = selected == Some(i);
+            .map(|(orig_i, item)| {
+                let is_selected = selected == Some(orig_i);
                 let cb = on_change.clone();
-                let item_id = ElementId::Name(format!("{id_str}-item-{i}").into());
+                let item_id = ElementId::Name(format!("{id_str}-item-{orig_i}").into());
 
-                // Use GPUI's native `hover()` style instead of gpui-animation's
-                // `transition_on_hover`. The animation variant caches the
-                // initial element state (including text_color) and fails to
-                // pick up `selected` changes on re-render, so the highlight
-                // never follows the new selection. Native hover applies the
-                // bg purely from the current render's style, with no cached
-                // state, so text_color updates take effect immediately.
                 div()
                     .id(item_id)
                     .flex()
@@ -299,15 +385,90 @@ impl RenderOnce for Dropdown {
                     }))
                     .bg(rgb(bg_base()))
                     .hover(|s| s.bg(rgb(surface_active())))
-                    .child(item.label)
+                    .child(item.label.clone())
                     .on_click(move |_e, w, cx| {
                         if let Some(ref f) = cb {
-                            f(i, w, cx);
+                            f(orig_i, w, cx);
                         }
                     })
                     .into_any_element()
             })
             .collect();
+
+        // Search box (if searchable). Same height as an item, only a
+        // bottom border to visually separate it from the item list.
+        let search_el = search_input.clone().map(|s| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(ITEM_HEIGHT)
+                .px_3()
+                .w_full()
+                .border_b_1()
+                .border_color(rgb(border()))
+                .child(
+                    svg()
+                        .path("icons/search.svg")
+                        .size(px(12.0))
+                        .text_color(rgb(text_muted())),
+                )
+                .child(
+                    gpui_component::input::Input::new(&s)
+                        .appearance(false)
+                        .bordered(false),
+                )
+        });
+
+        // Create button (if creatable + query doesn't match).
+        let create_el = if can_create {
+            let on_create = on_create.unwrap();
+            let query_str = search_input
+                .as_ref()
+                .map(|s| s.read(_cx).value().to_string())
+                .unwrap_or_default();
+            let on_toggle_close = on_toggle.clone();
+            Some(
+                div()
+                    .id(ElementId::Name(format!("{id_str}-create").into()))
+                    .flex()
+                    .items_center()
+                    .h(ITEM_HEIGHT)
+                    .px_3()
+                    .w_full()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(term_blue()))
+                    .hover(|s| s.bg(rgb(surface_active())))
+                    .child(t!("groups.create", name = query_str.as_str()).to_string())
+                    .on_click(move |_e, w, cx| {
+                        on_create(query_str.clone(), w, cx);
+                        // Close the menu after creating.
+                        if let Some(ref cb) = on_toggle_close {
+                            cb(w, cx);
+                        }
+                    })
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        // Empty-state hint when searchable + has query + no matches.
+        let empty_el =
+            (search_input.is_some() && has_search && item_els.is_empty() && create_el.is_none())
+                .then(|| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .h(ITEM_HEIGHT)
+                        .text_sm()
+                        .text_color(rgb(text_muted()))
+                        .child(t!("groups.no_results").to_string())
+                        .into_any_element()
+                });
 
         let menu = div()
             .id(menu_id.clone())
@@ -324,6 +485,20 @@ impl RenderOnce for Dropdown {
             .opacity(0.)
             .h(px(0.))
             .when(is_open, |el| el.occlude())
+            .when(is_open, |el| {
+                el.when_some(on_toggle, |el, cb| {
+                    let trigger_bounds = trigger_bounds.clone();
+                    el.on_mouse_down_out(move |e, w, cx| {
+                        if trigger_bounds
+                            .get()
+                            .is_some_and(|b| b.contains(&e.position))
+                        {
+                            return;
+                        }
+                        cb(w, cx);
+                    })
+                })
+            })
             .with_transition(menu_id)
             .transition_when_else(
                 is_open,
@@ -336,11 +511,14 @@ impl RenderOnce for Dropdown {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
                     .p_1()
+                    .gap_1()
                     .h_full()
                     .overflow_y_scrollbar()
-                    .children(item_els),
+                    .when_some(search_el, |el, s| el.child(s))
+                    .children(item_els)
+                    .when_some(empty_el, |el, e| el.child(e))
+                    .when_some(create_el, |el, c| el.child(c)),
             );
 
         // ------------------------------------------------------------------
@@ -352,10 +530,6 @@ impl RenderOnce for Dropdown {
             .w_full()
             .cursor_default()
             .child(trigger)
-            // `deferred` delays the menu's paint until after all ancestors
-            // and siblings, so the open menu renders on top of form elements
-            // that follow the dropdown in the layout. `occlude` (applied on
-            // the menu above when open) ensures it also captures clicks.
             .child(deferred(menu));
 
         root.style().refine(&style);

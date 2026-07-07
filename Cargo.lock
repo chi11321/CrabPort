@@ -1443,7 +1443,7 @@ dependencies = [
  "gpui-component",
  "lru",
  "parking_lot",
- "rust-i18n 4.1.0",
+ "rust-i18n",
  "rustc-hash 2.1.2",
  "smol",
  "tokio",
@@ -2732,7 +2732,7 @@ dependencies = [
  "paste",
  "regex",
  "ropey",
- "rust-i18n 3.1.5",
+ "rust-i18n",
  "schemars",
  "serde",
  "serde_json",
@@ -5627,21 +5627,8 @@ dependencies = [
  "globwalk",
  "once_cell",
  "regex",
- "rust-i18n-macro 3.1.5",
- "rust-i18n-support 3.1.5",
- "smallvec",
-]
-
-[[package]]
-name = "rust-i18n"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55691a65892c33ee2de49c15ea5600c6f4a70e8eeb8e6c3cd96d2a231d230c40"
-dependencies = [
- "globwalk",
- "regex",
- "rust-i18n-macro 4.1.0",
- "rust-i18n-support 4.1.0",
+ "rust-i18n-macro",
+ "rust-i18n-support",
  "smallvec",
 ]
 
@@ -5655,23 +5642,7 @@ dependencies = [
  "once_cell",
  "proc-macro2",
  "quote",
- "rust-i18n-support 3.1.5",
- "serde",
- "serde_json",
- "serde_yaml",
- "syn 2.0.118",
-]
-
-[[package]]
-name = "rust-i18n-macro"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30de488acadcf767d97cd48518a8da8ea9777b1c9a5beca4eab78bbf77d07309"
-dependencies = [
- "glob",
- "proc-macro2",
- "quote",
- "rust-i18n-support 4.1.0",
+ "rust-i18n-support",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5693,25 +5664,6 @@ dependencies = [
  "once_cell",
  "proc-macro2",
  "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "siphasher",
- "toml 0.8.23",
- "triomphe",
-]
-
-[[package]]
-name = "rust-i18n-support"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aea0fef8a93c06326b66392c95a115120e609674cb2132d37d276a6b05b545b4"
-dependencies = [
- "arc-swap",
- "base62",
- "globwalk",
- "itertools 0.11.0",
- "normpath",
  "serde",
  "serde_json",
  "serde_yaml",

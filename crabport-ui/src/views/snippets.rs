@@ -19,6 +19,7 @@
 //! └─────────────────────────────────┘
 //! ```
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
@@ -28,7 +29,10 @@ use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 use std::time::Duration;
 
+use crabport_core::credential::{GroupEntry, GroupKind};
+
 use crate::app::CrabportApp;
+use crate::app_state::AppState;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
@@ -47,6 +51,10 @@ pub struct SnippetRow {
     pub id: i64,
     pub name: String,
     pub command: String,
+    /// Starred by the user to pin it above un-starred snippets.
+    pub favorite: bool,
+    /// FK into the `groups` table. `None` = ungrouped.
+    pub group_id: Option<i64>,
 }
 
 /// Snippets management view.
@@ -73,6 +81,9 @@ pub struct SnippetsView {
     /// Snippet form dialog state, pushed in before each render. When
     /// `Some`, `SnippetFormView` is rendered on top of the list.
     form_state: Option<SnippetFormState>,
+    /// Per-group collapse state for the grouped list. A group id present in
+    /// this set renders its header with a right-chevron and hides its rows.
+    collapsed_groups: HashSet<i64>,
 }
 
 impl SnippetsView {
@@ -87,6 +98,7 @@ impl SnippetsView {
             on_new: None,
             on_edit: None,
             form_state: None,
+            collapsed_groups: HashSet::new(),
         }
     }
 
@@ -133,6 +145,13 @@ impl Render for SnippetsView {
         let alert_controller = self.alert_controller.clone();
         let hovered_snippet_id = self.hovered_snippet_id;
 
+        // Load snippet groups from the store on each render so newly-created
+        // groups appear immediately (mirrors how the hosts view loads hosts).
+        let groups: Vec<GroupEntry> = AppState::store(_cx)
+            .lock()
+            .groups(GroupKind::Snippet)
+            .unwrap_or_default();
+
         // Clear stale context-menu highlight if the menu closed.
         let menu_active = self
             .context_menu
@@ -148,6 +167,22 @@ impl Render for SnippetsView {
         let on_edit = self.on_edit.clone();
         let form_state = self.form_state.clone();
         let app = self.app.clone();
+
+        // Partition snippets: ungrouped (group_id is None) first, then one
+        // bucket per group. The store returns snippets sorted by
+        // `favorite DESC, id DESC`, so favorites float to the top of each
+        // bucket without further work here.
+        let mut ungrouped: Vec<&SnippetRow> = Vec::new();
+        let mut grouped: std::collections::HashMap<i64, Vec<&SnippetRow>> =
+            std::collections::HashMap::new();
+        for s in &self.snippets {
+            match s.group_id {
+                Some(gid) => grouped.entry(gid).or_default().push(s),
+                None => ungrouped.push(s),
+            }
+        }
+
+        let collapsed_groups = self.collapsed_groups.clone();
 
         div()
             .size_full()
@@ -208,15 +243,17 @@ impl Render for SnippetsView {
                             el.flex()
                                 .flex_col()
                                 .gap_1()
-                                .children(snippets.iter().map(|s| {
-                                    let snippet = s.clone();
+                                // Ungrouped snippets (favorites float to top).
+                                .children(ungrouped.iter().map(|s| {
+                                    let snippet = (*s).clone();
                                     let context_menu = context_menu.clone();
                                     let alert_controller = alert_controller.clone();
                                     let is_hovered = hovered_snippet_id == Some(s.id);
                                     let force_highlight = context_menu_snippet_id == Some(s.id);
                                     let entity = _cx.entity().downgrade();
                                     let on_edit = on_edit.clone();
-
+                                    let app = app.clone();
+                                    let groups_for_menu = groups.clone();
                                     snippet_row(
                                         &snippet,
                                         is_hovered,
@@ -225,8 +262,86 @@ impl Render for SnippetsView {
                                         context_menu,
                                         alert_controller,
                                         on_edit,
+                                        app,
+                                        groups_for_menu,
                                     )
                                     .into_any_element()
+                                }))
+                                // One section per group: header immediately
+                                // followed by its rows (wrapped in an
+                                // animated container so collapse/expand
+                                // eases height + opacity).
+                                .children(groups.iter().flat_map(|g| {
+                                    let gid = g.id;
+                                    let group = g.clone();
+                                    let members = grouped.get(&gid).cloned().unwrap_or_default();
+                                    let is_collapsed = collapsed_groups.contains(&gid);
+                                    let entity = _cx.entity().downgrade();
+
+                                    // Header first.
+                                    let header = group_header(
+                                        &group,
+                                        members.len(),
+                                        is_collapsed,
+                                        entity.clone(),
+                                    )
+                                    .into_any_element();
+
+                                    // Build rows always (even when collapsed) so
+                                    // the expand animation has content to reveal.
+                                    let rows: Vec<AnyElement> = members
+                                        .iter()
+                                        .map(|s| {
+                                            let snippet = (*s).clone();
+                                            let context_menu = context_menu.clone();
+                                            let alert_controller = alert_controller.clone();
+                                            let is_hovered = hovered_snippet_id == Some(s.id);
+                                            let force_highlight =
+                                                context_menu_snippet_id == Some(s.id);
+                                            let entity = _cx.entity().downgrade();
+                                            let on_edit = on_edit.clone();
+                                            let app = app.clone();
+                                            let groups_for_menu = groups.clone();
+                                            snippet_row(
+                                                &snippet,
+                                                is_hovered,
+                                                force_highlight,
+                                                entity,
+                                                context_menu,
+                                                alert_controller,
+                                                on_edit,
+                                                app,
+                                                groups_for_menu,
+                                            )
+                                            .into_any_element()
+                                        })
+                                        .collect();
+
+                                    // Animated body: collapses to h_0 +
+                                    // opacity_0 when collapsed.
+                                    let body_id = ElementId::Name(
+                                        format!("snippet-group-body-{}", gid).into(),
+                                    );
+                                    let body = div()
+                                        .id(body_id.clone())
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .overflow_hidden()
+                                        .with_transition(body_id)
+                                        .transition_when_else(
+                                            !is_collapsed,
+                                            Duration::from_millis(150),
+                                            Linear,
+                                            |el| el.max_h(px(2000.0)).opacity(1.0),
+                                            |el| el.max_h(px(0.0)).opacity(0.0),
+                                        )
+                                        .children(rows)
+                                        .into_any_element();
+
+                                    std::iter::once(header)
+                                        .chain(std::iter::once(body))
+                                        .collect::<Vec<_>>()
                                 }))
                         },
                     ),
@@ -251,12 +366,15 @@ fn snippet_row(
     context_menu: Option<Entity<ContextMenuController>>,
     alert_controller: Option<Entity<AlertController>>,
     on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    app: Entity<CrabportApp>,
+    groups: Vec<GroupEntry>,
 ) -> impl IntoElement {
     let row_id = ElementId::Name(format!("snippet-row-{}", snippet.id).into());
 
     let snippet_id = snippet.id;
     let snippet_name = snippet.name.clone();
     let snippet_command = snippet.command.clone();
+    let is_favorite = snippet.favorite;
     let is_highlighted = is_hovered || force_highlight;
 
     div()
@@ -269,9 +387,11 @@ fn snippet_row(
         .py_2()
         .rounded_md()
         .bg(rgb(bg_base()))
-        // Right-click context menu: "Edit" + "Delete".
+        // Right-click context menu: Favorite / Move-to-Group / Edit / Delete.
         .on_mouse_down(MouseButton::Right, {
             let entity = entity.clone();
+            let app = app.clone();
+            let groups = groups.clone();
             move |event, _w, cx| {
                 let Some(ref cm) = context_menu else {
                     return;
@@ -285,63 +405,22 @@ fn snippet_row(
                 let alert_controller = alert_controller.clone();
                 let snippet_name = snippet_name.clone();
                 let on_edit = on_edit.clone();
+                let app = app.clone();
+                let groups = groups.clone();
                 cm.update(cx, |c, cx| {
                     c.show(
                         ContextMenuState {
                             position: pos,
-                            items: vec![
-                                ContextMenuItem::new(t!("snippets.edit").to_string(), {
-                                    let on_edit = on_edit.clone();
-                                    move |w, cx| {
-                                        if let Some(ref cb) = on_edit {
-                                            cb(snippet_id, w, cx);
-                                        }
-                                    }
-                                }),
-                                ContextMenuItem::new(t!("snippets.delete").to_string(), {
-                                    let entity = entity_for_delete.clone();
-                                    let alert_controller = alert_controller.clone();
-                                    let snippet_name = snippet_name.clone();
-                                    move |_w, cx| {
-                                        let Some(ref ac) = alert_controller else {
-                                            return;
-                                        };
-                                        let entity = entity.clone();
-                                        ac.update(cx, |c, cx| {
-                                            c.show(
-                                                AlertState {
-                                                    severity: AlertSeverity::Danger,
-                                                    title: t!("snippets.delete_title")
-                                                        .to_string()
-                                                        .into(),
-                                                    description: Some(
-                                                        t!(
-                                                            "snippets.delete_prompt",
-                                                            name = snippet_name.as_str()
-                                                        )
-                                                        .to_string()
-                                                        .into(),
-                                                    ),
-                                                    confirm_label: t!("snippets.delete_confirm")
-                                                        .to_string()
-                                                        .into(),
-                                                    cancel_label: t!("terminal.host_key_cancel")
-                                                        .to_string()
-                                                        .into(),
-                                                    on_confirm: Some(Rc::new(move |_w, cx| {
-                                                        let _ = entity.update(cx, |view, cx| {
-                                                            view.delete_snippet(snippet_id, cx);
-                                                        });
-                                                    })),
-                                                    ..AlertState::default()
-                                                },
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                })
-                                .danger(true),
-                            ],
+                            items: build_snippet_context_menu(
+                                snippet_id,
+                                is_favorite,
+                                on_edit,
+                                entity_for_delete.clone(),
+                                alert_controller.clone(),
+                                snippet_name.clone(),
+                                app,
+                                groups,
+                            ),
                             ..ContextMenuState::default()
                         },
                         cx,
@@ -391,5 +470,218 @@ fn snippet_row(
                         .text_ellipsis()
                         .child(snippet_command.clone()),
                 ),
+        )
+        // Favorite star toggle (far right). Fades in on hover; stays visible
+        // (yellow) when already favorited so the user can see + unstar.
+        .child({
+            let app = app.clone();
+            let star_id = ElementId::Name(format!("snippet-star-{}", snippet.id).into());
+            let star_visible = is_highlighted || is_favorite;
+            div()
+                .id(star_id.clone())
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(
+                    svg()
+                        .path("icons/star.svg")
+                        .size_4()
+                        .text_color(rgb(if is_favorite {
+                            term_yellow()
+                        } else {
+                            text_muted()
+                        })),
+                )
+                .with_transition(star_id)
+                .transition_when_else(
+                    star_visible,
+                    Duration::from_millis(120),
+                    Linear,
+                    |el| el.opacity(1.0),
+                    |el| el.opacity(0.0),
+                )
+                .on_click(move |_e, _w, cx| {
+                    app.update(cx, |app, cx| {
+                        app.toggle_snippet_favorite(snippet_id, cx);
+                    });
+                })
+        })
+}
+
+/// Build the right-click context menu items for a snippet.
+///
+/// Order: Favorite toggle, Move-to-Group (ungrouped + one per group + New
+/// Group…), Edit, Delete.
+#[allow(clippy::too_many_arguments)]
+fn build_snippet_context_menu(
+    snippet_id: i64,
+    is_favorite: bool,
+    on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    entity: WeakEntity<SnippetsView>,
+    alert_controller: Option<Entity<AlertController>>,
+    snippet_name: String,
+    app: Entity<CrabportApp>,
+    _groups: Vec<GroupEntry>,
+) -> Vec<ContextMenuItem> {
+    let mut items: Vec<ContextMenuItem> = Vec::new();
+
+    // Favorite / Unfavorite toggle.
+    let app_for_fav = app.clone();
+    items.push(
+        ContextMenuItem::new(
+            if is_favorite {
+                t!("snippets.unfavorite").to_string()
+            } else {
+                t!("snippets.favorite").to_string()
+            },
+            move |_w, cx| {
+                app_for_fav.update(cx, |app, cx| {
+                    app.toggle_snippet_favorite(snippet_id, cx);
+                });
+            },
+        )
+        .divider_after(),
+    );
+
+    // Edit
+    items.push(ContextMenuItem::new(t!("snippets.edit").to_string(), {
+        let on_edit = on_edit.clone();
+        move |w, cx| {
+            if let Some(ref cb) = on_edit {
+                cb(snippet_id, w, cx);
+            }
+        }
+    }));
+
+    // Delete (with confirmation)
+    items.push(
+        ContextMenuItem::new(t!("snippets.delete").to_string(), {
+            let entity = entity.clone();
+            let alert_controller = alert_controller.clone();
+            let snippet_name = snippet_name.clone();
+            move |_w, cx| {
+                let Some(ref ac) = alert_controller else {
+                    return;
+                };
+                let entity = entity.clone();
+                ac.update(cx, |c, cx| {
+                    c.show(
+                        AlertState {
+                            severity: AlertSeverity::Danger,
+                            title: t!("snippets.delete_title").to_string().into(),
+                            description: Some(
+                                t!("snippets.delete_prompt", name = snippet_name.as_str())
+                                    .to_string()
+                                    .into(),
+                            ),
+                            confirm_label: t!("snippets.delete_confirm").to_string().into(),
+                            cancel_label: t!("terminal.host_key_cancel").to_string().into(),
+                            on_confirm: Some(Rc::new(move |_w, cx| {
+                                let _ = entity.update(cx, |view, cx| {
+                                    view.delete_snippet(snippet_id, cx);
+                                });
+                            })),
+                            ..AlertState::default()
+                        },
+                        cx,
+                    );
+                });
+            }
+        })
+        .danger(true),
+    );
+
+    items
+}
+
+// ---------------------------------------------------------------------------
+// Group header (collapsible)
+// ---------------------------------------------------------------------------
+
+/// Render a collapsible group header: chevron + folder icon + name +
+/// `groups.member_count`. Clicking toggles the group's collapse state.
+fn group_header(
+    group: &GroupEntry,
+    member_count: usize,
+    is_collapsed: bool,
+    entity: WeakEntity<SnippetsView>,
+) -> impl IntoElement {
+    let header_id = ElementId::Name(format!("snippet-group-{}", group.id).into());
+    let gid = group.id;
+    // Chevron animation ID encodes the collapsed state so toggling
+    // creates a fresh AnimationState and the rotation re-runs (mirrors
+    // the Dropdown chevron pattern).
+    let chevron_anim_id =
+        ElementId::Name(format!("snippet-group-chevron-{}-{}", gid, is_collapsed).into());
+
+    div()
+        .id(header_id.clone())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .mt_2()
+        .cursor_pointer()
+        .rounded_md()
+        .with_transition(header_id)
+        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+            if *hovered {
+                el.bg(rgb(surface_hover()))
+            } else {
+                el.bg(rgb(bg_base()))
+            }
+        })
+        .on_click(move |_e, _w, cx| {
+            let _ = entity.update(cx, |view, cx| {
+                if view.collapsed_groups.contains(&gid) {
+                    view.collapsed_groups.remove(&gid);
+                } else {
+                    view.collapsed_groups.insert(gid);
+                }
+                cx.notify();
+            });
+        })
+        // Chevron: animates 90° rotation on collapse/expand.
+        .child(
+            svg()
+                .path("icons/chevron-down.svg")
+                .size_3()
+                .text_color(rgb(text_muted()))
+                .with_animation(
+                    chevron_anim_id,
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                    move |this, delta| {
+                        // Collapsed: 0 -> -90° (points right).
+                        // Open: -90° -> 0° (points down).
+                        let angle = if is_collapsed {
+                            -delta * std::f32::consts::FRAC_PI_2
+                        } else {
+                            -(1.0 - delta) * std::f32::consts::FRAC_PI_2
+                        };
+                        this.with_transformation(Transformation::rotate(radians(angle)))
+                    },
+                ),
+        )
+        .child(
+            svg()
+                .path("icons/folder.svg")
+                .size_4()
+                .text_color(rgb(text_muted())),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(text_primary()))
+                .child(group.name.clone()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(t!("groups.member_count", count = member_count).to_string()),
         )
 }
