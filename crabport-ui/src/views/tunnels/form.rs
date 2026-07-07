@@ -132,6 +132,9 @@ pub struct TunnelFormState {
     /// Group dropdown open state (mirrors `host_dropdown_open` for the
     /// group selector).
     pub group_dropdown_open: bool,
+    /// Search input for the group dropdown (filtering + create). Owned here
+    /// so the query survives re-renders.
+    pub group_search_input: Entity<InputState>,
     /// Open/close animation state. `true` while the overlay is visible
     /// (drives the backdrop fade + dialog slide-in transition).
     pub open: bool,
@@ -154,6 +157,7 @@ impl TunnelFormState {
         let bind_port_input = cx.new(|cx| InputState::new(window, cx));
         let target_host_input = cx.new(|cx| InputState::new(window, cx));
         let target_port_input = cx.new(|cx| InputState::new(window, cx));
+        let group_search_input = cx.new(|cx| InputState::new(window, cx));
 
         Self {
             editing_id: None,
@@ -171,6 +175,7 @@ impl TunnelFormState {
             target_port_focused: false,
             host_dropdown_open: false,
             group_dropdown_open: false,
+            group_search_input,
             open: false,
             errors: TunnelValidationErrors::default(),
             favorite: false,
@@ -205,6 +210,8 @@ impl TunnelFormState {
         self.host_id = None;
         self.host_dropdown_open = false;
         self.group_dropdown_open = false;
+        self.group_search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.favorite = false;
         self.group_id = None;
         for input in [
@@ -236,6 +243,8 @@ impl TunnelFormState {
         self.host_id = Some(entry.host_id);
         self.host_dropdown_open = false;
         self.group_dropdown_open = false;
+        self.group_search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.favorite = entry.favorite;
         self.group_id = entry.group_id;
         self.name_input
@@ -365,6 +374,7 @@ pub struct TunnelFormView {
     host_id: Option<i64>,
     host_dropdown_open: bool,
     group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     hosts: Vec<ConnectionHost>,
     name_focused: bool,
     bind_addr_focused: bool,
@@ -406,6 +416,7 @@ impl TunnelFormView {
             host_id: state.host_id,
             host_dropdown_open: state.host_dropdown_open,
             group_dropdown_open: state.group_dropdown_open,
+            group_search_input: state.group_search_input.clone(),
             hosts,
             name_focused: state.name_focused,
             bind_addr_focused: state.bind_addr_focused,
@@ -441,6 +452,7 @@ impl RenderOnce for TunnelFormView {
                 self.host_id,
                 self.host_dropdown_open,
                 self.group_dropdown_open,
+                self.group_search_input,
                 self.hosts,
                 self.name_focused,
                 self.bind_addr_focused,
@@ -510,6 +522,7 @@ fn render_dialog(
     host_id: Option<i64>,
     host_dropdown_open: bool,
     group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     hosts: Vec<ConnectionHost>,
     name_focused: bool,
     bind_addr_focused: bool,
@@ -600,19 +613,20 @@ fn render_dialog(
                 .label(t!("tunnel_form.name").to_string())
                 .focused(name_focused),
         )
+        // Group selector (dropdown of tunnel groups, or "None" = ungrouped).
+        .child(render_group_selector(
+            group_id,
+            group_dropdown_open,
+            groups,
+            group_search_input,
+            app.clone(),
+        ))
         // Host selector (dropdown of saved hosts, or a hint if none).
         .child(render_host_selector(
             host_id,
             host_dropdown_open,
             hosts,
             errors.host.clone(),
-            app.clone(),
-        ))
-        // Group selector (dropdown of tunnel groups, or "None" = ungrouped).
-        .child(render_group_selector(
-            group_id,
-            group_dropdown_open,
-            groups,
             app.clone(),
         ))
         // Kind tabs (Local / Remote / Dynamic). Each pane shows the
@@ -900,6 +914,7 @@ fn render_group_selector(
     group_id: Option<i64>,
     dropdown_open: bool,
     groups: Vec<GroupEntry>,
+    group_search_input: Entity<InputState>,
     app: Entity<CrabportApp>,
 ) -> impl IntoElement {
     let label_div = div()
@@ -915,6 +930,26 @@ fn render_group_selector(
     let mut dropdown = Dropdown::new("tunnel-group-dropdown")
         .placeholder(t!("tunnel_form.group_none").to_string())
         .is_open(dropdown_open)
+        .searchable(group_search_input)
+        .on_create({
+            let app = app.clone();
+            move |name, _w, cx| {
+                app.update(cx, |app, cx| {
+                    // Create the group, then immediately select it.
+                    let kind = crabport_core::credential::GroupKind::Tunnel;
+                    if let Ok(gid) = crate::app_state::AppState::store(cx)
+                        .lock()
+                        .add_group(&name, kind, None)
+                    {
+                        if let Some(ref mut form) = app.tunnel_form {
+                            form.group_id = Some(gid);
+                            form.group_dropdown_open = false;
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
         .on_toggle({
             let app = app.clone();
             move |_w, cx| {

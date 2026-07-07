@@ -167,10 +167,12 @@ impl TunnelRegistry {
         self.tunnels.lock().retain(|t| t.config.id != id);
     }
 
-    /// Snapshot for UI rendering.
+    /// Snapshot for UI rendering. Sorted by `favorite DESC, id ASC` so
+    /// favorited tunnels float to the top — mirrors the store's `tunnels()`
+    /// query ordering.
     pub fn list(&self) -> Vec<TunnelView> {
-        self.tunnels
-            .lock()
+        let tunnels = self.tunnels.lock();
+        let mut views: Vec<TunnelView> = tunnels
             .iter()
             .map(|t| TunnelView {
                 id: t.config.id,
@@ -187,7 +189,11 @@ impl TunnelRegistry {
                 favorite: t.config.favorite,
                 group_id: t.config.group_id,
             })
-            .collect()
+            .collect();
+        // Sort: favorites first, then by id ascending (stable with the
+        // store's `tunnels()` query).
+        views.sort_by(|a, b| b.favorite.cmp(&a.favorite).then(a.id.cmp(&b.id)));
+        views
     }
 
     /// Is the given tunnel config currently running anywhere?

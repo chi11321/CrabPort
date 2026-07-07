@@ -245,6 +245,7 @@ impl CrabportApp {
         let editing_group_id = h.group_id;
 
         form.editing = true;
+        form.group_id = editing_group_id;
 
         form.on_connect = Some(Rc::new({
             let app = app.clone();
@@ -344,7 +345,10 @@ impl CrabportApp {
                         last_login: None,
                         favorite: editing_favorite,
                         proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),
-                        group_id: editing_group_id,
+                        group_id: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.group_id),
                     };
                     #[cfg(debug_assertions)]
                     tracing::info!(

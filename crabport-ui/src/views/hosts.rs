@@ -327,7 +327,7 @@ fn host_row(
                 let on_remove = on_remove.clone();
                 let on_connect = on_connect.clone();
                 let app_for_menu = app.clone();
-                let groups_for_menu = groups.clone();
+                let _groups_for_menu = groups.clone();
                 let host_favorite_for_menu = host_favorite;
                 cm.update(cx, |c, cx| {
                     let mut items: Vec<ContextMenuItem> = Vec::new();
@@ -357,45 +357,6 @@ fn host_row(
                             move |_w, cx| {
                                 app.update(cx, |app, cx| {
                                     app.toggle_host_favorite(host_id, cx);
-                                });
-                            }
-                        })
-                        .divider_after(),
-                    );
-
-                    // Move-to-Group section (mirrors snippet ctxmenu):
-                    // disabled header, Ungrouped, one per group, New Group…
-                    items.push(
-                        ContextMenuItem::new(t!("hosts.move_to_group").to_string(), |_, _| {})
-                            .disabled(true),
-                    );
-                    items.push(ContextMenuItem::new(t!("hosts.ungrouped").to_string(), {
-                        let app = app_for_menu.clone();
-                        move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.set_host_group(host_id, None, cx);
-                            });
-                        }
-                    }));
-                    for g in &groups_for_menu {
-                        let gid = g.id;
-                        let name = g.name.clone();
-                        let app = app_for_menu.clone();
-                        items.push(ContextMenuItem::new(name, move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.set_host_group(host_id, Some(gid), cx);
-                            });
-                        }));
-                    }
-                    items.push(
-                        ContextMenuItem::new(t!("hosts.new_group").to_string(), {
-                            let app = app_for_menu.clone();
-                            move |_w, cx| {
-                                app.update(cx, |app, cx| {
-                                    app.open_group_form_for_create(
-                                        crabport_core::credential::GroupKind::Host,
-                                        cx,
-                                    );
                                 });
                             }
                         })

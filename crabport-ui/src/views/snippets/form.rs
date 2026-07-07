@@ -97,6 +97,8 @@ pub struct SnippetFormState {
     /// pure function of the state (mirrors `host_dropdown_open` on the tunnel
     /// form).
     pub group_dropdown_open: bool,
+    /// Search input for the group dropdown (filtering + create).
+    pub group_search_input: Entity<InputState>,
     pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     pub on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
 }
@@ -105,6 +107,7 @@ impl SnippetFormState {
     pub fn new(window: &mut Window, cx: &mut App) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx));
         let command_input = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        let group_search_input = cx.new(|cx| InputState::new(window, cx));
 
         Self {
             editing_id: None,
@@ -117,6 +120,7 @@ impl SnippetFormState {
             favorite: false,
             group_id: None,
             group_dropdown_open: false,
+            group_search_input,
             on_close: None,
             on_save: None,
         }
@@ -145,6 +149,8 @@ impl SnippetFormState {
         self.favorite = false;
         self.group_id = None;
         self.group_dropdown_open = false;
+        self.group_search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.name_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.command_input
@@ -170,6 +176,8 @@ impl SnippetFormState {
         self.favorite = favorite;
         self.group_id = group_id;
         self.group_dropdown_open = false;
+        self.group_search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.name_input
             .update(cx, |state, cx| state.set_value(&name, window, cx));
         self.command_input
@@ -234,6 +242,7 @@ pub struct SnippetFormView {
     errors: SnippetValidationErrors,
     group_id: Option<i64>,
     group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
@@ -251,6 +260,7 @@ impl SnippetFormView {
             errors: state.errors.clone(),
             group_id: state.group_id,
             group_dropdown_open: state.group_dropdown_open,
+            group_search_input: state.group_search_input.clone(),
             app,
             on_close: state.on_close.clone(),
             on_save: state.on_save.clone(),
@@ -283,6 +293,7 @@ impl RenderOnce for SnippetFormView {
                 self.errors,
                 self.group_id,
                 self.group_dropdown_open,
+                self.group_search_input,
                 groups,
                 self.app,
                 on_close_for_dialog,
@@ -342,6 +353,7 @@ fn render_dialog(
     errors: SnippetValidationErrors,
     group_id: Option<i64>,
     group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     groups: Vec<GroupEntry>,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
@@ -397,6 +409,14 @@ fn render_dialog(
                 .focused(name_focused)
                 .when_some(errors.name.clone(), |el, e| el.error(e)),
         )
+        // Group dropdown
+        .child(render_group_selector(
+            group_id,
+            group_dropdown_open,
+            groups,
+            group_search_input,
+            app.clone(),
+        ))
         // Command (multi-line)
         .child(
             div().child(
@@ -408,13 +428,6 @@ fn render_dialog(
                     .when_some(errors.command.clone(), |el, e| el.error(e)),
             ),
         )
-        // Group dropdown
-        .child(render_group_selector(
-            group_id,
-            group_dropdown_open,
-            groups,
-            app.clone(),
-        ))
         // Buttons
         .child(render_buttons(app, on_close, on_save))
 }
@@ -486,6 +499,7 @@ fn render_group_selector(
     group_id: Option<i64>,
     dropdown_open: bool,
     groups: Vec<GroupEntry>,
+    group_search_input: Entity<InputState>,
     app: Entity<CrabportApp>,
 ) -> impl IntoElement {
     let label_div = div()
@@ -501,6 +515,25 @@ fn render_group_selector(
     let mut dropdown = Dropdown::new("snippet-group-dropdown")
         .placeholder(t!("tunnel_form.group").to_string())
         .is_open(dropdown_open)
+        .searchable(group_search_input)
+        .on_create({
+            let app = app.clone();
+            move |name, _w, cx| {
+                app.update(cx, |app, cx| {
+                    let kind = crabport_core::credential::GroupKind::Snippet;
+                    if let Ok(gid) = crate::app_state::AppState::store(cx)
+                        .lock()
+                        .add_group(&name, kind, None)
+                    {
+                        if let Some(ref mut form) = app.snippet_form {
+                            form.group_id = Some(gid);
+                            form.group_dropdown_open = false;
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
         .on_toggle({
             let app = app.clone();
             move |_w, cx| {
@@ -518,7 +551,6 @@ fn render_group_selector(
             move |index, _w, cx| {
                 app.update(cx, |app, cx| {
                     if let Some(ref mut form) = app.snippet_form {
-                        // index 0 => None; index i (i>0) => groups[i-1].id
                         form.group_id = if index == 0 {
                             None
                         } else {

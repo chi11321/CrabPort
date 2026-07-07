@@ -377,11 +377,15 @@ impl Render for TunnelsView {
                                         .flex_col()
                                         .gap_1()
                                         // Group header (clickable to collapse/expand)
-                                        .child(
+                                        .child({
+                                            let header_id = ElementId::Name(
+                                                format!("tunnel-group-header-{}", gid).into(),
+                                            );
+                                            let chevron_anim_id = ElementId::Name(
+                                                format!("tunnel-group-chevron-{}-{}", gid, collapsed).into(),
+                                            );
                                             div()
-                                                .id(ElementId::Name(
-                                                    format!("tunnel-group-header-{}", gid).into(),
-                                                ))
+                                                .id(header_id.clone())
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
@@ -390,7 +394,18 @@ impl Render for TunnelsView {
                                                 .py_1()
                                                 .cursor_pointer()
                                                 .rounded_md()
-                                                .hover(|s| s.bg(rgb(surface_hover())))
+                                                .with_transition(header_id)
+                                                .transition_on_hover(
+                                                    Duration::from_millis(120),
+                                                    Linear,
+                                                    move |hovered, el| {
+                                                        if *hovered {
+                                                            el.bg(rgb(surface_hover()))
+                                                        } else {
+                                                            el.bg(rgb(bg_base()))
+                                                        }
+                                                    },
+                                                )
                                                 .on_click(move |_e, _w, cx| {
                                                     let _ = header_entity.update(cx, |view, cx| {
                                                         if view.collapsed_groups.contains(&gid) {
@@ -406,13 +421,21 @@ impl Render for TunnelsView {
                                                         .path("icons/chevron-down.svg")
                                                         .size_3()
                                                         .text_color(rgb(text_muted()))
-                                                        .when(collapsed, |el| {
-                                                            el.with_transformation(
-                                                                Transformation::rotate(radians(
-                                                                    -90.0_f32.to_radians(),
-                                                                )),
-                                                            )
-                                                        }),
+                                                        .with_animation(
+                                                            chevron_anim_id,
+                                                            Animation::new(Duration::from_millis(200))
+                                                                .with_easing(ease_in_out),
+                                                            move |this, delta| {
+                                                                let angle = if collapsed {
+                                                                    -delta * std::f32::consts::FRAC_PI_2
+                                                                } else {
+                                                                    -(1.0 - delta) * std::f32::consts::FRAC_PI_2
+                                                                };
+                                                                this.with_transformation(
+                                                                    Transformation::rotate(radians(angle)),
+                                                                )
+                                                            },
+                                                        ),
                                                 )
                                                 .child(
                                                     svg()
@@ -438,25 +461,45 @@ impl Render for TunnelsView {
                                                             )
                                                             .to_string(),
                                                         ),
-                                                ),
-                                        );
-                                    if !collapsed {
-                                        section = section.children(build_rows(
-                                            members,
-                                            &hosts,
-                                            &groups,
-                                            &on_start,
-                                            &on_stop,
-                                            &on_edit,
-                                            &on_remove,
-                                            &context_menu,
-                                            &alert_controller,
-                                            hovered_tunnel_id,
-                                            context_menu_tunnel_id,
-                                            entity.clone(),
-                                            app.clone(),
-                                        ));
-                                    }
+                                                )
+                                        });
+                                    // Build rows always (even when collapsed)
+                                    // so the expand animation has content to
+                                    // reveal.
+                                    let rows = build_rows(
+                                        members,
+                                        &hosts,
+                                        &groups,
+                                        &on_start,
+                                        &on_stop,
+                                        &on_edit,
+                                        &on_remove,
+                                        &context_menu,
+                                        &alert_controller,
+                                        hovered_tunnel_id,
+                                        context_menu_tunnel_id,
+                                        entity.clone(),
+                                        app.clone(),
+                                    );
+                                    let body_id = ElementId::Name(
+                                        format!("tunnel-group-body-{}", gid).into(),
+                                    );
+                                    let body = div()
+                                        .id(body_id.clone())
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .overflow_hidden()
+                                        .with_transition(body_id)
+                                        .transition_when_else(
+                                            !collapsed,
+                                            Duration::from_millis(150),
+                                            Linear,
+                                            |el| el.max_h(px(2000.0)).opacity(1.0),
+                                            |el| el.max_h(px(0.0)).opacity(0.0),
+                                        )
+                                        .children(rows);
+                                    section = section.child(body);
                                     Some(section.into_any_element())
                                 }))
                         },
@@ -655,7 +698,7 @@ fn tunnel_row(
                 let on_start = on_start.clone();
                 let on_stop = on_stop.clone();
                 let alert_controller = alert_controller.clone();
-                let groups = groups_for_menu.clone();
+                let _groups = groups_for_menu.clone();
                 let app = app_for_menu.clone();
                 cm.update(cx, |c, cx| {
                     // Build the contextual Start/Stop item based on current
@@ -693,45 +736,7 @@ fn tunnel_row(
                     })
                     .divider_after();
 
-                    // Move-to-Group section (mirrors snippet ctxmenu):
-                    // disabled header, Ungrouped, one per group, New Group…
-                    let mut move_items: Vec<ContextMenuItem> = Vec::new();
-                    move_items.push(
-                        ContextMenuItem::new(t!("tunnels.move_to_group").to_string(), |_, _| {})
-                            .disabled(true),
-                    );
-                    move_items.push(ContextMenuItem::new(t!("tunnels.ungrouped").to_string(), {
-                        let app = app.clone();
-                        move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.set_tunnel_group(tunnel_id, None, cx);
-                            });
-                        }
-                    }));
-                    for g in &groups {
-                        let gid = g.id;
-                        let name = g.name.clone();
-                        let app = app.clone();
-                        move_items.push(ContextMenuItem::new(name, move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.set_tunnel_group(tunnel_id, Some(gid), cx);
-                            });
-                        }));
-                    }
-                    move_items.push(
-                        ContextMenuItem::new(t!("tunnels.new_group").to_string(), {
-                            let app = app.clone();
-                            move |_w, cx| {
-                                app.update(cx, |app, cx| {
-                                    app.open_group_form_for_create(GroupKind::Tunnel, cx);
-                                });
-                            }
-                        })
-                        .divider_after(),
-                    );
-
                     let mut items = vec![toggle_item, favorite_item];
-                    items.extend(move_items);
                     items.push(ContextMenuItem::new(t!("tunnels.edit").to_string(), {
                         let on_edit = on_edit.clone();
                         move |w, cx| {

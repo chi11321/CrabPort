@@ -268,7 +268,9 @@ impl Render for SnippetsView {
                                     .into_any_element()
                                 }))
                                 // One section per group: header immediately
-                                // followed by its rows (when not collapsed).
+                                // followed by its rows (wrapped in an
+                                // animated container so collapse/expand
+                                // eases height + opacity).
                                 .children(groups.iter().flat_map(|g| {
                                     let gid = g.id;
                                     let group = g.clone();
@@ -285,41 +287,60 @@ impl Render for SnippetsView {
                                     )
                                     .into_any_element();
 
-                                    // Then rows (unless collapsed).
-                                    let rows: Vec<AnyElement> = if is_collapsed {
-                                        Vec::new()
-                                    } else {
-                                        members
-                                            .iter()
-                                            .map(|s| {
-                                                let snippet = (*s).clone();
-                                                let context_menu = context_menu.clone();
-                                                let alert_controller = alert_controller.clone();
-                                                let is_hovered = hovered_snippet_id == Some(s.id);
-                                                let force_highlight =
-                                                    context_menu_snippet_id == Some(s.id);
-                                                let entity = _cx.entity().downgrade();
-                                                let on_edit = on_edit.clone();
-                                                let app = app.clone();
-                                                let groups_for_menu = groups.clone();
-                                                snippet_row(
-                                                    &snippet,
-                                                    is_hovered,
-                                                    force_highlight,
-                                                    entity,
-                                                    context_menu,
-                                                    alert_controller,
-                                                    on_edit,
-                                                    app,
-                                                    groups_for_menu,
-                                                )
-                                                .into_any_element()
-                                            })
-                                            .collect()
-                                    };
+                                    // Build rows always (even when collapsed) so
+                                    // the expand animation has content to reveal.
+                                    let rows: Vec<AnyElement> = members
+                                        .iter()
+                                        .map(|s| {
+                                            let snippet = (*s).clone();
+                                            let context_menu = context_menu.clone();
+                                            let alert_controller = alert_controller.clone();
+                                            let is_hovered = hovered_snippet_id == Some(s.id);
+                                            let force_highlight =
+                                                context_menu_snippet_id == Some(s.id);
+                                            let entity = _cx.entity().downgrade();
+                                            let on_edit = on_edit.clone();
+                                            let app = app.clone();
+                                            let groups_for_menu = groups.clone();
+                                            snippet_row(
+                                                &snippet,
+                                                is_hovered,
+                                                force_highlight,
+                                                entity,
+                                                context_menu,
+                                                alert_controller,
+                                                on_edit,
+                                                app,
+                                                groups_for_menu,
+                                            )
+                                            .into_any_element()
+                                        })
+                                        .collect();
+
+                                    // Animated body: collapses to h_0 +
+                                    // opacity_0 when collapsed.
+                                    let body_id = ElementId::Name(
+                                        format!("snippet-group-body-{}", gid).into(),
+                                    );
+                                    let body = div()
+                                        .id(body_id.clone())
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .overflow_hidden()
+                                        .with_transition(body_id)
+                                        .transition_when_else(
+                                            !is_collapsed,
+                                            Duration::from_millis(150),
+                                            Linear,
+                                            |el| el.max_h(px(2000.0)).opacity(1.0),
+                                            |el| el.max_h(px(0.0)).opacity(0.0),
+                                        )
+                                        .children(rows)
+                                        .into_any_element();
 
                                     std::iter::once(header)
-                                        .chain(rows.into_iter())
+                                        .chain(std::iter::once(body))
                                         .collect::<Vec<_>>()
                                 }))
                         },
@@ -501,7 +522,7 @@ fn build_snippet_context_menu(
     alert_controller: Option<Entity<AlertController>>,
     snippet_name: String,
     app: Entity<CrabportApp>,
-    groups: Vec<GroupEntry>,
+    _groups: Vec<GroupEntry>,
 ) -> Vec<ContextMenuItem> {
     let mut items: Vec<ContextMenuItem> = Vec::new();
 
@@ -520,45 +541,6 @@ fn build_snippet_context_menu(
                 });
             },
         )
-        .divider_after(),
-    );
-
-    // Move-to-Group section. The "Manage Groups" header provides a clear
-    // boundary; followed by Ungrouped, one item per existing group, and
-    // finally "New Group…" which opens the (shared) group form dialog.
-    items.push(
-        ContextMenuItem::new(t!("snippets.move_to_group").to_string(), |_, _| {}).disabled(true),
-    );
-
-    let app_for_ungrouped = app.clone();
-    items.push(ContextMenuItem::new(
-        t!("snippets.ungrouped").to_string(),
-        move |_w, cx| {
-            app_for_ungrouped.update(cx, |app, cx| {
-                app.set_snippet_group(snippet_id, None, cx);
-            });
-        },
-    ));
-
-    for g in &groups {
-        let app_for_group = app.clone();
-        let gid = g.id;
-        let label = g.name.clone();
-        items.push(ContextMenuItem::new(label, move |_w, cx| {
-            app_for_group.update(cx, |app, cx| {
-                app.set_snippet_group(snippet_id, Some(gid), cx);
-            });
-        }));
-    }
-
-    let app_for_new = app.clone();
-    items.push(
-        ContextMenuItem::new(t!("snippets.new_group").to_string(), move |w, cx| {
-            app_for_new.update(cx, |app, cx| {
-                app.open_group_form_for_create(GroupKind::Snippet, cx);
-            });
-            let _ = w;
-        })
         .divider_after(),
     );
 
@@ -627,6 +609,11 @@ fn group_header(
 ) -> impl IntoElement {
     let header_id = ElementId::Name(format!("snippet-group-{}", group.id).into());
     let gid = group.id;
+    // Chevron animation ID encodes the collapsed state so toggling
+    // creates a fresh AnimationState and the rotation re-runs (mirrors
+    // the Dropdown chevron pattern).
+    let chevron_anim_id =
+        ElementId::Name(format!("snippet-group-chevron-{}-{}", gid, is_collapsed).into());
 
     div()
         .id(header_id.clone())
@@ -639,8 +626,14 @@ fn group_header(
         .mt_2()
         .cursor_pointer()
         .rounded_md()
-        .hover(|s| s.bg(rgb(surface_hover())))
         .with_transition(header_id)
+        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+            if *hovered {
+                el.bg(rgb(surface_hover()))
+            } else {
+                el.bg(rgb(bg_base()))
+            }
+        })
         .on_click(move |_e, _w, cx| {
             let _ = entity.update(cx, |view, cx| {
                 if view.collapsed_groups.contains(&gid) {
@@ -651,17 +644,26 @@ fn group_header(
                 cx.notify();
             });
         })
-        // Chevron: rotates 90° (right) when collapsed, 0° (down) when open.
+        // Chevron: animates 90° rotation on collapse/expand.
         .child(
             svg()
                 .path("icons/chevron-down.svg")
                 .size_3()
                 .text_color(rgb(text_muted()))
-                .when(is_collapsed, |el| {
-                    el.with_transformation(Transformation::rotate(radians(
-                        std::f32::consts::FRAC_PI_2,
-                    )))
-                }),
+                .with_animation(
+                    chevron_anim_id,
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                    move |this, delta| {
+                        // Collapsed: 0 -> -90° (points right).
+                        // Open: -90° -> 0° (points down).
+                        let angle = if is_collapsed {
+                            -delta * std::f32::consts::FRAC_PI_2
+                        } else {
+                            -(1.0 - delta) * std::f32::consts::FRAC_PI_2
+                        };
+                        this.with_transformation(Transformation::rotate(radians(angle)))
+                    },
+                ),
         )
         .child(
             svg()
