@@ -49,9 +49,19 @@ pub fn render_content(
     let context_menu = &ctx.context_menu;
     let alert_controller = &ctx.alert;
     let active_tab = tabs.iter().find(|t| t.id == active_tab_id);
-    // Clone the tunnel list for the panel — the full-page TunnelsView
-    // (SidebarItem::Tunnels arm below) consumes the original `tunnel_list`.
-    let tunnel_list_for_panel = tunnel_list.clone();
+    // Filter the tunnel list for the panel down to only the tunnels that
+    // belong to the active terminal's host. A local PTY tab (`host_id` =
+    // `None`) has no host → empty list; an SSH/Telnet tab shows only its own
+    // host's tunnels. The full-page TunnelsView (SidebarItem::Tunnels arm
+    // below) consumes the original unfiltered `tunnel_list`.
+    let active_host_id = active_tab
+        .and_then(|tab| terminal_views.get(&tab.id))
+        .and_then(|entity| entity.read_with(cx, |view, _cx| view.host_id()));
+    let tunnel_list_for_panel: Vec<crate::views::tunnels::TunnelView> = tunnel_list
+        .iter()
+        .filter(|t| Some(t.host_id) == active_host_id)
+        .cloned()
+        .collect();
     let handle_c = handle.clone();
     let on_close: Rc<dyn Fn(u64, &mut Window, &mut App)> = Rc::new(move |id, _w, cx| {
         handle_c.update(cx, |app, cx| {
@@ -502,6 +512,7 @@ pub fn render_content(
             tunnels_on_start,
             tunnels_on_stop,
             context_menu.clone(),
+            active_tab_id,
             window,
             cx,
         );
@@ -712,7 +723,9 @@ pub fn render_content(
                             }
                             handle_for_panel.update(cx, |app, cx| {
                                 if let Some(k) = kinds.get(idx).copied() {
-                                    app.panel_active_tab = k;
+                                    // Store per-tab so each terminal
+                                    // connection keeps its own panel choice.
+                                    app.panel_active_tab.insert(active_tab_id, k);
                                     cx.notify();
                                 }
                             });

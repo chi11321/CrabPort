@@ -71,11 +71,14 @@ pub struct CrabportApp {
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
     pub hosts: Vec<ConnectionHost>,
     pub connection_form: Option<ConnectionFormState>,
-    /// Which right-hand panel pane the user last selected. Stored as a
-    /// semantic [`PanelKind`] (not a positional index) so the selection
-    /// survives switches between terminal backends whose pane sets differ
-    /// (e.g. SSH shows all four; Telnet shows only History + Snippets).
-    pub panel_active_tab: crate::views::panel::PanelKind,
+    /// Which right-hand panel pane the user last selected, keyed by tab id
+    /// so each terminal connection keeps its own panel selection (e.g. one
+    /// tab can show SFTP while another shows Tunnels). Stored as a semantic
+    /// [`PanelKind`] (not a positional index) so the selection survives
+    /// switches between terminal backends whose pane sets differ (e.g. SSH
+    /// shows all four; Telnet shows only History + Snippets). Lookups fall
+    /// back to the default [`PanelKind`] for tabs that haven't been visited.
+    pub panel_active_tab: HashMap<u64, crate::views::panel::PanelKind>,
     /// Tunnel form window state (singleton dialog for creating/editing a
     /// tunnel config). `None` when the dialog is closed.
     pub tunnel_form: Option<crate::views::tunnels::TunnelFormState>,
@@ -220,7 +223,7 @@ impl CrabportApp {
             terminal_views: HashMap::new(),
             hosts,
             connection_form: None,
-            panel_active_tab: crate::views::panel::PanelKind::default(),
+            panel_active_tab: HashMap::new(),
             tunnel_form: None,
             snippet_form: None,
             app_ctx,
@@ -313,10 +316,16 @@ impl Render for CrabportApp {
         // already borrowed) rather than via `handle.read_with` inside
         // `render_content` — that would be a nested read of `CrabportApp`
         // and panic ("cannot read while it is already being updated").
-        // Same pattern as `panel_active_tab`.
+        // Resolve the active tab's per-tab panel selection here too, so the
+        // panel reflects each terminal connection's own choice.
         let tunnel_list = self.app_ctx.tunnels.list();
         let tunnel_form_state = self.tunnel_form.clone();
         let snippet_form_state = self.snippet_form.clone();
+        let panel_active_tab = self
+            .panel_active_tab
+            .get(&self.active_tab_id)
+            .copied()
+            .unwrap_or_default();
 
         let content = crate::layouts::content::render_content(
             self.sidebar_item,
@@ -326,7 +335,7 @@ impl Render for CrabportApp {
             &self.terminal_views,
             &self.hosts,
             self.connection_form.as_ref(),
-            self.panel_active_tab,
+            panel_active_tab,
             tunnel_list,
             tunnel_form_state,
             snippet_form_state,

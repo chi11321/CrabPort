@@ -120,9 +120,9 @@ pub struct TerminalView {
     cursor_bounds: Arc<Mutex<Bounds<Pixels>>>,
     overlay: SharedOverlayState,
     remote_host: String,
-    /// Persisted host id for command-history storage. `None` for local
-    /// terminals (their history is in-memory only, not persisted).
-    #[allow(dead_code)]
+    /// Persisted host id for command-history storage and tunnel filtering.
+    /// `None` for local terminals (their history is in-memory only, not
+    /// persisted, and they have no host to filter tunnels by).
     host_id: Option<i64>,
     count: u64,
     ssh_info: Option<SshConnectionInfo>,
@@ -522,6 +522,13 @@ impl TerminalView {
 
     pub fn allow_tunnels(&self) -> bool {
         self.session.allow_tunnels()
+    }
+
+    /// The persisted host id this terminal is connected to, or `None` for
+    /// local PTY tabs. Used by the Tunnels panel to filter the tunnel list
+    /// to only those belonging to this terminal's host.
+    pub fn host_id(&self) -> Option<i64> {
+        self.host_id
     }
 
     pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {

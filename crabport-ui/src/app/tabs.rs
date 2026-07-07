@@ -114,8 +114,11 @@ impl CrabportApp {
                         (SftpTransferKind::Edit, true) => return,
                         (SftpTransferKind::Edit, false) => (
                             t!("sftp.notif_edit_save_failed_title").to_string(),
-                            t!("sftp.notif_edit_save_failed_msg", message = message.as_str())
-                                .to_string(),
+                            t!(
+                                "sftp.notif_edit_save_failed_msg",
+                                message = message.as_str()
+                            )
+                            .to_string(),
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
@@ -288,8 +291,11 @@ impl CrabportApp {
                         (SftpTransferKind::Edit, true) => return,
                         (SftpTransferKind::Edit, false) => (
                             t!("sftp.notif_edit_save_failed_title").to_string(),
-                            t!("sftp.notif_edit_save_failed_msg", message = message.as_str())
-                                .to_string(),
+                            t!(
+                                "sftp.notif_edit_save_failed_msg",
+                                message = message.as_str()
+                            )
+                            .to_string(),
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
@@ -432,6 +438,13 @@ impl CrabportApp {
                 v.close();
             });
         }
+        // Drop this tab's per-tab panel state so the HashMaps don't leak
+        // entries for closed tabs.
+        self.panel_active_tab.remove(&id);
+        self.app_ctx.tunnels_panel.update(cx, |panel, cx| {
+            panel.forget_tab(id);
+            cx.notify();
+        });
         self.tabs.retain(|t| t.id != id);
         if self.active_tab_id == id {
             self.active_tab_id = 0;
