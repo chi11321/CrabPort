@@ -15,7 +15,7 @@ parking_lot = "0.12"
 smol = "2.0.2"
 gpui-animation = "0.2.60"
 gpui-component = "0.5"
-rust-i18n = "4"
+rust-i18n = "3"
 lru = "0.12"
 rustc-hash = "2"
 tokio = { version = "1", features = ["sync"] }
