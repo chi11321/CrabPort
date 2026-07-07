@@ -3,6 +3,7 @@
 // `CrabportApp` because all `impl` blocks for the same type compose.
 pub mod connection;
 pub mod context;
+pub mod groups;
 pub mod hosts;
 pub mod snippets;
 pub mod tabs;
@@ -13,6 +14,7 @@ pub use context::AppCtx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use rust_i18n::t;
 
@@ -23,6 +25,7 @@ use crate::components::dialog::AlertController;
 use crate::components::notification::{NotificationController, NotificationPosition};
 use crate::layouts::command_palette::{CommandView, ConnectionType};
 use crate::layouts::sidebar::render_sidebar;
+use crate::views::groups::GroupFormState;
 use crate::views::hosts::ConnectionFormState;
 use crate::views::hosts::ConnectionHost;
 use crate::views::terminal::TerminalView;
@@ -85,6 +88,10 @@ pub struct CrabportApp {
     /// Snippet form window state (singleton dialog for creating/editing a
     /// snippet). `None` when the dialog is closed.
     pub snippet_form: Option<crate::views::snippets::SnippetFormState>,
+    /// Group form window state (singleton dialog for creating / renaming a
+    /// group). Shared across all collection kinds (Host / Snippet / Tunnel);
+    /// `None` when the dialog is closed.
+    pub group_form: Option<GroupFormState>,
     /// Single entry point for all long-lived shared services: global overlay
     /// controllers (alert / context-menu / notifications), the tunnel
     /// registry, the command palette, and the side-panel + sidebar views.
@@ -186,6 +193,7 @@ impl CrabportApp {
                 last_login: h.last_login,
                 favorite: h.favorite,
                 proxy_id: h.proxy_id,
+                group_id: h.group_id,
             })
             .collect();
 
@@ -226,6 +234,7 @@ impl CrabportApp {
             panel_active_tab: HashMap::new(),
             tunnel_form: None,
             snippet_form: None,
+            group_form: None,
             app_ctx,
             wired: false,
             last_focused_tab_id: None,
@@ -241,6 +250,13 @@ impl CrabportApp {
 
         let cmd = self.app_ctx.command_palette.clone();
         let app = cx.entity().clone();
+
+        // Hand the app entity to the tunnels panel so its per-row star toggle
+        // can drive favorite toggles without a new `set_state` param (which
+        // would require touching `content.rs`).
+        self.app_ctx
+            .tunnels_panel
+            .update(cx, |p, _cx| p.set_app(app.clone()));
 
         // ---- Command palette callbacks ----
         let cmd_for_close = cmd.clone();
@@ -321,6 +337,7 @@ impl Render for CrabportApp {
         let tunnel_list = self.app_ctx.tunnels.list();
         let tunnel_form_state = self.tunnel_form.clone();
         let snippet_form_state = self.snippet_form.clone();
+        let group_form_state = self.group_form.clone();
         let panel_active_tab = self
             .panel_active_tab
             .get(&self.active_tab_id)
@@ -378,6 +395,13 @@ impl Render for CrabportApp {
             .child(self.app_ctx.context_menu.clone())
             // -- Global toast notifications --
             .child(self.app_ctx.notifications.clone())
+            // -- Group form overlay (new / rename group, shared across kinds) --
+            .when_some(group_form_state, |el, state| {
+                el.child(crate::views::groups::GroupFormView::new(
+                    &state,
+                    handle.clone(),
+                ))
+            })
     }
 }
 

@@ -42,6 +42,8 @@ pub struct ConnectionHost {
     pub favorite: bool,
     /// FK into the `proxies` table. `None` means no proxy.
     pub proxy_id: Option<i64>,
+    /// FK into the `groups` table. `None` means ungrouped.
+    pub group_id: Option<i64>,
 }
 
 /// Hosts sidebar view.
@@ -224,6 +226,7 @@ impl Render for HostsView {
                                     entity,
                                     context_menu,
                                     alert_controller,
+                                    app.clone(),
                                     move |w, cx| {
                                         if let Some(ref cb) = on_connect {
                                             cb(host.id, w, cx);
@@ -264,6 +267,7 @@ fn host_row(
     entity: WeakEntity<HostsView>,
     context_menu: Option<Entity<ContextMenuController>>,
     alert_controller: Option<Entity<AlertController>>,
+    app: Entity<CrabportApp>,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
@@ -273,6 +277,7 @@ fn host_row(
 
     let host_id = host.id;
     let host_name = host.name.clone();
+    let host_favorite = host.favorite;
     let is_highlighted = is_hovered || force_highlight;
 
     div()
@@ -411,4 +416,43 @@ fn host_row(
                         .child(format!("{}@{}:{}", host.username, host.host, host.port)),
                 ),
         )
+        // Favorite star toggle (far right). Fades in on hover; stays visible
+        // (yellow) when already favorited so the user can see + unstar.
+        .child({
+            let app = app.clone();
+            let star_id = ElementId::Name(format!("host-star-{}", host.id).into());
+            let star_visible = is_highlighted || host_favorite;
+            div()
+                .id(star_id.clone())
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_5()
+                .cursor_pointer()
+                .rounded_md()
+                .hover(|s| s.bg(rgb(surface_hover())))
+                .child(
+                    svg()
+                        .path("icons/star.svg")
+                        .size_3()
+                        .text_color(rgb(if host_favorite {
+                            term_yellow()
+                        } else {
+                            text_muted()
+                        })),
+                )
+                .with_transition(star_id)
+                .transition_when_else(
+                    star_visible,
+                    Duration::from_millis(120),
+                    Linear,
+                    |el| el.opacity(1.0),
+                    |el| el.opacity(0.0),
+                )
+                .on_click(move |_e, _w, cx| {
+                    app.update(cx, |app, cx| {
+                        app.toggle_host_favorite(host_id, cx);
+                    });
+                })
+        })
 }

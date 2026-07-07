@@ -165,6 +165,8 @@ impl TunnelRegistry {
                 created_at: t.config.created_at,
                 running: t.runtime.is_some(),
                 borrowed_tab_id: t.runtime.as_ref().and_then(|r| r.borrowed_tab_id()),
+                favorite: t.config.favorite,
+                group_id: t.config.group_id,
             })
             .collect()
     }
@@ -262,6 +264,10 @@ pub struct TunnelView {
     pub running: bool,
     /// `Some(tab_id)` when this tunnel is borrowed from a terminal tab.
     pub borrowed_tab_id: Option<u64>,
+    /// Starred by the user to pin it above un-starred tunnels.
+    pub favorite: bool,
+    /// FK into the `groups` table. `None` = ungrouped.
+    pub group_id: Option<i64>,
 }
 
 /// Trait alias so `CrabportApp` can hold `Arc<dyn TunnelSource>` for the

@@ -186,6 +186,8 @@ pub fn render_content(
                                 id: s.id,
                                 name: s.name,
                                 command: s.command,
+                                favorite: s.favorite,
+                                group_id: s.group_id,
                             })
                             .collect::<Vec<_>>()
                     } else {

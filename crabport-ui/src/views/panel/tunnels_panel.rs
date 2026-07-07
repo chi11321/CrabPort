@@ -34,6 +34,7 @@ use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 
+use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::input::StyledInput;
@@ -84,6 +85,11 @@ pub struct TunnelsPanel {
     /// Current tunnel list snapshot. Reloaded from the registry on each
     /// `set_state` call.
     tunnels: Arc<Vec<TunnelView>>,
+    /// App entity handle, used to drive favorite toggles from the panel
+    /// (the panel's `set_state` callbacks are wired from `content.rs` and
+    /// can't grow new params without touching that file, so the panel
+    /// reaches the app directly via this handle for the star toggle).
+    app: Option<Entity<CrabportApp>>,
     /// Start callback — invoked with `(tunnel_id, tab_id)` on double-click /
     /// context-menu "Start". Routes to `CrabportApp::start_tunnel_borrowed`.
     on_start: Option<Rc<dyn Fn(i64, &mut App)>>,
@@ -112,6 +118,7 @@ impl TunnelsPanel {
     pub fn new() -> Self {
         Self {
             tunnels: Arc::new(Vec::new()),
+            app: None,
             on_start: None,
             on_stop: None,
             search_input: None,
@@ -235,6 +242,14 @@ impl Default for TunnelsPanel {
     }
 }
 
+impl TunnelsPanel {
+    /// Set the app entity handle (called once from `CrabportApp::wire` so the
+    /// panel can drive favorite toggles without a new `set_state` param).
+    pub fn set_app(&mut self, app: Entity<CrabportApp>) {
+        self.app = Some(app);
+    }
+}
+
 /// Fixed height of each tunnel row. The virtual list requires uniform
 /// item sizes.
 const ROW_HEIGHT: f32 = 36.0;
@@ -289,6 +304,8 @@ impl Render for TunnelsPanel {
         let filtered_for_list = Arc::new(filtered);
         let is_empty = filtered_for_list.is_empty();
 
+        let app_for_list = self.app.clone();
+
         let list = v_virtual_list(
             cx.entity(),
             "tunnel-panel-list",
@@ -298,6 +315,7 @@ impl Render for TunnelsPanel {
                 let on_start = on_start.clone();
                 let on_stop = on_stop.clone();
                 let context_menu = context_menu.clone();
+                let app = app_for_list.clone();
                 let entity = cx.entity().downgrade();
                 range
                     .map(|i| {
@@ -356,6 +374,9 @@ impl Render for TunnelsPanel {
                         // right-click closure after this.
                         let running_for_dblclick = tunnel.running;
                         let tunnel_id_for_dblclick = tunnel.id;
+                        let favorite_for_star = t.favorite;
+                        let tunnel_id_for_star = tunnel.id;
+                        let app_for_star = app.clone();
 
                         div()
                             .id(row_id.clone())
@@ -511,6 +532,52 @@ impl Render for TunnelsPanel {
                             )
                             // Status dot.
                             .child(div().size_2().rounded_full().bg(rgb(status_dot)))
+                            // Favorite star toggle (far right, compact). Fades
+                            // in on hover; stays visible (yellow) when already
+                            // favorited so the user can see + unstar.
+                            .child({
+                                let app = app_for_star.clone();
+                                let star_id =
+                                    ElementId::Name(format!("tunnel-panel-star-{i}").into());
+                                let star_visible = is_highlighted || favorite_for_star;
+                                div()
+                                    .id(star_id.clone())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size_4()
+                                    .cursor_pointer()
+                                    .rounded(px(3.0))
+                                    .hover(|s| s.bg(rgba((surface_hover() << 8) | 0x40)))
+                                    .child(svg().path("icons/star.svg").size(px(10.0)).text_color(
+                                        rgb(if favorite_for_star {
+                                            term_yellow()
+                                        } else {
+                                            text_muted()
+                                        }),
+                                    ))
+                                    .with_transition(star_id)
+                                    .transition_when_else(
+                                        star_visible,
+                                        std::time::Duration::from_millis(120),
+                                        Linear,
+                                        |el| el.opacity(1.0),
+                                        |el| el.opacity(0.0),
+                                    )
+                                    .on_click({
+                                        let app = app.clone();
+                                        move |_e, _w, cx| {
+                                            if let Some(app) = app.clone() {
+                                                app.update(cx, |app, cx| {
+                                                    app.toggle_tunnel_favorite(
+                                                        tunnel_id_for_star,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }
+                                    })
+                            })
                     })
                     .collect::<Vec<_>>()
             },

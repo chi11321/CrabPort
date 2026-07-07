@@ -2,6 +2,7 @@ use crate::color::*;
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutQuad};
 use gpui_component::scroll::ScrollableElement;
+use std::cell::Cell;
 use std::f32::consts::PI;
 use std::{rc::Rc, time::Duration};
 
@@ -162,6 +163,14 @@ impl RenderOnce for Dropdown {
         // A disabled dropdown never shows its menu, regardless of `is_open`.
         let is_open = is_open && !disabled;
 
+        // Shared slot for the trigger's window-space bounds, captured each
+        // frame by the `canvas` child inside the trigger (see below) and read
+        // by the menu's `on_mouse_down_out` handler. Using `Cell<Option<...>>`
+        // lets the prepaint callback (which runs before paint) hand the bounds
+        // to the mouse-down listener registered during paint, all within a
+        // single frame and without needing an Entity to hold state.
+        let trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
+
         let item_count = items.len();
         let selected_label = selected
             .and_then(|i| items.get(i))
@@ -240,7 +249,27 @@ impl RenderOnce for Dropdown {
                     .child(selected_label),
             )
             .child(chevron)
-            .when_some(on_toggle, |this, cb| {
+            // Capture the trigger's bounds each frame so the menu's
+            // `on_mouse_down_out` handler can tell a click *on the trigger*
+            // (which the trigger's own `on_click` will toggle) apart from a
+            // click *outside* the dropdown (which should dismiss the menu).
+            // The canvas is absolute + size_full so it overlays the trigger
+            // exactly without participating in the flex layout, and it has no
+            // hitbox so it never intercepts pointer events.
+            .child(
+                canvas(
+                    {
+                        let trigger_bounds = trigger_bounds.clone();
+                        move |bounds, _window, _cx| {
+                            trigger_bounds.set(Some(bounds));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(on_toggle.clone(), |this, cb| {
                 this.when(!disabled, |this| {
                     this.on_click(move |_e, w, cx| {
                         cb(w, cx);
@@ -324,6 +353,38 @@ impl RenderOnce for Dropdown {
             .opacity(0.)
             .h(px(0.))
             .when(is_open, |el| el.occlude())
+            // Dismiss the menu when the user mouse-downs outside of it. This
+            // mirrors the context_menu's backdrop-click behavior but without a
+            // full-screen overlay: the menu's own hitbox defines "inside", so
+            // any mouse-down that lands outside (on another field, empty space,
+            // etc.) fires the handler during the capture phase.
+            //
+            // We deliberately skip dismissal when the click lands on the
+            // trigger: that case is handled by the trigger's `on_click` which
+            // toggles `is_open`. Without this guard, clicking the trigger to
+            // close would dismiss here *and* toggle, netting to no change (or
+            // re-opening, depending on order). We also guard with `is_open` so
+            // a collapsed (height-0) menu — whose hitbox contains no point —
+            // doesn't fire the handler for every click in the window and flip
+            // the dropdown open.
+            .when(is_open, |el| {
+                el.when_some(on_toggle, |el, cb| {
+                    let trigger_bounds = trigger_bounds.clone();
+                    el.on_mouse_down_out(move |e, w, cx| {
+                        // If the click is on the trigger, let the trigger's
+                        // own click handler toggle the state.
+                        if trigger_bounds
+                            .get()
+                            .is_some_and(|b| b.contains(&e.position))
+                        {
+                            return;
+                        }
+                        // Otherwise dismiss by toggling (caller's `on_toggle`
+                        // flips `dropdown_open` from true -> false).
+                        cb(w, cx);
+                    })
+                })
+            })
             .with_transition(menu_id)
             .transition_when_else(
                 is_open,

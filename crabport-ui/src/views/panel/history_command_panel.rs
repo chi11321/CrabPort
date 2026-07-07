@@ -206,7 +206,7 @@ impl Render for HistoryCommandPanel {
                             .hover(|s| s.bg(rgb(surface_hover())))
                             .on_click(move |_e, _w, cx| {
                                 let store = crate::app_state::AppState::store(cx);
-                                let _ = store.lock().add_snippet("", &cmd_for_save);
+                                let _ = store.lock().add_snippet("", &cmd_for_save, false, None);
                             })
                             .child(
                                 svg()

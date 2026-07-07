@@ -129,6 +129,8 @@ impl CrabportApp {
             target_host: out.target_host,
             target_port: out.target_port,
             created_at: now,
+            favorite: out.favorite,
+            group_id: out.group_id,
         };
         let store = AppState::store(cx);
         match out.editing_id {
@@ -339,7 +341,9 @@ impl CrabportApp {
             match rx.await {
                 Ok(Some((session, manager))) => {
                     let _ = this.update(cx, |app, cx| {
-                        app.app_ctx.tunnels.set_owned(tunnel_id_for_set, session, manager);
+                        app.app_ctx
+                            .tunnels
+                            .set_owned(tunnel_id_for_set, session, manager);
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(
                                 Notification::new(t!("tunnels.notif_start_title").to_string())
@@ -488,7 +492,8 @@ impl CrabportApp {
         // reflects the "running" state and `stop_tunnel` can find the manager.
         // The manager is `Arc`-backed, so the clone held by the registry keeps
         // the tunnels alive even after the spawn task below drops its clone.
-        self.app_ctx.tunnels
+        self.app_ctx
+            .tunnels
             .set_borrowed(tunnel_id, tab_id, manager.clone());
 
         let tunnel_id_for_set = tunnel_id;
@@ -595,6 +600,41 @@ impl CrabportApp {
             let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Toggle the favorite flag on a tunnel config. Persists via the store,
+    /// then reloads tunnel configs into the registry (preserving any live
+    // runtime) so the list re-sorts with favorites floating to the top.
+    pub fn toggle_tunnel_favorite(&mut self, tunnel_id: i64, cx: &mut Context<Self>) {
+        let store = AppState::store(cx);
+        match store.lock().toggle_tunnel_favorite(tunnel_id) {
+            Ok(_) => {
+                let configs = store.lock().tunnels().unwrap_or_default();
+                self.app_ctx.tunnels.set_configs(configs);
+            }
+            Err(e) => {
+                tracing::error!("toggle_tunnel_favorite failed: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Move a tunnel to a different group (`None` = ungrouped). Persists via
+    // the store, then reloads tunnel configs into the registry (preserving
+    // any live runtime) so the grouped list re-renders.
+    pub fn set_tunnel_group(
+        &mut self,
+        tunnel_id: i64,
+        group_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let store = AppState::store(cx);
+        if let Err(e) = store.lock().set_tunnel_group(tunnel_id, group_id) {
+            tracing::error!("set_tunnel_group failed: {e}");
+        }
+        let configs = store.lock().tunnels().unwrap_or_default();
+        self.app_ctx.tunnels.set_configs(configs);
         cx.notify();
     }
 }

@@ -46,6 +46,7 @@ impl CrabportApp {
                     last_login: h.last_login,
                     favorite: h.favorite,
                     proxy_id: h.proxy_id,
+                    group_id: h.group_id,
                 })
                 .collect();
         }
@@ -238,6 +239,10 @@ impl CrabportApp {
         let editing_host_id = h.id;
         let editing_cred_id = h.credential_id;
         let editing_proxy_id = h.proxy_id;
+        // Preserve favorite + group across edits — the form doesn't expose
+        // these, so without capturing them `update_host` would reset them.
+        let editing_favorite = h.favorite;
+        let editing_group_id = h.group_id;
 
         form.editing = true;
 
@@ -337,8 +342,9 @@ impl CrabportApp {
                             ConnectionKind::SSH => CoreHostKind::Ssh,
                         },
                         last_login: None,
-                        favorite: false,
+                        favorite: editing_favorite,
                         proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),
+                        group_id: editing_group_id,
                     };
                     #[cfg(debug_assertions)]
                     tracing::info!(

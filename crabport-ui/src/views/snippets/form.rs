@@ -20,9 +20,13 @@ use gpui_animation::{animation::TransitionExt, transition::general::Linear};
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
+use crabport_core::credential::{GroupEntry, GroupKind};
+
 use crate::app::CrabportApp;
+use crate::app_state::AppState;
 use crate::color::*;
 use crate::components::button::Button;
+use crate::components::dropdown::Dropdown;
 use crate::components::input::StyledInput;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +40,10 @@ pub struct SnippetFormOutput {
     pub editing_id: Option<i64>,
     pub name: String,
     pub command: String,
+    /// Starred by the user to pin it above un-starred snippets.
+    pub favorite: bool,
+    /// FK into the `groups` table. `None` = ungrouped.
+    pub group_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +88,15 @@ pub struct SnippetFormState {
     /// Per-field validation errors. Populated by `validate()` and rendered
     /// via `StyledInput.error(...)` on the relevant fields. Cleared on open.
     pub errors: SnippetValidationErrors,
+    /// Starred flag, edited via a star toggle in the form.
+    pub favorite: bool,
+    /// FK into the `groups` table. `None` = ungrouped. Edited via a group
+    /// dropdown in the form.
+    pub group_id: Option<i64>,
+    /// Open state for the group dropdown. Owned here so the renderer is a
+    /// pure function of the state (mirrors `host_dropdown_open` on the tunnel
+    /// form).
+    pub group_dropdown_open: bool,
     pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     pub on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
 }
@@ -97,6 +114,9 @@ impl SnippetFormState {
             command_focused: false,
             open: false,
             errors: SnippetValidationErrors::default(),
+            favorite: false,
+            group_id: None,
+            group_dropdown_open: false,
             on_close: None,
             on_save: None,
         }
@@ -112,6 +132,7 @@ impl SnippetFormState {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.group_dropdown_open = false;
     }
 
     pub fn is_open(&self) -> bool {
@@ -121,6 +142,9 @@ impl SnippetFormState {
     /// Reset all fields to blank defaults and open the dialog in create mode.
     pub fn open_for_create(&mut self, window: &mut Window, cx: &mut App) {
         self.editing_id = None;
+        self.favorite = false;
+        self.group_id = None;
+        self.group_dropdown_open = false;
         self.name_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.command_input
@@ -135,12 +159,17 @@ impl SnippetFormState {
         id: i64,
         name: &str,
         command: &str,
+        favorite: bool,
+        group_id: Option<i64>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let name = name.to_string();
         let command = command.to_string();
         self.editing_id = Some(id);
+        self.favorite = favorite;
+        self.group_id = group_id;
+        self.group_dropdown_open = false;
         self.name_input
             .update(cx, |state, cx| state.set_value(&name, window, cx));
         self.command_input
@@ -162,6 +191,8 @@ impl SnippetFormState {
             editing_id: self.editing_id,
             name: self.name_text(cx),
             command: self.command_text(cx),
+            favorite: self.favorite,
+            group_id: self.group_id,
         }
     }
 
@@ -201,6 +232,9 @@ pub struct SnippetFormView {
     name_focused: bool,
     command_focused: bool,
     errors: SnippetValidationErrors,
+    favorite: bool,
+    group_id: Option<i64>,
+    group_dropdown_open: bool,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
@@ -216,6 +250,9 @@ impl SnippetFormView {
             name_focused: state.name_focused,
             command_focused: state.command_focused,
             errors: state.errors.clone(),
+            favorite: state.favorite,
+            group_id: state.group_id,
+            group_dropdown_open: state.group_dropdown_open,
             app,
             on_close: state.on_close.clone(),
             on_save: state.on_save.clone(),
@@ -226,6 +263,14 @@ impl SnippetFormView {
 impl RenderOnce for SnippetFormView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let on_close_for_dialog = self.on_close.clone();
+
+        // Load snippet groups from the store so newly-created groups appear
+        // without a round-trip through the app state (mirrors how the tunnel
+        // form receives `hosts` pre-loaded).
+        let groups = AppState::store(_cx)
+            .lock()
+            .groups(GroupKind::Snippet)
+            .unwrap_or_default();
 
         render_overlay(
             self.open,
@@ -238,6 +283,10 @@ impl RenderOnce for SnippetFormView {
                 self.name_focused,
                 self.command_focused,
                 self.errors,
+                self.favorite,
+                self.group_id,
+                self.group_dropdown_open,
+                groups,
                 self.app,
                 on_close_for_dialog,
                 self.on_save,
@@ -294,6 +343,10 @@ fn render_dialog(
     name_focused: bool,
     command_focused: bool,
     errors: SnippetValidationErrors,
+    favorite: bool,
+    group_id: Option<i64>,
+    group_dropdown_open: bool,
+    groups: Vec<GroupEntry>,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
@@ -341,13 +394,27 @@ fn render_dialog(
                 .text_color(rgb(text_primary()))
                 .child(title),
         )
-        // Name
+        // Name (with favorite star toggle inline)
         .child(
-            div().child(
-                StyledInput::new("snippet-edit-name", name_input)
-                    .label(t!("snippets.name").to_string())
-                    .focused(name_focused)
-                    .when_some(errors.name.clone(), |el, e| el.error(e)),
+            div().flex().flex_col().gap_1().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div().child(
+                            StyledInput::new("snippet-edit-name", name_input)
+                                .label(t!("snippets.name").to_string())
+                                .focused(name_focused)
+                                .when_some(errors.name.clone(), |el, e| el.error(e)),
+                        ),
+                    )
+                    .child(render_favorite_toggle(
+                        "snippet-edit-favorite",
+                        favorite,
+                        app.clone(),
+                    )),
             ),
         )
         // Command (multi-line)
@@ -361,6 +428,13 @@ fn render_dialog(
                     .when_some(errors.command.clone(), |el, e| el.error(e)),
             ),
         )
+        // Group dropdown
+        .child(render_group_selector(
+            group_id,
+            group_dropdown_open,
+            groups,
+            app.clone(),
+        ))
         // Buttons
         .child(render_buttons(app, on_close, on_save))
 }
@@ -420,4 +494,107 @@ fn render_buttons(
                     }
                 }),
         )
+}
+
+// ---------------------------------------------------------------------------
+// Favorite toggle + group dropdown
+// ---------------------------------------------------------------------------
+
+/// A clickable star that toggles `form.favorite`. Filled yellow when
+/// `favorite`, muted outline otherwise. Mirrors the star styling used in the
+/// command palette (`icons/star.svg` + `term_yellow()`).
+fn render_favorite_toggle(
+    id: &'static str,
+    favorite: bool,
+    app: Entity<CrabportApp>,
+) -> impl IntoElement {
+    div()
+        .id(ElementId::Name(id.into()))
+        .flex()
+        .items_end()
+        .h_9()
+        .px_2()
+        .cursor_pointer()
+        .rounded_md()
+        .hover(|s| s.bg(rgb(surface_hover())))
+        .child(
+            svg()
+                .path("icons/star.svg")
+                .size_4()
+                .text_color(rgb(if favorite {
+                    term_yellow()
+                } else {
+                    text_muted()
+                })),
+        )
+        .on_click(move |_e, _w, cx| {
+            app.update(cx, |app, cx| {
+                if let Some(ref mut form) = app.snippet_form {
+                    form.favorite = !form.favorite;
+                    cx.notify();
+                }
+            });
+        })
+}
+
+/// Group dropdown. Items = `[connection_form.group_none] ++ groups`. Mirrors
+/// `render_host_selector` in the tunnel form.
+fn render_group_selector(
+    group_id: Option<i64>,
+    dropdown_open: bool,
+    groups: Vec<GroupEntry>,
+    app: Entity<CrabportApp>,
+) -> impl IntoElement {
+    let label_div = div()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_muted()))
+        .child(t!("tunnel_form.group").to_string());
+
+    // Index 0 = "None" (ungrouped); following indices map to groups[i-1].
+    let selected_idx =
+        group_id.and_then(|id| groups.iter().position(|g| g.id == id).map(|i| i + 1));
+
+    let mut dropdown = Dropdown::new("snippet-group-dropdown")
+        .placeholder(t!("tunnel_form.group").to_string())
+        .is_open(dropdown_open)
+        .on_toggle({
+            let app = app.clone();
+            move |_w, cx| {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.snippet_form {
+                        form.group_dropdown_open = !form.group_dropdown_open;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .on_change({
+            let app = app.clone();
+            let groups = groups.clone();
+            move |index, _w, cx| {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.snippet_form {
+                        // index 0 => None; index i (i>0) => groups[i-1].id
+                        form.group_id = if index == 0 {
+                            None
+                        } else {
+                            groups.get(index - 1).map(|g| g.id)
+                        };
+                        form.group_dropdown_open = false;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+
+    dropdown = dropdown.item_with_value(t!("tunnel_form.group_none").to_string(), "");
+    for g in &groups {
+        dropdown = dropdown.item_with_value(g.name.clone(), g.id.to_string());
+    }
+    if let Some(idx) = selected_idx {
+        dropdown = dropdown.selected(idx);
+    }
+
+    label_div.child(dropdown)
 }

@@ -130,6 +130,7 @@ impl CrabportApp {
                         last_login: None,
                         favorite: false,
                         proxy_id,
+                        group_id: None,
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -144,6 +145,7 @@ impl CrabportApp {
                         last_login: None,
                         favorite: false,
                         proxy_id,
+                        group_id: None,
                     });
                     let (private_key_arg, passphrase_arg) = match auth_kind {
                         AuthKind::Password => (None, None),

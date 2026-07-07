@@ -468,6 +468,11 @@ pub struct HostEntry {
     /// `proxies` table. `None` means direct connection.
     #[serde(default)]
     pub proxy_id: Option<i64>,
+    /// User-assigned group id for organizing hosts in the sessions list.
+    /// FK into the `groups` table. `None` means "ungrouped" (shown at the
+    /// top level).
+    #[serde(default)]
+    pub group_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +552,14 @@ pub struct SnippetEntry {
     pub command: String,
     #[serde(default)]
     pub created_at: i64,
+    /// Starred by the user to pin it above un-starred snippets. Stored as
+    /// an INTEGER (0/1) in SQLite.
+    #[serde(default)]
+    pub favorite: bool,
+    /// User-assigned group id for organizing snippets. FK into the `groups`
+    /// table. `None` means "ungrouped" (shown at the top level).
+    #[serde(default)]
+    pub group_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +632,64 @@ pub struct TunnelEntry {
     /// Local/Remote only: the target port. 0 for Dynamic.
     #[serde(default)]
     pub target_port: u16,
+    #[serde(default)]
+    pub created_at: i64,
+    /// Starred by the user to pin it above un-starred tunnels. Stored as
+    /// an INTEGER (0/1) in SQLite.
+    #[serde(default)]
+    pub favorite: bool,
+    /// User-assigned group id for organizing tunnels. FK into the `groups`
+    /// table. `None` means "ungrouped" (shown at the top level).
+    #[serde(default)]
+    pub group_id: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Group
+// ---------------------------------------------------------------------------
+
+/// Which collection a group organizes. The `groups` table is shared across
+/// all three collections (hosts / snippets / tunnels) so this discriminates
+/// which list a group belongs to — a "Production" host group is distinct
+/// from a "Production" snippet group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupKind {
+    #[default]
+    Host,
+    Snippet,
+    Tunnel,
+}
+
+impl GroupKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupKind::Host => "host",
+            GroupKind::Snippet => "snippet",
+            GroupKind::Tunnel => "tunnel",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "snippet" => GroupKind::Snippet,
+            "tunnel" => GroupKind::Tunnel,
+            _ => GroupKind::Host,
+        }
+    }
+}
+
+/// A user-created group for organizing hosts / snippets / tunnels in their
+/// respective management views. `kind` scopes the group to one collection so
+/// the same name can be reused across collections without collision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroupEntry {
+    pub id: i64,
+    pub name: String,
+    /// Which collection this group belongs to (see [`GroupKind`]).
+    pub kind: GroupKind,
+    /// Display ordering within a collection's group list. Lower sorts first.
+    #[serde(default)]
+    pub sort_order: i64,
     #[serde(default)]
     pub created_at: i64,
 }

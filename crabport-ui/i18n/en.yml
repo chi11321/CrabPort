@@ -54,6 +54,8 @@ connection_form:
   error_proxy_url_required: "Proxy URL is required"
   validation_title: "Missing required fields"
   validation_message: "Please fill in the highlighted fields before submitting."
+  group: "Group"
+  group_none: "None"
 sessions:
   new_button: "New"
   empty: "No saved sessions. Click '+ New' to create one."
@@ -95,6 +97,12 @@ tunnels:
   # --- Panel (borrowed tunnels) ---
   panel_empty: "No tunnels"
   panel_hint: "Double-click to start · right-click to stop"
+  favorite: "Favorite"
+  unfavorite: "Unfavorite"
+  move_to_group: "Move to Group"
+  new_group: "New Group…"
+  manage_groups: "Manage Groups"
+  ungrouped: "Ungrouped"
 tunnel_form:
   title_new: "New Tunnel"
   title_edit: "Edit Tunnel"
@@ -121,6 +129,9 @@ tunnel_form:
   error_port_invalid: "Port must be a number between 1 and 65535"
   validation_title: "Missing required fields"
   validation_message: "Please fill in the highlighted fields before submitting."
+  group: "Group"
+  group_none: "None"
+  favorite: "Favorite"
 terminal:
   reconnect: "Reconnect"
   host_key_unknown: "Unknown Host Key"
@@ -176,6 +187,15 @@ hosts:
   notif_saved_msg: 'Host "%{name}" was saved.'
   notif_save_failed_title: "Host save failed"
   notif_save_failed_msg: 'Saving host "%{name}" failed.'
+  favorite: "Favorite"
+  unfavorite: "Unfavorite"
+  move_to_group: "Move to Group"
+  new_group: "New Group…"
+  manage_groups: "Manage Groups"
+  rename_group: "Rename Group"
+  delete_group: "Delete Group"
+  delete_group_prompt: 'Delete group "%{name}"? Its members become ungrouped.'
+  ungrouped: "Ungrouped"
 snippets:
   new_button: "New"
   empty: "No saved snippets. Save commands from the History panel."
@@ -197,6 +217,22 @@ snippets:
   notif_updated_msg: 'Snippet "%{name}" was updated.'
   notif_save_failed_title: "Snippet save failed"
   notif_save_failed_msg: 'Saving snippet "%{name}" failed.'
+  favorite: "Favorite"
+  unfavorite: "Unfavorite"
+  move_to_group: "Move to Group"
+  new_group: "New Group…"
+  manage_groups: "Manage Groups"
+  ungrouped: "Ungrouped"
+groups:
+  new_title: "New Group"
+  rename_title: "Rename Group"
+  name: "Group Name"
+  save: "Save"
+  cancel: "Cancel"
+  error_name_required: "Group name is required"
+  manage_title: "Manage Groups"
+  empty: "No groups yet."
+  member_count: "%{count} items"
 window:
   about:
     title: "About CrabPort"
