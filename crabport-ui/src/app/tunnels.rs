@@ -604,14 +604,14 @@ impl CrabportApp {
     }
 
     /// Toggle the favorite flag on a tunnel config. Persists via the store,
-    /// then reloads tunnel configs into the registry (preserving any live
-    // runtime) so the list re-sorts with favorites floating to the top.
+    /// then mirrors the change into the registry in place (preserving any
+    /// live runtime) so the list re-sorts with favorites floating to the top
+    /// — without rebuilding the whole registry list.
     pub fn toggle_tunnel_favorite(&mut self, tunnel_id: i64, cx: &mut Context<Self>) {
         let store = AppState::store(cx);
         match store.lock().toggle_tunnel_favorite(tunnel_id) {
-            Ok(_) => {
-                let configs = store.lock().tunnels().unwrap_or_default();
-                self.app_ctx.tunnels.set_configs(configs);
+            Ok(new_val) => {
+                self.app_ctx.tunnels.set_favorite(tunnel_id, new_val);
             }
             Err(e) => {
                 tracing::error!("toggle_tunnel_favorite failed: {e}");
@@ -621,8 +621,7 @@ impl CrabportApp {
     }
 
     /// Move a tunnel to a different group (`None` = ungrouped). Persists via
-    // the store, then reloads tunnel configs into the registry (preserving
-    // any live runtime) so the grouped list re-renders.
+    /// the store, then mirrors into the registry in place.
     pub fn set_tunnel_group(
         &mut self,
         tunnel_id: i64,
@@ -633,8 +632,7 @@ impl CrabportApp {
         if let Err(e) = store.lock().set_tunnel_group(tunnel_id, group_id) {
             tracing::error!("set_tunnel_group failed: {e}");
         }
-        let configs = store.lock().tunnels().unwrap_or_default();
-        self.app_ctx.tunnels.set_configs(configs);
+        self.app_ctx.tunnels.set_group(tunnel_id, group_id);
         cx.notify();
     }
 }

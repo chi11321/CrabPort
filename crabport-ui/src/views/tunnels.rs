@@ -674,7 +674,8 @@ fn tunnel_row(
                                 on_start(w, cx);
                             }
                         })
-                    };
+                    }
+                    .divider_after();
 
                     // Favorite toggle.
                     let favorite_label = if tunnel_favorite {
@@ -689,10 +690,24 @@ fn tunnel_row(
                                 app.toggle_tunnel_favorite(tunnel_id, cx);
                             });
                         }
-                    });
+                    })
+                    .divider_after();
 
-                    // Move-to-group: flat list of groups + Ungrouped + New Group.
+                    // Move-to-Group section (mirrors snippet ctxmenu):
+                    // disabled header, Ungrouped, one per group, New Group…
                     let mut move_items: Vec<ContextMenuItem> = Vec::new();
+                    move_items.push(
+                        ContextMenuItem::new(t!("tunnels.move_to_group").to_string(), |_, _| {})
+                            .disabled(true),
+                    );
+                    move_items.push(ContextMenuItem::new(t!("tunnels.ungrouped").to_string(), {
+                        let app = app.clone();
+                        move |_w, cx| {
+                            app.update(cx, |app, cx| {
+                                app.set_tunnel_group(tunnel_id, None, cx);
+                            });
+                        }
+                    }));
                     for g in &groups {
                         let gid = g.id;
                         let name = g.name.clone();
@@ -703,31 +718,20 @@ fn tunnel_row(
                             });
                         }));
                     }
-                    move_items.push(ContextMenuItem::new(t!("tunnels.ungrouped").to_string(), {
-                        let app = app.clone();
-                        move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.set_tunnel_group(tunnel_id, None, cx);
-                            });
-                        }
-                    }));
-                    move_items.push(ContextMenuItem::new(t!("tunnels.new_group").to_string(), {
-                        let app = app.clone();
-                        move |_w, cx| {
-                            app.update(cx, |app, cx| {
-                                app.open_group_form_for_create(GroupKind::Tunnel, cx);
-                            });
-                        }
-                    }));
+                    move_items.push(
+                        ContextMenuItem::new(t!("tunnels.new_group").to_string(), {
+                            let app = app.clone();
+                            move |_w, cx| {
+                                app.update(cx, |app, cx| {
+                                    app.open_group_form_for_create(GroupKind::Tunnel, cx);
+                                });
+                            }
+                        })
+                        .divider_after(),
+                    );
 
-                    let mut items = vec![favorite_item];
-                    // Mark the last move item with a divider so the
-                    // Start/Stop/Edit/Delete group is visually separated.
-                    if let Some(last) = move_items.last_mut() {
-                        *last = last.clone().divider_after();
-                    }
+                    let mut items = vec![toggle_item, favorite_item];
                     items.extend(move_items);
-                    items.push(toggle_item);
                     items.push(ContextMenuItem::new(t!("tunnels.edit").to_string(), {
                         let on_edit = on_edit.clone();
                         move |w, cx| {
@@ -904,11 +908,8 @@ fn tunnel_row(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .size_5()
                         .cursor_pointer()
-                        .rounded_md()
-                        .hover(|s| s.bg(rgb(surface_hover())))
-                        .child(svg().path("icons/star.svg").size_3().text_color(rgb(
+                        .child(svg().path("icons/star.svg").size_4().text_color(rgb(
                             if tunnel_favorite {
                                 term_yellow()
                             } else {

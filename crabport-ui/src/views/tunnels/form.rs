@@ -373,8 +373,6 @@ pub struct TunnelFormView {
     target_port_focused: bool,
     errors: TunnelValidationErrors,
     app: Entity<CrabportApp>,
-    /// Starred flag, snapshot from `TunnelFormState::favorite`.
-    favorite: bool,
     /// FK into the `groups` table. `None` = ungrouped. Snapshot from
     // `TunnelFormState::group_id`.
     group_id: Option<i64>,
@@ -416,7 +414,6 @@ impl TunnelFormView {
             target_port_focused: state.target_port_focused,
             errors: state.errors.clone(),
             app,
-            favorite: state.favorite,
             group_id: state.group_id,
             groups,
             on_close: state.on_close.clone(),
@@ -451,7 +448,6 @@ impl RenderOnce for TunnelFormView {
                 self.target_host_focused,
                 self.target_port_focused,
                 self.errors,
-                self.favorite,
                 self.group_id,
                 self.groups,
                 self.app,
@@ -521,7 +517,6 @@ fn render_dialog(
     target_host_focused: bool,
     target_port_focused: bool,
     errors: TunnelValidationErrors,
-    favorite: bool,
     group_id: Option<i64>,
     groups: Vec<GroupEntry>,
     app: Entity<CrabportApp>,
@@ -599,63 +594,11 @@ fn render_dialog(
                 .text_color(rgb(text_primary()))
                 .child(title),
         )
-        // Name + favorite toggle (star button next to the label).
+        // Name
         .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_end()
-                .gap_2()
-                .child(
-                    div().flex_1().child(
-                        StyledInput::new("tunnel-name", name_input)
-                            .label(t!("tunnel_form.name").to_string())
-                            .focused(name_focused),
-                    ),
-                )
-                .child(
-                    div()
-                        .id(ElementId::Name("tunnel-form-favorite".into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .h_9()
-                        .px_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(bg_base()))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(surface_hover())))
-                        .on_click({
-                            let app = app.clone();
-                            move |_e, _w, cx| {
-                                app.update(cx, |app, cx| {
-                                    if let Some(ref mut form) = app.tunnel_form {
-                                        form.favorite = !form.favorite;
-                                        cx.notify();
-                                    }
-                                });
-                            }
-                        })
-                        .child(
-                            svg()
-                                .path("icons/star.svg")
-                                .size_3()
-                                .text_color(rgb(if favorite {
-                                    term_yellow()
-                                } else {
-                                    text_muted()
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(text_muted()))
-                                .child(t!("tunnel_form.favorite").to_string()),
-                        ),
-                ),
+            StyledInput::new("tunnel-name", name_input)
+                .label(t!("tunnel_form.name").to_string())
+                .focused(name_focused),
         )
         // Host selector (dropdown of saved hosts, or a hint if none).
         .child(render_host_selector(

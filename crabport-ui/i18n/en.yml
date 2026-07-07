@@ -180,6 +180,7 @@ sftp:
 hosts:
   edit: "Edit"
   delete: "Delete"
+  connect: "Connect"
   delete_title: "Delete Host"
   delete_prompt: 'Are you sure you want to delete "%{name}"? This cannot be undone.'
   delete_confirm: "Delete"

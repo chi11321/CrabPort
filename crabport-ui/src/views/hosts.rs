@@ -137,6 +137,11 @@ impl Render for HostsView {
         let context_menu = self.context_menu.clone();
         let alert_controller = self.alert_controller.clone();
         let hovered_host_id = self.hovered_host_id;
+        // Load host groups once for the list (group headers + ctxmenu).
+        let groups = crate::app_state::AppState::store(_cx)
+            .lock()
+            .groups(crabport_core::credential::GroupKind::Host)
+            .unwrap_or_default();
 
         // If the global context menu is no longer active, clear the
         // "menu-triggering row" highlight. We do this in render (read-only
@@ -227,11 +232,8 @@ impl Render for HostsView {
                                     context_menu,
                                     alert_controller,
                                     app.clone(),
-                                    move |w, cx| {
-                                        if let Some(ref cb) = on_connect {
-                                            cb(host.id, w, cx);
-                                        }
-                                    },
+                                    groups.clone(),
+                                    on_connect.clone(),
                                     move |w, cx| {
                                         if let Some(ref cb) = on_edit {
                                             cb(host.id, w, cx);
@@ -268,7 +270,8 @@ fn host_row(
     context_menu: Option<Entity<ContextMenuController>>,
     alert_controller: Option<Entity<AlertController>>,
     app: Entity<CrabportApp>,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
+    groups: Vec<crabport_core::credential::GroupEntry>,
+    on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -279,6 +282,9 @@ fn host_row(
     let host_name = host.name.clone();
     let host_favorite = host.favorite;
     let is_highlighted = is_hovered || force_highlight;
+
+    let on_connect_for_dblclick = on_connect.clone();
+    let host_id_for_dblclick = host_id;
 
     div()
         .id(row_id.clone())
@@ -292,21 +298,26 @@ fn host_row(
         .bg(rgb(bg_base()))
         .on_double_click(move |_, w, cx| {
             gpui_animation::reset_transition(&row_id_clone);
-            on_click(w, cx);
+            if let Some(ref cb) = on_connect_for_dblclick {
+                cb(host_id_for_dblclick, w, cx);
+            }
         })
-        // Right-click context menu: "Edit" + "Delete". Also record which
-        // row triggered the menu so it stays highlighted while the menu is
-        // open.
+        // Right-click context menu: Connect, Favorite, Move-to-Group,
+        // Edit, Delete. Also record which row triggered the menu so it
+        // stays highlighted while the menu is open.
         .on_mouse_down(MouseButton::Right, {
             let on_edit = Rc::new(on_edit);
             let on_remove = Rc::new(on_remove);
             let entity = entity.clone();
+            let on_connect = on_connect.clone();
+            let app = app.clone();
+            let groups = groups.clone();
             move |event, _w, cx| {
                 let Some(ref cm) = context_menu else {
                     return;
                 };
                 // Mark this row as the menu-triggering row so it keeps the
-                // hover background while the overlay is up.
+                // hover background while the menu is up.
                 let _ = entity.update(cx, |view, cx| {
                     view.context_menu_host_id = Some(host_id);
                     cx.notify();
@@ -314,59 +325,138 @@ fn host_row(
                 let pos = event.position;
                 let on_edit = on_edit.clone();
                 let on_remove = on_remove.clone();
+                let on_connect = on_connect.clone();
+                let app_for_menu = app.clone();
+                let groups_for_menu = groups.clone();
+                let host_favorite_for_menu = host_favorite;
                 cm.update(cx, |c, cx| {
+                    let mut items: Vec<ContextMenuItem> = Vec::new();
+
+                    // Connect
+                    items.push(
+                        ContextMenuItem::new(t!("hosts.connect").to_string(), {
+                            let on_connect = on_connect.clone();
+                            move |w, cx| {
+                                if let Some(ref cb) = on_connect {
+                                    cb(host_id, w, cx);
+                                }
+                            }
+                        })
+                        .divider_after(),
+                    );
+
+                    // Favorite toggle
+                    let favorite_label = if host_favorite_for_menu {
+                        t!("hosts.unfavorite").to_string()
+                    } else {
+                        t!("hosts.favorite").to_string()
+                    };
+                    items.push(
+                        ContextMenuItem::new(favorite_label, {
+                            let app = app_for_menu.clone();
+                            move |_w, cx| {
+                                app.update(cx, |app, cx| {
+                                    app.toggle_host_favorite(host_id, cx);
+                                });
+                            }
+                        })
+                        .divider_after(),
+                    );
+
+                    // Move-to-Group section (mirrors snippet ctxmenu):
+                    // disabled header, Ungrouped, one per group, New Group…
+                    items.push(
+                        ContextMenuItem::new(t!("hosts.move_to_group").to_string(), |_, _| {})
+                            .disabled(true),
+                    );
+                    items.push(ContextMenuItem::new(t!("hosts.ungrouped").to_string(), {
+                        let app = app_for_menu.clone();
+                        move |_w, cx| {
+                            app.update(cx, |app, cx| {
+                                app.set_host_group(host_id, None, cx);
+                            });
+                        }
+                    }));
+                    for g in &groups_for_menu {
+                        let gid = g.id;
+                        let name = g.name.clone();
+                        let app = app_for_menu.clone();
+                        items.push(ContextMenuItem::new(name, move |_w, cx| {
+                            app.update(cx, |app, cx| {
+                                app.set_host_group(host_id, Some(gid), cx);
+                            });
+                        }));
+                    }
+                    items.push(
+                        ContextMenuItem::new(t!("hosts.new_group").to_string(), {
+                            let app = app_for_menu.clone();
+                            move |_w, cx| {
+                                app.update(cx, |app, cx| {
+                                    app.open_group_form_for_create(
+                                        crabport_core::credential::GroupKind::Host,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .divider_after(),
+                    );
+
+                    // Edit
+                    items.push(ContextMenuItem::new(t!("hosts.edit").to_string(), {
+                        let on_edit = on_edit.clone();
+                        move |w, cx| {
+                            on_edit(w, cx);
+                        }
+                    }));
+
+                    // Delete (with confirmation)
+                    items.push(
+                        ContextMenuItem::new(t!("hosts.delete").to_string(), {
+                            let on_remove = on_remove.clone();
+                            let alert_controller = alert_controller.clone();
+                            let host_name = host_name.clone();
+                            move |_w, cx| {
+                                let Some(ref ac) = alert_controller else {
+                                    return;
+                                };
+                                let on_remove = on_remove.clone();
+                                ac.update(cx, |c, cx| {
+                                    c.show(
+                                        AlertState {
+                                            severity: AlertSeverity::Danger,
+                                            title: t!("hosts.delete_title").to_string().into(),
+                                            description: Some(
+                                                t!(
+                                                    "hosts.delete_prompt",
+                                                    name = host_name.as_str()
+                                                )
+                                                .to_string()
+                                                .into(),
+                                            ),
+                                            confirm_label: t!("hosts.delete_confirm")
+                                                .to_string()
+                                                .into(),
+                                            cancel_label: t!("terminal.host_key_cancel")
+                                                .to_string()
+                                                .into(),
+                                            on_confirm: Some(Rc::new(move |w, cx| {
+                                                on_remove(w, cx);
+                                            })),
+                                            ..AlertState::default()
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .danger(true),
+                    );
+
                     c.show(
                         ContextMenuState {
                             position: pos,
-                            items: vec![
-                                ContextMenuItem::new(t!("hosts.edit").to_string(), {
-                                    let on_edit = on_edit.clone();
-                                    move |w, cx| {
-                                        on_edit(w, cx);
-                                    }
-                                }),
-                                ContextMenuItem::new(t!("hosts.delete").to_string(), {
-                                    let on_remove = on_remove.clone();
-                                    let alert_controller = alert_controller.clone();
-                                    let host_name = host_name.clone();
-                                    move |_w, cx| {
-                                        let Some(ref ac) = alert_controller else {
-                                            return;
-                                        };
-                                        let on_remove = on_remove.clone();
-                                        ac.update(cx, |c, cx| {
-                                            c.show(
-                                                AlertState {
-                                                    severity: AlertSeverity::Danger,
-                                                    title: t!("hosts.delete_title")
-                                                        .to_string()
-                                                        .into(),
-                                                    description: Some(
-                                                        t!(
-                                                            "hosts.delete_prompt",
-                                                            name = host_name.as_str()
-                                                        )
-                                                        .to_string()
-                                                        .into(),
-                                                    ),
-                                                    confirm_label: t!("hosts.delete_confirm")
-                                                        .to_string()
-                                                        .into(),
-                                                    cancel_label: t!("terminal.host_key_cancel")
-                                                        .to_string()
-                                                        .into(),
-                                                    on_confirm: Some(Rc::new(move |w, cx| {
-                                                        on_remove(w, cx);
-                                                    })),
-                                                    ..AlertState::default()
-                                                },
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                })
-                                .danger(true),
-                            ],
+                            items,
                             ..ContextMenuState::default()
                         },
                         cx,
@@ -427,14 +517,11 @@ fn host_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .size_5()
                 .cursor_pointer()
-                .rounded_md()
-                .hover(|s| s.bg(rgb(surface_hover())))
                 .child(
                     svg()
                         .path("icons/star.svg")
-                        .size_3()
+                        .size_4()
                         .text_color(rgb(if host_favorite {
                             term_yellow()
                         } else {

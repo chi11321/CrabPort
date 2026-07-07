@@ -130,6 +130,25 @@ impl TunnelRegistry {
         }
     }
 
+    /// Toggle the favorite flag on a config in place (preserving runtime
+    /// state). Cheaper than `set_configs` for a single-field change and
+    /// avoids reallocating the whole list.
+    pub fn set_favorite(&self, id: i64, favorite: bool) {
+        let mut tunnels = self.tunnels.lock();
+        if let Some(t) = tunnels.iter_mut().find(|t| t.config.id == id) {
+            t.config.favorite = favorite;
+        }
+    }
+
+    /// Move a config to a different group in place (preserving runtime
+    /// state).
+    pub fn set_group(&self, id: i64, group_id: Option<i64>) {
+        let mut tunnels = self.tunnels.lock();
+        if let Some(t) = tunnels.iter_mut().find(|t| t.config.id == id) {
+            t.config.group_id = group_id;
+        }
+    }
+
     /// Remove a tunnel config + stop its runtime if any.
     pub async fn remove(&self, id: i64) {
         let removed = self

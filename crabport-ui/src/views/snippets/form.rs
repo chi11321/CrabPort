@@ -232,7 +232,6 @@ pub struct SnippetFormView {
     name_focused: bool,
     command_focused: bool,
     errors: SnippetValidationErrors,
-    favorite: bool,
     group_id: Option<i64>,
     group_dropdown_open: bool,
     app: Entity<CrabportApp>,
@@ -250,7 +249,6 @@ impl SnippetFormView {
             name_focused: state.name_focused,
             command_focused: state.command_focused,
             errors: state.errors.clone(),
-            favorite: state.favorite,
             group_id: state.group_id,
             group_dropdown_open: state.group_dropdown_open,
             app,
@@ -283,7 +281,6 @@ impl RenderOnce for SnippetFormView {
                 self.name_focused,
                 self.command_focused,
                 self.errors,
-                self.favorite,
                 self.group_id,
                 self.group_dropdown_open,
                 groups,
@@ -343,7 +340,6 @@ fn render_dialog(
     name_focused: bool,
     command_focused: bool,
     errors: SnippetValidationErrors,
-    favorite: bool,
     group_id: Option<i64>,
     group_dropdown_open: bool,
     groups: Vec<GroupEntry>,
@@ -394,28 +390,12 @@ fn render_dialog(
                 .text_color(rgb(text_primary()))
                 .child(title),
         )
-        // Name (with favorite star toggle inline)
+        // Name
         .child(
-            div().flex().flex_col().gap_1().child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div().child(
-                            StyledInput::new("snippet-edit-name", name_input)
-                                .label(t!("snippets.name").to_string())
-                                .focused(name_focused)
-                                .when_some(errors.name.clone(), |el, e| el.error(e)),
-                        ),
-                    )
-                    .child(render_favorite_toggle(
-                        "snippet-edit-favorite",
-                        favorite,
-                        app.clone(),
-                    )),
-            ),
+            StyledInput::new("snippet-edit-name", name_input)
+                .label(t!("snippets.name").to_string())
+                .focused(name_focused)
+                .when_some(errors.name.clone(), |el, e| el.error(e)),
         )
         // Command (multi-line)
         .child(
@@ -497,45 +477,8 @@ fn render_buttons(
 }
 
 // ---------------------------------------------------------------------------
-// Favorite toggle + group dropdown
+// Group dropdown
 // ---------------------------------------------------------------------------
-
-/// A clickable star that toggles `form.favorite`. Filled yellow when
-/// `favorite`, muted outline otherwise. Mirrors the star styling used in the
-/// command palette (`icons/star.svg` + `term_yellow()`).
-fn render_favorite_toggle(
-    id: &'static str,
-    favorite: bool,
-    app: Entity<CrabportApp>,
-) -> impl IntoElement {
-    div()
-        .id(ElementId::Name(id.into()))
-        .flex()
-        .items_end()
-        .h_9()
-        .px_2()
-        .cursor_pointer()
-        .rounded_md()
-        .hover(|s| s.bg(rgb(surface_hover())))
-        .child(
-            svg()
-                .path("icons/star.svg")
-                .size_4()
-                .text_color(rgb(if favorite {
-                    term_yellow()
-                } else {
-                    text_muted()
-                })),
-        )
-        .on_click(move |_e, _w, cx| {
-            app.update(cx, |app, cx| {
-                if let Some(ref mut form) = app.snippet_form {
-                    form.favorite = !form.favorite;
-                    cx.notify();
-                }
-            });
-        })
-}
 
 /// Group dropdown. Items = `[connection_form.group_none] ++ groups`. Mirrors
 /// `render_host_selector` in the tunnel form.

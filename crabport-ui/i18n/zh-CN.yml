@@ -179,6 +179,7 @@ sftp:
 hosts:
   edit: "编辑"
   delete: "删除"
+  connect: "连接"
   delete_title: "删除主机"
   delete_prompt: "确定要删除「%{name}」吗？此操作无法撤销。"
   delete_confirm: "删除"

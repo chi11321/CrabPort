@@ -461,14 +461,11 @@ fn snippet_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .size_5()
                 .cursor_pointer()
-                .rounded_md()
-                .hover(|s| s.bg(rgb(surface_hover())))
                 .child(
                     svg()
                         .path("icons/star.svg")
-                        .size_3()
+                        .size_4()
                         .text_color(rgb(if is_favorite {
                             term_yellow()
                         } else {
@@ -523,7 +520,6 @@ fn build_snippet_context_menu(
                 });
             },
         )
-        .with_icon("icons/star.svg")
         .divider_after(),
     );
 
