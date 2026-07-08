@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::color::*;
-use crate::views::hosts::ConnectionHost;
+use crate::views::sessions::ConnectionHost;
 
 // ---------------------------------------------------------------------------
 // Connection type

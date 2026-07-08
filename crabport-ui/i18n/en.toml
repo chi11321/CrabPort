@@ -109,6 +109,9 @@ unfavorite = "Unfavorite"
 move_to_group = "Move to Group"
 new_group = "New Group…"
 manage_groups = "Manage Groups"
+rename_group = "Rename Group"
+delete_group = "Delete Group"
+delete_group_prompt = 'Delete group "%{name}"? Its members become ungrouped.'
 ungrouped = "Ungrouped"
 
 [tunnel_form]
@@ -236,6 +239,9 @@ unfavorite = "Unfavorite"
 move_to_group = "Move to Group"
 new_group = "New Group…"
 manage_groups = "Manage Groups"
+rename_group = "Rename Group"
+delete_group = "Delete Group"
+delete_group_prompt = 'Delete group "%{name}"? Its members become ungrouped.'
 ungrouped = "Ungrouped"
 
 [groups]
@@ -251,6 +257,7 @@ member_count = "%{count} items"
 search_placeholder = "Search…"
 create = 'Create "%{name}"'
 no_results = "No matching groups"
+favorites = "Favorites"
 
 [window.about]
 title = "About CrabPort"

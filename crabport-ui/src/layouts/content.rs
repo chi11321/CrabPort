@@ -11,7 +11,7 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
-use crate::views::hosts::{ConnectionFormState, ConnectionHost};
+use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::panel::PanelKind;
 use crate::views::terminal::TerminalView;
 
@@ -43,7 +43,7 @@ pub fn render_content(
     let snippets_panel = &ctx.snippets_panel;
     let history_panel = &ctx.history_panel;
     let tunnels_panel = &ctx.tunnels_panel;
-    let hosts_view = &ctx.hosts_view;
+    let sessions_view = &ctx.sessions_view;
     let snippets_view = &ctx.snippets_view;
     let tunnels_view = &ctx.tunnels_view;
     let context_menu = &ctx.context_menu;
@@ -104,7 +104,7 @@ pub fn render_content(
                     let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
                     let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
 
-                    hosts_view.update(cx, |view, cx| {
+                    sessions_view.update(cx, |view, cx| {
                         view.set_state(
                             hosts.to_vec(),
                             form_entity.cloned(),
@@ -118,7 +118,7 @@ pub fn render_content(
                         );
                     });
 
-                    hosts_view.clone().into_any_element()
+                    sessions_view.clone().into_any_element()
                 }
                 SidebarItem::Tunnels => {
                     let app_handle = handle.clone();

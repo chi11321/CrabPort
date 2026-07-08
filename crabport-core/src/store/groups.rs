@@ -27,8 +27,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, kind, sort_order, created_at FROM groups \
-                 WHERE kind = ?1 ORDER BY sort_order ASC, id ASC",
+                "SELECT id, name, kind, sort_order, created_at, favorite FROM groups \n                 WHERE kind = ?1 ORDER BY favorite DESC, sort_order ASC, id ASC",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
         let rows = stmt
@@ -40,6 +39,7 @@ impl Store {
                     kind: GroupKind::from_str(&kind_str),
                     sort_order: row.get(3)?,
                     created_at: row.get(4)?,
+                    favorite: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -54,7 +54,7 @@ impl Store {
     pub fn find_group(&self, id: i64) -> Result<Option<GroupEntry>, StoreError> {
         self.db
             .query_row(
-                "SELECT id, name, kind, sort_order, created_at FROM groups WHERE id = ?1",
+                "SELECT id, name, kind, sort_order, created_at, favorite FROM groups WHERE id = ?1",
                 params![id],
                 |row| {
                     let kind_str: String = row.get(2)?;
@@ -64,6 +64,7 @@ impl Store {
                         kind: GroupKind::from_str(&kind_str),
                         sort_order: row.get(3)?,
                         created_at: row.get(4)?,
+                        favorite: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -97,7 +98,7 @@ impl Store {
         };
         self.db
             .execute(
-                "INSERT INTO groups (name, kind, sort_order, created_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO groups (name, kind, sort_order, created_at, favorite) VALUES (?1, ?2, ?3, ?4, 0)",
                 params![name, kind.as_str(), sort_order, now],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -129,6 +130,18 @@ impl Store {
                     .map_err(|e| StoreError::Db(e.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    /// Toggle the favorite flag for a group. Favorite groups sort above
+    /// non-favorite groups within the same kind.
+    pub fn toggle_group_favorite(&self, id: i64) -> Result<(), StoreError> {
+        self.db
+            .execute(
+                "UPDATE groups SET favorite = CASE WHEN favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
         Ok(())
     }
 

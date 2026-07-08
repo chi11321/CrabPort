@@ -327,8 +327,18 @@ impl Store {
                 .map_err(|e| StoreError::Db(e.to_string()))?;
         }
 
+        // Migration 10: group favorites.
+        //
+        // Adds a `favorite` column to `groups` so an entire group can be
+        // starred and pinned above non-starred groups within the same kind.
+        if current < 10 {
+            self.db
+                .execute_batch("ALTER TABLE groups ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;")
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+        }
+
         // Record the latest migration version
-        let latest = 9;
+        let latest = 10;
         if current < latest {
             self.db
                 .execute(

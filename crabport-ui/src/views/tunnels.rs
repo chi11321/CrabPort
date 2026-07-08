@@ -1,7 +1,7 @@
 //! Tunnels management view — the full-page sidebar view for managing saved
 //! SSH port-forwarding tunnels (Local / Remote / Dynamic).
 //!
-//! Mirrors [`crate::views::hosts::HostsView`] in structure: a header with a
+//! Mirrors [`crate::views::sessions::SessionsView`] in structure: a header with a
 //! "New" button, a scrollable list of rows with hover-fade action buttons,
 //! and a right-click context menu (Start/Stop, Edit, Delete) plus an alert
 //! confirmation dialog for delete.
@@ -28,7 +28,10 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::{
+    animation::TransitionExt,
+    transition::general::{EaseInOutQuad, Linear},
+};
 use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 
@@ -38,9 +41,15 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
-use crate::views::hosts::ConnectionHost;
+use crate::components::group_header::group_header;
+use crate::views::sessions::ConnectionHost;
+use gpui_component::input::InputState;
 
 use crabport_core::credential::{GroupEntry, GroupKind, TunnelKind};
+
+/// Sentinel id used for the virtual "Favorites" group in collapse state.
+/// Uses `i64::MAX` so it can never collide with a real group id.
+const FAVORITES_GROUP_ID: i64 = i64::MAX;
 
 /// Color accents for the kind badge (subtle tint, not the full primary
 /// blue). Read live from the theme so a preset switch recolors the
@@ -65,16 +74,19 @@ fn status_stopped_color() -> u32 {
 /// fade in with easing when the row is hovered — without polluting
 /// `CrabportApp` state.
 pub struct TunnelsView {
-    /// The tunnel row currently being hovered, if any.
-    hovered_tunnel_id: Option<i64>,
+    /// The tunnel row currently being hovered, if any. Keyed by
+    /// `(id, is_favorite_copy)` so the favorites copy of an item and its
+    /// real-group copy don't share hover state (they'd otherwise
+    /// cross-highlight because both match the same id).
+    hovered_tunnel_id: Option<(i64, bool)>,
     /// The tunnel row that triggered the currently-open context menu, if any.
     /// While set, that row stays highlighted in the hover color even though
     /// the mouse has moved to the overlay.
-    context_menu_tunnel_id: Option<i64>,
+    context_menu_tunnel_id: Option<(i64, bool)>,
     // External data pushed in before each render.
     tunnels: Vec<TunnelView>,
     hosts: Vec<ConnectionHost>,
-    /// Held for the context-menu/alert wiring (mirrors `HostsView`). Not yet
+    /// Held for the context-menu/alert wiring (mirrors `SessionsView`). Not yet
     /// read inside render — kept so future versions can reach the app entity
     /// without changing the public API.
     #[allow(dead_code)]
@@ -91,7 +103,7 @@ pub struct TunnelsView {
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     // The tunnel form dialog state, pushed in before each render. When
     // `Some` and `is_open()`, the view renders the `TunnelFormView` overlay
-    // on top of the list — mirroring how `HostsView` renders
+    // on top of the list — mirroring how `SessionsView` renders
     // `ConnectionFormView`.
     form_state: Option<TunnelFormState>,
     /// Per-render snapshot of tunnel groups (loaded from the store in
@@ -101,6 +113,10 @@ pub struct TunnelsView {
     /// Collapsed group ids (collapsible group headers). Ungrouped tunnels
     // are always shown.
     collapsed_groups: HashSet<i64>,
+    /// The group id currently being renamed inline, if any.
+    renaming_group_id: Option<i64>,
+    /// `InputState` backing the inline group-rename editor.
+    rename_input: Option<Entity<InputState>>,
 }
 
 impl TunnelsView {
@@ -121,6 +137,8 @@ impl TunnelsView {
             form_state: None,
             groups: Vec::new(),
             collapsed_groups: HashSet::new(),
+            renaming_group_id: None,
+            rename_input: None,
         }
     }
 
@@ -140,7 +158,7 @@ impl TunnelsView {
         cx: &mut Context<Self>,
     ) {
         // Clear stale hover if the tunnel disappeared.
-        if let Some(id) = self.hovered_tunnel_id
+        if let Some((id, _)) = self.hovered_tunnel_id
             && !tunnels.iter().any(|t| t.id == id)
         {
             self.hovered_tunnel_id = None;
@@ -160,6 +178,80 @@ impl TunnelsView {
         // loop. The TunnelsView re-renders naturally because its parent
         // (CrabportApp) re-renders.
         let _ = cx;
+    }
+
+    // -------------------------------------------------------------------
+    // Inline group rename
+    // -------------------------------------------------------------------
+
+    /// Begin renaming a group inline: stash the id, (re)seed the rename
+    /// `InputState` with the current name, and focus it.
+    fn start_group_rename(
+        &mut self,
+        group_id: i64,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.renaming_group_id = Some(group_id);
+        if self.rename_input.is_none() {
+            let entity = cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder("new name");
+                state.focus(window, cx);
+                state
+            });
+            cx.subscribe(
+                &entity,
+                |this, _input, event: &gpui_component::input::InputEvent, cx| {
+                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                        this.commit_group_rename(cx);
+                    }
+                },
+            )
+            .detach();
+            let blur_handle = entity.read(cx).focus_handle(cx);
+            cx.on_blur(&blur_handle, window, |this, _window, cx| {
+                if this.renaming_group_id.is_some() {
+                    this.cancel_group_rename(cx);
+                }
+            })
+            .detach();
+            self.rename_input = Some(entity);
+        }
+        if let Some(ref input) = self.rename_input {
+            input.update(cx, |state, cx| {
+                state.set_value(current_name, window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Commit the inline rename.
+    fn commit_group_rename(&mut self, cx: &mut Context<Self>) {
+        let group_id = match self.renaming_group_id.take() {
+            Some(id) => id,
+            None => return,
+        };
+        let new_name = self.rename_input.as_ref().and_then(|input| {
+            let v = input.read(cx).value().to_string();
+            if v.trim().is_empty() { None } else { Some(v) }
+        });
+        let Some(new_name) = new_name else {
+            cx.notify();
+            return;
+        };
+        let app = self.app.clone();
+        app.update(cx, |app, cx| {
+            app.rename_group(group_id, &new_name, cx);
+        });
+        cx.notify();
+    }
+
+    /// Abort the inline rename without persisting.
+    fn cancel_group_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_group_id = None;
+        cx.notify();
     }
 }
 
@@ -197,6 +289,8 @@ impl Render for TunnelsView {
             self.context_menu_tunnel_id = None;
         }
         let context_menu_tunnel_id = self.context_menu_tunnel_id;
+        let renaming_group_id = self.renaming_group_id;
+        let rename_input = self.rename_input.clone();
         let collapsed_groups = self.collapsed_groups.clone();
         let entity = _cx.entity().downgrade();
 
@@ -213,6 +307,12 @@ impl Render for TunnelsView {
             }
         }
 
+        // Favorites bucket: every tunnel with `favorite == true`, regardless
+        // of which group it belongs to. This is a *virtual* group — the
+        // items still appear in their real groups below.
+        let favorites: Vec<&TunnelView> = tunnels.iter().filter(|t| t.favorite).collect();
+        let favorites_collapsed = self.collapsed_groups.contains(&FAVORITES_GROUP_ID);
+
         // Build the row elements for a slice of tunnels. Returns a Vec so it
         // can be spliced into either the ungrouped section or a group body.
         let build_rows = |tunnels_slice: &[&TunnelView],
@@ -224,10 +324,11 @@ impl Render for TunnelsView {
                           on_remove: &Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
                           context_menu: &Option<Entity<ContextMenuController>>,
                           alert_controller: &Option<Entity<AlertController>>,
-                          hovered_tunnel_id: Option<i64>,
-                          context_menu_tunnel_id: Option<i64>,
+                          hovered_tunnel_id: Option<(i64, bool)>,
+                          context_menu_tunnel_id: Option<(i64, bool)>,
                           entity: WeakEntity<TunnelsView>,
-                          app: Entity<CrabportApp>|
+                          app: Entity<CrabportApp>,
+                          is_favorite_copy: bool|
          -> Vec<AnyElement> {
             tunnels_slice
                 .iter()
@@ -244,8 +345,9 @@ impl Render for TunnelsView {
                     let on_remove = on_remove.clone();
                     let context_menu = context_menu.clone();
                     let alert_controller = alert_controller.clone();
-                    let is_hovered = hovered_tunnel_id == Some(tunnel.id);
-                    let force_highlight = context_menu_tunnel_id == Some(tunnel.id);
+                    let is_hovered = hovered_tunnel_id == Some((tunnel.id, is_favorite_copy));
+                    let force_highlight =
+                        context_menu_tunnel_id == Some((tunnel.id, is_favorite_copy));
                     let groups = groups.to_vec();
                     let app_for_row = app.clone();
                     let entity_for_row = entity.clone();
@@ -253,6 +355,7 @@ impl Render for TunnelsView {
                     tunnel_row(
                         &tunnel,
                         &host_name,
+                        is_favorite_copy,
                         is_hovered,
                         force_highlight,
                         entity_for_row,
@@ -360,7 +463,86 @@ impl Render for TunnelsView {
                                     context_menu_tunnel_id,
                                     entity.clone(),
                                     app.clone(),
+                                    false,
                                 ))
+                                // --- Virtual Favorites group (all starred items) ---
+                                .when(!favorites.is_empty(), |el| {
+                                    let fav_count = favorites.len();
+                                    let header = group_header(
+                                        "tunnel",
+                                        FAVORITES_GROUP_ID,
+                                        t!("groups.favorites").to_string(),
+                                        favorites.len(),
+                                        favorites_collapsed,
+                                        false,
+                                        true,
+                                        {
+                                            let entity = entity.clone();
+                                            Rc::new(move |_w, cx| {
+                                                let _ = entity.update(cx, |view, cx| {
+                                                    if view
+                                                        .collapsed_groups
+                                                        .contains(&FAVORITES_GROUP_ID)
+                                                    {
+                                                        view.collapsed_groups
+                                                            .remove(&FAVORITES_GROUP_ID);
+                                                    } else {
+                                                        view.collapsed_groups
+                                                            .insert(FAVORITES_GROUP_ID);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            })
+                                        },
+                                        None,
+                                        None,
+                                        false,
+                                        None,
+                                    )
+                                    .into_any_element();
+
+                                    // Build rows for the favorites bucket.
+                                    let fav_rows = build_rows(
+                                        &favorites,
+                                        &hosts,
+                                        &groups,
+                                        &on_start,
+                                        &on_stop,
+                                        &on_edit,
+                                        &on_remove,
+                                        &context_menu,
+                                        &alert_controller,
+                                        hovered_tunnel_id,
+                                        context_menu_tunnel_id,
+                                        entity.clone(),
+                                        app.clone(),
+                                        true,
+                                    );
+
+                                    let body_id = ElementId::Name(
+                                        format!("tunnel-group-body-{}", FAVORITES_GROUP_ID).into(),
+                                    );
+                                    let body = div()
+                                        .id(body_id.clone())
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .overflow_hidden()
+                                        .with_transition(body_id)
+                                        .transition_when_else(
+                                            !favorites_collapsed,
+                                            Duration::from_millis(200),
+                                            EaseInOutQuad,
+                                            move |el| {
+                                                el.h(px(fav_count as f32 * 86.0 - 4.0)).opacity(1.0)
+                                            },
+                                            |el| el.h(px(0.0)).opacity(0.0),
+                                        )
+                                        .children(fav_rows)
+                                        .into_any_element();
+
+                                    el.child(header).child(body)
+                                })
                                 // --- Grouped tunnels, one section per group ---
                                 .children(groups.iter().filter_map(|g| {
                                     let members = grouped.get(&g.id)?;
@@ -369,100 +551,156 @@ impl Render for TunnelsView {
                                     }
                                     let collapsed = collapsed_groups.contains(&g.id);
                                     let gid = g.id;
-                                    let header_entity = entity.clone();
                                     let group_name = g.name.clone();
+                                    let group_favorite = g.favorite;
+                                    let group = g.clone();
                                     let member_count = members.len();
-                                    let mut section = div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        // Group header (clickable to collapse/expand)
-                                        .child({
-                                            let header_id = ElementId::Name(
-                                                format!("tunnel-group-header-{}", gid).into(),
-                                            );
-                                            let chevron_anim_id = ElementId::Name(
-                                                format!("tunnel-group-chevron-{}-{}", gid, collapsed).into(),
-                                            );
-                                            div()
-                                                .id(header_id.clone())
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .px_3()
-                                                .py_1()
-                                                .cursor_pointer()
-                                                .rounded_md()
-                                                .with_transition(header_id)
-                                                .transition_on_hover(
-                                                    Duration::from_millis(120),
-                                                    Linear,
-                                                    move |hovered, el| {
-                                                        if *hovered {
-                                                            el.bg(rgb(surface_hover()))
-                                                        } else {
-                                                            el.bg(rgb(bg_base()))
-                                                        }
-                                                    },
-                                                )
-                                                .on_click(move |_e, _w, cx| {
-                                                    let _ = header_entity.update(cx, |view, cx| {
-                                                        if view.collapsed_groups.contains(&gid) {
-                                                            view.collapsed_groups.remove(&gid);
-                                                        } else {
-                                                            view.collapsed_groups.insert(gid);
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                })
-                                                .child(
-                                                    svg()
-                                                        .path("icons/chevron-down.svg")
-                                                        .size_3()
-                                                        .text_color(rgb(text_muted()))
-                                                        .with_animation(
-                                                            chevron_anim_id,
-                                                            Animation::new(Duration::from_millis(200))
-                                                                .with_easing(ease_in_out),
-                                                            move |this, delta| {
-                                                                let angle = if collapsed {
-                                                                    -delta * std::f32::consts::FRAC_PI_2
-                                                                } else {
-                                                                    -(1.0 - delta) * std::f32::consts::FRAC_PI_2
-                                                                };
-                                                                this.with_transformation(
-                                                                    Transformation::rotate(radians(angle)),
-                                                                )
+                                    let mut section = div().flex().flex_col().gap_1();
+                                    let header = group_header(
+                                        "tunnel",
+                                        gid,
+                                        group_name.clone(),
+                                        member_count,
+                                        collapsed,
+                                        group_favorite,
+                                        false,
+                                        Rc::new({
+                                            let header_entity = entity.clone();
+                                            move |_w, cx| {
+                                                let _ = header_entity.update(cx, |view, cx| {
+                                                    if view.collapsed_groups.contains(&gid) {
+                                                        view.collapsed_groups.remove(&gid);
+                                                    } else {
+                                                        view.collapsed_groups.insert(gid);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                        Some(Rc::new({
+                                            let app = app.clone();
+                                            move |_w, cx| {
+                                                app.update(cx, |app, cx| {
+                                                    app.toggle_group_favorite(gid, cx);
+                                                });
+                                            }
+                                        })),
+                                        Some({
+                                            let context_menu = context_menu.clone();
+                                            let alert_controller = alert_controller.clone();
+                                            let app = app.clone();
+                                            let group_for_menu = group.clone();
+                                            let entity = entity.clone();
+                                            Rc::new(move |event, _w, cx| {
+                                                let Some(ref cm) = context_menu else {
+                                                    return;
+                                                };
+                                                let pos = event.position;
+                                                let alert_controller = alert_controller.clone();
+                                                let app = app.clone();
+                                                let group = group_for_menu.clone();
+                                                cm.update(cx, |c, cx| {
+                                                    let mut items: Vec<ContextMenuItem> = Vec::new();
+
+                                                    // Rename Group
+                                                    items.push(ContextMenuItem::new(
+                                                        t!("tunnels.rename_group").to_string(),
+                                                        {
+                                                            let group = group.clone();
+                                                            let entity = entity.clone();
+                                                            move |w, cx| {
+                                                                let _ = entity.update(cx, |view, cx| {
+                                                                    view.start_group_rename(group.id, group.name.clone(), w, cx);
+                                                                });
+                                                            }
+                                                        },
+                                                    ));
+
+                                                    // Delete Group (with confirmation)
+                                                    items.push(
+                                                        ContextMenuItem::new(
+                                                            t!("tunnels.delete_group").to_string(),
+                                                            {
+                                                                let alert_controller =
+                                                                    alert_controller.clone();
+                                                                let app = app.clone();
+                                                                let group = group.clone();
+                                                                move |_w, cx| {
+                                                                    let Some(ref ac) =
+                                                                        alert_controller
+                                                                    else {
+                                                                        return;
+                                                                    };
+                                                                    let app = app.clone();
+                                                                    let gid = group.id;
+                                                                    let name =
+                                                                        group.name.clone();
+                                                                    ac.update(cx, |c, cx| {
+                                                                        c.show(
+                                                                            AlertState {
+                                                                                severity:
+                                                                                    AlertSeverity::Danger,
+                                                                                title: t!(
+                                                                                    "tunnels.delete_group"
+                                                                                )
+                                                                                .to_string()
+                                                                                .into(),
+                                                                                description: Some(
+                                                                                    t!(
+                                                                                        "tunnels.delete_group_prompt",
+                                                                                        name = name.as_str()
+                                                                                    )
+                                                                                    .to_string()
+                                                                                    .into(),
+                                                                                ),
+                                                                                confirm_label: t!(
+                                                                                    "tunnels.delete"
+                                                                                )
+                                                                                .to_string()
+                                                                                .into(),
+                                                                                cancel_label: t!(
+                                                                                    "terminal.host_key_cancel"
+                                                                                )
+                                                                                .to_string()
+                                                                                .into(),
+                                                                                on_confirm: Some(
+                                                                                    Rc::new(move |_w, cx| {
+                                                                                        app.update(cx, |app, cx| {
+                                                                                            app.remove_group(gid, crabport_core::credential::GroupKind::Tunnel, cx);
+                                                                                        });
+                                                                                    }),
+                                                                                ),
+                                                                                ..AlertState::default()
+                                                                            },
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                }
                                                             },
-                                                        ),
-                                                )
-                                                .child(
-                                                    svg()
-                                                        .path("icons/folder.svg")
-                                                        .size_3()
-                                                        .text_color(rgb(text_muted())),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(rgb(text_primary()))
-                                                        .child(group_name.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(text_muted()))
-                                                        .child(
-                                                            t!(
-                                                                "groups.member_count",
-                                                                count = member_count
-                                                            )
-                                                            .to_string(),
-                                                        ),
-                                                )
-                                        });
+                                                        )
+                                                        .danger(true),
+                                                    );
+
+                                                    c.show(
+                                                        ContextMenuState {
+                                                            position: pos,
+                                                            items,
+                                                            ..ContextMenuState::default()
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            })
+                                        }),
+                                        renaming_group_id == Some(gid),
+                                        if renaming_group_id == Some(gid) {
+                                            rename_input.clone()
+                                        } else {
+                                            None
+                                        },
+                                    )
+                                    .into_any_element();
+                                    section = section.child(header);
                                     // Build rows always (even when collapsed)
                                     // so the expand animation has content to
                                     // reveal.
@@ -480,6 +718,7 @@ impl Render for TunnelsView {
                                         context_menu_tunnel_id,
                                         entity.clone(),
                                         app.clone(),
+                                        false,
                                     );
                                     let body_id = ElementId::Name(
                                         format!("tunnel-group-body-{}", gid).into(),
@@ -493,10 +732,13 @@ impl Render for TunnelsView {
                                         .with_transition(body_id)
                                         .transition_when_else(
                                             !collapsed,
-                                            Duration::from_millis(150),
-                                            Linear,
-                                            |el| el.max_h(px(2000.0)).opacity(1.0),
-                                            |el| el.max_h(px(0.0)).opacity(0.0),
+                                            Duration::from_millis(200),
+                                            EaseInOutQuad,
+                                            move |el| {
+                                                el.h(px(member_count as f32 * 86.0 - 4.0))
+                                                    .opacity(1.0)
+                                            },
+                                            |el| el.h(px(0.0)).opacity(0.0),
                                         )
                                         .children(rows);
                                     section = section.child(body);
@@ -506,7 +748,7 @@ impl Render for TunnelsView {
                     ),
             )
             // --- Tunnel form overlay (create/edit) ---
-            // Mirrors `HostsView`'s rendering of `ConnectionFormView`: when
+            // Mirrors `SessionsView`'s rendering of `ConnectionFormView`: when
             // the form state is `Some`, render the overlay on top of the list.
             .when_some(form_state, move |el, state| {
                 el.child(TunnelFormView::new(&state, app, form_hosts, _cx))
@@ -586,6 +828,7 @@ pub fn render_tunnels_view(on_new: impl Fn(&mut Window, &mut App) + 'static) -> 
 fn tunnel_row(
     tunnel: &TunnelView,
     host_name: &str,
+    is_favorite_copy: bool,
     is_hovered: bool,
     force_highlight: bool,
     entity: WeakEntity<TunnelsView>,
@@ -598,7 +841,19 @@ fn tunnel_row(
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let row_id = ElementId::Name(format!("tunnel-row-{}", tunnel.id).into());
+    // The favorites bucket renders the same tunnel a second time (the
+    // item also appears under its real group below). Each instance needs
+    // a distinct transition id, otherwise hover state is shared across
+    // both and they animate in lockstep. Suffix "-fav" disambiguates the
+    // copy.
+    let row_id = ElementId::Name(
+        format!(
+            "tunnel-row-{}{}",
+            tunnel.id,
+            if is_favorite_copy { "-fav" } else { "" }
+        )
+        .into(),
+    );
 
     let tunnel_id = tunnel.id;
     let tunnel_running = tunnel.running;
@@ -689,7 +944,7 @@ fn tunnel_row(
                 // Mark this row as the menu-triggering row so it keeps the
                 // hover background while the overlay is up.
                 let _ = entity.update(cx, |view, cx| {
-                    view.context_menu_tunnel_id = Some(tunnel_id);
+                    view.context_menu_tunnel_id = Some((tunnel_id, is_favorite_copy));
                     cx.notify();
                 });
                 let pos = event.position;
@@ -811,8 +1066,8 @@ fn tunnel_row(
         .on_hover(move |hovered, _w, cx| {
             let _ = entity.update(cx, |view, cx| {
                 if *hovered {
-                    view.hovered_tunnel_id = Some(tunnel_id);
-                } else if view.hovered_tunnel_id == Some(tunnel_id) {
+                    view.hovered_tunnel_id = Some((tunnel_id, is_favorite_copy));
+                } else if view.hovered_tunnel_id == Some((tunnel_id, is_favorite_copy)) {
                     view.hovered_tunnel_id = None;
                 }
                 cx.notify();

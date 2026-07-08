@@ -11,7 +11,7 @@ use rust_i18n::t;
 
 use crate::app_state::AppState;
 use crate::components::notification::{Notification, NotificationLevel};
-use crate::views::hosts::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
+use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
     CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
     PrivateKeyKind, ProxyConfig, ProxyEntry,

@@ -22,7 +22,7 @@ use crate::components::context_menu::ContextMenuController;
 use crate::components::dialog::AlertController;
 use crate::components::notification::NotificationController;
 use crate::layouts::command_palette::CommandView;
-use crate::views::hosts::HostsView;
+use crate::views::sessions::SessionsView;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
@@ -64,7 +64,7 @@ pub struct AppCtx {
     pub tunnels_panel: Entity<TunnelsPanel>,
 
     // -- Full-page sidebar views (rendered on the Home tab) --
-    pub hosts_view: Entity<HostsView>,
+    pub sessions_view: Entity<SessionsView>,
     pub snippets_view: Entity<SnippetsView>,
     pub tunnels_view: Entity<TunnelsView>,
 }
