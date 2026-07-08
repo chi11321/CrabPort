@@ -44,7 +44,7 @@ pub struct SftpPanel {
     /// though the mouse has moved to the overlay.
     context_menu_entry: Option<String>,
     /// The entry currently being hovered, if any. Used to drive the hover
-    /// background transition (same pattern as HostsView).
+    /// background transition (same pattern as SessionsView).
     hovered_entry: Option<String>,
     /// Multi-selection set. Keyed by entry name (unique within the current
     /// cwd listing). `.` and `..` are never added — they're navigation

@@ -2,6 +2,7 @@ pub mod button;
 pub mod context_menu;
 pub mod dialog;
 pub mod dropdown;
+pub mod group_header;
 pub mod input;
 pub mod notification;
 pub mod number_input;

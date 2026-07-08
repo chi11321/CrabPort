@@ -18,7 +18,7 @@ use super::CrabportApp;
 use crate::app_state::AppState;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::groups::{GroupFormOutput, GroupFormState};
-use crate::views::hosts::ConnectionHost;
+use crate::views::sessions::ConnectionHost;
 
 impl CrabportApp {
     // -----------------------------------------------------------------------
@@ -160,6 +160,73 @@ impl CrabportApp {
     }
 
     // -----------------------------------------------------------------------
+    // Group favorite toggle + delete
+    // -----------------------------------------------------------------------
+
+    /// Toggle the favorite flag for a group. Favorite groups sort above
+    /// non-favorite groups within the same kind.
+    pub fn toggle_group_favorite(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        let _ = AppState::store(cx).lock().toggle_group_favorite(group_id);
+        cx.notify();
+    }
+
+    /// Rename a group in place (used by the inline rename editor on group
+    /// headers). Persists via `update_group` (name only, sort_order
+    /// unchanged) and notifies so the header re-renders with the new name.
+    pub fn rename_group(&mut self, group_id: i64, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(e) = AppState::store(cx)
+            .lock()
+            .update_group(group_id, &name, None)
+        {
+            tracing::error!("rename_group failed: {e}");
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Delete a group by id. The store uses `ON DELETE SET NULL` on the
+    /// `group_id` FK in `hosts` / `snippets` / `tunnels`, so every member
+    /// falls back to "ungrouped" automatically. We then refresh the
+    /// in-memory collections so the list re-renders under "Ungrouped"
+    /// immediately (the SQL side is already correct, but the cached
+    /// `self.hosts` Vec and the tunnel registry still hold the stale
+    /// `group_id`).
+    ///
+    /// `kind` selects which in-memory cache to refresh after the delete.
+    pub fn remove_group(&mut self, group_id: i64, kind: GroupKind, cx: &mut Context<Self>) {
+        if let Err(e) = AppState::store(cx).lock().remove_group(group_id) {
+            tracing::error!("remove_group failed: {e}");
+            return;
+        }
+        match kind {
+            GroupKind::Host => {
+                self.reload_hosts(cx);
+            }
+            GroupKind::Snippet => {
+                // Snippets are re-read from the store on every render via
+                // `set_state`, so no in-memory cache to refresh — a notify
+                // is enough.
+            }
+            GroupKind::Tunnel => {
+                // Mirror the SQL `SET NULL` into the registry so the running
+                // tunnels drop their stale `group_id` without a full reload.
+                let tunnels = self.app_ctx.tunnels.clone();
+                let views = tunnels.list();
+                for v in views {
+                    if v.group_id == Some(group_id) {
+                        tunnels.set_group(v.id, None);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------------
     // Host favorite + group assignment
     // -----------------------------------------------------------------------
 
@@ -196,9 +263,9 @@ impl CrabportApp {
                     port: h.port,
                     username: h.username,
                     kind: match h.kind {
-                        CoreHostKind::Ssh => crate::views::hosts::ConnectionKind::SSH,
-                        CoreHostKind::Telnet => crate::views::hosts::ConnectionKind::Telnet,
-                        CoreHostKind::Serial => crate::views::hosts::ConnectionKind::Serial,
+                        CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
+                        CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
+                        CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
                     },
                     credential_id: h.credential_id,
                     last_login: h.last_login,

@@ -29,7 +29,7 @@ use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::input::StyledInput;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::views::hosts::ConnectionHost;
+use crate::views::sessions::ConnectionHost;
 
 // ---------------------------------------------------------------------------
 // TunnelKind helpers (Local / Remote / Dynamic ↔ tab index)

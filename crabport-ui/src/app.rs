@@ -26,8 +26,8 @@ use crate::components::notification::{NotificationController, NotificationPositi
 use crate::layouts::command_palette::{CommandView, ConnectionType};
 use crate::layouts::sidebar::render_sidebar;
 use crate::views::groups::GroupFormState;
-use crate::views::hosts::ConnectionFormState;
-use crate::views::hosts::ConnectionHost;
+use crate::views::sessions::ConnectionFormState;
+use crate::views::sessions::ConnectionHost;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
 
@@ -159,7 +159,7 @@ impl CrabportApp {
             cx.new(|_cx| crate::views::panel::history_command_panel::HistoryCommandPanel::new());
         let tunnels_panel = cx.new(|_cx| crate::views::panel::tunnels_panel::TunnelsPanel::new());
         let app_entity = cx.entity();
-        let hosts_view = cx.new(|_cx| crate::views::hosts::HostsView::new(app_entity.clone()));
+        let sessions_view = cx.new(|_cx| crate::views::sessions::SessionsView::new(app_entity.clone()));
         let snippets_view =
             cx.new(|_cx| crate::views::snippets::SnippetsView::new(app_entity.clone()));
         let tunnels_view =
@@ -185,9 +185,9 @@ impl CrabportApp {
                 port: h.port,
                 username: h.username,
                 kind: match h.kind {
-                    CoreHostKind::Ssh => crate::views::hosts::ConnectionKind::SSH,
-                    CoreHostKind::Telnet => crate::views::hosts::ConnectionKind::Telnet,
-                    CoreHostKind::Serial => crate::views::hosts::ConnectionKind::Serial,
+                    CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
+                    CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
+                    CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
                 },
                 credential_id: h.credential_id,
                 last_login: h.last_login,
@@ -217,7 +217,7 @@ impl CrabportApp {
             snippets_panel,
             history_panel,
             tunnels_panel,
-            hosts_view,
+            sessions_view,
             snippets_view,
             tunnels_view,
         };

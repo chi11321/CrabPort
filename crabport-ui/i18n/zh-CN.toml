@@ -108,6 +108,9 @@ unfavorite = "取消收藏"
 move_to_group = "移动到分组"
 new_group = "新建分组…"
 manage_groups = "管理分组"
+rename_group = "重命名分组"
+delete_group = "删除分组"
+delete_group_prompt = "删除分组「%{name}」？其成员将变为未分组。"
 ungrouped = "未分组"
 
 [tunnel_form]
@@ -235,6 +238,9 @@ unfavorite = "取消收藏"
 move_to_group = "移动到分组"
 new_group = "新建分组…"
 manage_groups = "管理分组"
+rename_group = "重命名分组"
+delete_group = "删除分组"
+delete_group_prompt = "删除分组「%{name}」？其成员将变为未分组。"
 ungrouped = "未分组"
 
 [groups]
@@ -250,6 +256,7 @@ member_count = "%{count} 项"
 search_placeholder = "搜索…"
 create = "创建「%{name}」"
 no_results = "无匹配分组"
+favorites = "收藏"
 
 [window.about]
 title = "关于 CrabPort"

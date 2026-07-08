@@ -692,4 +692,7 @@ pub struct GroupEntry {
     pub sort_order: i64,
     #[serde(default)]
     pub created_at: i64,
+    /// Starred by the user to pin the group above non-starred groups.
+    #[serde(default)]
+    pub favorite: bool,
 }
