@@ -173,7 +173,7 @@ impl RenderOnce for Tabs {
         // across two separate loops — we move them once here and feed the
         // two halves into SegmentedControl / panels below.
         let mut segments: Vec<Segment> = Vec::new();
-        let mut panels: Vec<AnyElement> = Vec::new();
+        let mut panels: Vec<(usize, AnyElement)> = Vec::new();
         for (i, pane) in self.panes.into_iter().enumerate() {
             let cb = on_change_rc.clone();
             let is_active = i == active;
@@ -189,39 +189,57 @@ impl RenderOnce for Tabs {
                 seg = seg.icon(path);
             }
             segments.push(seg);
-            panels.push(
-                div()
-                    .id(panel_id.clone())
-                    .flex_none()
-                    .w(panel_w)
-                    .h_full()
-                    .overflow_hidden()
-                    .opacity(0.)
-                    .with_transition(panel_id)
-                    .transition_when_else(
-                        is_active,
-                        Duration::from_millis(280),
-                        EaseInOutQuad,
-                        |state| state.opacity(1.),
-                        |state| state.opacity(0.),
-                    )
-                    .child(pane.content)
-                    .into_any_element(),
-            );
+            // Each panel is absolutely positioned at `left = i / count` so
+            // that the draw order (array order) can differ from the visual
+            // position. We push non-active panels first, then the active
+            // panel last, so the active panel's children (especially
+            // InputState-backed inputs) are painted after the non-active
+            // ones. This is critical: InputState stores a single
+            // `last_bounds`/`last_layout` set by its paint() method. If a
+            // non-active panel's input paints last, it overwrites the
+            // bounds with its (off-screen) position, breaking click-to-
+            // position for the active panel's inputs.
+            let panel = div()
+                .id(panel_id.clone())
+                .absolute()
+                .top_0()
+                .left(DefiniteLength::Fraction(i as f32 / count as f32))
+                .w(panel_w)
+                .h_full()
+                .overflow_hidden()
+                .opacity(0.)
+                .with_transition(panel_id)
+                .transition_when_else(
+                    is_active,
+                    Duration::from_millis(280),
+                    EaseInOutQuad,
+                    |state| state.opacity(1.),
+                    |state| state.opacity(0.),
+                )
+                .child(pane.content)
+                .into_any_element();
+            if is_active {
+                panels.push((i, panel));
+            } else {
+                panels.insert(0, (i, panel));
+            }
         }
         for seg in segments {
             ctrl = ctrl.segment(seg);
         }
 
+        // Panels are absolutely positioned, so the track doesn't need to be
+        // a flex_row. We keep it absolute + full-width so the `left` slide
+        // transition still works.
         let mut track = div()
             .id(track_id.clone())
             .absolute()
-            .flex()
-            .flex_row()
+            .top_0()
+            .left_0()
             .h_full()
             .w(DefiniteLength::Fraction(count as f32))
             .with_transition(track_id)
-            .children(panels);
+            .children(panels.into_iter().map(|(_, el)| el));
 
         for i in 0..count {
             let target = DefiniteLength::Fraction(-(i as f32));

@@ -321,43 +321,49 @@ impl RenderOnce for Dropdown {
 
         // Menu height for the open/close transition.
         //
-        // We animate `h()` between 0 (closed) and a capped max (open).
-        // Rather than estimating the exact content height (which is fragile
-        // due to sub-pixel rounding of gaps/padding/border), we set the
-        // open height to `MAX_MENU_HEIGHT` and let `overflow_hidden` on
-        // the outer div clip any excess. The inner content div has
-        // `max_h(MAX_MENU_HEIGHT)` + `overflow_y_scrollbar` so it scrolls
-        // when content exceeds the cap. When content is shorter than the
-        // cap, the outer div still renders at `MAX_MENU_HEIGHT` but the
-        // inner content only fills what it needs — the extra space is
-        // just empty background, which is fine since the menu has a
-        // solid `bg(bg_base())`.
+        // Layout (top → bottom):
+        //   border_1 (1px)
+        //   search box     — fixed, h(ITEM_HEIGHT), only when searchable
+        //   item list      — scrollable, natural = p_1(8) + items*32 + gaps
+        //   create button  — fixed, h(ITEM_HEIGHT), only when creatable
+        //   border_1 (1px)
         //
-        // To avoid the empty space when content is short, we DO compute
-        // the natural height — but only use it if it's less than the cap.
-        // The computation accounts for: ITEM_HEIGHT per child, gap_1 (4px)
-        // between children, p_1 (8px) padding on the inner div, and
-        // border_1 (2px) on the outer div.
+        // The search box and create button are pinned OUTSIDE the scroll
+        // area so only items scroll. Gaps (gap_1 = 4px) apply between
+        // items inside an inner div that is NOT the element passed to
+        // `overflow_y_scrollbar` — the Scrollable wrapper strips style
+        // off its direct element and moves it to a wrapper, so any
+        // gap/padding on the scrolled element itself is lost. Keeping
+        // them on a nested child preserves them.
         let content_item_count = filtered.len();
         let has_search_el = search_input.is_some();
         let has_create_el = can_create;
         let has_empty_el = _has_empty;
-        let child_count = content_item_count
-            + has_search_el as usize
-            + has_empty_el as usize
-            + has_create_el as usize;
-        // Each child is ITEM_HEIGHT. Gaps between adjacent children = 4px
-        // each (gap_1 = rems(0.25) = 4px). Inner padding p_1 = 8px total.
-        // Outer border_1 = 2px total (included in h()).
-        let gap_total = child_count.saturating_sub(1) as f32 * 4.0;
-        let natural_height = f32::from(ITEM_HEIGHT) * child_count as f32
-            + gap_total
-            + 8.0  // p_1 padding (top + bottom)
-            + 2.0; // border_1 (top + bottom, included in h())
-        let menu_h = if natural_height > f32::from(MAX_MENU_HEIGHT) {
+
+        let search_h = if has_search_el {
+            f32::from(ITEM_HEIGHT)
+        } else {
+            0.0
+        };
+        let create_h = if has_create_el {
+            f32::from(ITEM_HEIGHT)
+        } else {
+            0.0
+        };
+
+        // Items that live inside the scrollable inner div.
+        let items_child_count = content_item_count + has_empty_el as usize;
+        let items_gap = items_child_count.saturating_sub(1) as f32 * 4.0; // gap_1
+        let items_inner_h = f32::from(ITEM_HEIGHT) * items_child_count as f32 + items_gap + 8.0; // p_1 padding (top + bottom = 4 + 4)
+
+        let natural_total = 2.0 // border_1 (top + bottom, included in h())
+            + search_h
+            + create_h
+            + items_inner_h;
+        let menu_h = if natural_total > f32::from(MAX_MENU_HEIGHT) {
             MAX_MENU_HEIGHT
         } else {
-            px(natural_height)
+            px(natural_total)
         };
 
         // Build the item elements from the filtered list.
@@ -507,19 +513,30 @@ impl RenderOnce for Dropdown {
                 move |state| state.h(menu_h).opacity(1.),
                 move |state| state.h(px(0.)).opacity(0.),
             )
+            // Column layout: search (fixed) | items (scroll) | create (fixed)
+            .flex()
+            .flex_col()
+            // Pinned search header — stays visible while items scroll.
+            .when_some(search_el, |el, s| el.child(s))
+            // Scrollable item body. Only this region scrolls.
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .p_1()
-                    .gap_1()
-                    .h_full()
+                    .id(ElementId::Name(format!("{id_str}-scroll").into()))
+                    .flex_1()
+                    .min_h_0()
                     .overflow_y_scrollbar()
-                    .when_some(search_el, |el, s| el.child(s))
-                    .children(item_els)
-                    .when_some(empty_el, |el, e| el.child(e))
-                    .when_some(create_el, |el, c| el.child(c)),
-            );
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .p_1()
+                            .gap_1()
+                            .children(item_els)
+                            .when_some(empty_el, |el, e| el.child(e)),
+                    ),
+            )
+            // Pinned create footer — stays visible while items scroll.
+            .when_some(create_el, |el, c| el.child(c));
 
         // ------------------------------------------------------------------
         // Root
