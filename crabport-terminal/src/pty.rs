@@ -230,6 +230,18 @@ impl CrabPortTerminal for PtyBackend {
     fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
         Some(self)
     }
+
+    fn spawn_channel(&self, cols: u16, rows: u16) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        // Local PTY: just spawn a brand-new shell process. There's no
+        // "connection" to share — each pane gets its own independent PTY.
+        match PtyBackend::new(cols, rows) {
+            Ok(backend) => Some(std::sync::Arc::new(backend)),
+            Err(e) => {
+                tracing::error!("PtyBackend spawn_channel failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 impl CrabPortMonitor for PtyBackend {

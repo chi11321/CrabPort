@@ -42,6 +42,7 @@ use crate::views::terminal::runs::build_runs;
 use crate::views::terminal::selection::*;
 
 pub mod connection_overlay;
+pub mod split;
 
 mod color;
 mod fonts;
@@ -625,6 +626,64 @@ impl TerminalView {
         self.tunnel_source.as_ref()
     }
 
+    // --- Split-pane support ---
+    //
+    // A split pane gets its own *independent* PTY/channel on the same
+    // underlying connection (SSH: new session channel + PTY + shell on the
+    // existing authenticated handle; local: new shell process; Telnet: new
+    // connection since Telnet has no channel multiplexing). Each pane has
+    // its own term grid, scrollback, and input/output — they are fully
+    // independent, not mirrored.
+
+    /// The remote host label (empty for local PTY).
+    pub fn remote_host(&self) -> &str {
+        &self.remote_host
+    }
+
+    /// SSH connection info, if this is an SSH tab.
+    pub fn ssh_info(&self) -> Option<&SshConnectionInfo> {
+        self.ssh_info.as_ref()
+    }
+
+    /// Telnet connection info, if this is a Telnet tab.
+    pub fn telnet_info(&self) -> Option<&TelnetConnectionInfo> {
+        self.telnet_info.as_ref()
+    }
+
+    /// The shared connection-overlay state (host-key prompt, etc.).
+    pub fn overlay_state(&self) -> SharedOverlayState {
+        self.overlay.clone()
+    }
+
+    /// The tunnel source Arc, if any (for SSH tabs).
+    pub fn tunnel_source_arc(&self) -> Option<Arc<dyn CrabPortTunnel>> {
+        self.tunnel_source.clone()
+    }
+
+    /// Set the tunnel source (optional builder, used by split-pane creation
+    /// to share the SSH tunnel source with the new pane).
+    pub fn with_tunnel_source_opt(mut self, source: Option<Arc<dyn CrabPortTunnel>>) -> Self {
+        self.tunnel_source = source;
+        self
+    }
+
+    /// Create a new [`TerminalView`] for a split pane. The new pane gets an
+    /// independent PTY/channel via `backend.spawn_channel()`:
+    /// - **SSH**: opens a new session channel on the existing authenticated
+    ///   connection (no re-auth, no new TCP connect).
+    /// - **Local PTY**: spawns a new shell process.
+    /// - **Telnet**: `spawn_channel` returns `None`, so the caller falls
+    ///   back to creating a new `TelnetBackend` (new TCP connection).
+    ///
+    /// Returns `None` if the backend can't spawn a channel.
+    pub fn spawn_channel_backend(
+        &self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Option<Arc<dyn crabport_terminal::terminal::CrabPortTerminal>> {
+        self.backend.spawn_channel(80, 24)
+    }
+
     /// Returns the host-key info for a currently-pending host-key prompt,
     /// if any. The prompt stays pending in the overlay until resolved via
     /// [`resolve_pending_host_key`]. Used by the global alert controller
@@ -1061,6 +1120,8 @@ impl Render for TerminalView {
             .id(ElementId::Name(
                 format!("terminal-view-{}", self.count).into(),
             ))
+            .pt_2()
+            .pl_2()
             .relative()
             .size_full()
             .overflow_hidden()

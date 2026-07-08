@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use rust_i18n::t;
 
@@ -11,9 +12,10 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
-use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::panel::PanelKind;
+use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
+use crate::views::terminal::split::{DIVIDER_HIT, SplitDir, SplitNode};
 
 pub fn render_content(
     selected: SidebarItem,
@@ -21,6 +23,8 @@ pub fn render_content(
     tabs: &[Tab],
     active_tab_id: u64,
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
+    split_trees: &HashMap<u64, crate::views::terminal::split::SplitTree>,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
     form_entity: Option<&ConnectionFormState>,
     // Active panel pane the user last selected (semantic identity, not a
@@ -65,7 +69,7 @@ pub fn render_content(
     let handle_c = handle.clone();
     let on_close: Rc<dyn Fn(u64, &mut Window, &mut App)> = Rc::new(move |id, _w, cx| {
         handle_c.update(cx, |app, cx| {
-            app.close_tab(id, cx);
+            app.close_active_pane_or_tab(id, cx);
         });
     });
 
@@ -236,13 +240,83 @@ pub fn render_content(
             }
         }
         Some(TabKind::Terminal) => {
-            if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
+            if let Some(tab) = active_tab {
+                let tab_id = tab.id;
+                // If this tab has a split tree, render the panes recursively;
+                // otherwise fall back to the single terminal view.
+                let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
+                    render_split_node(&tree.root, tree.active_pane, tab_id, pane_views, handle)
+                        .into_any_element()
+                } else if let Some(terminal_entity) = terminal_views.get(&tab_id) {
+                    div()
+                        .size_full()
+                        .key_context("Terminal")
+                        .child(terminal_entity.clone())
+                        .into_any_element()
+                } else {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_color(rgb(text_muted())).child("Terminal"))
+                        .into_any_element()
+                };
+                // Floating split-action buttons (top-right of the terminal
+                // content area). "Split Right" / "Split Down" create a new
+                // local-PTY pane; disabled when there's no terminal yet.
+                let has_term =
+                    terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
+                let handle_split_r = handle.clone();
+                let handle_split_d = handle.clone();
                 div()
                     .size_full()
-                    .pt_2()
-                    .pl_2()
+                    .relative()
                     .key_context("Terminal")
-                    .child(terminal_entity.clone())
+                    .child(inner)
+                    .when(has_term, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .right_2()
+                                .flex()
+                                .flex_row()
+                                .gap_1()
+                                .child(render_split_button(
+                                    "term-split-right",
+                                    "icons/panel-right.svg",
+                                    t!("terminal.split_right").to_string(),
+                                    {
+                                        let handle = handle_split_r.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.split_active_pane(
+                                                    crate::views::terminal::split::SplitDir::Vertical,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    },
+                                ))
+                                .child(render_split_button(
+                                    "term-split-down",
+                                    "icons/panel-bottom.svg",
+                                    t!("terminal.split_down").to_string(),
+                                    {
+                                        let handle = handle_split_d.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.split_active_pane(
+                                                    crate::views::terminal::split::SplitDir::Horizontal,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    },
+                                )),
+                        )
+                    })
                     .into_any_element()
             } else {
                 div()
@@ -741,4 +815,231 @@ pub fn render_content(
             metrics,
             sftp_progress,
         ))
+}
+
+// ---------------------------------------------------------------------------
+// Terminal split-pane rendering
+// ---------------------------------------------------------------------------
+//
+// Renders a [`SplitNode`] tree as nested flex containers. Each split draws a
+// draggable divider between its two children. Clicking a pane focuses it
+// (updates the tab's active pane so the toolbar follows).
+
+/// Recursively render a split node into a full-size element.
+fn render_split_node(
+    node: &SplitNode,
+    active_pane: u64,
+    tab_id: u64,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
+    handle: &Entity<CrabportApp>,
+) -> AnyElement {
+    match node {
+        SplitNode::Pane(pane_id) => {
+            let pane_id = *pane_id;
+            let is_active = pane_id == active_pane;
+            let view = pane_views.get(&pane_id).cloned();
+            let view_for_focus = view.clone();
+            let mut el = div()
+                .id(ElementId::Name(
+                    format!("pane-{}-{}", tab_id, pane_id).into(),
+                ))
+                .size_full()
+                // A thin focus ring around the active pane so the user can
+                // see which pane drives the toolbar / receives keystrokes.
+                .when(is_active, |el| el.bg(rgba((surface_hover() << 8) | 0x18)))
+                .on_mouse_down(MouseButton::Left, {
+                    let handle = handle.clone();
+                    move |_e, w, cx| {
+                        handle.update(cx, |app, cx| {
+                            app.focus_pane(tab_id, pane_id, cx);
+                        });
+                        // Grab keyboard focus for the clicked pane's terminal.
+                        if let Some(view) = &view_for_focus {
+                            let fh = view.read_with(cx, |v, cx| v.focus_handle(cx));
+                            w.focus(&fh);
+                        }
+                    }
+                });
+            if let Some(view) = view {
+                el = el.child(view);
+            }
+            el.into_any_element()
+        }
+        SplitNode::Split { dir, ratio, a, b } => {
+            let dir = *dir;
+            let ratio = *ratio;
+            let a_pane = leaf_pane_id(a);
+            let b_pane = leaf_pane_id(b);
+            // Render both children.
+            let child_a = render_split_node(a, active_pane, tab_id, pane_views, handle);
+            let child_b = render_split_node(b, active_pane, tab_id, pane_views, handle);
+
+            let (flex_dir, divider_size) = match dir {
+                SplitDir::Vertical => (FlexDirection::Row, DIVIDER_HIT),
+                SplitDir::Horizontal => (FlexDirection::Column, DIVIDER_HIT),
+            };
+            let is_row = flex_dir == FlexDirection::Row;
+
+            // The divider is a draggable element between the two children.
+            // Its size is fixed (DIVIDER_HIT * 2 px wide band); the children
+            // get `flex_1` so they share the remaining space. The ratio is
+            // applied via explicit flex-basis fractions so dragging updates
+            // the layout immediately.
+            let divider_id =
+                ElementId::Name(format!("split-divider-{}-{}-{}", tab_id, a_pane, b_pane).into());
+            let handle_c = handle.clone();
+            // Shared slot for the split container's pixel bounds, captured
+            // during prepaint so the divider's mouse handlers can convert a
+            // window-space cursor into a `[0,1]` ratio relative to the split.
+            let bounds_slot = std::sync::Arc::new(parking_lot::Mutex::new(None::<Bounds<Pixels>>));
+            let bounds_slot_for_measure = bounds_slot.clone();
+
+            div()
+                .id(ElementId::Name(
+                    format!("split-{}-{}-{}", tab_id, a_pane, b_pane).into(),
+                ))
+                .size_full()
+                .flex()
+                .when(is_row, |el| el.flex_row())
+                .when(!is_row, |el| el.flex_col())
+                // Record the container bounds so the divider drag can map
+                // cursor → ratio. An invisible absolute canvas fills the
+                // container; its prepaint callback runs before the divider's
+                // mouse handlers and stashes the container rect.
+                .child(
+                    canvas(
+                        move |bounds, _window, _cx| bounds,
+                        move |bounds, _, _window, _cx| {
+                            *bounds_slot_for_measure.lock() = Some(bounds);
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                // Child A: `ratio` fraction of the space.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .h_full()
+                        .when(is_row, |el| el.w(DefiniteLength::Fraction(ratio)))
+                        .when(!is_row, |el| el.h(DefiniteLength::Fraction(ratio)))
+                        .overflow_hidden()
+                        .child(child_a),
+                )
+                // Divider: a draggable bar. `on_mouse_down` begins the drag
+                // (capturing the container bounds from the slot above);
+                // `on_mouse_move` updates the ratio while the left button is
+                // held; `on_mouse_up` ends the drag.
+                .child(
+                    div()
+                        .id(divider_id.clone())
+                        .flex_shrink_0()
+                        .bg(rgb(border()))
+                        .when(is_row, |el| {
+                            el.w(px(divider_size)).h_full().cursor_col_resize()
+                        })
+                        .when(!is_row, |el| {
+                            el.h(px(divider_size)).w_full().cursor_row_resize()
+                        })
+                        .on_mouse_down(MouseButton::Left, {
+                            let handle = handle_c.clone();
+                            let bounds_slot = bounds_slot.clone();
+                            move |_event, _w, cx| {
+                                let bounds = bounds_slot.lock().clone();
+                                if let Some(bounds) = bounds {
+                                    handle.update(cx, |app, cx| {
+                                        app.begin_split_drag(tab_id, a_pane, dir, bounds, cx);
+                                    });
+                                }
+                            }
+                        })
+                        .on_mouse_move({
+                            let handle = handle_c.clone();
+                            move |event, _w, cx| {
+                                if event.dragging() {
+                                    handle.update(cx, |app, cx| {
+                                        app.update_split_drag(event.position, cx);
+                                    });
+                                }
+                            }
+                        })
+                        .on_mouse_up(MouseButton::Left, {
+                            let handle = handle_c.clone();
+                            move |_event, _w, cx| {
+                                handle.update(cx, |app, cx| {
+                                    app.end_split_drag(cx);
+                                });
+                            }
+                        }),
+                )
+                // Child B: remainder.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(child_b),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+/// The pane id of the first leaf under a node (used to key dividers).
+fn leaf_pane_id(node: &SplitNode) -> u64 {
+    match node {
+        SplitNode::Pane(id) => *id,
+        SplitNode::Split { a, .. } => leaf_pane_id(a),
+    }
+}
+
+/// A compact icon button for the split-action overlay (top-right of the
+/// terminal content area). Ghost style: transparent bg, eased hover bg.
+fn render_split_button(
+    id: &'static str,
+    icon: &'static str,
+    tooltip: String,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+    let btn_id = ElementId::Name(format!("{}-btn", id).into());
+    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let rest_bg = rgba((surface_hover() << 8) | 0x00);
+    div()
+        .id(btn_id.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.0))
+        .rounded(px(4.0))
+        .cursor_pointer()
+        // Pre-set the rest (transparent) bg so the transition registry has
+        // a concrete `Some(bg)` to interpolate *from* on hover-in. Without
+        // this, the initial `to.bg` is `None` and `None → Some` jumps
+        // straight to the target (no fade-in), only the reverse animates.
+        .bg(rest_bg)
+        .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
+        .on_click(move |_e, w, cx| {
+            on_click(w, cx);
+            cx.stop_propagation();
+        })
+        .with_transition(btn_id)
+        .transition_on_hover(
+            std::time::Duration::from_millis(120),
+            Linear,
+            move |hovered, el| {
+                if *hovered {
+                    el.bg(hover_bg)
+                } else {
+                    el.bg(rgba((surface_hover() << 8) | 0x00))
+                }
+            },
+        )
+        .child(
+            svg()
+                .path(icon)
+                .size(px(14.0))
+                .text_color(rgb(text_muted())),
+        )
 }
