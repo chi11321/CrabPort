@@ -1,12 +1,12 @@
 [package]
 name = "CrabPort"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [package.metadata.bundle]
 name = "CrabPort"
 identifier = "org.eu.tachibana-kanade.crabport"
-version = "0.1.1"
+version = "0.1.2"
 copyright = "Copyright © 2026 ch1ll321"
 icon = ["app-icon.icns", "app-icon.png"]
 
