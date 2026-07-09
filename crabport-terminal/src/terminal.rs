@@ -179,6 +179,26 @@ pub trait CrabPortTerminal: Send + Sync {
     /// reported via [`BackendEvent::SftpTransferFinished`]; subsequent uploads
     /// triggered by saves each emit their own `SftpTransferFinished`.
     fn sftp_open_in_editor(&self, _remote_path: &str) {}
+
+    /// Open a new independent PTY/channel on the *same underlying connection*
+    /// and return a new backend driving it. Used by terminal split: each
+    /// pane gets its own independent input/output stream without reconnecting.
+    ///
+    /// - **SSH**: opens a new session channel + PTY + shell on the existing
+    ///   authenticated handle (no re-auth, no new TCP connection).
+    /// - **Local PTY**: spawns a new shell process.
+    /// - **Telnet**: returns `None` (Telnet has no channel multiplexing;
+    ///   the caller should create a new connection instead).
+    ///
+    /// Returns `None` if the backend doesn't support channel spawning, or if
+    /// the connection isn't ready yet.
+    fn spawn_channel(
+        &self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

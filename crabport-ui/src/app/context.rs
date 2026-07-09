@@ -21,12 +21,13 @@ use gpui::*;
 use crate::components::context_menu::ContextMenuController;
 use crate::components::dialog::AlertController;
 use crate::components::notification::NotificationController;
+use crate::components::tooltip::TooltipController;
 use crate::layouts::command_palette::CommandView;
-use crate::views::sessions::SessionsView;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
 use crate::views::panel::tunnels_panel::TunnelsPanel;
+use crate::views::sessions::SessionsView;
 use crate::views::snippets::SnippetsView;
 use crate::views::tunnels::{TunnelRegistry, TunnelsView};
 
@@ -46,6 +47,8 @@ pub struct AppCtx {
     pub alert: Entity<AlertController>,
     /// Global right-click context-menu host.
     pub context_menu: Entity<ContextMenuController>,
+    /// Global tooltip host (hover tooltips with fade-in/out).
+    pub tooltip: Entity<TooltipController>,
     /// Global toast notification host.
     pub notifications: Entity<NotificationController>,
 

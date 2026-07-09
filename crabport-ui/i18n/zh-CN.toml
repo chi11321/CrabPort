@@ -151,6 +151,9 @@ host_key_algo = "算法"
 host_key_fingerprint = "指纹"
 host_key_accept = "信任并连接"
 host_key_cancel = "取消"
+split_right = "向右分屏"
+split_down = "向下分屏"
+close_pane = "关闭窗格"
 
 [sftp]
 enter = "进入"

@@ -9,3 +9,4 @@ pub mod number_input;
 pub mod segmented_control;
 pub mod switch;
 pub mod tabs;
+pub mod tooltip;

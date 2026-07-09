@@ -236,6 +236,29 @@ impl CrabPortTerminal for SshBackend {
             }
         });
     }
+
+    fn spawn_channel(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Option<std::sync::Arc<dyn crabport_terminal::terminal::CrabPortTerminal>> {
+        // `new_channel_backend` is async (it awaits the SSH handle lock +
+        // channel allocation on the tokio runtime). We can't await here, so
+        // spawn it on TOKIO and return None — the caller polls via a oneshot.
+        //
+        // But the trait is sync. Instead, we use `try_send` on a tokio
+        // blocking call: since the handle is behind a tokio mutex, we spawn
+        // the async work on TOKIO and use a oneshot channel to get the result
+        // back synchronously via `block_on`.
+        //
+        // Actually, the simplest correct approach: spawn on TOKIO, use a
+        // std oneshot, and block on it via a tokio Enter guard. But blocking
+        // on tokio from within tokio panics. Since this method is called
+        // from the gpui main thread (not inside a tokio task), we can safely
+        // use `TOKIO.block_on(...)`.
+        let backend = TOKIO.block_on(self.new_channel_backend(cols, rows)).ok()?;
+        Some(std::sync::Arc::new(backend))
+    }
 }
 
 impl CrabPortMonitor for SshBackend {

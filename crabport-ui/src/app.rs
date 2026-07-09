@@ -72,6 +72,36 @@ pub struct CrabportApp {
     pub hovered_tab_id: Option<u64>,
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
+    /// Per-tab split layout. Each terminal tab owns a [`SplitTree`] describing
+    /// how its panes are arranged. Absent for non-terminal tabs and terminal
+    /// tabs that haven't been split (a single pane is still tracked here so
+    /// close/active-pane logic is uniform).
+    pub split_trees: HashMap<u64, crate::views::terminal::split::SplitTree>,
+    /// Every terminal pane's view, keyed by pane id (NOT tab id — a split tab
+    /// has multiple panes). `terminal_views` (above) is kept in sync to point
+    /// at the *active* pane's view so the existing toolbar / panel / SFTP /
+    /// tunnel-borrow logic in `content.rs` keeps working without per-pane
+    /// lookups.
+    pub pane_views: HashMap<u64, Entity<TerminalView>>,
+    /// Monotonic pane-id counter, so pane ids are unique across the whole app
+    /// (avoids id collisions in the gpui element-id space when a pane is
+    /// moved between tabs in the future).
+    pub next_pane_id: u64,
+    /// The last terminal pane that had keyboard focus, tracked via each
+    /// pane's `on_focused` callback. Unlike per-pane `is_focused`, this is
+    /// **not** cleared when focus moves to a non-terminal element (e.g. the
+    /// split-toolbar button), so `split_active_pane` can always split the
+    /// pane the user was last typing in. Cleared/updated only when another
+    /// terminal pane gains focus, or when the pane is closed.
+    pub last_focused_pane: Option<u64>,
+    /// Pane id to focus on the next render, set by `split_active_pane` so the
+    /// newly-created pane receives keyboard focus (and its cursor becomes
+    /// solid). Consumed in `render`.
+    pub pending_focus_pane: Option<u64>,
+    /// Active divider drag, if any. Set when the user presses on a split
+    /// divider; the split container records its pixel extent so each
+    /// mouse-move can convert the cursor position into a ratio.
+    pub split_drag: Option<crate::views::terminal::split::SplitDrag>,
     pub hosts: Vec<ConnectionHost>,
     pub connection_form: Option<ConnectionFormState>,
     /// Which right-hand panel pane the user last selected, keyed by tab id
@@ -159,13 +189,15 @@ impl CrabportApp {
             cx.new(|_cx| crate::views::panel::history_command_panel::HistoryCommandPanel::new());
         let tunnels_panel = cx.new(|_cx| crate::views::panel::tunnels_panel::TunnelsPanel::new());
         let app_entity = cx.entity();
-        let sessions_view = cx.new(|_cx| crate::views::sessions::SessionsView::new(app_entity.clone()));
+        let sessions_view =
+            cx.new(|_cx| crate::views::sessions::SessionsView::new(app_entity.clone()));
         let snippets_view =
             cx.new(|_cx| crate::views::snippets::SnippetsView::new(app_entity.clone()));
         let tunnels_view =
             cx.new(|_cx| crate::views::tunnels::TunnelsView::new(app_entity.clone()));
         let alert = cx.new(|_cx| AlertController::new());
         let context_menu = cx.new(|_cx| ContextMenuController::new());
+        let tooltip = cx.new(|_cx| crate::components::tooltip::TooltipController::new());
         let notifications =
             cx.new(|_cx| NotificationController::new(NotificationPosition::BottomRight));
         let tunnels = Arc::new(crate::views::tunnels::TunnelRegistry::new());
@@ -210,6 +242,7 @@ impl CrabportApp {
             app: app_entity,
             alert,
             context_menu,
+            tooltip,
             notifications,
             tunnels,
             command_palette,
@@ -229,6 +262,12 @@ impl CrabportApp {
             hovered_tab_id: None,
             next_tab_id: 1,
             terminal_views: HashMap::new(),
+            split_trees: HashMap::new(),
+            pane_views: HashMap::new(),
+            next_pane_id: 1,
+            last_focused_pane: None,
+            pending_focus_pane: None,
+            split_drag: None,
             hosts,
             connection_form: None,
             panel_active_tab: HashMap::new(),
@@ -350,6 +389,8 @@ impl Render for CrabportApp {
             &self.tabs,
             self.active_tab_id,
             &self.terminal_views,
+            &self.split_trees,
+            &self.pane_views,
             &self.hosts,
             self.connection_form.as_ref(),
             panel_active_tab,
@@ -376,6 +417,16 @@ impl Render for CrabportApp {
             self.last_focused_tab_id = Some(self.active_tab_id);
         }
 
+        // Move keyboard focus to a freshly-split pane (set by
+        // `split_active_pane`) so the user can immediately type into the new
+        // pane and its cursor renders solid.
+        if let Some(pane_id) = self.pending_focus_pane.take() {
+            if let Some(view) = self.pane_views.get(&pane_id).cloned() {
+                let fh = view.read_with(cx, |view, cx| view.focus_handle(cx));
+                _window.focus(&fh);
+            }
+        }
+
         // ---- Root ----
         div()
             .size_full()
@@ -393,6 +444,8 @@ impl Render for CrabportApp {
             .child(self.app_ctx.alert.clone())
             // -- Global context menu --
             .child(self.app_ctx.context_menu.clone())
+            // -- Global tooltip --
+            .child(self.app_ctx.tooltip.clone())
             // -- Global toast notifications --
             .child(self.app_ctx.notifications.clone())
             // -- Group form overlay (new / rename group, shared across kinds) --
