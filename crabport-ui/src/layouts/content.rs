@@ -283,6 +283,12 @@ pub fn render_content(
                                 .flex()
                                 .flex_row()
                                 .gap_1()
+                                // Occlude so mouse-down on the split buttons
+                                // doesn't fall through to the terminal pane
+                                // underneath (which would re-focus that pane
+                                // and make `split_active_pane` target the
+                                // wrong pane).
+                                .occlude()
                                 .child(render_split_button(
                                     "term-split-right",
                                     "icons/panel-right.svg",
@@ -903,6 +909,12 @@ fn render_pane(
             format!("pane-{}-{}", tab_id, pane_id).into(),
         ))
         .size_full()
+        // Occlude so this pane's hitbox blocks sibling panes' mouse
+        // handlers — without this, overlapping hitboxes (e.g. when the
+        // resizable-panel flex layout doesn't fully clip children) cause a
+        // single click to fire `on_mouse_down` on *every* pane, re-focusing
+        // the wrong one.
+        .occlude()
         .when(is_active, |el| el.bg(rgba((surface_hover() << 8) | 0x18)))
         .on_mouse_down(MouseButton::Left, {
             let handle = handle.clone();
@@ -914,6 +926,7 @@ fn render_pane(
                     let fh = view.read_with(cx, |v, cx| v.focus_handle(cx));
                     w.focus(&fh);
                 }
+                cx.stop_propagation();
             }
         });
     if let Some(view) = view {

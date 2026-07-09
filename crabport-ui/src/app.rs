@@ -87,6 +87,17 @@ pub struct CrabportApp {
     /// (avoids id collisions in the gpui element-id space when a pane is
     /// moved between tabs in the future).
     pub next_pane_id: u64,
+    /// The last terminal pane that had keyboard focus, tracked via each
+    /// pane's `on_focused` callback. Unlike per-pane `is_focused`, this is
+    /// **not** cleared when focus moves to a non-terminal element (e.g. the
+    /// split-toolbar button), so `split_active_pane` can always split the
+    /// pane the user was last typing in. Cleared/updated only when another
+    /// terminal pane gains focus, or when the pane is closed.
+    pub last_focused_pane: Option<u64>,
+    /// Pane id to focus on the next render, set by `split_active_pane` so the
+    /// newly-created pane receives keyboard focus (and its cursor becomes
+    /// solid). Consumed in `render`.
+    pub pending_focus_pane: Option<u64>,
     /// Active divider drag, if any. Set when the user presses on a split
     /// divider; the split container records its pixel extent so each
     /// mouse-move can convert the cursor position into a ratio.
@@ -254,6 +265,8 @@ impl CrabportApp {
             split_trees: HashMap::new(),
             pane_views: HashMap::new(),
             next_pane_id: 1,
+            last_focused_pane: None,
+            pending_focus_pane: None,
             split_drag: None,
             hosts,
             connection_form: None,
@@ -402,6 +415,16 @@ impl Render for CrabportApp {
                 _window.focus(&fh);
             }
             self.last_focused_tab_id = Some(self.active_tab_id);
+        }
+
+        // Move keyboard focus to a freshly-split pane (set by
+        // `split_active_pane`) so the user can immediately type into the new
+        // pane and its cursor renders solid.
+        if let Some(pane_id) = self.pending_focus_pane.take() {
+            if let Some(view) = self.pane_views.get(&pane_id).cloned() {
+                let fh = view.read_with(cx, |view, cx| view.focus_handle(cx));
+                _window.focus(&fh);
+            }
         }
 
         // ---- Root ----

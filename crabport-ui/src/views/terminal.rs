@@ -119,6 +119,15 @@ pub struct TerminalView {
     /// paint. Used by [`EntityInputHandler::bounds_for_range`] to position the
     /// IME candidate window near the cursor.
     cursor_bounds: Arc<Mutex<Bounds<Pixels>>>,
+    /// Whether this terminal pane currently has keyboard focus, tracked via
+    /// `on_focus`/`on_blur` listeners registered on first render. Read by the
+    /// paint callback to render a solid cursor when focused vs. a hollow
+    /// outline when not focused (no blinking).
+    is_focused: Arc<AtomicBool>,
+    /// Lazily-registered focus/blur listeners (registered on first render,
+    /// where a `&mut Window` is available). Held in an `Option` so the
+    /// `Subscription`s stay alive for as long as the view.
+    focus_sub: Option<gpui::Subscription>,
     overlay: SharedOverlayState,
     remote_host: String,
     /// Persisted host id for command-history storage and tunnel filtering.
@@ -129,6 +138,10 @@ pub struct TerminalView {
     ssh_info: Option<SshConnectionInfo>,
     telnet_info: Option<TelnetConnectionInfo>,
     on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
+    /// Invoked when this pane receives keyboard focus, passing this pane's
+    /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
+    /// and the toolbar follow keyboard focus, not just mouse clicks.
+    on_focused: Option<Rc<dyn Fn(u64, &mut App)>>,
     /// Latest SFTP transfer progress pushed by the backend, or `None` when
     /// no transfer is in flight. Updated by the backend-event subscriber;
     /// read by the toolbar via [`Self::sftp_progress`].
@@ -254,6 +267,10 @@ impl TerminalView {
         }
 
         let needs_repaint = Arc::new(AtomicBool::new(true));
+        // `is_focused` is created here (rather than only in the struct
+        // literal) so it can be captured by the paint closure. Read to render
+        // a solid cursor when focused vs. a hollow outline when not focused.
+        let is_focused = Arc::new(AtomicBool::new(false));
         let is_remote = !host.is_empty();
 
         // Backend error/close events.
@@ -491,6 +508,8 @@ impl TerminalView {
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
             ))),
+            is_focused,
+            focus_sub: None,
             overlay,
             remote_host: host,
             host_id,
@@ -498,6 +517,7 @@ impl TerminalView {
             ssh_info,
             telnet_info,
             on_backend_closed: None,
+            on_focused: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
@@ -597,6 +617,21 @@ impl TerminalView {
         self.on_backend_closed = Some(Rc::new(f));
     }
 
+    /// The stable pane id this view was created with (passed as `count` to
+    /// the constructor). The app uses it to identify which pane in a split
+    /// tree received keyboard focus, so `split_active_pane` operates on the
+    /// focused pane rather than just the last-clicked one.
+    pub fn pane_id(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether this pane currently has keyboard focus. Read by the app to
+    /// determine which pane to split (the focused one) without relying on
+    /// mouse-click bookkeeping.
+    pub fn is_focused(&self) -> bool {
+        self.is_focused.load(Ordering::Acquire)
+    }
+
     /// Set the callback invoked whenever `sftp_progress` changes. The app
     /// uses this to trigger a re-render of the toolbar (which reads the
     /// progress snapshot) without observing every terminal repaint.
@@ -611,6 +646,14 @@ impl TerminalView {
         f: impl Fn(SftpTransferKind, bool, String, &mut App) + 'static,
     ) {
         self.on_sftp_transfer_finished = Some(Rc::new(f));
+    }
+
+    /// Set the callback invoked when this pane receives keyboard focus. The
+    /// app uses it to mark this pane as the active pane of its tab, so that
+    /// `split_active_pane` and the toolbar follow keyboard focus (not just
+    /// mouse clicks). The callback receives this pane's id.
+    pub fn set_on_focused(&mut self, f: impl Fn(u64, &mut App) + 'static) {
+        self.on_focused = Some(Rc::new(f));
     }
 
     /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
@@ -1055,6 +1098,36 @@ impl Render for TerminalView {
             }
         }
 
+        // Lazily register focus/blur listeners (only once — a `&mut Window`
+        // is required, which we only have inside `render`). These track
+        // `is_focused` so the paint callback can render a solid cursor when
+        // focused vs. a hollow outline when not focused. On focus we also
+        // fire the `on_focused` callback so the app can sync
+        // `split_trees[tab].active_pane` to the keyboard-focused pane.
+        if self.focus_sub.is_none() {
+            let is_focused = self.is_focused.clone();
+            let focused_cb = self.on_focused.clone();
+            let pane_id = self.count;
+            let fh = self.focus_handle.clone();
+            let sub_f = cx.on_focus(&fh, _window, move |_this, _window, cx| {
+                is_focused.store(true, Ordering::Release);
+                if let Some(cb) = &focused_cb {
+                    let cb = cb.clone();
+                    cx.defer(move |cx| cb(pane_id, cx));
+                }
+            });
+            let is_focused_b = self.is_focused.clone();
+            let sub_b = cx.on_blur(&fh, _window, move |_this, _window, _cx| {
+                is_focused_b.store(false, Ordering::Release);
+            });
+            // Re-fetch focus state immediately so the first frame after a
+            // focus change (e.g. switching tabs via the app's
+            // `window.focus()`) is correct even before a listener fires.
+            self.is_focused
+                .store(fh.is_focused(_window), Ordering::Release);
+            self.focus_sub = Some(gpui::Subscription::join(sub_f, sub_b));
+        }
+
         let session_c = self.session.clone();
         let session = session_c.clone();
         let font_size = self.font_size;
@@ -1105,6 +1178,9 @@ impl Render for TerminalView {
         let cursor_bounds_paint = self.cursor_bounds.clone();
         let entity_input = cx.entity();
         let focus_handle_input = self.focus_handle.clone();
+        // Read by the paint callback to render a solid cursor when focused
+        // vs. a hollow outline when not focused (no blinking).
+        let is_focused_paint = self.is_focused.clone();
 
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
@@ -1549,12 +1625,16 @@ impl Render for TerminalView {
                                 // window there via `bounds_for_range`.
                                 *cursor_bounds_paint.lock() =
                                     Bounds::new(point(cx_x, cx_y), size(cell_width, line_height));
+                                // Focused → solid cursor; not focused → hollow
+                                // outline (no blinking).
+                                let focused = is_focused_paint.load(Ordering::Acquire);
                                 paint_cursor(
                                     cursor_shape,
                                     cx_x,
                                     cx_y,
                                     cell_width,
                                     line_height,
+                                    focused,
                                     window,
                                 );
                             }
@@ -1993,7 +2073,11 @@ impl EntityInputHandler for TerminalView {
 }
 
 /// Paint the terminal cursor as one or more quads.
-/// Paint the terminal cursor as one or more quads.
+///
+/// `focused` controls the cursor style: when the pane has keyboard focus the
+/// cursor is rendered solid; when not focused it's rendered as a hollow
+/// outline so the user can still see where the cursor is without it competing
+/// for attention with the focused pane's solid cursor. There is no blinking.
 #[allow(clippy::too_many_arguments)]
 fn paint_cursor(
     shape: CursorShape,
@@ -2001,17 +2085,30 @@ fn paint_cursor(
     cx_y: Pixels,
     cell_width: Pixels,
     line_height: Pixels,
+    focused: bool,
     window: &mut Window,
 ) {
     match shape {
         CursorShape::Block => {
-            let c: Hsla = rgb(term_cursor()).into();
-            window.paint_quad(fill(
-                Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
-                c.opacity(0.5),
-            ));
+            if focused {
+                // Solid filled block.
+                window.paint_quad(fill(
+                    Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
+                    rgb(term_cursor()),
+                ));
+            } else {
+                // Hollow outline so the unfocused pane's cursor stays
+                // visible but clearly secondary.
+                window.paint_quad(outline(
+                    Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
+                    rgb(term_cursor()),
+                    BorderStyle::Solid,
+                ));
+            }
         }
         CursorShape::HollowBlock => {
+            // The requested shape is already hollow; render the outline in
+            // both states (it's inherently non-solid).
             window.paint_quad(outline(
                 Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
                 rgb(term_cursor()),
@@ -2019,18 +2116,25 @@ fn paint_cursor(
             ));
         }
         CursorShape::Underline => {
+            // For underline/beam there's no meaningful hollow variant, so
+            // render the shape at full opacity when focused and dimmed when
+            // not focused to convey the secondary state.
+            let opacity = if focused { 1.0 } else { 0.4 };
+            let c: Hsla = rgb(term_cursor()).into();
             window.paint_quad(fill(
                 Bounds::new(
                     point(cx_x, cx_y + line_height - px(2.0)),
                     size(cell_width, px(2.0)),
                 ),
-                rgb(term_cursor()),
+                c.opacity(opacity),
             ));
         }
         CursorShape::Beam => {
+            let opacity = if focused { 1.0 } else { 0.4 };
+            let c: Hsla = rgb(term_cursor()).into();
             window.paint_quad(fill(
                 Bounds::new(point(cx_x, cx_y), size(px(1.5), line_height)),
-                rgb(term_cursor()),
+                c.opacity(opacity),
             ));
         }
         CursorShape::Hidden => {}

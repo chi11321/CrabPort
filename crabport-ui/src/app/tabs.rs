@@ -138,6 +138,11 @@ impl CrabportApp {
             });
         });
 
+        // Sync the split tree's active pane when this pane receives keyboard
+        // focus (e.g. via Tab cycling), so `split_active_pane` and the
+        // toolbar follow keyboard focus, not just mouse clicks.
+        self.register_pane_focus_callback(&terminal_view, cx);
+
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
 
@@ -323,6 +328,11 @@ impl CrabportApp {
             view.set_tunnel_source(tunnel_source);
         });
 
+        // Sync the split tree's active pane when this pane receives keyboard
+        // focus (e.g. via Tab cycling), so `split_active_pane` and the
+        // toolbar follow keyboard focus, not just mouse clicks.
+        self.register_pane_focus_callback(&terminal_view, cx);
+
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
 
@@ -409,6 +419,11 @@ impl CrabportApp {
             });
         });
 
+        // Sync the split tree's active pane when this pane receives keyboard
+        // focus (e.g. via Tab cycling), so `split_active_pane` and the
+        // toolbar follow keyboard focus, not just mouse clicks.
+        self.register_pane_focus_callback(&terminal_view, cx);
+
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
 
@@ -448,6 +463,10 @@ impl CrabportApp {
             for pane_id in tree.pane_ids() {
                 if let Some(view) = self.pane_views.remove(&pane_id) {
                     view.update(cx, |v, _cx| v.close());
+                }
+                // Clear last-focused record if it pointed at one of these.
+                if self.last_focused_pane == Some(pane_id) {
+                    self.last_focused_pane = None;
                 }
             }
         }
@@ -509,12 +528,29 @@ impl CrabportApp {
     /// PTY [`TerminalView`] for the new pane, registers it, and splices it
     /// into the split tree. The new pane becomes active. No-op if the active
     /// tab isn't a terminal tab.
+    ///
+    /// The pane being split is the **keyboard-focused** pane (not just the
+    /// last-clicked one). We find it by scanning the active tab's panes for
+    /// the one whose `TerminalView::is_focused()` returns true, falling back
+    /// to the tree's `active_pane` if none reports focus (e.g. focus is
+    /// elsewhere but the user invokes split via the toolbar button).
     pub fn split_active_pane(&mut self, dir: SplitDir, cx: &mut Context<Self>) {
         let tab_id = self.active_tab_id;
-        let Some(tree) = self.split_trees.get(&tab_id) else {
+        let Some(tree) = self.split_trees.get(&tab_id).cloned() else {
             return;
         };
-        let active_pane = tree.active_pane;
+        // The pane being split is the last one to have had keyboard focus
+        // (`last_focused_pane`), tracked via each pane's `on_focused`
+        // callback and via `focus_pane` on click. This is **not** cleared
+        // when focus moves to a non-terminal element (e.g. the split toolbar
+        // button), so splitting always targets the pane the user was last
+        // typing in — e.g. split-down splits the focused left pane, not the
+        // right one. Falls back to the tree's `active_pane` if we have no
+        // record (e.g. focus was never on a pane this session).
+        let active_pane = self
+            .last_focused_pane
+            .filter(|&p| tree.root.find_pane(p))
+            .unwrap_or(tree.active_pane);
         let new_pane_id = self.alloc_pane_id();
 
         // Create an independent new PTY/channel for the split pane.
@@ -600,6 +636,9 @@ impl CrabportApp {
                 });
             });
         });
+        // Sync the split tree's active pane when this pane receives keyboard
+        // focus, so subsequent splits target the focused pane.
+        self.register_pane_focus_callback(&view, cx);
         self.pane_views.insert(new_pane_id, view);
         if let Some(tree) = self.split_trees.get_mut(&tab_id) {
             tree.split_active(dir, new_pane_id);
@@ -609,6 +648,12 @@ impl CrabportApp {
                 self.terminal_views.insert(tab_id, active_view);
             }
         }
+        // Move keyboard focus to the newly-created pane so the user can
+        // immediately type into it, and its cursor renders solid. Done on
+        // the next render (where a `&mut Window` is available) rather than
+        // here because `split_active_pane` only has a `&mut Context<Self>`.
+        self.pending_focus_pane = Some(new_pane_id);
+        self.last_focused_pane = Some(new_pane_id);
         cx.notify();
     }
 
@@ -619,6 +664,11 @@ impl CrabportApp {
         // Remove the pane's view from the registry + close its backend.
         if let Some(view) = self.pane_views.remove(&pane_id) {
             view.update(cx, |v, _cx| v.close());
+        }
+        // If the closed pane was the last focused one, drop the record so
+        // `split_active_pane` falls back to the tree's active pane.
+        if self.last_focused_pane == Some(pane_id) {
+            self.last_focused_pane = None;
         }
         let Some(tree) = self.split_trees.remove(&tab_id) else {
             return;
@@ -650,6 +700,10 @@ impl CrabportApp {
                 tree.active_pane = pane_id;
             }
         }
+        // Record this as the last pane to have keyboard focus so
+        // `split_active_pane` targets it even after focus moves to a
+        // non-terminal element (e.g. the split toolbar button).
+        self.last_focused_pane = Some(pane_id);
         if let Some(view) = self.pane_views.get(&pane_id).cloned() {
             self.terminal_views.insert(tab_id, view);
         }
@@ -670,6 +724,64 @@ impl CrabportApp {
             tree.set_ratio_for_child(pane_id, ratio);
         }
         cx.notify();
+    }
+
+    /// Mark `pane_id` as the active pane of whichever tab owns it, syncing
+    /// `terminal_views[tab]` so the toolbar / right-hand panel follow keyboard
+    /// focus. Called from a pane's `on_focused` callback when it receives
+    /// keyboard focus (e.g. via Tab cycling or clicking), so that
+    /// `split_active_pane` operates on the focused pane rather than just the
+    /// last-clicked one.
+    ///
+    /// This is a no-op if no split tree contains `pane_id` (e.g. the pane was
+    /// closed between focus being grabbed and this callback firing).
+    pub fn sync_active_pane_from_focus(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        let tab_id = self
+            .split_trees
+            .iter()
+            .find(|(_, tree)| tree.root.find_pane(pane_id))
+            .map(|(t, _)| *t);
+        let Some(tab_id) = tab_id else {
+            return;
+        };
+        // Record this as the last pane to have keyboard focus so
+        // `split_active_pane` can target it even after focus moves to a
+        // non-terminal element (e.g. the split toolbar button).
+        self.last_focused_pane = Some(pane_id);
+        // Avoid redundant work / notify if the pane is already active.
+        let already_active = self
+            .split_trees
+            .get(&tab_id)
+            .is_some_and(|t| t.active_pane == pane_id);
+        if already_active {
+            return;
+        }
+        if let Some(tree) = self.split_trees.get_mut(&tab_id) {
+            tree.active_pane = pane_id;
+        }
+        if let Some(view) = self.pane_views.get(&pane_id).cloned() {
+            self.terminal_views.insert(tab_id, view);
+        }
+        cx.notify();
+    }
+
+    /// Wire a freshly-created pane's `on_focused` callback so that when it
+    /// receives keyboard focus the app marks it as the active pane of its
+    /// tab. Used by `add_tab` / `add_ssh_tab` / `add_telnet_tab` /
+    /// `split_active_pane`.
+    fn register_pane_focus_callback(
+        &mut self,
+        view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let app_handle = cx.entity().downgrade();
+        view.update(cx, |v, _cx| {
+            v.set_on_focused(move |pane_id, cx| {
+                let _ = app_handle.update(cx, |app, cx| {
+                    app.sync_active_pane_from_focus(pane_id, cx);
+                });
+            });
+        });
     }
 
     /// Begin a divider drag for the split whose first child is `pane_id`.
