@@ -689,6 +689,13 @@ impl CrabportApp {
                 if let Some(active_view) = self.pane_views.get(&new_tree.active_pane).cloned() {
                     self.terminal_views.insert(tab_id, active_view);
                 }
+                // Move keyboard focus to the remaining active pane so the
+                // user can keep typing without clicking another pane first.
+                // Mirrors the split-pane path: set `pending_focus_pane` so
+                // the next render (where `&mut Window` is available) grabs
+                // focus, and track it as the last-focused pane.
+                self.pending_focus_pane = Some(new_tree.active_pane);
+                self.last_focused_pane = Some(new_tree.active_pane);
                 cx.notify();
             }
         }

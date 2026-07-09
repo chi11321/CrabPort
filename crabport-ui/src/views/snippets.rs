@@ -492,14 +492,7 @@ impl Render for SnippetsView {
                                                 });
                                             })
                                         },
-                                        Some({
-                                            let app = app.clone();
-                                            Rc::new(move |_w, cx| {
-                                                app.update(cx, |app, cx| {
-                                                    app.toggle_group_favorite(gid, cx);
-                                                });
-                                            })
-                                        }),
+                                        None,
                                         Some({
                                             let context_menu = context_menu.clone();
                                             let alert_controller = alert_controller.clone();

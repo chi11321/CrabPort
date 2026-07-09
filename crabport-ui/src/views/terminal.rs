@@ -2151,10 +2151,12 @@ fn paint_cursor(
     match shape {
         CursorShape::Block => {
             if focused {
-                // Solid filled block.
+                // Solid filled block, semi-transparent so the character
+                // beneath remains visible.
+                let c: Hsla = rgb(term_cursor()).into();
                 window.paint_quad(fill(
                     Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
-                    rgb(term_cursor()),
+                    c.opacity(0.5),
                 ));
             } else {
                 // Hollow outline so the unfocused pane's cursor stays
