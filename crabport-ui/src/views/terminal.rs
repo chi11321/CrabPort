@@ -230,6 +230,43 @@ impl TerminalView {
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_backend_and_host_and_overlay_and_history(
+            backend,
+            cols,
+            rows,
+            host,
+            host_id,
+            overlay,
+            ssh_info,
+            telnet_info,
+            count,
+            None,
+            cx,
+        )
+    }
+
+    /// Like [`with_backend_and_host_and_overlay`] but optionally shares the
+    /// command-history buffer with another pane. Used when splitting a
+    /// terminal so all panes of the same tab see the same history.
+    ///
+    /// `shared_history` = `None` creates a fresh history (first pane of a
+    /// tab); `Some(arc)` reuses the source pane's history (split panes). The
+    /// Store-backed persistence callback is wired in both cases so commands
+    /// captured in any pane still land in the DB; pre-seeding from the Store
+    /// is skipped when sharing (the source pane already did it).
+    pub fn with_backend_and_host_and_overlay_and_history(
+        backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+        cols: usize,
+        rows: usize,
+        host: String,
+        host_id: Option<i64>,
+        overlay: SharedOverlayState,
+        ssh_info: Option<SshConnectionInfo>,
+        telnet_info: Option<TelnetConnectionInfo>,
+        count: u64,
+        shared_history: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         // Font size, line height, and cell width are derived from the
         // persisted terminal font settings (`[appearance.terminal]`). The
@@ -241,22 +278,37 @@ impl TerminalView {
         let line_height = metrics.line_height;
         let cell_width = metrics.cell_width;
 
-        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
+        let is_shared = shared_history.is_some();
+        let session = if let Some(hist) = shared_history {
+            Arc::new(TerminalSession::new_with_shared_history(
+                backend.clone(),
+                cols,
+                rows,
+                hist,
+            ))
+        } else {
+            Arc::new(TerminalSession::new(backend.clone(), cols, rows))
+        };
         session.start();
 
         // Wire command-history persistence: when the session captures a new
         // command, persist it to the Store for this host (if any). Local
         // terminals (host_id = None) keep history in-memory only.
+        //
+        // When sharing history (split panes), skip the Store pre-seed — the
+        // source pane already populated the shared buffer, and re-seeding
+        // would clobber it with a stale snapshot.
         if let Some(hid) = host_id {
             let store = crate::app_state::AppState::store(cx);
-            // Pre-load persisted history into the in-memory buffer so the
-            // panel has data before the user types anything new.
-            if let Ok(cmds) = store.lock().commands_for_host(hid) {
-                let mut history = std::collections::VecDeque::new();
-                for c in cmds {
-                    history.push_back(c);
+            // Only pre-seed for the first pane (no shared history).
+            if !is_shared {
+                if let Ok(cmds) = store.lock().commands_for_host(hid) {
+                    let mut history = std::collections::VecDeque::new();
+                    for c in cmds {
+                        history.push_back(c);
+                    }
+                    *session.command_history_deque() = history;
                 }
-                *session.command_history_deque() = history;
             }
             // `store` is `Arc<Mutex<Store>>` — clone for the callback so
             // the original binding stays usable above.
@@ -577,6 +629,14 @@ impl TerminalView {
     /// backend that tracks history.
     pub fn command_history(&self) -> Vec<String> {
         self.session.command_history()
+    }
+
+    /// Cloned handle to the shared command-history buffer. Used when
+    /// splitting this pane so the new pane shares the same history.
+    pub fn command_history_arc(
+        &self,
+    ) -> Arc<parking_lot::Mutex<std::collections::VecDeque<String>>> {
+        self.session.command_history_arc()
     }
 
     /// Write raw bytes to the terminal **without** capturing them as a

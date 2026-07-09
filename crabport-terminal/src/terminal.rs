@@ -301,6 +301,11 @@ pub struct TerminalSession {
     _wakeup_rx: InactiveReceiver<()>,
     /// Command history, most-recent-first. Capped at [`MAX_COMMAND_HISTORY`]
     /// entries; the oldest is evicted when full.
+    ///
+    /// Shared across all split panes of the same tab so the History panel
+    /// stays consistent no matter which pane is active. Each split pane
+    /// clones this `Arc` from its source pane via
+    /// [`TerminalSession::new_with_shared_history`].
     command_history: Arc<Mutex<VecDeque<String>>>,
     /// In-progress input line + ANSI escape parser state, accumulated by
     /// [`Self::write`] and submitted to `command_history` on Enter (CR/LF).
@@ -333,6 +338,40 @@ impl TerminalSession {
             started: AtomicBool::new(false),
             _wakeup_rx,
             command_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_COMMAND_HISTORY))),
+            line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
+            on_command: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Like [`new`](Self::new) but shares `command_history` with another
+    /// session — used when splitting a terminal pane so all panes of the
+    /// same tab see the same command history.
+    ///
+    /// Each split pane keeps its own `line_buffer` (input-line capture is
+    /// per-pane, since each pane has its own prompt); only the completed
+    /// history is shared.
+    pub fn new_with_shared_history(
+        backend: Arc<dyn CrabPortTerminal>,
+        cols: usize,
+        rows: usize,
+        command_history: Arc<Mutex<VecDeque<String>>>,
+    ) -> Self {
+        let (wakeup_tx, wakeup_rx) = broadcast(256);
+        let _wakeup_rx = wakeup_rx.deactivate();
+
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            EventProxy::new(wakeup_tx.clone()),
+        )));
+
+        Self {
+            backend,
+            term,
+            wakeup_tx,
+            started: AtomicBool::new(false),
+            _wakeup_rx,
+            command_history,
             line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
         }
@@ -461,6 +500,13 @@ impl TerminalSession {
     /// session creation. Returns a guard; caller assigns the whole deque.
     pub fn command_history_deque(&self) -> parking_lot::MutexGuard<'_, VecDeque<String>> {
         self.command_history.lock()
+    }
+
+    /// Cloned handle to the shared command-history buffer. Used when
+    /// splitting a pane so the new pane shares the same history as its
+    /// source (see [`Self::new_with_shared_history`]).
+    pub fn command_history_arc(&self) -> Arc<Mutex<VecDeque<String>>> {
+        self.command_history.clone()
     }
 
     /// Register a callback invoked whenever a new command is captured
