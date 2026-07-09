@@ -24,7 +24,9 @@ fn workaround_wsl2_wayland_version() {
     let is_wsl2 = std::fs::read_to_string("/proc/version")
         .is_ok_and(|v| v.contains("microsoft-standard-WSL2"));
     if is_wsl2 {
-        std::env::remove_var("WAYLAND_DISPLAY");
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
     }
 }
 
