@@ -570,11 +570,14 @@ impl CrabportApp {
             let ssh_info = src.read_with(cx, |v, _| v.ssh_info().cloned());
             let telnet_info = src.read_with(cx, |v, _| v.telnet_info().cloned());
             let tunnel_source = src.read_with(cx, |v, _| v.tunnel_source_arc());
+            // Share the source pane's command history so all split panes of
+            // this tab see the same list in the History panel.
+            let shared_history = src.read_with(cx, |v, _| v.command_history_arc());
 
             if let Some(backend) = spawned_backend {
                 // SSH channel / local PTY: build the view with the spawned backend.
                 cx.new(|cx| {
-                    TerminalView::with_backend_and_host_and_overlay(
+                    TerminalView::with_backend_and_host_and_overlay_and_history(
                         backend,
                         80,
                         24,
@@ -584,6 +587,7 @@ impl CrabportApp {
                         ssh_info,
                         telnet_info,
                         count,
+                        Some(shared_history),
                         cx,
                     )
                     .with_tunnel_source_opt(tunnel_source)
@@ -605,7 +609,7 @@ impl CrabportApp {
                     ),
                 );
                 cx.new(|cx| {
-                    TerminalView::with_backend_and_host_and_overlay(
+                    TerminalView::with_backend_and_host_and_overlay_and_history(
                         backend,
                         80,
                         24,
@@ -615,6 +619,7 @@ impl CrabportApp {
                         None,
                         Some(info),
                         count,
+                        Some(shared_history),
                         cx,
                     )
                 })
@@ -684,6 +689,13 @@ impl CrabportApp {
                 if let Some(active_view) = self.pane_views.get(&new_tree.active_pane).cloned() {
                     self.terminal_views.insert(tab_id, active_view);
                 }
+                // Move keyboard focus to the remaining active pane so the
+                // user can keep typing without clicking another pane first.
+                // Mirrors the split-pane path: set `pending_focus_pane` so
+                // the next render (where `&mut Window` is available) grabs
+                // focus, and track it as the last-focused pane.
+                self.pending_focus_pane = Some(new_tree.active_pane);
+                self.last_focused_pane = Some(new_tree.active_pane);
                 cx.notify();
             }
         }

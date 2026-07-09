@@ -82,7 +82,6 @@ pub fn group_header(
         .px_3()
         .py_1()
         .mt_2()
-        .cursor_pointer()
         .rounded_md()
         // Pre-set the rest background so the transition registry has a
         // concrete `Some(bg)` to interpolate *from* on hover-in. Without
@@ -205,7 +204,6 @@ pub fn group_header(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .cursor_pointer()
                     .child(
                         svg()
                             .path("icons/star.svg")

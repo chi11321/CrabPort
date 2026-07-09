@@ -333,7 +333,6 @@ impl RenderOnce for Button {
                             .h_5()
                             .w_5()
                             .rounded_sm()
-                            .cursor_pointer()
                             .child(
                                 svg()
                                     .path("icons/close.svg")

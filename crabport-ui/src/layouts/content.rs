@@ -965,7 +965,6 @@ fn render_split_button(
         .justify_center()
         .size(px(24.0))
         .rounded(px(4.0))
-        .cursor_pointer()
         // Pre-set the rest (transparent) bg so the transition registry has
         // a concrete `Some(bg)` to interpolate *from* on hover-in.
         .bg(rest_bg)

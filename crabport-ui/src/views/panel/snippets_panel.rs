@@ -217,7 +217,6 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .cursor_pointer()
                             .hover(|s| s.bg(rgb(surface_hover())))
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_run_for_btn.as_ref() {
@@ -243,7 +242,6 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .cursor_pointer()
                             .hover(|s| s.bg(rgb(surface_hover())))
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {

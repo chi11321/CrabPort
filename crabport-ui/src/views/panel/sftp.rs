@@ -1133,9 +1133,7 @@ fn render_sftp_action_button(
         .justify_center()
         .size(px(24.0))
         .rounded(px(4.0))
-        .when(enabled, |el| {
-            el.cursor_pointer().hover(move |s| s.bg(hover_bg))
-        })
+        .when(enabled, |el| el.hover(move |s| s.bg(hover_bg)))
         .when(!enabled, |el| el.cursor_not_allowed())
         .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
         .when(enabled, |el| {
