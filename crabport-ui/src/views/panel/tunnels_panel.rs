@@ -545,7 +545,6 @@ impl Render for TunnelsPanel {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .cursor_pointer()
                                     .child(svg().path("icons/star.svg").size(px(14.0)).text_color(
                                         rgb(if favorite_for_star {
                                             term_yellow()

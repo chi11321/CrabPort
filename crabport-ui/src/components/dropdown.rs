@@ -247,11 +247,7 @@ impl RenderOnce for Dropdown {
             }))
             .border_1()
             .border_color(rgb(border()))
-            .when_else(
-                disabled,
-                |el| el.cursor_not_allowed().opacity(0.5),
-                |el| el.cursor_pointer(),
-            )
+            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
             .child(
                 div()
                     .text_sm()
@@ -382,7 +378,6 @@ impl RenderOnce for Dropdown {
                     .px_3()
                     .w_full()
                     .rounded_sm()
-                    .cursor_pointer()
                     .text_sm()
                     .text_color(rgb(if is_selected {
                         text_primary()
@@ -443,7 +438,6 @@ impl RenderOnce for Dropdown {
                     .px_3()
                     .w_full()
                     .rounded_sm()
-                    .cursor_pointer()
                     .text_sm()
                     .text_color(rgb(term_blue()))
                     .hover(|s| s.bg(rgb(surface_active())))

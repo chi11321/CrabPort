@@ -943,7 +943,6 @@ fn host_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_pointer()
                 .child(
                     svg()
                         .path("icons/star.svg")

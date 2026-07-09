@@ -1920,7 +1920,6 @@ impl Render for TerminalView {
                                 .w(px(6.0))
                                 .rounded_full()
                                 .bg(rgb(0x4d4e50))
-                                .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, {
                                     let scrollbar_drag_offset_c = scrollbar_drag_offset_c.clone();
                                     let scrollbar_dragging_c = scrollbar_dragging_c.clone();

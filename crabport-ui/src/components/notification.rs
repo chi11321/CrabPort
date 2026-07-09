@@ -588,7 +588,6 @@ fn render_notification_card(
         trailing = trailing.child(
             div()
                 .id(action_id)
-                .cursor_pointer()
                 .px_1()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -608,7 +607,6 @@ fn render_notification_card(
     trailing = trailing.child(
         div()
             .id(close_id)
-            .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()

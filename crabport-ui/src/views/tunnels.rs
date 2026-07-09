@@ -1161,7 +1161,6 @@ fn tunnel_row(
                         .flex()
                         .items_center()
                         .justify_center()
-                        .cursor_pointer()
                         .child(svg().path("icons/star.svg").size_4().text_color(rgb(
                             if tunnel_favorite {
                                 term_yellow()

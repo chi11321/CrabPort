@@ -175,7 +175,7 @@ impl RenderOnce for Switch {
                 disabled,
                 |el| el.cursor_not_allowed().opacity(0.6),
                 |el| {
-                    el.cursor_pointer().when_some(on_change, |el, cb| {
+                    el.when_some(on_change, |el, cb| {
                         el.on_click(move |_e, w, cx| {
                             // Toggle and dispatch the *new* value.
                             cb(&!checked, w, cx);
