@@ -9,7 +9,29 @@ use crabport_ui::menus::{Hide, Minimize, OpenAbout, OpenSettings, Quit, Zoom};
 use crabport_ui::windows::AuxWindowKind;
 use gpui::*;
 
+/// Work around a crash on WSL2.
+///
+/// WSLg ships a Weston compositor that advertises `xdg_wm_base` at a
+/// version below 2. gpui 0.2.2 binds that global with `globals.bind(&qh,
+/// 2..=5, ()).unwrap()` (see `platform/linux/wayland/client.rs:151`), so the
+/// `UnsupportedVersion` error turns into a panic before any window opens.
+///
+/// gpui's `guess_compositor` picks Wayland whenever `WAYLAND_DISPLAY` is set
+/// and non-empty, with no fallback to X11 on bind failure. Dropping the
+/// variable forces the X11 path, which works fine under WSLg.
+#[cfg(target_os = "linux")]
+fn workaround_wsl2_wayland_version() {
+    let is_wsl2 = std::fs::read_to_string("/proc/version")
+        .is_ok_and(|v| v.contains("microsoft-standard-WSL2"));
+    if is_wsl2 {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    workaround_wsl2_wayland_version();
+
     #[cfg(debug_assertions)]
     crabport_core::log::init();
 
