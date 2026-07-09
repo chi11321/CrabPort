@@ -186,6 +186,7 @@ impl CrabportApp {
             cx.new(|_cx| crate::views::tunnels::TunnelsView::new(app_entity.clone()));
         let alert = cx.new(|_cx| AlertController::new());
         let context_menu = cx.new(|_cx| ContextMenuController::new());
+        let tooltip = cx.new(|_cx| crate::components::tooltip::TooltipController::new());
         let notifications =
             cx.new(|_cx| NotificationController::new(NotificationPosition::BottomRight));
         let tunnels = Arc::new(crate::views::tunnels::TunnelRegistry::new());
@@ -230,6 +231,7 @@ impl CrabportApp {
             app: app_entity,
             alert,
             context_menu,
+            tooltip,
             notifications,
             tunnels,
             command_palette,
@@ -419,6 +421,8 @@ impl Render for CrabportApp {
             .child(self.app_ctx.alert.clone())
             // -- Global context menu --
             .child(self.app_ctx.context_menu.clone())
+            // -- Global tooltip --
+            .child(self.app_ctx.tooltip.clone())
             // -- Global toast notifications --
             .child(self.app_ctx.notifications.clone())
             // -- Group form overlay (new / rename group, shared across kinds) --
