@@ -19,18 +19,19 @@ impl Store {
     // Tunnels CRUD
     // -------------------------------------------------------------------
 
-    /// List all saved tunnels, ordered by id ascending.
+    /// List all saved tunnels, ordered by favorite then id ascending.
     pub fn tunnels(&self) -> Result<Vec<TunnelEntry>, StoreError> {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at FROM tunnels ORDER BY id",
+                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at, favorite, group_id FROM tunnels ORDER BY favorite DESC, id",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         let rows = stmt
             .query_map([], |row| {
                 let kind_str: String = row.get(3)?;
+                let favorite: i64 = row.get(9)?;
                 Ok(TunnelEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -41,6 +42,8 @@ impl Store {
                     target_host: row.get(6)?,
                     target_port: row.get(7)?,
                     created_at: row.get(8)?,
+                    favorite: favorite != 0,
+                    group_id: row.get(10)?,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -52,18 +55,19 @@ impl Store {
         Ok(out)
     }
 
-    /// List all tunnels belonging to a given host, ordered by id ascending.
+    /// List all tunnels belonging to a given host, ordered by favorite then id ascending.
     pub fn tunnels_for_host(&self, host_id: i64) -> Result<Vec<TunnelEntry>, StoreError> {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at FROM tunnels WHERE host_id=?1 ORDER BY id",
+                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at, favorite, group_id FROM tunnels WHERE host_id=?1 ORDER BY favorite DESC, id",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         let rows = stmt
             .query_map(params![host_id], |row| {
                 let kind_str: String = row.get(3)?;
+                let favorite: i64 = row.get(9)?;
                 Ok(TunnelEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -74,6 +78,8 @@ impl Store {
                     target_host: row.get(6)?,
                     target_port: row.get(7)?,
                     created_at: row.get(8)?,
+                    favorite: favorite != 0,
+                    group_id: row.get(10)?,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -90,12 +96,13 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at FROM tunnels WHERE id=?1",
+                "SELECT id, name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at, favorite, group_id FROM tunnels WHERE id=?1",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
         stmt.query_row(params![id], |row| {
             let kind_str: String = row.get(3)?;
+            let favorite: i64 = row.get(9)?;
             Ok(TunnelEntry {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -106,6 +113,8 @@ impl Store {
                 target_host: row.get(6)?,
                 target_port: row.get(7)?,
                 created_at: row.get(8)?,
+                favorite: favorite != 0,
+                group_id: row.get(10)?,
             })
         })
         .optional()
@@ -124,7 +133,7 @@ impl Store {
         };
         self.db
             .execute(
-                "INSERT INTO tunnels (name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO tunnels (name, host_id, kind, bind_addr, bind_port, target_host, target_port, created_at, favorite, group_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     tunnel.name,
                     tunnel.host_id,
@@ -134,6 +143,8 @@ impl Store {
                     tunnel.target_host,
                     tunnel.target_port,
                     tunnel.created_at,
+                    tunnel.favorite as i64,
+                    tunnel.group_id,
                 ],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -150,7 +161,7 @@ impl Store {
         };
         self.db
             .execute(
-                "UPDATE tunnels SET name=?1, host_id=?2, kind=?3, bind_addr=?4, bind_port=?5, target_host=?6, target_port=?7 WHERE id=?8",
+                "UPDATE tunnels SET name=?1, host_id=?2, kind=?3, bind_addr=?4, bind_port=?5, target_host=?6, target_port=?7, favorite=?8, group_id=?9 WHERE id=?10",
                 params![
                     tunnel.name,
                     tunnel.host_id,
@@ -159,8 +170,41 @@ impl Store {
                     tunnel.bind_port,
                     tunnel.target_host,
                     tunnel.target_port,
+                    tunnel.favorite as i64,
+                    tunnel.group_id,
                     tunnel.id,
                 ],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Toggle the favorite flag for a tunnel. Returns the new value.
+    pub fn toggle_tunnel_favorite(&self, id: i64) -> Result<bool, StoreError> {
+        let current: i64 = self
+            .db
+            .query_row(
+                "SELECT favorite FROM tunnels WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let new_val = current == 0;
+        self.db
+            .execute(
+                "UPDATE tunnels SET favorite = ?1 WHERE id = ?2",
+                params![new_val as i64, id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    /// Move a tunnel to a different group (`None` = ungrouped).
+    pub fn set_tunnel_group(&self, id: i64, group_id: Option<i64>) -> Result<(), StoreError> {
+        self.db
+            .execute(
+                "UPDATE tunnels SET group_id = ?1 WHERE id = ?2",
+                params![group_id, id],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
         Ok(())

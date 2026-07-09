@@ -252,6 +252,8 @@ fn render_sftp_progress(progress: Option<SftpProgress>) -> Option<impl IntoEleme
     let kind_label = match p.kind {
         SftpTransferKind::Download => t!("sftp.progress.download").to_string(),
         SftpTransferKind::Upload => t!("sftp.progress.upload").to_string(),
+        SftpTransferKind::Rename => t!("sftp.rename").to_string(),
+        SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
     };
     let (stage_label, stage_color) = match p.stage {
         SftpTransferStage::Compress => (t!("sftp.progress.compress").to_string(), term_yellow()),
@@ -264,6 +266,8 @@ fn render_sftp_progress(progress: Option<SftpProgress>) -> Option<impl IntoEleme
     let icon_path = match p.kind {
         SftpTransferKind::Download => "icons/terminal-toolbar/arrow-down-to-line.svg",
         SftpTransferKind::Upload => "icons/terminal-toolbar/arrow-up-to-line.svg",
+        SftpTransferKind::Rename => "icons/terminal-toolbar/edit.svg",
+        SftpTransferKind::Edit => "icons/terminal-toolbar/arrow-up-to-line.svg",
     };
     // Middle-truncate long paths so the head (top-level dir) and tail
     // (filename) stay visible — e.g. "/home/user/.../deeply/nested/file.txt".

@@ -526,6 +526,120 @@ impl SshBackend {
         }
     }
 
+    /// Open a **new PTY channel** on the existing authenticated SSH
+    /// connection and return a fresh `SshBackend` that drives only that
+    /// channel's event loop. The returned backend shares the same SSH
+    /// `handle`, monitor state, SFTP session, and reverse-forward registry
+    /// — so SFTP / tunnels / monitor work across all panes — but has its
+    /// own independent command queue + event broadcast so each pane's
+    /// input/output is isolated.
+    ///
+    /// Returns `Err` if the connection isn't established yet, or if
+    /// channel/PTY/shell allocation fails.
+    pub async fn new_channel_backend(&self, cols: u16, rows: u16) -> anyhow::Result<Self> {
+        // Acquire the shared handle.
+        let handle_guard = self.handle.lock().await;
+        let sh = handle_guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SSH connection not yet established"))?;
+        let sh = sh.lock().await;
+
+        // Open a new session channel on the existing connection.
+        let mut channel: Channel<Msg> = sh
+            .channel_open_session()
+            .await
+            .map_err(|e| anyhow::anyhow!("channel_open_session failed: {e}"))?;
+
+        // Request PTY.
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        channel
+            .request_pty(false, &term, cols as u32, rows as u32, 0, 0, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("request_pty failed: {e}"))?;
+
+        // Start shell.
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|e| anyhow::anyhow!("request_shell failed: {e}"))?;
+
+        drop(sh);
+        drop(handle_guard);
+
+        // Build a new backend struct that shares the connection-level state
+        // but has its own command queue + event broadcast + event loop.
+        let (event_tx, event_rx) = broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        let (command_tx, command_rx) = unbounded::<Command>();
+
+        let event_tx2 = event_tx.clone();
+        let monitor2 = self.monitor.clone();
+        let sftp_session2 = self.sftp_session.clone();
+        let sftp_entries2 = self.sftp_entries.clone();
+        let sftp_cwd2 = self.sftp_cwd.clone();
+        let transfer_tasks: Arc<PlMutex<Vec<AbortHandle>>> = Arc::new(PlMutex::new(Vec::new()));
+        let transfer_tasks_close = transfer_tasks.clone();
+
+        TOKIO.spawn(async move {
+            loop {
+                select! {
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { data }) => {
+                                let _ = event_tx2
+                                    .broadcast(BackendEvent::Data(data.to_vec()))
+                                    .await;
+                            }
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                let _ = event_tx2.broadcast(BackendEvent::Closed).await;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    cmd = command_rx.recv() => {
+                        match cmd {
+                            Ok(Command::Write(data)) => {
+                                let _ = channel.data(Cursor::new(data)).await;
+                            }
+                            Ok(Command::Resize(cols, rows)) => {
+                                let _ = channel
+                                    .window_change(cols as u32, rows as u32, 0, 0)
+                                    .await;
+                            }
+                            Ok(Command::Close) | Err(_) => {
+                                let aborted = {
+                                    let mut tasks = transfer_tasks_close.lock();
+                                    tasks.drain(..).collect::<Vec<_>>()
+                                };
+                                for handle in aborted {
+                                    handle.abort();
+                                }
+                                let _ = channel.eof().await;
+                                let _ = event_tx2.broadcast(BackendEvent::Closed).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            command_tx,
+            event_tx,
+            _event_rx,
+            monitor: monitor2,
+            _on_status: self._on_status.clone(),
+            handle: self.handle.clone(),
+            sftp_entries: sftp_entries2,
+            sftp_cwd: sftp_cwd2,
+            sftp_session: sftp_session2,
+            transfer_tasks,
+            reverse_registry: self.reverse_registry.clone(),
+        })
+    }
+
     // -----------------------------------------------------------------------
     // File transfer (implicit gzip + remote tmp staging)
     // -----------------------------------------------------------------------

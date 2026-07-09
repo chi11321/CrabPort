@@ -27,11 +27,14 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
 
-use crate::app::{CrabPortTab, TerminalShiftTab, TerminalTab};
+use crate::app::{
+    CrabPortTab, TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab,
+    TerminalTab,
+};
 use crate::color::{selection_bg, term_bg, term_cursor, term_fg};
 use crate::views::terminal::color::*;
 use crate::views::terminal::connection_overlay::*;
-use crate::views::terminal::fonts::palette;
+use crate::views::terminal::fonts::{TerminalMetrics, palette};
 use crate::views::terminal::render_cache::{
     CellSnap, RenderCache, RowSnapshot, SharedRenderCache, hash_row,
 };
@@ -39,6 +42,7 @@ use crate::views::terminal::runs::build_runs;
 use crate::views::terminal::selection::*;
 
 pub mod connection_overlay;
+pub mod split;
 
 mod color;
 mod fonts;
@@ -70,10 +74,21 @@ pub struct SftpProgress {
 
 pub struct TerminalView {
     session: Arc<TerminalSession>,
+    /// Cloned `Arc` to the underlying backend, kept so this view can call
+    /// trait methods (`sftp_rename`, `sftp_open_in_editor`, …) that
+    /// `TerminalSession` doesn't yet forward. `TerminalSession` owns the
+    /// backend privately; this clone is cheap and stays in sync because the
+    /// only mutation point is `reconnect`, which reassigns both.
+    backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
     focus_handle: FocusHandle,
     font_size: Pixels,
     line_height: Pixels,
     cell_width: Pixels,
+    /// Cached (family, size) we last applied, so the render entry point can
+    /// detect external config changes (e.g. from the Settings window) and
+    /// recompute metrics without each tab needing an explicit notification.
+    /// `None` until the first render finishes setup.
+    applied_font_signature: Option<(String, f32)>,
     last_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     selection: Arc<Mutex<Option<Selection>>>,
     render_cache: SharedRenderCache,
@@ -104,16 +119,29 @@ pub struct TerminalView {
     /// paint. Used by [`EntityInputHandler::bounds_for_range`] to position the
     /// IME candidate window near the cursor.
     cursor_bounds: Arc<Mutex<Bounds<Pixels>>>,
+    /// Whether this terminal pane currently has keyboard focus, tracked via
+    /// `on_focus`/`on_blur` listeners registered on first render. Read by the
+    /// paint callback to render a solid cursor when focused vs. a hollow
+    /// outline when not focused (no blinking).
+    is_focused: Arc<AtomicBool>,
+    /// Lazily-registered focus/blur listeners (registered on first render,
+    /// where a `&mut Window` is available). Held in an `Option` so the
+    /// `Subscription`s stay alive for as long as the view.
+    focus_sub: Option<gpui::Subscription>,
     overlay: SharedOverlayState,
     remote_host: String,
-    /// Persisted host id for command-history storage. `None` for local
-    /// terminals (their history is in-memory only, not persisted).
-    #[allow(dead_code)]
+    /// Persisted host id for command-history storage and tunnel filtering.
+    /// `None` for local terminals (their history is in-memory only, not
+    /// persisted, and they have no host to filter tunnels by).
     host_id: Option<i64>,
     count: u64,
     ssh_info: Option<SshConnectionInfo>,
     telnet_info: Option<TelnetConnectionInfo>,
     on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
+    /// Invoked when this pane receives keyboard focus, passing this pane's
+    /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
+    /// and the toolbar follow keyboard focus, not just mouse clicks.
+    on_focused: Option<Rc<dyn Fn(u64, &mut App)>>,
     /// Latest SFTP transfer progress pushed by the backend, or `None` when
     /// no transfer is in flight. Updated by the backend-event subscriber;
     /// read by the toolbar via [`Self::sftp_progress`].
@@ -202,34 +230,85 @@ impl TerminalView {
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus_handle = cx.focus_handle();
-        let font_size = px(13.0);
-        let line_height = px(20.0);
-        // Consolas (Windows) has slightly narrower glyphs than Menlo (macOS);
-        // a mismatch here causes character gaps and clipping, so pick the
-        // advance width that matches the platform's monospace font.
-        let cell_width = if cfg!(target_os = "windows") {
-            px(7.2)
-        } else {
-            px(7.8)
-        };
+        Self::with_backend_and_host_and_overlay_and_history(
+            backend,
+            cols,
+            rows,
+            host,
+            host_id,
+            overlay,
+            ssh_info,
+            telnet_info,
+            count,
+            None,
+            cx,
+        )
+    }
 
-        let session = Arc::new(TerminalSession::new(backend, cols, rows));
+    /// Like [`with_backend_and_host_and_overlay`] but optionally shares the
+    /// command-history buffer with another pane. Used when splitting a
+    /// terminal so all panes of the same tab see the same history.
+    ///
+    /// `shared_history` = `None` creates a fresh history (first pane of a
+    /// tab); `Some(arc)` reuses the source pane's history (split panes). The
+    /// Store-backed persistence callback is wired in both cases so commands
+    /// captured in any pane still land in the DB; pre-seeding from the Store
+    /// is skipped when sharing (the source pane already did it).
+    pub fn with_backend_and_host_and_overlay_and_history(
+        backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+        cols: usize,
+        rows: usize,
+        host: String,
+        host_id: Option<i64>,
+        overlay: SharedOverlayState,
+        ssh_info: Option<SshConnectionInfo>,
+        telnet_info: Option<TelnetConnectionInfo>,
+        count: u64,
+        shared_history: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        // Font size, line height, and cell width are derived from the
+        // persisted terminal font settings (`[appearance.terminal]`). The
+        // cell width is measured from the configured font so the monospace
+        // grid stays aligned across family/size changes. See
+        // [`TerminalMetrics::from_config`].
+        let metrics = TerminalMetrics::from_config(cx);
+        let font_size = metrics.font_size;
+        let line_height = metrics.line_height;
+        let cell_width = metrics.cell_width;
+
+        let is_shared = shared_history.is_some();
+        let session = if let Some(hist) = shared_history {
+            Arc::new(TerminalSession::new_with_shared_history(
+                backend.clone(),
+                cols,
+                rows,
+                hist,
+            ))
+        } else {
+            Arc::new(TerminalSession::new(backend.clone(), cols, rows))
+        };
         session.start();
 
         // Wire command-history persistence: when the session captures a new
         // command, persist it to the Store for this host (if any). Local
         // terminals (host_id = None) keep history in-memory only.
+        //
+        // When sharing history (split panes), skip the Store pre-seed — the
+        // source pane already populated the shared buffer, and re-seeding
+        // would clobber it with a stale snapshot.
         if let Some(hid) = host_id {
             let store = crate::app_state::AppState::store(cx);
-            // Pre-load persisted history into the in-memory buffer so the
-            // panel has data before the user types anything new.
-            if let Ok(cmds) = store.lock().commands_for_host(hid) {
-                let mut history = std::collections::VecDeque::new();
-                for c in cmds {
-                    history.push_back(c);
+            // Only pre-seed for the first pane (no shared history).
+            if !is_shared {
+                if let Ok(cmds) = store.lock().commands_for_host(hid) {
+                    let mut history = std::collections::VecDeque::new();
+                    for c in cmds {
+                        history.push_back(c);
+                    }
+                    *session.command_history_deque() = history;
                 }
-                *session.command_history_deque() = history;
             }
             // `store` is `Arc<Mutex<Store>>` — clone for the callback so
             // the original binding stays usable above.
@@ -240,6 +319,10 @@ impl TerminalView {
         }
 
         let needs_repaint = Arc::new(AtomicBool::new(true));
+        // `is_focused` is created here (rather than only in the struct
+        // literal) so it can be captured by the paint closure. Read to render
+        // a solid cursor when focused vs. a hollow outline when not focused.
+        let is_focused = Arc::new(AtomicBool::new(false));
         let is_remote = !host.is_empty();
 
         // Backend error/close events.
@@ -282,6 +365,8 @@ impl TerminalView {
                         let prefix = match kind {
                             crabport_terminal::terminal::SftpTransferKind::Download => "Download",
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
+                            crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
+                            crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -451,10 +536,12 @@ impl TerminalView {
 
         Self {
             session,
+            backend,
             focus_handle,
             font_size,
             line_height,
             cell_width,
+            applied_font_signature: None,
             last_bounds: Arc::new(Mutex::new(None)),
             selection: Arc::new(Mutex::new(None)),
             render_cache: Arc::new(Mutex::new(RenderCache::default())),
@@ -473,6 +560,8 @@ impl TerminalView {
                 point(px(0.0), px(0.0)),
                 size(px(0.0), px(0.0)),
             ))),
+            is_focused,
+            focus_sub: None,
             overlay,
             remote_host: host,
             host_id,
@@ -480,6 +569,7 @@ impl TerminalView {
             ssh_info,
             telnet_info,
             on_backend_closed: None,
+            on_focused: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
@@ -505,6 +595,13 @@ impl TerminalView {
 
     pub fn allow_tunnels(&self) -> bool {
         self.session.allow_tunnels()
+    }
+
+    /// The persisted host id this terminal is connected to, or `None` for
+    /// local PTY tabs. Used by the Tunnels panel to filter the tunnel list
+    /// to only those belonging to this terminal's host.
+    pub fn host_id(&self) -> Option<i64> {
+        self.host_id
     }
 
     pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
@@ -534,6 +631,14 @@ impl TerminalView {
         self.session.command_history()
     }
 
+    /// Cloned handle to the shared command-history buffer. Used when
+    /// splitting this pane so the new pane shares the same history.
+    pub fn command_history_arc(
+        &self,
+    ) -> Arc<parking_lot::Mutex<std::collections::VecDeque<String>>> {
+        self.session.command_history_arc()
+    }
+
     /// Write raw bytes to the terminal **without** capturing them as a
     /// command. Used by the History panel's "paste" action so inserting a
     /// historical command into the input line doesn't re-record it.
@@ -547,6 +652,21 @@ impl TerminalView {
         self.session.sftp_delete(remote_path);
     }
 
+    /// Rename a remote file or directory. Forwards directly to the backend
+    /// (`TerminalSession` doesn't expose a wrapper yet) via the cloned
+    /// `backend` `Arc`. Completion is reported through the backend's event
+    /// stream as `BackendEvent::SftpTransferFinished`.
+    pub fn sftp_rename(&self, old_path: &str, new_path: &str) {
+        self.backend.sftp_rename(old_path, new_path);
+    }
+
+    /// Download a remote file to a local temp path and open it in the OS
+    /// default editor. Forwards directly to the backend. Completion is
+    /// reported through the backend's event stream.
+    pub fn sftp_open_in_editor(&self, remote_path: &str) {
+        self.backend.sftp_open_in_editor(remote_path);
+    }
+
     /// Latest SFTP transfer progress, or `None` if no transfer is in flight.
     /// Read by the terminal toolbar to render a stage-aware progress log.
     pub fn sftp_progress(&self) -> Option<&SftpProgress> {
@@ -555,6 +675,21 @@ impl TerminalView {
 
     pub fn set_on_backend_closed(&mut self, f: impl Fn(&mut App) + 'static) {
         self.on_backend_closed = Some(Rc::new(f));
+    }
+
+    /// The stable pane id this view was created with (passed as `count` to
+    /// the constructor). The app uses it to identify which pane in a split
+    /// tree received keyboard focus, so `split_active_pane` operates on the
+    /// focused pane rather than just the last-clicked one.
+    pub fn pane_id(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether this pane currently has keyboard focus. Read by the app to
+    /// determine which pane to split (the focused one) without relying on
+    /// mouse-click bookkeeping.
+    pub fn is_focused(&self) -> bool {
+        self.is_focused.load(Ordering::Acquire)
     }
 
     /// Set the callback invoked whenever `sftp_progress` changes. The app
@@ -573,6 +708,14 @@ impl TerminalView {
         self.on_sftp_transfer_finished = Some(Rc::new(f));
     }
 
+    /// Set the callback invoked when this pane receives keyboard focus. The
+    /// app uses it to mark this pane as the active pane of its tab, so that
+    /// `split_active_pane` and the toolbar follow keyboard focus (not just
+    /// mouse clicks). The callback receives this pane's id.
+    pub fn set_on_focused(&mut self, f: impl Fn(u64, &mut App) + 'static) {
+        self.on_focused = Some(Rc::new(f));
+    }
+
     /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
     /// panel can start "borrowed" tunnels reusing this SSH connection.
     /// Only set for SSH tabs (local PTY backends have no tunnel source).
@@ -584,6 +727,64 @@ impl TerminalView {
     /// the Tunnels panel to start borrowed tunnels.
     pub fn tunnel_source(&self) -> Option<&Arc<dyn CrabPortTunnel>> {
         self.tunnel_source.as_ref()
+    }
+
+    // --- Split-pane support ---
+    //
+    // A split pane gets its own *independent* PTY/channel on the same
+    // underlying connection (SSH: new session channel + PTY + shell on the
+    // existing authenticated handle; local: new shell process; Telnet: new
+    // connection since Telnet has no channel multiplexing). Each pane has
+    // its own term grid, scrollback, and input/output — they are fully
+    // independent, not mirrored.
+
+    /// The remote host label (empty for local PTY).
+    pub fn remote_host(&self) -> &str {
+        &self.remote_host
+    }
+
+    /// SSH connection info, if this is an SSH tab.
+    pub fn ssh_info(&self) -> Option<&SshConnectionInfo> {
+        self.ssh_info.as_ref()
+    }
+
+    /// Telnet connection info, if this is a Telnet tab.
+    pub fn telnet_info(&self) -> Option<&TelnetConnectionInfo> {
+        self.telnet_info.as_ref()
+    }
+
+    /// The shared connection-overlay state (host-key prompt, etc.).
+    pub fn overlay_state(&self) -> SharedOverlayState {
+        self.overlay.clone()
+    }
+
+    /// The tunnel source Arc, if any (for SSH tabs).
+    pub fn tunnel_source_arc(&self) -> Option<Arc<dyn CrabPortTunnel>> {
+        self.tunnel_source.clone()
+    }
+
+    /// Set the tunnel source (optional builder, used by split-pane creation
+    /// to share the SSH tunnel source with the new pane).
+    pub fn with_tunnel_source_opt(mut self, source: Option<Arc<dyn CrabPortTunnel>>) -> Self {
+        self.tunnel_source = source;
+        self
+    }
+
+    /// Create a new [`TerminalView`] for a split pane. The new pane gets an
+    /// independent PTY/channel via `backend.spawn_channel()`:
+    /// - **SSH**: opens a new session channel on the existing authenticated
+    ///   connection (no re-auth, no new TCP connect).
+    /// - **Local PTY**: spawns a new shell process.
+    /// - **Telnet**: `spawn_channel` returns `None`, so the caller falls
+    ///   back to creating a new `TelnetBackend` (new TCP connection).
+    ///
+    /// Returns `None` if the backend can't spawn a channel.
+    pub fn spawn_channel_backend(
+        &self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Option<Arc<dyn crabport_terminal::terminal::CrabPortTerminal>> {
+        self.backend.spawn_channel(80, 24)
     }
 
     /// Returns the host-key info for a currently-pending host-key prompt,
@@ -662,7 +863,7 @@ impl TerminalView {
         let cols: usize = 80;
         let rows: usize = 24;
 
-        let session = Arc::new(TerminalSession::new(backend, cols, rows));
+        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
         session.start();
 
         self.render_cache.lock().clear_all();
@@ -704,6 +905,8 @@ impl TerminalView {
                         let prefix = match kind {
                             crabport_terminal::terminal::SftpTransferKind::Download => "Download",
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
+                            crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
+                            crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         let _ = entity.update(cx, |this, cx| {
@@ -797,6 +1000,7 @@ impl TerminalView {
         .detach();
 
         self.session = session;
+        self.backend = backend;
         cx.notify();
     }
 
@@ -856,6 +1060,47 @@ impl TerminalView {
             result
         })
     }
+
+    // -----------------------------------------------------------------
+    // Font settings reload
+    // -----------------------------------------------------------------
+
+    /// Re-read the terminal font settings from `config.toml` and recompute
+    /// the cached `font_size` / `line_height` / `cell_width`. Clears the
+    /// shaped-glyph LRU so the next repaint reshapes every line with the new
+    /// metrics, and forces a PTY resize so the new cell size maps to the
+    /// right `cols`/`rows` for the current viewport.
+    ///
+    /// Call this after mutating `config.appearance.terminal` (e.g. from the
+    /// Settings window or the in-terminal zoom shortcuts).
+    pub fn reload_font_settings(&mut self, cx: &mut Context<Self>) {
+        let metrics = TerminalMetrics::from_config(cx);
+        let changed = self.font_size != metrics.font_size
+            || self.line_height != metrics.line_height
+            || self.cell_width != metrics.cell_width;
+        self.font_size = metrics.font_size;
+        self.line_height = metrics.line_height;
+        self.cell_width = metrics.cell_width;
+        // Record the config we just applied so the render-entry auto-check
+        // doesn't redundantly re-derive metrics on the next frame.
+        let family = crate::views::terminal::fonts::font_family();
+        let size = crabport_core::config::snapshot()
+            .appearance
+            .terminal
+            .effective_font_size();
+        self.applied_font_signature = Some((family, size));
+        if changed {
+            // Drop cached shaped lines — they were laid out for the old
+            // font/size and would render at the wrong width.
+            self.render_cache.lock().shaped.clear();
+            // Invalidate last_bounds so the prepaint step re-runs the
+            // cols/rows resize with the new cell metrics.
+            *self.last_bounds.lock() = None;
+            self.needs_repaint
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        cx.notify();
+    }
 }
 // ---- GPUI Render ----
 
@@ -898,6 +1143,49 @@ impl Render for TerminalView {
                 })
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+
+        // Auto-detect font config changes made elsewhere (e.g. the Settings
+        // window). Comparing the cached signature against the live config is
+        // cheap, and lets every terminal tab pick up new font settings
+        // without requiring an explicit cross-window notification.
+        {
+            let cfg = crabport_core::config::snapshot().appearance.terminal;
+            let family = cfg.effective_font_family().to_string();
+            let size = cfg.effective_font_size();
+            if self.applied_font_signature != Some((family.clone(), size)) {
+                self.reload_font_settings(cx);
+            }
+        }
+
+        // Lazily register focus/blur listeners (only once — a `&mut Window`
+        // is required, which we only have inside `render`). These track
+        // `is_focused` so the paint callback can render a solid cursor when
+        // focused vs. a hollow outline when not focused. On focus we also
+        // fire the `on_focused` callback so the app can sync
+        // `split_trees[tab].active_pane` to the keyboard-focused pane.
+        if self.focus_sub.is_none() {
+            let is_focused = self.is_focused.clone();
+            let focused_cb = self.on_focused.clone();
+            let pane_id = self.count;
+            let fh = self.focus_handle.clone();
+            let sub_f = cx.on_focus(&fh, _window, move |_this, _window, cx| {
+                is_focused.store(true, Ordering::Release);
+                if let Some(cb) = &focused_cb {
+                    let cb = cb.clone();
+                    cx.defer(move |cx| cb(pane_id, cx));
+                }
+            });
+            let is_focused_b = self.is_focused.clone();
+            let sub_b = cx.on_blur(&fh, _window, move |_this, _window, _cx| {
+                is_focused_b.store(false, Ordering::Release);
+            });
+            // Re-fetch focus state immediately so the first frame after a
+            // focus change (e.g. switching tabs via the app's
+            // `window.focus()`) is correct even before a listener fires.
+            self.is_focused
+                .store(fh.is_focused(_window), Ordering::Release);
+            self.focus_sub = Some(gpui::Subscription::join(sub_f, sub_b));
         }
 
         let session_c = self.session.clone();
@@ -950,6 +1238,9 @@ impl Render for TerminalView {
         let cursor_bounds_paint = self.cursor_bounds.clone();
         let entity_input = cx.entity();
         let focus_handle_input = self.focus_handle.clone();
+        // Read by the paint callback to render a solid cursor when focused
+        // vs. a hollow outline when not focused (no blinking).
+        let is_focused_paint = self.is_focused.clone();
 
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
@@ -965,6 +1256,8 @@ impl Render for TerminalView {
             .id(ElementId::Name(
                 format!("terminal-view-{}", self.count).into(),
             ))
+            .pt_2()
+            .pl_2()
             .relative()
             .size_full()
             .overflow_hidden()
@@ -981,6 +1274,30 @@ impl Render for TerminalView {
                 this.session.write(b"\x1b[Z");
                 this.session.scroll_to_bottom();
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TerminalIncreaseFont, _window, cx| {
+                // Bump the persisted font size by 1px (clamped inside the
+                // config accessor) and re-derive cell metrics. We go through
+                // `config::update` so the change survives restarts and is
+                // shared by every terminal tab in the app.
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size =
+                        (cfg.appearance.terminal.font_size + 1.0).clamp(8.0, 32.0);
+                });
+                this.reload_font_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalDecreaseFont, _window, cx| {
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size =
+                        (cfg.appearance.terminal.font_size - 1.0).clamp(8.0, 32.0);
+                });
+                this.reload_font_settings(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TerminalResetFont, _window, cx| {
+                let _ = crabport_core::config::update(|cfg| {
+                    cfg.appearance.terminal.font_size = 13.0;
+                });
+                this.reload_font_settings(cx);
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
@@ -1368,12 +1685,16 @@ impl Render for TerminalView {
                                 // window there via `bounds_for_range`.
                                 *cursor_bounds_paint.lock() =
                                     Bounds::new(point(cx_x, cx_y), size(cell_width, line_height));
+                                // Focused → solid cursor; not focused → hollow
+                                // outline (no blinking).
+                                let focused = is_focused_paint.load(Ordering::Acquire);
                                 paint_cursor(
                                     cursor_shape,
                                     cx_x,
                                     cx_y,
                                     cell_width,
                                     line_height,
+                                    focused,
                                     window,
                                 );
                             }
@@ -1599,7 +1920,6 @@ impl Render for TerminalView {
                                 .w(px(6.0))
                                 .rounded_full()
                                 .bg(rgb(0x4d4e50))
-                                .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, {
                                     let scrollbar_drag_offset_c = scrollbar_drag_offset_c.clone();
                                     let scrollbar_dragging_c = scrollbar_dragging_c.clone();
@@ -1812,7 +2132,11 @@ impl EntityInputHandler for TerminalView {
 }
 
 /// Paint the terminal cursor as one or more quads.
-/// Paint the terminal cursor as one or more quads.
+///
+/// `focused` controls the cursor style: when the pane has keyboard focus the
+/// cursor is rendered solid; when not focused it's rendered as a hollow
+/// outline so the user can still see where the cursor is without it competing
+/// for attention with the focused pane's solid cursor. There is no blinking.
 #[allow(clippy::too_many_arguments)]
 fn paint_cursor(
     shape: CursorShape,
@@ -1820,17 +2144,32 @@ fn paint_cursor(
     cx_y: Pixels,
     cell_width: Pixels,
     line_height: Pixels,
+    focused: bool,
     window: &mut Window,
 ) {
     match shape {
         CursorShape::Block => {
-            let c: Hsla = rgb(term_cursor()).into();
-            window.paint_quad(fill(
-                Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
-                c.opacity(0.5),
-            ));
+            if focused {
+                // Solid filled block, semi-transparent so the character
+                // beneath remains visible.
+                let c: Hsla = rgb(term_cursor()).into();
+                window.paint_quad(fill(
+                    Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
+                    c.opacity(0.5),
+                ));
+            } else {
+                // Hollow outline so the unfocused pane's cursor stays
+                // visible but clearly secondary.
+                window.paint_quad(outline(
+                    Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
+                    rgb(term_cursor()),
+                    BorderStyle::Solid,
+                ));
+            }
         }
         CursorShape::HollowBlock => {
+            // The requested shape is already hollow; render the outline in
+            // both states (it's inherently non-solid).
             window.paint_quad(outline(
                 Bounds::new(point(cx_x, cx_y), size(cell_width, line_height)),
                 rgb(term_cursor()),
@@ -1838,18 +2177,25 @@ fn paint_cursor(
             ));
         }
         CursorShape::Underline => {
+            // For underline/beam there's no meaningful hollow variant, so
+            // render the shape at full opacity when focused and dimmed when
+            // not focused to convey the secondary state.
+            let opacity = if focused { 1.0 } else { 0.4 };
+            let c: Hsla = rgb(term_cursor()).into();
             window.paint_quad(fill(
                 Bounds::new(
                     point(cx_x, cx_y + line_height - px(2.0)),
                     size(cell_width, px(2.0)),
                 ),
-                rgb(term_cursor()),
+                c.opacity(opacity),
             ));
         }
         CursorShape::Beam => {
+            let opacity = if focused { 1.0 } else { 0.4 };
+            let c: Hsla = rgb(term_cursor()).into();
             window.paint_quad(fill(
                 Bounds::new(point(cx_x, cx_y), size(px(1.5), line_height)),
-                rgb(term_cursor()),
+                c.opacity(opacity),
             ));
         }
         CursorShape::Hidden => {}

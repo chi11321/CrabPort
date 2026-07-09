@@ -44,7 +44,7 @@ pub struct SftpPanel {
     /// though the mouse has moved to the overlay.
     context_menu_entry: Option<String>,
     /// The entry currently being hovered, if any. Used to drive the hover
-    /// background transition (same pattern as HostsView).
+    /// background transition (same pattern as SessionsView).
     hovered_entry: Option<String>,
     /// Multi-selection set. Keyed by entry name (unique within the current
     /// cwd listing). `.` and `..` are never added — they're navigation
@@ -64,6 +64,17 @@ pub struct SftpPanel {
     /// Delete callback — invoked with the remote path to remove. The
     /// backend stats the path to decide between file/dir removal.
     on_delete: Option<Rc<dyn Fn(String, &mut App)>>,
+    /// Rename callback — invoked with `(old_remote_path, new_remote_path)`.
+    on_rename: Option<Rc<dyn Fn(String, String, &mut App)>>,
+    /// Edit callback — invoked with the remote path to download + open locally.
+    on_edit: Option<Rc<dyn Fn(String, &mut App)>>,
+    /// When `Some`, a small inline rename-prompt overlay is rendered over the
+    /// panel. Holds the entry name being renamed (used as the dialog title
+    /// and to resolve the old remote path from the current cwd).
+    renaming_entry: Option<String>,
+    /// `InputState` backing the rename-prompt overlay. Lazily created the
+    /// first time the user triggers a rename; reused thereafter.
+    rename_input: Option<Entity<InputState>>,
     /// Scroll handle for the virtual list. Doubles as the handle for the
     /// custom `Scrollbar::vertical` overlay so the scrollbar style stays
     /// consistent with the rest of the app.
@@ -86,6 +97,10 @@ impl SftpPanel {
             on_download: None,
             on_upload: None,
             on_delete: None,
+            on_rename: None,
+            on_edit: None,
+            renaming_entry: None,
+            rename_input: None,
             scroll_handle: VirtualListScrollHandle::new(),
         }
     }
@@ -100,6 +115,8 @@ impl SftpPanel {
         on_download: Option<Rc<dyn Fn(String, String, &mut App)>>,
         on_upload: Option<Rc<dyn Fn(String, String, &mut App)>>,
         on_delete: Option<Rc<dyn Fn(String, &mut App)>>,
+        on_rename: Option<Rc<dyn Fn(String, String, &mut App)>>,
+        on_edit: Option<Rc<dyn Fn(String, &mut App)>>,
         active_tab_id: u64,
         context_menu: Entity<crate::components::context_menu::ContextMenuController>,
         alert_controller: Entity<AlertController>,
@@ -163,6 +180,8 @@ impl SftpPanel {
             self.on_download = on_download;
             self.on_upload = on_upload;
             self.on_delete = on_delete;
+            self.on_rename = on_rename;
+            self.on_edit = on_edit;
             return;
         }
 
@@ -223,12 +242,110 @@ impl SftpPanel {
         self.on_download = on_download;
         self.on_upload = on_upload;
         self.on_delete = on_delete;
+        self.on_rename = on_rename;
+        self.on_edit = on_edit;
         self.active_tab_id = Some(active_tab_id);
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
         if tab_changed || entries_changed {
             self.selected.clear();
+            self.renaming_entry = None;
         }
+    }
+
+    /// Begin renaming `entry_name`: stash the name, (re)seed the inline
+    /// rename `InputState` with the current name, and focus it. Called from
+    /// the context-menu callback, which receives a `&mut Window`.
+    fn start_rename(&mut self, entry_name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.renaming_entry = Some(entry_name.clone());
+        // Lazily create the InputState the first time.
+        if self.rename_input.is_none() {
+            let entity = cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder("new name");
+                state.focus(window, cx);
+                state
+            });
+            // Submit on Enter, cancel on Escape.
+            cx.subscribe(
+                &entity,
+                |this, _input, event: &gpui_component::input::InputEvent, cx| {
+                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                        this.commit_rename(cx);
+                    }
+                },
+            )
+            .detach();
+            // Cancel on blur — the user clicked away.
+            let blur_handle = entity.read(cx).focus_handle(cx);
+            cx.on_blur(&blur_handle, window, |this, _window, cx| {
+                if this.renaming_entry.is_some() {
+                    this.cancel_rename(cx);
+                }
+            })
+            .detach();
+            self.rename_input = Some(entity);
+        }
+        // Seed the input with the entry's current name.
+        if let Some(ref input) = self.rename_input {
+            input.update(cx, |state, cx| {
+                state.set_value(entry_name, window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Commit the rename: read the new name from `rename_input`, join it
+    /// onto the current cwd to form the new remote path, invoke `on_rename`,
+    /// and close the overlay.
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let new_name = self.rename_input.as_ref().and_then(|input| {
+            let v = input.read(cx).value().to_string();
+            if v.is_empty() { None } else { Some(v) }
+        });
+        let Some(new_name) = new_name else {
+            return;
+        };
+        let Some(entry_name) = self.renaming_entry.take() else {
+            return;
+        };
+        // If the name hasn't changed, don't send a rename request — just
+        // close the inline editor.
+        if new_name == entry_name {
+            self.selected.clear();
+            cx.notify();
+            return;
+        }
+        let cwd_str = self
+            .cwd
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let old_path = if cwd_str.ends_with('/') {
+            format!("{}{}", cwd_str, entry_name)
+        } else {
+            format!("{}/{}", cwd_str, entry_name)
+        };
+        let new_path = if cwd_str.ends_with('/') {
+            format!("{}{}", cwd_str, new_name)
+        } else {
+            format!("{}/{}", cwd_str, new_name)
+        };
+        if let Some(ref cb) = self.on_rename {
+            let cb = cb.clone();
+            let old = old_path.clone();
+            let new = new_path.clone();
+            cx.defer(move |cx| cb(old, new, cx));
+        }
+        // Clear the selection so the renamed row's highlight doesn't linger.
+        self.selected.clear();
+        cx.notify();
+    }
+
+    /// Abort the rename overlay without invoking the callback.
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_entry = None;
+        cx.notify();
     }
 }
 
@@ -250,6 +367,12 @@ impl Render for SftpPanel {
 
         let path_input = self.path_input.clone();
         let entity = _cx.entity().downgrade();
+
+        // The inline rename InputState is created in `start_rename` (which has
+        // a `&mut Window`). Here we just clone the Entity so row closures can
+        // render it in place of the label when `renaming_entry` matches.
+        let renaming_entry = self.renaming_entry.clone();
+        let rename_input = self.rename_input.clone();
 
         // If the global context menu is no longer active, clear the
         // "menu-triggering entry" highlight.
@@ -430,6 +553,8 @@ impl Render for SftpPanel {
                                         let on_navigate = this.on_navigate.clone();
                                         let on_download = this.on_download.clone();
                                         let on_delete = this.on_delete.clone();
+                                        let on_rename = this.on_rename.clone();
+                                        let on_edit = this.on_edit.clone();
                                         let context_menu = this.context_menu.clone();
                                         let alert_controller = this.alert_controller.clone();
                                         let entity = cx.entity().downgrade();
@@ -438,6 +563,9 @@ impl Render for SftpPanel {
                                             this.context_menu_entry.as_deref() == Some(name.as_str());
                                         let is_selected = this.selected.contains(name.as_str()) && name != "..";
                                         let is_highlighted = is_hovered || force_highlight;
+                                        // Is this row currently being renamed inline?
+                                        let is_renaming = renaming_entry.as_deref() == Some(name.as_str());
+                                        let row_rename_input = rename_input.clone();
                                         let row_id = ElementId::Name(format!("sftp-{i}").into());
                                         let row_id_for_transition = row_id.clone();
 
@@ -460,6 +588,7 @@ impl Render for SftpPanel {
                                                 let name = name.clone();
                                                 let is_dir = is_dir;
                                                 let on_navigate = on_navigate.clone();
+                                                let on_edit = on_edit.clone();
                                                 let target = target_path.clone();
                                                 let entity = entity.clone();
                                                 move |event, _w, cx| {
@@ -467,6 +596,14 @@ impl Render for SftpPanel {
                                                     // navigates regardless of modifiers.
                                                     if is_dir && event.click_count == 2 {
                                                         if let Some(ref cb) = on_navigate {
+                                                            cb(target.clone(), cx);
+                                                        }
+                                                        return;
+                                                    }
+                                                    // Double-click on a file opens it in
+                                                    // the local editor.
+                                                    if !is_dir && event.click_count == 2 && name != ".." && name != "." {
+                                                        if let Some(ref cb) = on_edit {
                                                             cb(target.clone(), cx);
                                                         }
                                                         return;
@@ -498,6 +635,8 @@ impl Render for SftpPanel {
                                                 let on_navigate = on_navigate.clone();
                                                 let on_download = on_download.clone();
                                                 let on_delete = on_delete.clone();
+                                                let on_rename = on_rename.clone();
+                                                let on_edit = on_edit.clone();
                                                 let entity = entity.clone();
                                                 let alert_controller = alert_controller.clone();
                                                 move |event, _w, cx| {
@@ -576,6 +715,29 @@ impl Render for SftpPanel {
                                                         ));
                                                     }
 
+                                                    // "Open in Editor" — only for a single selected
+                                                    // file (directories aren't editable this way).
+                                                    // Placed after "Enter" and before "Download" so
+                                                    // the order reads: Enter (dirs) → Open in Editor
+                                                    // (files) → Download → Rename → Delete.
+                                                    if menu_entries.len() == 1 && !menu_entries[0].1 && on_edit.is_some() {
+                                                        let remote_path = menu_entries[0].2.clone();
+                                                        let on_edit = on_edit.clone();
+                                                        let entity_for_clear = entity.clone();
+                                                        items.push(ContextMenuItem::new(
+                                                            t!("sftp.edit").to_string(),
+                                                            move |_w, cx| {
+                                                                if let Some(ref cb) = on_edit {
+                                                                    cb(remote_path.clone(), cx);
+                                                                }
+                                                                let _ = entity_for_clear.update(cx, |view, cx| {
+                                                                    view.selected.clear();
+                                                                    cx.notify();
+                                                                });
+                                                            },
+                                                        ));
+                                                    }
+
                                                     // "Download" — available whenever there's at
                                                     // least one selectable entry. The backend's
                                                     // `sftp_download` dispatches between file
@@ -610,6 +772,24 @@ impl Render for SftpPanel {
                                                                 cx,
                                                             );
                                                         }));
+                                                    }
+
+                                                    // "Rename" — only for a single selected entry
+                                                    // (file or dir) that isn't `..`. Sets
+                                                    // `renaming_entry` so the row's label is
+                                                    // replaced by an inline `StyledInput`
+                                                    // on the next render.
+                                                    if menu_entries.len() == 1 && name != ".." && on_rename.is_some() {
+                                                        let entry_name = menu_entries[0].0.clone();
+                                                        let entity_for_rename = entity.clone();
+                                                        items.push(ContextMenuItem::new(
+                                                            t!("sftp.rename").to_string(),
+                                                            move |_w, cx| {
+                                                                let _ = entity_for_rename.update(cx, |view, cx| {
+                                                                    view.start_rename(entry_name.clone(), _w, cx);
+                                                                });
+                                                            },
+                                                        ));
                                                     }
 
                                                     // Fallback: right-click on `..` (or `.`)
@@ -776,14 +956,39 @@ impl Render for SftpPanel {
                                                     .flex_shrink_0()
                                                     .text_color(rgb(text_muted())),
                                             )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(text_primary()))
-                                                    .whitespace_nowrap()
-                                                    .overflow_hidden()
-                                                    .child(name.clone()),
+                                            // When this row is being renamed, replace the
+                                            // static label with an inline `StyledInput`.
+                                            // The input was already created + focused in
+                                            // `start_rename`; here we just render it in
+                                            // place. Otherwise show the entry name as
+                                            // usual.
+                                            .when_some(
+                                                if is_renaming { row_rename_input } else { None },
+                                                |el, input| {
+                                                    el.child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .child(
+                                                                StyledInput::new(
+                                                                    format!("sftp-rename-{i}"),
+                                                                    input,
+                                                                )
+                                                                .xsmall(),
+                                                            ),
+                                                    )
+                                                },
                                             )
+                                            .when(!is_renaming, |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(text_primary()))
+                                                        .whitespace_nowrap()
+                                                        .overflow_hidden()
+                                                        .child(name.clone()),
+                                                )
+                                            })
                                     })
                                     .collect::<Vec<_>>()
                             },
@@ -802,7 +1007,7 @@ impl Render for SftpPanel {
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
                             ),
-                    ),
+                    )
             )
     }
 }
@@ -928,9 +1133,7 @@ fn render_sftp_action_button(
         .justify_center()
         .size(px(24.0))
         .rounded(px(4.0))
-        .when(enabled, |el| {
-            el.cursor_pointer().hover(move |s| s.bg(hover_bg))
-        })
+        .when(enabled, |el| el.hover(move |s| s.bg(hover_bg)))
         .when(!enabled, |el| el.cursor_not_allowed())
         .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
         .when(enabled, |el| {

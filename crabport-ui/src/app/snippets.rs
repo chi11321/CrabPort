@@ -1,5 +1,5 @@
 //! Snippet form dialog methods for `CrabportApp` (open/create/edit/close and
-//! persistence via the credential store).
+//! persistence via the credential store), plus favorite / group mutations.
 
 use gpui::*;
 use rust_i18n::t;
@@ -67,7 +67,15 @@ impl CrabportApp {
             self.snippet_form = Some(form);
         }
         if let Some(ref mut form) = self.snippet_form {
-            form.open_for_edit(snippet.id, &snippet.name, &snippet.command, window, cx);
+            form.open_for_edit(
+                snippet.id,
+                &snippet.name,
+                &snippet.command,
+                snippet.favorite,
+                snippet.group_id,
+                window,
+                cx,
+            );
         }
         cx.notify();
     }
@@ -103,7 +111,13 @@ impl CrabportApp {
         let name = out.name.clone();
         match out.editing_id {
             Some(id) => {
-                if let Err(e) = store.lock().update_snippet(id, &out.name, &out.command) {
+                if let Err(e) = store.lock().update_snippet(
+                    id,
+                    &out.name,
+                    &out.command,
+                    out.favorite,
+                    out.group_id,
+                ) {
                     tracing::error!("update_snippet failed: {e}");
                     self.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -132,7 +146,11 @@ impl CrabportApp {
                 });
             }
             None => {
-                if let Err(e) = store.lock().add_snippet(&out.name, &out.command) {
+                if let Err(e) =
+                    store
+                        .lock()
+                        .add_snippet(&out.name, &out.command, out.favorite, out.group_id)
+                {
                     tracing::error!("add_snippet failed: {e}");
                     self.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -162,5 +180,31 @@ impl CrabportApp {
             }
         }
         self.close_snippet_form(cx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Favorite / group mutations
+    // -----------------------------------------------------------------------
+
+    /// Toggle the favorite flag on a snippet and notify so the list re-renders.
+    /// Called from the star icon on each snippet row and from the context menu.
+    pub fn toggle_snippet_favorite(&mut self, id: i64, cx: &mut Context<Self>) {
+        let store = AppState::store(cx);
+        if let Err(e) = store.lock().toggle_snippet_favorite(id) {
+            tracing::error!("toggle_snippet_favorite failed: {e}");
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Move a snippet to a different group (`None` = ungrouped). Called from
+    /// the context menu's "Move to Group" items.
+    pub fn set_snippet_group(&mut self, id: i64, group_id: Option<i64>, cx: &mut Context<Self>) {
+        let store = AppState::store(cx);
+        if let Err(e) = store.lock().set_snippet_group(id, group_id) {
+            tracing::error!("set_snippet_group failed: {e}");
+            return;
+        }
+        cx.notify();
     }
 }

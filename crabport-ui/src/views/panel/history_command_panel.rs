@@ -202,11 +202,10 @@ impl Render for HistoryCommandPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .cursor_pointer()
                             .hover(|s| s.bg(rgb(surface_hover())))
                             .on_click(move |_e, _w, cx| {
                                 let store = crate::app_state::AppState::store(cx);
-                                let _ = store.lock().add_snippet("", &cmd_for_save);
+                                let _ = store.lock().add_snippet("", &cmd_for_save, false, None);
                             })
                             .child(
                                 svg()
@@ -227,7 +226,6 @@ impl Render for HistoryCommandPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .cursor_pointer()
                             .hover(|s| s.bg(rgb(surface_hover())))
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {

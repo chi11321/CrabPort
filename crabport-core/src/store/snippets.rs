@@ -13,7 +13,13 @@ use super::Store;
 
 impl Store {
     /// Insert a new snippet. `name` defaults to the command text when empty.
-    pub fn add_snippet(&self, name: &str, command: &str) -> Result<i64, StoreError> {
+    pub fn add_snippet(
+        &self,
+        name: &str,
+        command: &str,
+        favorite: bool,
+        group_id: Option<i64>,
+    ) -> Result<i64, StoreError> {
         let name = if name.trim().is_empty() {
             command
         } else {
@@ -25,26 +31,29 @@ impl Store {
             .unwrap_or(0);
         self.db
             .execute(
-                "INSERT INTO snippets (name, command, created_at) VALUES (?1, ?2, ?3)",
-                params![name, command, now],
+                "INSERT INTO snippets (name, command, created_at, favorite, group_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, command, now, favorite as i64, group_id],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Load all snippets, most-recently-created first.
+    /// Load all snippets, favorites first then most-recently-created.
     pub fn snippets(&self) -> Result<Vec<SnippetEntry>, StoreError> {
         let mut stmt = self
             .db
-            .prepare("SELECT id, name, command, created_at FROM snippets ORDER BY id DESC")
+            .prepare("SELECT id, name, command, created_at, favorite, group_id FROM snippets ORDER BY favorite DESC, id DESC")
             .map_err(|e| StoreError::Db(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
+                let favorite: i64 = row.get(4)?;
                 Ok(SnippetEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     command: row.get(2)?,
                     created_at: row.get(3)?,
+                    favorite: favorite != 0,
+                    group_id: row.get(5)?,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -63,8 +72,15 @@ impl Store {
         Ok(())
     }
 
-    /// Update an existing snippet's name + command.
-    pub fn update_snippet(&self, id: i64, name: &str, command: &str) -> Result<(), StoreError> {
+    /// Update an existing snippet's name, command, favorite, and group.
+    pub fn update_snippet(
+        &self,
+        id: i64,
+        name: &str,
+        command: &str,
+        favorite: bool,
+        group_id: Option<i64>,
+    ) -> Result<(), StoreError> {
         let name = if name.trim().is_empty() {
             command
         } else {
@@ -72,8 +88,39 @@ impl Store {
         };
         self.db
             .execute(
-                "UPDATE snippets SET name = ?1, command = ?2 WHERE id = ?3",
-                params![name, command, id],
+                "UPDATE snippets SET name = ?1, command = ?2, favorite = ?3, group_id = ?4 WHERE id = ?5",
+                params![name, command, favorite as i64, group_id, id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Toggle the favorite flag for a snippet. Returns the new value.
+    pub fn toggle_snippet_favorite(&self, id: i64) -> Result<bool, StoreError> {
+        let current: i64 = self
+            .db
+            .query_row(
+                "SELECT favorite FROM snippets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        let new_val = current == 0;
+        self.db
+            .execute(
+                "UPDATE snippets SET favorite = ?1 WHERE id = ?2",
+                params![new_val as i64, id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    /// Move a snippet to a different group (`None` = ungrouped).
+    pub fn set_snippet_group(&self, id: i64, group_id: Option<i64>) -> Result<(), StoreError> {
+        self.db
+            .execute(
+                "UPDATE snippets SET group_id = ?1 WHERE id = ?2",
+                params![group_id, id],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
         Ok(())

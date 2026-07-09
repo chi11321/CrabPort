@@ -7,6 +7,7 @@
 //! in the process.
 
 use gpui::*;
+use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
 use rust_i18n::t;
 
@@ -15,6 +16,7 @@ use crabport_core::config;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
+use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
 
 // ---------------------------------------------------------------------------
 // Tab enum
@@ -49,6 +51,22 @@ pub struct SettingsWindow {
     // Dropdown open states (Dropdown is uncontrolled — caller manages it).
     locale_dropdown_open: bool,
     theme_dropdown_open: bool,
+    font_family_dropdown_open: bool,
+    /// Search input backing the terminal font-family dropdown. Lets the
+    /// user type to filter the (potentially long) list of installed fonts.
+    font_search_input: Entity<InputState>,
+    /// `InputState` backing the terminal font-size stepper. Pre-filled with
+    /// the persisted size on open and re-clamped on every edit via
+    /// [`subscribe_number_filter`].
+    font_size_input: Entity<InputState>,
+    /// Focus flag for the font-size input (drives the accent border).
+    font_size_focused: bool,
+    /// Cached list of *all* system-installed font family names shown in the
+    /// Terminal section's font dropdown. Built lazily on first render of the
+    /// Appearance pane. We show every font (not just monospace) so the user
+    /// can pick any family; the terminal renderer measures the actual glyph
+    /// advance width so non-monospace fonts still lay out on a grid.
+    mono_font_names: Vec<String>,
 }
 
 impl SettingsWindow {
@@ -57,7 +75,7 @@ impl SettingsWindow {
     /// singleton check).
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(820.0), px(600.0)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(720.0), px(820.0)), cx)),
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.settings.title").to_string().into()),
                 appears_transparent: true,
@@ -80,11 +98,56 @@ impl SettingsWindow {
         .expect("Failed to open Settings window")
     }
 
-    fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Pre-fill the font-size stepper with the persisted value so the
+        // input shows the current size on first open rather than blank.
+        let current_size = config::snapshot().appearance.terminal.effective_font_size() as i64;
+        let font_size_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(current_size.to_string(), window, cx);
+            state
+        });
+        // Enforce digits-only + clamp into [8, 32] on every edit, then
+        // persist the cleaned value and repaint every window so each
+        // terminal picks up the new size on its next render.
+        subscribe_number_filter(&font_size_input, 8, 32, window, cx, |_this, value, cx| {
+            let _ = config::update(|cfg| {
+                cfg.appearance.terminal.font_size = value as f32;
+            });
+            cx.refresh_windows();
+        })
+        .detach();
+        // Track focus so the stepper's accent border reflects keyboard
+        // focus (mirrors how StyledInput expects a `focused` bool).
+        cx.subscribe(
+            &font_size_input,
+            |this, _input, event: &InputEvent, cx| match event {
+                InputEvent::Focus => {
+                    this.font_size_focused = true;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.font_size_focused = false;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
+        .detach();
+        // Search box for the font-family dropdown — filters the list of
+        // installed fonts by case-insensitive substring.
+        let font_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("groups.search_placeholder").to_string())
+        });
         Self {
             tab: SettingsTab::General,
             locale_dropdown_open: false,
             theme_dropdown_open: false,
+            font_family_dropdown_open: false,
+            font_search_input,
+            font_size_input,
+            font_size_focused: false,
+            mono_font_names: Vec::new(),
         }
     }
 
@@ -227,7 +290,7 @@ impl SettingsWindow {
     // Appearance pane
     // -------------------------------------------------------------------
 
-    fn render_appearance_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_appearance_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let handle = cx.entity().clone();
         let locale_idx = if config::snapshot().appearance.locale == "zh-CN" {
             1
@@ -243,6 +306,16 @@ impl SettingsWindow {
             .iter()
             .position(|p| *p == current_name.as_str())
             .unwrap_or(0);
+
+        // Lazily build the font family list on first render. We query
+        // the OS for *every* installed font (not just monospace) so the
+        // user can pick any family; the terminal renderer measures the
+        // actual glyph advance width so non-monospace fonts still lay out
+        // on a grid.
+        if self.mono_font_names.is_empty() {
+            self.mono_font_names = collect_monospace_fonts(cx);
+        }
+        let mono_fonts = &self.mono_font_names;
 
         div()
             .size_full()
@@ -342,6 +415,114 @@ impl SettingsWindow {
                         ),
                     ),
             )
+            // --- Terminal font ---
+            .child({
+                // Resolve the configured font family for the dropdown.
+                let term_cfg = config::snapshot().appearance.terminal;
+                let current_family = term_cfg.effective_font_family().to_string();
+
+                // Index of the configured family in the candidate list. If the
+                // configured value isn't in the heuristic list, we prepend it
+                // (handled below by always including the configured family).
+                let font_idx = mono_fonts
+                    .iter()
+                    .position(|f| *f == current_family)
+                    .unwrap_or(0);
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(Self::section_header(t!(
+                        "window.settings.appearance.section_terminal"
+                    )))
+                    .child(Self::section_desc(t!(
+                        "window.settings.appearance.terminal_desc"
+                    )))
+                    // Font family dropdown
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(text_muted())).child(
+                                t!("window.settings.appearance.terminal_font_family").to_string(),
+                            ))
+                            .child(div().w(px(240.0)).child({
+                                let mut dd = Dropdown::new("settings-term-font")
+                                    .is_open(self.font_family_dropdown_open)
+                                    .selected(font_idx)
+                                    .searchable(self.font_search_input.clone())
+                                    .on_toggle({
+                                        let h = handle.clone();
+                                        let search = self.font_search_input.clone();
+                                        move |_w, cx| {
+                                            h.update(cx, |view, cx| {
+                                                // Clear the search query on
+                                                // close so the next open shows
+                                                // the full font list.
+                                                if view.font_family_dropdown_open {
+                                                    search.update(cx, |s, cx| {
+                                                        s.set_value("", _w, cx);
+                                                    });
+                                                }
+                                                view.font_family_dropdown_open =
+                                                    !view.font_family_dropdown_open;
+                                                cx.notify();
+                                            });
+                                        }
+                                    });
+                                for name in mono_fonts.iter() {
+                                    dd = dd.item(name.clone());
+                                }
+                                dd.on_change({
+                                    let h = handle.clone();
+                                    let names = mono_fonts.clone();
+                                    let search = self.font_search_input.clone();
+                                    move |idx, _w, cx| {
+                                        if let Some(name) = names.get(idx) {
+                                            let _ = config::update(|cfg| {
+                                                cfg.appearance.terminal.font_family = name.clone();
+                                            });
+                                            // Repaint every window so each
+                                            // terminal picks up the new font
+                                            // on its next render.
+                                            cx.refresh_windows();
+                                        }
+                                        h.update(cx, |view, cx| {
+                                            view.font_family_dropdown_open = false;
+                                            search.update(cx, |s, cx| {
+                                                s.set_value("", _w, cx);
+                                            });
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                            })),
+                    )
+                    // Font size stepper input (digits-only, clamped 8–32).
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(text_muted())).child(
+                                t!("window.settings.appearance.terminal_font_size").to_string(),
+                            ))
+                            .child(
+                                div().w(px(180.0)).child(
+                                    StyledNumberInput::new(
+                                        "settings-term-font-size",
+                                        self.font_size_input.clone(),
+                                    )
+                                    .focused(self.font_size_focused)
+                                    .min(8)
+                                    .max(32)
+                                    .step(1),
+                                ),
+                            ),
+                    )
+            })
     }
 }
 
@@ -376,6 +557,43 @@ impl Render for SettingsWindow {
 // ---------------------------------------------------------------------------
 // open_path helper — best-effort cross-platform "reveal in Finder/Explorer"
 // ---------------------------------------------------------------------------
+
+/// Build the list of font family names shown in the Terminal section's
+/// font dropdown.
+///
+/// We query the OS for **every** installed family (via the gpui text
+/// system) so the user can pick any font — not just ones our heuristic
+/// flagged as monospace. The platform default family is always prepended
+/// so a fresh install shows a sensible first option, and the currently
+/// configured family is appended if it isn't already in the list (so a
+/// hand-edited `config.toml` value stays visible/selectable).
+fn collect_monospace_fonts(cx: &mut App) -> Vec<String> {
+    let mut names: Vec<String> = cx.text_system().all_font_names();
+
+    // De-dup while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|n| seen.insert(n.to_lowercase()));
+
+    // Ensure the platform default is present and first.
+    let default_family = crabport_core::config::default_terminal_font_family().to_string();
+    names.retain(|n| *n != default_family);
+    let mut result = vec![default_family];
+    result.extend(names);
+
+    // Ensure the currently configured family is selectable even if it's a
+    // custom value that `all_font_names` didn't return (e.g. a family name
+    // from a hand-edited config.toml that the OS doesn't report).
+    let configured = crabport_core::config::snapshot()
+        .appearance
+        .terminal
+        .effective_font_family()
+        .to_string();
+    if !result.contains(&configured) {
+        result.push(configured);
+    }
+
+    result
+}
 
 fn open_path(path: &std::path::Path, _cx: &mut App) -> Result<(), ()> {
     #[cfg(target_os = "macos")]

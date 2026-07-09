@@ -78,7 +78,6 @@ impl RenderOnce for WithCertificateForm {
                                 .h(px(22.0))
                                 .px_2()
                                 .rounded_sm()
-                                .cursor_pointer()
                                 .text_xs()
                                 .text_color(rgb(text_primary()))
                                 .bg(rgb(surface_hover()))

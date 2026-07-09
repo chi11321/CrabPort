@@ -45,6 +45,10 @@ pub struct AppearanceConfig {
     /// `config.toml`. Missing fields fall back to the modern-dark default.
     #[serde(default)]
     pub theme: ThemeConfig,
+
+    /// Terminal font + size settings. Stored under `[appearance.terminal]`.
+    #[serde(default)]
+    pub terminal: TerminalConfig,
 }
 
 fn default_locale() -> String {
@@ -56,7 +60,74 @@ impl Default for AppearanceConfig {
         Self {
             locale: default_locale(),
             theme: ThemeConfig::default(),
+            terminal: TerminalConfig::default(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TerminalConfig
+// ---------------------------------------------------------------------------
+
+/// Terminal font configuration. Stored under `[appearance.terminal]` in
+/// `config.toml`.
+///
+/// `font_family` is the family name (e.g. `"Menlo"`); an empty string means
+/// "use the platform default monospace". `font_size` is in CSS pixels.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalConfig {
+    /// Monospace font family name. An empty value falls back to the
+    /// platform-native default (`Menlo` on macOS, `Consolas` on Windows,
+    /// `DejaVu Sans Mono` elsewhere) so a fresh install works out of the
+    /// box without knowing font names.
+    #[serde(default)]
+    pub font_family: String,
+
+    /// Font size in CSS pixels. Clamped into `[8.0, 32.0]` at use sites.
+    #[serde(default = "default_terminal_font_size")]
+    pub font_size: f32,
+}
+
+fn default_terminal_font_size() -> f32 {
+    13.0
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            font_family: String::new(),
+            font_size: default_terminal_font_size(),
+        }
+    }
+}
+
+impl TerminalConfig {
+    /// Resolve the effective font family, substituting the platform-native
+    /// monospace default when the configured value is empty.
+    pub fn effective_font_family(&self) -> &str {
+        if self.font_family.is_empty() {
+            default_terminal_font_family()
+        } else {
+            self.font_family.as_str()
+        }
+    }
+
+    /// Clamp the configured font size into the supported range. Keeps
+    /// hand-edited `config.toml` values from bricking the terminal.
+    pub fn effective_font_size(&self) -> f32 {
+        self.font_size.clamp(8.0, 32.0)
+    }
+}
+
+/// Platform-native default monospace family. Matches the cell-width metrics
+/// baked into the terminal renderer so a fresh install lines up cleanly.
+pub fn default_terminal_font_family() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
     }
 }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use rust_i18n::t;
 
@@ -11,9 +12,10 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
-use crate::views::hosts::{ConnectionFormState, ConnectionHost};
 use crate::views::panel::PanelKind;
+use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
+use crate::views::terminal::split::{SplitDir, SplitNode};
 
 pub fn render_content(
     selected: SidebarItem,
@@ -21,6 +23,8 @@ pub fn render_content(
     tabs: &[Tab],
     active_tab_id: u64,
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
+    split_trees: &HashMap<u64, crate::views::terminal::split::SplitTree>,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
     hosts: &[ConnectionHost],
     form_entity: Option<&ConnectionFormState>,
     // Active panel pane the user last selected (semantic identity, not a
@@ -43,19 +47,29 @@ pub fn render_content(
     let snippets_panel = &ctx.snippets_panel;
     let history_panel = &ctx.history_panel;
     let tunnels_panel = &ctx.tunnels_panel;
-    let hosts_view = &ctx.hosts_view;
+    let sessions_view = &ctx.sessions_view;
     let snippets_view = &ctx.snippets_view;
     let tunnels_view = &ctx.tunnels_view;
     let context_menu = &ctx.context_menu;
     let alert_controller = &ctx.alert;
     let active_tab = tabs.iter().find(|t| t.id == active_tab_id);
-    // Clone the tunnel list for the panel — the full-page TunnelsView
-    // (SidebarItem::Tunnels arm below) consumes the original `tunnel_list`.
-    let tunnel_list_for_panel = tunnel_list.clone();
+    // Filter the tunnel list for the panel down to only the tunnels that
+    // belong to the active terminal's host. A local PTY tab (`host_id` =
+    // `None`) has no host → empty list; an SSH/Telnet tab shows only its own
+    // host's tunnels. The full-page TunnelsView (SidebarItem::Tunnels arm
+    // below) consumes the original unfiltered `tunnel_list`.
+    let active_host_id = active_tab
+        .and_then(|tab| terminal_views.get(&tab.id))
+        .and_then(|entity| entity.read_with(cx, |view, _cx| view.host_id()));
+    let tunnel_list_for_panel: Vec<crate::views::tunnels::TunnelView> = tunnel_list
+        .iter()
+        .filter(|t| Some(t.host_id) == active_host_id)
+        .cloned()
+        .collect();
     let handle_c = handle.clone();
     let on_close: Rc<dyn Fn(u64, &mut Window, &mut App)> = Rc::new(move |id, _w, cx| {
         handle_c.update(cx, |app, cx| {
-            app.close_tab(id, cx);
+            app.close_active_pane_or_tab(id, cx);
         });
     });
 
@@ -94,7 +108,7 @@ pub fn render_content(
                     let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
                     let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
 
-                    hosts_view.update(cx, |view, cx| {
+                    sessions_view.update(cx, |view, cx| {
                         view.set_state(
                             hosts.to_vec(),
                             form_entity.cloned(),
@@ -108,7 +122,7 @@ pub fn render_content(
                         );
                     });
 
-                    hosts_view.clone().into_any_element()
+                    sessions_view.clone().into_any_element()
                 }
                 SidebarItem::Tunnels => {
                     let app_handle = handle.clone();
@@ -176,6 +190,8 @@ pub fn render_content(
                                 id: s.id,
                                 name: s.name,
                                 command: s.command,
+                                favorite: s.favorite,
+                                group_id: s.group_id,
                             })
                             .collect::<Vec<_>>()
                     } else {
@@ -224,13 +240,91 @@ pub fn render_content(
             }
         }
         Some(TabKind::Terminal) => {
-            if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
+            if let Some(tab) = active_tab {
+                let tab_id = tab.id;
+                // If this tab has a split tree, render the panes recursively;
+                // otherwise fall back to the single terminal view.
+                let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
+                    render_split_node(&tree.root, tree.active_pane, tab_id, pane_views, handle)
+                        .into_any_element()
+                } else if let Some(terminal_entity) = terminal_views.get(&tab_id) {
+                    div()
+                        .size_full()
+                        .key_context("Terminal")
+                        .child(terminal_entity.clone())
+                        .into_any_element()
+                } else {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_color(rgb(text_muted())).child("Terminal"))
+                        .into_any_element()
+                };
+                // Floating split-action buttons (top-right of the terminal
+                // content area). "Split Right" / "Split Down" create a new
+                // local-PTY pane; disabled when there's no terminal yet.
+                let has_term =
+                    terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
+                let handle_split_r = handle.clone();
+                let handle_split_d = handle.clone();
                 div()
                     .size_full()
-                    .pt_2()
-                    .pl_2()
+                    .relative()
                     .key_context("Terminal")
-                    .child(terminal_entity.clone())
+                    .child(inner)
+                    .when(has_term, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .right_2()
+                                .flex()
+                                .flex_row()
+                                .gap_1()
+                                // Occlude so mouse-down on the split buttons
+                                // doesn't fall through to the terminal pane
+                                // underneath (which would re-focus that pane
+                                // and make `split_active_pane` target the
+                                // wrong pane).
+                                .occlude()
+                                .child(render_split_button(
+                                    "term-split-right",
+                                    "icons/panel-right.svg",
+                                    t!("terminal.split_right").to_string(),
+                                    ctx.tooltip.clone(),
+                                    {
+                                        let handle = handle_split_r.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.split_active_pane(
+                                                    crate::views::terminal::split::SplitDir::Vertical,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    },
+                                ))
+                                .child(render_split_button(
+                                    "term-split-down",
+                                    "icons/panel-bottom.svg",
+                                    t!("terminal.split_down").to_string(),
+                                    ctx.tooltip.clone(),
+                                    {
+                                        let handle = handle_split_d.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.split_active_pane(
+                                                    crate::views::terminal::split::SplitDir::Horizontal,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    },
+                                )),
+                        )
+                    })
                     .into_any_element()
             } else {
                 div()
@@ -383,6 +477,42 @@ pub fn render_content(
         None
     };
 
+    // Build SFTP rename callback. Forwards `(old_remote_path, new_remote_path)`
+    // to the backend's `sftp_rename`. Completion is reported via
+    // `BackendEvent::SftpTransferFinished`, same as the other SFTP ops.
+    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
+        active_tab.and_then(|tab| {
+            terminal_views.get(&tab.id).map(|entity| {
+                let entity = entity.clone();
+                Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_rename(&old_path, &new_path);
+                    });
+                }) as Rc<dyn Fn(String, String, &mut App)>
+            })
+        })
+    } else {
+        None
+    };
+
+    // Build SFTP open-in-editor callback. Forwards the remote path to the
+    // backend's `sftp_open_in_editor`, which downloads to a local tmp path
+    // and launches the OS default editor.
+    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
+        active_tab.and_then(|tab| {
+            terminal_views.get(&tab.id).map(|entity| {
+                let entity = entity.clone();
+                Rc::new(move |remote_path: String, cx: &mut App| {
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_open_in_editor(&remote_path);
+                    });
+                }) as Rc<dyn Fn(String, &mut App)>
+            })
+        })
+    } else {
+        None
+    };
+
     // ---- Panel capability flags ----
     //
     // Each right-hand panel pane is shown only when the active terminal's
@@ -421,6 +551,8 @@ pub fn render_content(
             sftp_download,
             sftp_upload,
             sftp_delete,
+            sftp_rename,
+            sftp_edit,
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),
@@ -464,6 +596,7 @@ pub fn render_content(
             tunnels_on_start,
             tunnels_on_stop,
             context_menu.clone(),
+            active_tab_id,
             window,
             cx,
         );
@@ -674,7 +807,9 @@ pub fn render_content(
                             }
                             handle_for_panel.update(cx, |app, cx| {
                                 if let Some(k) = kinds.get(idx).copied() {
-                                    app.panel_active_tab = k;
+                                    // Store per-tab so each terminal
+                                    // connection keeps its own panel choice.
+                                    app.panel_active_tab.insert(active_tab_id, k);
                                     cx.notify();
                                 }
                             });
@@ -688,4 +823,185 @@ pub fn render_content(
             metrics,
             sftp_progress,
         ))
+}
+
+// ---------------------------------------------------------------------------
+// Terminal split-pane rendering
+// ---------------------------------------------------------------------------
+//
+// Renders a [`SplitNode`] tree as nested flex containers. Each split draws a
+// draggable divider between its two children. Clicking a pane focuses it
+// (updates the tab's active pane so the toolbar follows).
+
+/// Recursively render a split node into a full-size element using
+/// gpui-component's `ResizablePanelGroup` for drag-to-resize dividers.
+fn render_split_node(
+    node: &SplitNode,
+    active_pane: u64,
+    tab_id: u64,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
+    handle: &Entity<CrabportApp>,
+) -> AnyElement {
+    use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
+    match node {
+        SplitNode::Pane(pane_id) => {
+            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
+        }
+        SplitNode::Split { dir, a, b, .. } => {
+            let dir = *dir;
+            let group_id =
+                ElementId::Name(format!("split-group-{}-{}", tab_id, leaf_pane_id(node)).into());
+            let axis = match dir {
+                SplitDir::Vertical => gpui::Axis::Horizontal,
+                SplitDir::Horizontal => gpui::Axis::Vertical,
+            };
+            // Render children. For a nested split child, wrap it in a
+            // `resizable_panel` so the inner group fills its allocated space.
+            let child_a = render_split_child(a, active_pane, tab_id, pane_views, handle);
+            let child_b = render_split_child(b, active_pane, tab_id, pane_views, handle);
+
+            let group = if axis == gpui::Axis::Horizontal {
+                h_resizable(group_id)
+            } else {
+                v_resizable(group_id)
+            };
+            group
+                .child(resizable_panel().child(child_a))
+                .child(resizable_panel().child(child_b))
+                .into_any_element()
+        }
+    }
+}
+
+/// Render a split child — either a leaf pane or a nested group (wrapped
+/// in a `resizable_panel` by the caller's group).
+fn render_split_child(
+    node: &SplitNode,
+    active_pane: u64,
+    tab_id: u64,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
+    handle: &Entity<CrabportApp>,
+) -> AnyElement {
+    match node {
+        SplitNode::Pane(pane_id) => {
+            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
+        }
+        SplitNode::Split { .. } => {
+            // Nested split: render as a group, which itself becomes the child.
+            render_split_node(node, active_pane, tab_id, pane_views, handle)
+        }
+    }
+}
+
+/// Render a single terminal pane with click-to-focus + active highlight.
+fn render_pane(
+    pane_id: u64,
+    active_pane: u64,
+    tab_id: u64,
+    pane_views: &HashMap<u64, Entity<TerminalView>>,
+    handle: &Entity<CrabportApp>,
+) -> impl IntoElement {
+    let is_active = pane_id == active_pane;
+    let view = pane_views.get(&pane_id).cloned();
+    let view_for_focus = view.clone();
+    let mut el = div()
+        .id(ElementId::Name(
+            format!("pane-{}-{}", tab_id, pane_id).into(),
+        ))
+        .size_full()
+        // Occlude so this pane's hitbox blocks sibling panes' mouse
+        // handlers — without this, overlapping hitboxes (e.g. when the
+        // resizable-panel flex layout doesn't fully clip children) cause a
+        // single click to fire `on_mouse_down` on *every* pane, re-focusing
+        // the wrong one.
+        .occlude()
+        .when(is_active, |el| el.bg(rgba((surface_hover() << 8) | 0x18)))
+        .on_mouse_down(MouseButton::Left, {
+            let handle = handle.clone();
+            move |_e, w, cx| {
+                handle.update(cx, |app, cx| {
+                    app.focus_pane(tab_id, pane_id, cx);
+                });
+                if let Some(view) = &view_for_focus {
+                    let fh = view.read_with(cx, |v, cx| v.focus_handle(cx));
+                    w.focus(&fh);
+                }
+                cx.stop_propagation();
+            }
+        });
+    if let Some(view) = view {
+        el = el.child(view);
+    }
+    el
+}
+
+/// The pane id of the first leaf under a node (used to key dividers).
+fn leaf_pane_id(node: &SplitNode) -> u64 {
+    match node {
+        SplitNode::Pane(id) => *id,
+        SplitNode::Split { a, .. } => leaf_pane_id(a),
+    }
+}
+
+/// A compact icon button for the split-action overlay (top-right of the
+/// terminal content area). Ghost style: transparent bg, eased hover bg.
+/// Uses the global [`TooltipController`] for hover tooltips with fade-in/out.
+fn render_split_button(
+    id: &'static str,
+    icon: &'static str,
+    tooltip_text: String,
+    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+    let btn_id = ElementId::Name(format!("{}-btn", id).into());
+    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let rest_bg = rgba((surface_hover() << 8) | 0x00);
+    let tooltip_text_clone = tooltip_text.clone();
+    div()
+        .id(btn_id.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.0))
+        .rounded(px(4.0))
+        // Pre-set the rest (transparent) bg so the transition registry has
+        // a concrete `Some(bg)` to interpolate *from* on hover-in.
+        .bg(rest_bg)
+        // `on_hover` / `on_click` must be on the AnimatedWrapper (i.e. after
+        // `with_transition`), not on the raw div — the wrapper's own render
+        // also calls `on_hover` internally and panics if one is already set.
+        .with_transition(btn_id)
+        .on_hover(move |hovered, w, cx| {
+            if *hovered {
+                tooltip_ctrl.update(cx, |t, cx| {
+                    t.show(tooltip_text_clone.clone(), w.mouse_position(), cx);
+                });
+            } else {
+                tooltip_ctrl.update(cx, |t, cx| {
+                    t.hide(cx);
+                });
+            }
+        })
+        .on_click(move |_e, w, cx| {
+            on_click(w, cx);
+            cx.stop_propagation();
+        })
+        .transition_on_hover(
+            std::time::Duration::from_millis(120),
+            Linear,
+            move |hovered, el| {
+                if *hovered {
+                    el.bg(hover_bg)
+                } else {
+                    el.bg(rgba((surface_hover() << 8) | 0x00))
+                }
+            },
+        )
+        .child(
+            svg()
+                .path(icon)
+                .size(px(14.0))
+                .text_color(rgb(text_muted())),
+        )
 }

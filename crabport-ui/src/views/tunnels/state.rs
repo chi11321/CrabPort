@@ -130,6 +130,25 @@ impl TunnelRegistry {
         }
     }
 
+    /// Toggle the favorite flag on a config in place (preserving runtime
+    /// state). Cheaper than `set_configs` for a single-field change and
+    /// avoids reallocating the whole list.
+    pub fn set_favorite(&self, id: i64, favorite: bool) {
+        let mut tunnels = self.tunnels.lock();
+        if let Some(t) = tunnels.iter_mut().find(|t| t.config.id == id) {
+            t.config.favorite = favorite;
+        }
+    }
+
+    /// Move a config to a different group in place (preserving runtime
+    /// state).
+    pub fn set_group(&self, id: i64, group_id: Option<i64>) {
+        let mut tunnels = self.tunnels.lock();
+        if let Some(t) = tunnels.iter_mut().find(|t| t.config.id == id) {
+            t.config.group_id = group_id;
+        }
+    }
+
     /// Remove a tunnel config + stop its runtime if any.
     pub async fn remove(&self, id: i64) {
         let removed = self
@@ -148,10 +167,12 @@ impl TunnelRegistry {
         self.tunnels.lock().retain(|t| t.config.id != id);
     }
 
-    /// Snapshot for UI rendering.
+    /// Snapshot for UI rendering. Sorted by `favorite DESC, id ASC` so
+    /// favorited tunnels float to the top — mirrors the store's `tunnels()`
+    /// query ordering.
     pub fn list(&self) -> Vec<TunnelView> {
-        self.tunnels
-            .lock()
+        let tunnels = self.tunnels.lock();
+        let mut views: Vec<TunnelView> = tunnels
             .iter()
             .map(|t| TunnelView {
                 id: t.config.id,
@@ -165,8 +186,14 @@ impl TunnelRegistry {
                 created_at: t.config.created_at,
                 running: t.runtime.is_some(),
                 borrowed_tab_id: t.runtime.as_ref().and_then(|r| r.borrowed_tab_id()),
+                favorite: t.config.favorite,
+                group_id: t.config.group_id,
             })
-            .collect()
+            .collect();
+        // Sort: favorites first, then by id ascending (stable with the
+        // store's `tunnels()` query).
+        views.sort_by(|a, b| b.favorite.cmp(&a.favorite).then(a.id.cmp(&b.id)));
+        views
     }
 
     /// Is the given tunnel config currently running anywhere?
@@ -262,6 +289,10 @@ pub struct TunnelView {
     pub running: bool,
     /// `Some(tab_id)` when this tunnel is borrowed from a terminal tab.
     pub borrowed_tab_id: Option<u64>,
+    /// Starred by the user to pin it above un-starred tunnels.
+    pub favorite: bool,
+    /// FK into the `groups` table. `None` = ungrouped.
+    pub group_id: Option<i64>,
 }
 
 /// Trait alias so `CrabportApp` can hold `Arc<dyn TunnelSource>` for the

@@ -11,7 +11,7 @@ use rust_i18n::t;
 
 use crate::app_state::AppState;
 use crate::components::notification::{Notification, NotificationLevel};
-use crate::views::hosts::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
+use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
     CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
     PrivateKeyKind, ProxyConfig, ProxyEntry,
@@ -130,6 +130,7 @@ impl CrabportApp {
                         last_login: None,
                         favorite: false,
                         proxy_id,
+                        group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -144,6 +145,7 @@ impl CrabportApp {
                         last_login: None,
                         favorite: false,
                         proxy_id,
+                        group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
                     });
                     let (private_key_arg, passphrase_arg) = match auth_kind {
                         AuthKind::Password => (None, None),

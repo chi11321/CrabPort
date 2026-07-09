@@ -9,7 +9,7 @@ use rust_i18n::t;
 
 use crate::app_state::AppState;
 use crate::components::notification::{Notification, NotificationLevel};
-use crate::views::hosts::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
+use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
     CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
     PrivateKeyKind,
@@ -38,14 +38,15 @@ impl CrabportApp {
                     port: h.port,
                     username: h.username,
                     kind: match h.kind {
-                        CoreHostKind::Ssh => crate::views::hosts::ConnectionKind::SSH,
-                        CoreHostKind::Telnet => crate::views::hosts::ConnectionKind::Telnet,
-                        CoreHostKind::Serial => crate::views::hosts::ConnectionKind::Serial,
+                        CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
+                        CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
+                        CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
                     },
                     credential_id: h.credential_id,
                     last_login: h.last_login,
                     favorite: h.favorite,
                     proxy_id: h.proxy_id,
+                    group_id: h.group_id,
                 })
                 .collect();
         }
@@ -92,7 +93,7 @@ impl CrabportApp {
         // password-only auth (credentials are sent via the terminal prompt
         // in v1). Serial has no backend yet.
         match host.kind {
-            crate::views::hosts::ConnectionKind::Telnet => {
+            crate::views::sessions::ConnectionKind::Telnet => {
                 self.add_telnet_tab(
                     &host.name,
                     Some(host_id),
@@ -160,9 +161,9 @@ impl CrabportApp {
         // (SSH / Telnet / Serial). Without this the form always defaults to
         // SSH and a saved Telnet host would appear as SSH when edited.
         form.kind = match h.kind {
-            crate::views::hosts::ConnectionKind::SSH => ConnectionKind::SSH,
-            crate::views::hosts::ConnectionKind::Telnet => ConnectionKind::Telnet,
-            crate::views::hosts::ConnectionKind::Serial => ConnectionKind::Serial,
+            crate::views::sessions::ConnectionKind::SSH => ConnectionKind::SSH,
+            crate::views::sessions::ConnectionKind::Telnet => ConnectionKind::Telnet,
+            crate::views::sessions::ConnectionKind::Serial => ConnectionKind::Serial,
         };
 
         form.name_input.update(cx, |state, cx| {
@@ -238,8 +239,13 @@ impl CrabportApp {
         let editing_host_id = h.id;
         let editing_cred_id = h.credential_id;
         let editing_proxy_id = h.proxy_id;
+        // Preserve favorite + group across edits — the form doesn't expose
+        // these, so without capturing them `update_host` would reset them.
+        let editing_favorite = h.favorite;
+        let editing_group_id = h.group_id;
 
         form.editing = true;
+        form.group_id = editing_group_id;
 
         form.on_connect = Some(Rc::new({
             let app = app.clone();
@@ -337,8 +343,12 @@ impl CrabportApp {
                             ConnectionKind::SSH => CoreHostKind::Ssh,
                         },
                         last_login: None,
-                        favorite: false,
+                        favorite: editing_favorite,
                         proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),
+                        group_id: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.group_id),
                     };
                     #[cfg(debug_assertions)]
                     tracing::info!(
@@ -386,6 +396,8 @@ impl CrabportApp {
                         h.username = username.clone();
                         h.credential_id = Some(new_cred_id);
                         h.proxy_id = entry.proxy_id;
+                        h.favorite = editing_favorite;
+                        h.group_id = entry.group_id;
                     }
 
                     cx.notify();

@@ -20,6 +20,7 @@
 //! source), so `render_content` only wires callbacks when the active tab is
 //! remote.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 
+use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::input::StyledInput;
@@ -56,11 +58,38 @@ fn status_stopped_color() -> u32 {
     text_muted()
 }
 
+/// Per-tab state held by the tunnels panel so each terminal connection
+/// keeps its own search query, hover, and context-menu-triggering row.
+/// The panel swaps this state in/out when the active tab changes.
+struct TabPanelState {
+    search_query: String,
+    hovered_row: Option<usize>,
+    /// The tunnel row that triggered the currently-open context menu, if
+    /// any. While set, that row stays highlighted even though the mouse
+    /// has moved to the overlay.
+    context_menu_row: Option<usize>,
+}
+
+impl Default for TabPanelState {
+    fn default() -> Self {
+        Self {
+            search_query: String::new(),
+            hovered_row: None,
+            context_menu_row: None,
+        }
+    }
+}
+
 /// Tunnels panel view.
 pub struct TunnelsPanel {
     /// Current tunnel list snapshot. Reloaded from the registry on each
     /// `set_state` call.
     tunnels: Arc<Vec<TunnelView>>,
+    /// App entity handle, used to drive favorite toggles from the panel
+    /// (the panel's `set_state` callbacks are wired from `content.rs` and
+    /// can't grow new params without touching that file, so the panel
+    /// reaches the app directly via this handle for the star toggle).
+    app: Option<Entity<CrabportApp>>,
     /// Start callback — invoked with `(tunnel_id, tab_id)` on double-click /
     /// context-menu "Start". Routes to `CrabportApp::start_tunnel_borrowed`.
     on_start: Option<Rc<dyn Fn(i64, &mut App)>>,
@@ -68,40 +97,45 @@ pub struct TunnelsPanel {
     /// Routes to `CrabportApp::stop_tunnel`.
     on_stop: Option<Rc<dyn Fn(i64, &mut App)>>,
     /// Search input state (lazily initialized on the first `set_state`).
+    /// Shared across tabs — its visible text is resynced to the active
+    /// tab's `search_query` on tab switch via `InputState::set_value`.
     search_input: Option<Entity<InputState>>,
-    /// Current search query. Updated via `InputEvent::Change` subscription.
-    search_query: String,
     /// Scroll handle for the virtual list + custom scrollbar.
     scroll_handle: VirtualListScrollHandle,
-    /// Per-row hover state, keyed by tunnel index in the filtered list.
-    hovered_row: Option<usize>,
-    /// The tunnel row that triggered the currently-open context menu, if any.
-    /// While set, that row stays highlighted even though the mouse has moved
-    /// to the overlay.
-    context_menu_row: Option<usize>,
     /// Global context menu host. Held so the panel can open a right-click
     /// menu on rows (Start / Stop).
     context_menu: Option<Entity<ContextMenuController>>,
+    /// The tab whose state is currently surfaced in the panel. `None`
+    /// before the first `set_state` (e.g. on the Home tab).
+    active_tab_id: Option<u64>,
+    /// Per-tab panel state. Each terminal connection keeps its own search
+    /// query + hover/context-menu row so switching tabs doesn't bleed one
+    /// connection's view state into another.
+    tab_states: HashMap<u64, TabPanelState>,
 }
 
 impl TunnelsPanel {
     pub fn new() -> Self {
         Self {
             tunnels: Arc::new(Vec::new()),
+            app: None,
             on_start: None,
             on_stop: None,
             search_input: None,
-            search_query: String::new(),
             scroll_handle: VirtualListScrollHandle::new(),
-            hovered_row: None,
-            context_menu_row: None,
             context_menu: None,
+            active_tab_id: None,
+            tab_states: HashMap::new(),
         }
     }
 
     /// Update the tunnel list + callbacks from the active context.
     /// Called by the content layout each render. `tunnels` is the live
     /// snapshot from `TunnelRegistry::list()` so running state is current.
+    ///
+    /// `tab_id` identifies the active terminal tab so the panel can keep
+    /// per-tab search query / hover / context-menu-row state independent
+    /// across terminal connections.
     #[allow(clippy::too_many_arguments)]
     pub fn set_state(
         &mut self,
@@ -109,6 +143,7 @@ impl TunnelsPanel {
         on_start: Option<Rc<dyn Fn(i64, &mut App)>>,
         on_stop: Option<Rc<dyn Fn(i64, &mut App)>>,
         context_menu: Entity<ContextMenuController>,
+        tab_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -120,13 +155,41 @@ impl TunnelsPanel {
                 &entity,
                 |this, input, event: &gpui_component::input::InputEvent, cx| {
                     if let gpui_component::input::InputEvent::Change { .. } = event {
-                        this.search_query = input.read(cx).value().to_string();
-                        cx.notify();
+                        // Write into the active tab's state so each
+                        // connection keeps its own query.
+                        if let Some(id) = this.active_tab_id {
+                            let q = input.read(cx).value().to_string();
+                            this.tab_states.entry(id).or_default().search_query = q;
+                            cx.notify();
+                        }
                     }
                 },
             )
             .detach();
             self.search_input = Some(entity);
+        }
+
+        // Switch the active tab's state. When the tab changes, resync the
+        // shared search input to the new tab's query so the field shows the
+        // right text. `set_value` does not emit `InputEvent::Change`, so the
+        // subscription above won't double-write.
+        let tab_changed = self.active_tab_id != Some(tab_id);
+        if tab_changed {
+            self.active_tab_id = Some(tab_id);
+            let new_query = self
+                .tab_states
+                .entry(tab_id)
+                .or_default()
+                .search_query
+                .clone();
+            if let Some(ref input) = self.search_input {
+                input.update(cx, |state, cx| {
+                    state.set_value(new_query, window, cx);
+                });
+            }
+            // Clear stale hover/context-menu highlight from the previously
+            // active tab so it doesn't leak into the new tab's render.
+            cx.notify();
         }
 
         let new_tunnels = Arc::new(tunnels);
@@ -140,10 +203,23 @@ impl TunnelsPanel {
         }
     }
 
-    /// The filtered view of `self.tunnels` for the current `search_query`.
+    /// Drop the per-tab state for a closing tab so the `tab_states` map
+    /// doesn't leak entries for closed tabs. Called from `close_tab`.
+    pub fn forget_tab(&mut self, tab_id: u64) {
+        self.tab_states.remove(&tab_id);
+        if self.active_tab_id == Some(tab_id) {
+            self.active_tab_id = None;
+        }
+    }
+
+    /// The filtered view of `self.tunnels` for the active tab's search query.
     /// Case-insensitive substring match on name + bind address.
     fn filtered(&self) -> Vec<usize> {
-        let q = self.search_query.trim().to_lowercase();
+        let q = self
+            .active_tab_id
+            .and_then(|id| self.tab_states.get(&id))
+            .map(|s| s.search_query.trim().to_lowercase())
+            .unwrap_or_default();
         if q.is_empty() {
             return (0..self.tunnels.len()).collect();
         }
@@ -166,6 +242,14 @@ impl Default for TunnelsPanel {
     }
 }
 
+impl TunnelsPanel {
+    /// Set the app entity handle (called once from `CrabportApp::wire` so the
+    /// panel can drive favorite toggles without a new `set_state` param).
+    pub fn set_app(&mut self, app: Entity<CrabportApp>) {
+        self.app = Some(app);
+    }
+}
+
 /// Fixed height of each tunnel row. The virtual list requires uniform
 /// item sizes.
 const ROW_HEIGHT: f32 = 36.0;
@@ -184,20 +268,29 @@ impl Render for TunnelsPanel {
             .iter()
             .map(|&i| self.tunnels[i].clone())
             .collect();
-        let hovered_row = self.hovered_row;
-        let context_menu_row = self.context_menu_row;
+        let hovered_row = self
+            .active_tab_id
+            .and_then(|id| self.tab_states.get(&id))
+            .and_then(|s| s.hovered_row);
+        let context_menu_row = self
+            .active_tab_id
+            .and_then(|id| self.tab_states.get(&id))
+            .and_then(|s| s.context_menu_row);
 
         // If the global context menu is no longer active, clear the
-        // "menu-triggering row" highlight.
+        // "menu-triggering row" highlight for the active tab.
         let menu_active = self
             .context_menu
             .as_ref()
             .map(|cm| cm.read_with(cx, |c, _| c.is_active()))
             .unwrap_or(false);
         if !menu_active {
-            self.context_menu_row = None;
+            if let Some(id) = self.active_tab_id {
+                if let Some(state) = self.tab_states.get_mut(&id) {
+                    state.context_menu_row = None;
+                }
+            }
         }
-        let context_menu_row = context_menu_row;
 
         // Pre-compute item sizes for the virtual list.
         let item_sizes = Rc::new(
@@ -211,6 +304,8 @@ impl Render for TunnelsPanel {
         let filtered_for_list = Arc::new(filtered);
         let is_empty = filtered_for_list.is_empty();
 
+        let app_for_list = self.app.clone();
+
         let list = v_virtual_list(
             cx.entity(),
             "tunnel-panel-list",
@@ -220,6 +315,7 @@ impl Render for TunnelsPanel {
                 let on_start = on_start.clone();
                 let on_stop = on_stop.clone();
                 let context_menu = context_menu.clone();
+                let app = app_for_list.clone();
                 let entity = cx.entity().downgrade();
                 range
                     .map(|i| {
@@ -278,6 +374,9 @@ impl Render for TunnelsPanel {
                         // right-click closure after this.
                         let running_for_dblclick = tunnel.running;
                         let tunnel_id_for_dblclick = tunnel.id;
+                        let favorite_for_star = t.favorite;
+                        let tunnel_id_for_star = tunnel.id;
+                        let app_for_star = app.clone();
 
                         div()
                             .id(row_id.clone())
@@ -322,7 +421,12 @@ impl Render for TunnelsPanel {
                                         return;
                                     };
                                     let _ = entity.update(cx, |view, cx| {
-                                        view.context_menu_row = Some(i);
+                                        if let Some(id) = view.active_tab_id {
+                                            view.tab_states
+                                                .entry(id)
+                                                .or_default()
+                                                .context_menu_row = Some(i);
+                                        }
                                         cx.notify();
                                     });
                                     let pos = event.position;
@@ -366,12 +470,15 @@ impl Render for TunnelsPanel {
                                 let entity = entity.clone();
                                 move |hovered, _w, cx| {
                                     let _ = entity.update(cx, |view, cx| {
-                                        if *hovered {
-                                            view.hovered_row = Some(i);
-                                        } else if view.hovered_row == Some(i) {
-                                            view.hovered_row = None;
+                                        if let Some(id) = view.active_tab_id {
+                                            let state = view.tab_states.entry(id).or_default();
+                                            if *hovered {
+                                                state.hovered_row = Some(i);
+                                            } else if state.hovered_row == Some(i) {
+                                                state.hovered_row = None;
+                                            }
+                                            cx.notify();
                                         }
-                                        cx.notify();
                                     });
                                 }
                             })
@@ -425,6 +532,48 @@ impl Render for TunnelsPanel {
                             )
                             // Status dot.
                             .child(div().size_2().rounded_full().bg(rgb(status_dot)))
+                            // Favorite star toggle (far right, compact). Fades
+                            // in on hover; stays visible (yellow) when already
+                            // favorited so the user can see + unstar.
+                            .child({
+                                let app = app_for_star.clone();
+                                let star_id =
+                                    ElementId::Name(format!("tunnel-panel-star-{i}").into());
+                                let star_visible = is_highlighted || favorite_for_star;
+                                div()
+                                    .id(star_id.clone())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(svg().path("icons/star.svg").size(px(14.0)).text_color(
+                                        rgb(if favorite_for_star {
+                                            term_yellow()
+                                        } else {
+                                            text_muted()
+                                        }),
+                                    ))
+                                    .with_transition(star_id)
+                                    .transition_when_else(
+                                        star_visible,
+                                        std::time::Duration::from_millis(120),
+                                        Linear,
+                                        |el| el.opacity(1.0),
+                                        |el| el.opacity(0.0),
+                                    )
+                                    .on_click({
+                                        let app = app.clone();
+                                        move |_e, _w, cx| {
+                                            if let Some(app) = app.clone() {
+                                                app.update(cx, |app, cx| {
+                                                    app.toggle_tunnel_favorite(
+                                                        tunnel_id_for_star,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }
+                                    })
+                            })
                     })
                     .collect::<Vec<_>>()
             },

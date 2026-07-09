@@ -10,6 +10,7 @@ use super::with_proxy::{ProxyKind, WithProxyForm};
 use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::button::Button;
+use crate::components::dropdown::Dropdown;
 use crate::components::input::{StyledInput, StyledPasswordInput};
 use crate::components::tabs::{TabPane, Tabs};
 use crabport_core::credential::PrivateKeyKind;
@@ -99,6 +100,13 @@ pub struct ConnectionFormState {
     pub private_key_path_focused: bool,
     pub proxy_url_focused: bool,
     pub editing: bool,
+    /// FK into the `groups` table. `None` = ungrouped. Edited via a group
+    /// dropdown in the form.
+    pub group_id: Option<i64>,
+    /// Open state for the group dropdown.
+    pub group_dropdown_open: bool,
+    /// Search input for the group dropdown (filtering + create).
+    pub group_search_input: Entity<InputState>,
     /// Per-field validation errors. Populated by `validate()` and rendered
     /// via `StyledInput.error(...)` on the relevant fields. Cleared on open.
     pub errors: ValidationErrors,
@@ -128,6 +136,7 @@ impl ConnectionFormState {
         // `StyledInput` chrome (label / error / disabled styling) applies.
         let private_key_path_input = cx.new(|cx| InputState::new(window, cx));
         let proxy_url_input = cx.new(|cx| InputState::new(window, cx));
+        let group_search_input = cx.new(|cx| InputState::new(window, cx));
 
         Self {
             active: false,
@@ -154,6 +163,9 @@ impl ConnectionFormState {
             private_key_path_focused: false,
             proxy_url_focused: false,
             editing: false,
+            group_id: None,
+            group_dropdown_open: false,
+            group_search_input,
             errors: ValidationErrors::default(),
             on_close: None,
             on_connect: None,
@@ -163,6 +175,9 @@ impl ConnectionFormState {
     pub fn open(&mut self, window: &mut Window, cx: &mut App) {
         self.active = true;
         self.errors = ValidationErrors::default();
+        self.group_dropdown_open = false;
+        self.group_search_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.name_input.update(cx, |state, cx| {
             state.focus(window, cx);
         });
@@ -397,6 +412,9 @@ pub struct ConnectionFormView {
     private_key_path_focused: bool,
     proxy_url_focused: bool,
     editing: bool,
+    group_id: Option<i64>,
+    group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     errors: ValidationErrors,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
@@ -429,6 +447,9 @@ impl ConnectionFormView {
             private_key_path_focused: state.private_key_path_focused,
             proxy_url_focused: state.proxy_url_focused,
             editing: state.editing,
+            group_id: state.group_id,
+            group_dropdown_open: state.group_dropdown_open,
+            group_search_input: state.group_search_input.clone(),
             errors: state.errors.clone(),
             app,
             on_close: state.on_close.clone(),
@@ -438,7 +459,7 @@ impl ConnectionFormView {
 }
 
 impl RenderOnce for ConnectionFormView {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let on_close_for_dialog = self.on_close.clone();
 
         render_overlay(
@@ -468,8 +489,12 @@ impl RenderOnce for ConnectionFormView {
                 self.private_key_focused,
                 self.private_key_path_focused,
                 self.proxy_url_focused,
+                self.group_id,
+                self.group_dropdown_open,
+                self.group_search_input,
                 self.errors,
                 self.app,
+                cx,
                 on_close_for_dialog,
                 self.on_connect,
             ),
@@ -541,8 +566,12 @@ fn render_dialog(
     private_key_focused: bool,
     private_key_path_focused: bool,
     proxy_url_focused: bool,
+    group_id: Option<i64>,
+    group_dropdown_open: bool,
+    group_search_input: Entity<InputState>,
     errors: ValidationErrors,
     app: Entity<CrabportApp>,
+    cx: &App,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
@@ -602,6 +631,14 @@ fn render_dialog(
                     .focused(name_focused),
             ),
         )
+        // Group selector (searchable + creatable dropdown)
+        .child(render_group_selector(
+            group_id,
+            group_dropdown_open,
+            group_search_input,
+            app.clone(),
+            cx,
+        ))
         // Connection-type tabs: SSH has the full form, Telnet/Serial are
         // placeholders until their backends land. The tab's `on_change`
         // writes `form.kind` so the connect button / save flow know which
@@ -888,6 +925,97 @@ fn render_dialog(
         )
         // Buttons
         .child(render_buttons(editing, kind, on_close, on_connect))
+}
+
+/// Group selector dropdown for the connection form. Searchable + creatable
+/// — mirrors the tunnel/snippet group selectors. The first item is always
+/// "None" (ungrouped); existing groups follow.
+fn render_group_selector(
+    group_id: Option<i64>,
+    dropdown_open: bool,
+    group_search_input: Entity<InputState>,
+    app: Entity<CrabportApp>,
+    cx: &App,
+) -> impl IntoElement {
+    use crate::app_state::AppState;
+    use crabport_core::credential::{GroupEntry, GroupKind};
+
+    let groups: Vec<GroupEntry> = AppState::store(cx)
+        .lock()
+        .groups(GroupKind::Host)
+        .unwrap_or_default();
+
+    let label_div = div()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_muted()))
+        .child(t!("connection_form.group").to_string());
+
+    // Index 0 = "None" (ungrouped); groups start at index 1.
+    let selected_idx =
+        group_id.and_then(|id| groups.iter().position(|g| g.id == id).map(|i| i + 1));
+
+    let mut dropdown = Dropdown::new("conn-form-group-dropdown")
+        .placeholder(t!("connection_form.group_none").to_string())
+        .is_open(dropdown_open)
+        .searchable(group_search_input)
+        .on_create({
+            let app = app.clone();
+            move |name, _w, cx| {
+                app.update(cx, |app, cx| {
+                    if let Ok(gid) =
+                        AppState::store(cx)
+                            .lock()
+                            .add_group(&name, GroupKind::Host, None)
+                    {
+                        if let Some(ref mut form) = app.connection_form {
+                            form.group_id = Some(gid);
+                            form.group_dropdown_open = false;
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
+        .on_toggle({
+            let app = app.clone();
+            move |_w, cx| {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.connection_form {
+                        form.group_dropdown_open = !form.group_dropdown_open;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .on_change({
+            let app = app.clone();
+            let groups = groups.clone();
+            move |index, _w, cx| {
+                let new_group = if index == 0 {
+                    None
+                } else {
+                    groups.get(index - 1).map(|g| g.id)
+                };
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.connection_form {
+                        form.group_id = new_group;
+                        form.group_dropdown_open = false;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+
+    dropdown = dropdown.item_with_value(t!("connection_form.group_none").to_string(), "none");
+    for g in &groups {
+        dropdown = dropdown.item_with_value(g.name.clone(), g.id.to_string());
+    }
+    if let Some(idx) = selected_idx {
+        dropdown = dropdown.selected(idx);
+    }
+
+    label_div.child(dropdown)
 }
 
 fn render_host_port_row(

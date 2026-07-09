@@ -126,6 +126,7 @@ pub(crate) async fn sftp_upload_file_impl(
     progress_cb(0);
 
     // 1. Stream-compress the local file up to the remote tmp .gz.
+    #[cfg(debug_assertions)]
     tracing::info!(
         "SFTP upload file: step 1 transfer+compress local={local_path} -> remote_tmp={tmp} total={total}"
     );

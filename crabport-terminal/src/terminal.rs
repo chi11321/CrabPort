@@ -66,6 +66,12 @@ pub struct SftpTransferBytes {
 pub enum SftpTransferKind {
     Download,
     Upload,
+    /// A rename / move operation (no actual byte transfer, but we reuse the
+    /// finished event so the UI's existing plumbing applies).
+    Rename,
+    /// "Open in editor": download → local edit → re-upload on save. Success
+    /// is silent; only upload failures surface a notification.
+    Edit,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -160,6 +166,39 @@ pub trait CrabPortTerminal: Send + Sync {
     /// `kind = Delete` (a synthetic kind — there's no actual transfer, but
     /// we reuse the event so the UI's existing finish handling applies).
     fn sftp_delete(&self, _remote_path: &str) {}
+
+    /// Rename/move a remote file or directory from `old_path` to `new_path`.
+    /// The backend resolves `new_path` against the current cwd if it's
+    /// relative, and refuses if the destination already exists.
+    /// Completion is reported via [`BackendEvent::SftpTransferFinished`].
+    fn sftp_rename(&self, _old_path: &str, _new_path: &str) {}
+
+    /// Download a remote file to a local temp path, open it in the OS default
+    /// editor, watch for edits, and re-upload on every save until the file is
+    /// closed or the backend drops. Completion of the initial download is
+    /// reported via [`BackendEvent::SftpTransferFinished`]; subsequent uploads
+    /// triggered by saves each emit their own `SftpTransferFinished`.
+    fn sftp_open_in_editor(&self, _remote_path: &str) {}
+
+    /// Open a new independent PTY/channel on the *same underlying connection*
+    /// and return a new backend driving it. Used by terminal split: each
+    /// pane gets its own independent input/output stream without reconnecting.
+    ///
+    /// - **SSH**: opens a new session channel + PTY + shell on the existing
+    ///   authenticated handle (no re-auth, no new TCP connection).
+    /// - **Local PTY**: spawns a new shell process.
+    /// - **Telnet**: returns `None` (Telnet has no channel multiplexing;
+    ///   the caller should create a new connection instead).
+    ///
+    /// Returns `None` if the backend doesn't support channel spawning, or if
+    /// the connection isn't ready yet.
+    fn spawn_channel(
+        &self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +301,11 @@ pub struct TerminalSession {
     _wakeup_rx: InactiveReceiver<()>,
     /// Command history, most-recent-first. Capped at [`MAX_COMMAND_HISTORY`]
     /// entries; the oldest is evicted when full.
+    ///
+    /// Shared across all split panes of the same tab so the History panel
+    /// stays consistent no matter which pane is active. Each split pane
+    /// clones this `Arc` from its source pane via
+    /// [`TerminalSession::new_with_shared_history`].
     command_history: Arc<Mutex<VecDeque<String>>>,
     /// In-progress input line + ANSI escape parser state, accumulated by
     /// [`Self::write`] and submitted to `command_history` on Enter (CR/LF).
@@ -294,6 +338,40 @@ impl TerminalSession {
             started: AtomicBool::new(false),
             _wakeup_rx,
             command_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_COMMAND_HISTORY))),
+            line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
+            on_command: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Like [`new`](Self::new) but shares `command_history` with another
+    /// session — used when splitting a terminal pane so all panes of the
+    /// same tab see the same command history.
+    ///
+    /// Each split pane keeps its own `line_buffer` (input-line capture is
+    /// per-pane, since each pane has its own prompt); only the completed
+    /// history is shared.
+    pub fn new_with_shared_history(
+        backend: Arc<dyn CrabPortTerminal>,
+        cols: usize,
+        rows: usize,
+        command_history: Arc<Mutex<VecDeque<String>>>,
+    ) -> Self {
+        let (wakeup_tx, wakeup_rx) = broadcast(256);
+        let _wakeup_rx = wakeup_rx.deactivate();
+
+        let term = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize::new(cols, rows),
+            EventProxy::new(wakeup_tx.clone()),
+        )));
+
+        Self {
+            backend,
+            term,
+            wakeup_tx,
+            started: AtomicBool::new(false),
+            _wakeup_rx,
+            command_history,
             line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
         }
@@ -422,6 +500,13 @@ impl TerminalSession {
     /// session creation. Returns a guard; caller assigns the whole deque.
     pub fn command_history_deque(&self) -> parking_lot::MutexGuard<'_, VecDeque<String>> {
         self.command_history.lock()
+    }
+
+    /// Cloned handle to the shared command-history buffer. Used when
+    /// splitting a pane so the new pane shares the same history as its
+    /// source (see [`Self::new_with_shared_history`]).
+    pub fn command_history_arc(&self) -> Arc<Mutex<VecDeque<String>>> {
+        self.command_history.clone()
     }
 
     /// Register a callback invoked whenever a new command is captured

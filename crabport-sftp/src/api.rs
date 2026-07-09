@@ -33,6 +33,12 @@ pub trait CrabPortSftp: Send + Sync {
     /// Canonicalize (resolve) a path on the remote host.
     async fn canonicalize(&self, remote_path: &str) -> Result<String>;
 
+    /// Rename/move a remote file or directory from `old_path` to `new_path`.
+    /// The destination must not exist on most servers (SFTP `rename` is
+    /// non-atomic and overwrites are server-dependent); callers should check
+    /// `exists` first if they need overwrite semantics.
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()>;
+
     /// Close the SFTP session.
     async fn close(&self) -> Result<()>;
 }
