@@ -17,6 +17,21 @@ use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
 
+/// Clone the active terminal's `Entity` so a callback can forward calls to
+/// the backend without capturing a borrow on `terminal_views`.
+fn terminal_entity(
+    is_terminal: bool,
+    active_tab: Option<&Tab>,
+    terminal_views: &HashMap<u64, Entity<TerminalView>>,
+) -> Option<Entity<TerminalView>> {
+    if !is_terminal {
+        return None;
+    }
+    active_tab
+        .and_then(|tab| terminal_views.get(&tab.id))
+        .cloned()
+}
+
 pub fn render_content(
     selected: SidebarItem,
     handle: &Entity<CrabportApp>,
@@ -355,35 +370,27 @@ pub fn render_content(
         .unwrap_or(false);
 
     // Read monitor status & metrics from the active TerminalView's backend
-    let (status, metrics, sftp_progress) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            terminal_entity.read_with(cx, |view, _cx| {
-                let (status, metrics) = if let Some(m) = view.monitor() {
-                    (m.status(), m.metrics())
-                } else {
-                    (
-                        crabport_terminal::terminal::RemoteStatus::Local,
-                        crabport_terminal::terminal::RemoteMetrics::default(),
-                    )
-                };
-                // Clone the live SFTP progress snapshot so the toolbar can
-                // render it without holding the entity lock across the
-                // render call. `None` when no transfer is in flight.
-                (status, metrics, view.sftp_progress().cloned())
-            })
-        } else {
-            (
-                crabport_terminal::terminal::RemoteStatus::Local,
-                crabport_terminal::terminal::RemoteMetrics::default(),
-                None,
-            )
-        }
-    } else {
-        (
+    let sftp_term = terminal_entity(is_terminal, active_tab, terminal_views);
+    let (status, metrics, sftp_progress) = match &sftp_term {
+        Some(entity) => entity.read_with(cx, |view, _cx| {
+            let (status, metrics) = if let Some(m) = view.monitor() {
+                (m.status(), m.metrics())
+            } else {
+                (
+                    crabport_terminal::terminal::RemoteStatus::Local,
+                    crabport_terminal::terminal::RemoteMetrics::default(),
+                )
+            };
+            // Clone the live SFTP progress snapshot so the toolbar can
+            // render it without holding the entity lock across the
+            // render call. `None` when no transfer is in flight.
+            (status, metrics, view.sftp_progress().cloned())
+        }),
+        None => (
             crabport_terminal::terminal::RemoteStatus::Local,
             crabport_terminal::terminal::RemoteMetrics::default(),
             None,
-        )
+        ),
     };
 
     // Read SFTP state from the active TerminalView's backend and push it
@@ -391,132 +398,77 @@ pub fn render_content(
     let (sftp_entries, sftp_cwd): (
         std::sync::Arc<Vec<(String, bool)>>,
         Option<std::sync::Arc<String>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            terminal_entity.read_with(cx, |view, _cx| {
-                if view.allow_sftp() {
-                    (view.sftp_entries().unwrap_or_default(), view.sftp_cwd())
-                } else {
-                    (std::sync::Arc::new(Vec::new()), None)
-                }
-            })
-        } else {
-            (std::sync::Arc::new(Vec::new()), None)
-        }
-    } else {
-        (std::sync::Arc::new(Vec::new()), None)
+    ) = match &sftp_term {
+        Some(entity) => entity.read_with(cx, |view, _cx| {
+            if view.allow_sftp() {
+                (view.sftp_entries().unwrap_or_default(), view.sftp_cwd())
+            } else {
+                (std::sync::Arc::new(Vec::new()), None)
+            }
+        }),
+        None => (std::sync::Arc::new(Vec::new()), None),
     };
 
-    // Build SFTP navigate callback
-    let sftp_navigate: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |path: String, cx: &mut App| {
+    // ---- SFTP callbacks ----
+    //
+    // Each callback clones the active terminal entity and forwards a call to
+    // the matching `view.sftp_*` method. The callbacks are `None` when the
+    // active tab isn't a terminal or has no terminal entity.
+
+    let sftp_navigate: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_navigate(&path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
+
+    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(
+                move |remote_path: String, local_path: String, cx: &mut App| {
                     entity.read_with(cx, |view, _cx| {
-                        view.sftp_navigate(&path);
+                        view.sftp_download(&remote_path, &local_path);
                     });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
 
-    // Build SFTP download callback. Mirrors `sftp_navigate`'s shape: a thin
-    // closure that forwards `(remote_path, local_path)` to the active
-    // terminal's backend. The backend reports completion asynchronously via
-    // `BackendEvent::SftpTransferFinished`, which `TerminalView` already
-    // surfaces as a status line — no extra plumbing needed here.
-    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(
-                    move |remote_path: String, local_path: String, cx: &mut App| {
-                        entity.read_with(cx, |view, _cx| {
-                            view.sftp_download(&remote_path, &local_path);
-                        });
-                    },
-                ) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
-
-    // Build SFTP upload callback. Same shape as `sftp_download` but with the
-    // argument order swapped to match `view.sftp_upload(local, remote)`.
-    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(
-                    move |local_path: String, remote_path: String, cx: &mut App| {
-                        entity.read_with(cx, |view, _cx| {
-                            view.sftp_upload(&local_path, &remote_path);
-                        });
-                    },
-                ) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
-
-    // Build SFTP delete callback. Forwards the remote path to the backend's
-    // `sftp_delete`, which stats the path to choose `remove_file` vs
-    // recursive `remove_dir`.
-    let sftp_delete: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |remote_path: String, cx: &mut App| {
+    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(
+                move |local_path: String, remote_path: String, cx: &mut App| {
                     entity.read_with(cx, |view, _cx| {
-                        view.sftp_delete(&remote_path);
+                        view.sftp_upload(&local_path, &remote_path);
                     });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
 
-    // Build SFTP rename callback. Forwards `(old_remote_path, new_remote_path)`
-    // to the backend's `sftp_rename`. Completion is reported via
-    // `BackendEvent::SftpTransferFinished`, same as the other SFTP ops.
-    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_rename(&old_path, &new_path);
-                    });
-                }) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+    let sftp_delete: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |remote_path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_delete(&remote_path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
 
-    // Build SFTP open-in-editor callback. Forwards the remote path to the
-    // backend's `sftp_open_in_editor`, which downloads to a local tmp path
-    // and launches the OS default editor.
-    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |remote_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_open_in_editor(&remote_path);
-                    });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
+                entity.read_with(cx, |view, _cx| {
+                    view.sftp_rename(&old_path, &new_path);
+                });
+            }) as Rc<dyn Fn(String, String, &mut App)>
+        });
+
+    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |remote_path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_open_in_editor(&remote_path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
 
     // ---- Panel capability flags ----
     //
@@ -529,23 +481,19 @@ pub fn render_content(
     // longer gates panel visibility — `cap_tunnels` (from the backend's
     // `allow_tunnels()`) is the source of truth now.
     let _is_remote = active_tab.map(|t| t.is_remote).unwrap_or(false);
-    let (cap_sftp, cap_history, cap_snippets, cap_tunnels) = if is_terminal {
-        active_tab
-            .and_then(|tab| terminal_views.get(&tab.id))
-            .map(|entity| {
-                entity.read_with(cx, |view, _cx| {
-                    (
-                        view.allow_sftp(),
-                        view.allow_history(),
-                        view.allow_snippets(),
-                        view.allow_tunnels(),
-                    )
-                })
+    let (cap_sftp, cap_history, cap_snippets, cap_tunnels) = sftp_term
+        .as_ref()
+        .map(|entity| {
+            entity.read_with(cx, |view, _cx| {
+                (
+                    view.allow_sftp(),
+                    view.allow_history(),
+                    view.allow_snippets(),
+                    view.allow_tunnels(),
+                )
             })
-            .unwrap_or((false, false, false, false))
-    } else {
-        (false, false, false, false)
-    };
+        })
+        .unwrap_or((false, false, false, false));
     // SFTP panel visibility follows the backend's capability (`cap_sftp`),
     // used directly below — no separate `has_sftp` alias needed.
     sftp_panel.update(cx, |panel, cx| {
@@ -574,7 +522,7 @@ pub fn render_content(
     // `app.stop_tunnel`. Only wire `on_start` for backends that can lend
     // their connection (`cap_tunnels`) — a local PTY or Telnet backend
     // exposes no tunnel source, so borrowed tunnels can't start.
-    let tunnels_on_start: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal && cap_tunnels {
+    let tunnels_on_start: Option<Rc<dyn Fn(i64, &mut App)>> = if cap_tunnels {
         let handle_for_start = handle.clone();
         let tab_id = active_tab_id;
         Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
@@ -585,7 +533,7 @@ pub fn render_content(
     } else {
         None
     };
-    let tunnels_on_stop: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal {
+    let tunnels_on_stop: Option<Rc<dyn Fn(i64, &mut App)>> = if sftp_term.is_some() {
         let handle_for_stop = handle.clone();
         Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
             handle_for_stop.update(cx, |app, cx| {
@@ -616,9 +564,9 @@ pub fn render_content(
     let (history_commands, history_on_paste): (
         std::sync::Arc<Vec<crate::views::panel::history_command_panel::HistoryCommand>>,
         Option<Rc<dyn Fn(String, &mut App)>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let cmds = terminal_entity.read_with(cx, |view, _cx| {
+    ) = match &sftp_term {
+        Some(entity) => {
+            let cmds = entity.read_with(cx, |view, _cx| {
                 view.command_history()
                     .into_iter()
                     .map(
@@ -630,7 +578,7 @@ pub fn render_content(
                     .collect::<Vec<_>>()
             });
             let cmds = std::sync::Arc::new(cmds);
-            let term_for_paste = terminal_entity.clone();
+            let term_for_paste = entity.clone();
             let on_paste: Rc<dyn Fn(String, &mut App)> =
                 Rc::new(move |cmd: String, cx: &mut App| {
                     term_for_paste.read_with(cx, |view, _cx| {
@@ -638,11 +586,8 @@ pub fn render_content(
                     });
                 });
             (cmds, Some(on_paste))
-        } else {
-            (std::sync::Arc::new(Vec::new()), None)
         }
-    } else {
-        (std::sync::Arc::new(Vec::new()), None)
+        None => (std::sync::Arc::new(Vec::new()), None),
     };
     history_panel.update(cx, |panel, cx| {
         panel.set_state(history_commands, history_on_paste, window, cx);
@@ -656,15 +601,15 @@ pub fn render_content(
     let (snippets_on_run, snippets_on_paste): (
         Option<Rc<dyn Fn(String, &mut App)>>,
         Option<Rc<dyn Fn(String, &mut App)>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let term_for_run = terminal_entity.clone();
+    ) = match &sftp_term {
+        Some(entity) => {
+            let term_for_run = entity.clone();
             let on_run: Rc<dyn Fn(String, &mut App)> = Rc::new(move |cmd: String, cx: &mut App| {
                 term_for_run.read_with(cx, |view, _cx| {
                     view.write_raw(format!("{}\r", cmd).as_bytes());
                 });
             });
-            let term_for_paste = terminal_entity.clone();
+            let term_for_paste = entity.clone();
             let on_paste: Rc<dyn Fn(String, &mut App)> =
                 Rc::new(move |cmd: String, cx: &mut App| {
                     term_for_paste.read_with(cx, |view, _cx| {
@@ -672,11 +617,8 @@ pub fn render_content(
                     });
                 });
             (Some(on_run), Some(on_paste))
-        } else {
-            (None, None)
         }
-    } else {
-        (None, None)
+        None => (None, None),
     };
     snippets_panel.update(cx, |panel, cx| {
         panel.set_state(snippets_on_run, snippets_on_paste, window, cx);
@@ -691,61 +633,59 @@ pub fn render_content(
     // already showing — the overlay retains the `PendingHostKey` until the
     // user resolves it (the alert's confirm/cancel callbacks call
     // `TerminalView::resolve_pending_host_key`).
-    if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let pending = terminal_entity.read_with(cx, |view, _| view.pending_host_key_info());
-            if let Some(info) = pending {
-                let controller_busy = alert_controller.read_with(cx, |c, _| c.is_active());
-                if !controller_busy {
-                    let term_for_confirm = terminal_entity.clone();
-                    let on_confirm = Rc::new(move |_w: &mut Window, cx: &mut App| {
-                        term_for_confirm.update(cx, |view, _cx| {
-                            view.resolve_pending_host_key(true);
-                        });
+    if let Some(terminal_entity) = &sftp_term {
+        let pending = terminal_entity.read_with(cx, |view, _| view.pending_host_key_info());
+        if let Some(info) = pending {
+            let controller_busy = alert_controller.read_with(cx, |c, _| c.is_active());
+            if !controller_busy {
+                let term_for_confirm = terminal_entity.clone();
+                let on_confirm = Rc::new(move |_w: &mut Window, cx: &mut App| {
+                    term_for_confirm.update(cx, |view, _cx| {
+                        view.resolve_pending_host_key(true);
                     });
-                    let term_for_cancel = terminal_entity.clone();
-                    let on_cancel = Rc::new(move |_w: &mut Window, cx: &mut App| {
-                        term_for_cancel.update(cx, |view, _cx| {
-                            view.resolve_pending_host_key(false);
-                        });
+                });
+                let term_for_cancel = terminal_entity.clone();
+                let on_cancel = Rc::new(move |_w: &mut Window, cx: &mut App| {
+                    term_for_cancel.update(cx, |view, _cx| {
+                        view.resolve_pending_host_key(false);
                     });
-                    alert_controller.update(cx, |c, cx| {
-                        c.show(
-                            AlertState {
-                                severity: AlertSeverity::Warning,
-                                title: t!("terminal.host_key_unknown").to_string().into(),
-                                description: {
-                                    let host_port = if info.port == 22 {
-                                        info.host.clone()
-                                    } else {
-                                        format!("{}:{}", info.host, info.port)
-                                    };
-                                    Some(
-                                        t!("terminal.host_key_prompt", host = host_port.as_str())
-                                            .to_string()
-                                            .into(),
-                                    )
-                                },
-                                details: vec![
-                                    (
-                                        t!("terminal.host_key_algo").to_string().into(),
-                                        info.algo.clone().into(),
-                                    ),
-                                    (
-                                        t!("terminal.host_key_fingerprint").to_string().into(),
-                                        info.fingerprint.clone().into(),
-                                    ),
-                                ],
-                                confirm_label: t!("terminal.host_key_accept").to_string().into(),
-                                cancel_label: t!("terminal.host_key_cancel").to_string().into(),
-                                open: true,
-                                on_confirm: Some(on_confirm),
-                                on_cancel: Some(on_cancel),
+                });
+                alert_controller.update(cx, |c, cx| {
+                    c.show(
+                        AlertState {
+                            severity: AlertSeverity::Warning,
+                            title: t!("terminal.host_key_unknown").to_string().into(),
+                            description: {
+                                let host_port = if info.port == 22 {
+                                    info.host.clone()
+                                } else {
+                                    format!("{}:{}", info.host, info.port)
+                                };
+                                Some(
+                                    t!("terminal.host_key_prompt", host = host_port.as_str())
+                                        .to_string()
+                                        .into(),
+                                )
                             },
-                            cx,
-                        );
-                    });
-                }
+                            details: vec![
+                                (
+                                    t!("terminal.host_key_algo").to_string().into(),
+                                    info.algo.clone().into(),
+                                ),
+                                (
+                                    t!("terminal.host_key_fingerprint").to_string().into(),
+                                    info.fingerprint.clone().into(),
+                                ),
+                            ],
+                            confirm_label: t!("terminal.host_key_accept").to_string().into(),
+                            cancel_label: t!("terminal.host_key_cancel").to_string().into(),
+                            open: true,
+                            on_confirm: Some(on_confirm),
+                            on_cancel: Some(on_cancel),
+                        },
+                        cx,
+                    );
+                });
             }
         }
     }

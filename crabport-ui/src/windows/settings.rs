@@ -5,6 +5,8 @@
 //! process-wide [`crabport_core::config::CONFIG`] `LazyLock`, so changes are
 //! persisted to `config.toml` immediately and visible to every other window
 //! in the process.
+//!
+//! Sections are built declaratively via [`crate::windows::settings_section::Section`].
 
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
@@ -17,6 +19,10 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
+use crate::components::settings_section::Section;
+use crate::components::window_layout::{
+    SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
+};
 
 // ---------------------------------------------------------------------------
 // Tab enum
@@ -29,15 +35,25 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    fn all() -> [SettingsTab; 2] {
-        [SettingsTab::General, SettingsTab::Appearance]
-    }
+    const ALL: [SettingsTab; 2] = [SettingsTab::General, SettingsTab::Appearance];
 
     fn label(self) -> SharedString {
         match self {
             SettingsTab::General => t!("window.settings.tab.general").into(),
             SettingsTab::Appearance => t!("window.settings.tab.appearance").into(),
         }
+    }
+
+    fn sidebar_entries() -> Vec<SidebarTabEntry> {
+        Self::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| SidebarTabEntry {
+                id: ElementId::Name(format!("settings-tab-{i}").into()),
+                label: tab.label(),
+                icon: None,
+            })
+            .collect()
     }
 }
 
@@ -63,9 +79,7 @@ pub struct SettingsWindow {
     font_size_focused: bool,
     /// Cached list of *all* system-installed font family names shown in the
     /// Terminal section's font dropdown. Built lazily on first render of the
-    /// Appearance pane. We show every font (not just monospace) so the user
-    /// can pick any family; the terminal renderer measures the actual glyph
-    /// advance width so non-monospace fonts still lay out on a grid.
+    /// Appearance pane.
     mono_font_names: Vec<String>,
 }
 
@@ -152,64 +166,7 @@ impl SettingsWindow {
     }
 
     // -------------------------------------------------------------------
-    // Sidebar
-    // -------------------------------------------------------------------
-
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let handle = cx.entity().clone();
-        div()
-            .h_full()
-            .w(px(180.0))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(rgb(border()))
-            .bg(rgb(bg_sidebar()))
-            .flex()
-            .flex_col()
-            .pt_11()
-            .px_2()
-            .gap_2()
-            .children(SettingsTab::all().map(|item| {
-                let is_selected = item == self.tab;
-                let h = handle.clone();
-                Button::new(ElementId::Name(format!("settings-tab-{:?}", item).into()))
-                    .tab()
-                    .selected(is_selected)
-                    .child(item.label())
-                    .on_click(move |_e, _w, cx| {
-                        h.update(cx, |view, _| {
-                            view.tab = item;
-                        });
-                    })
-                    .h_9()
-                    .border_0()
-                    .px_2()
-                    .text_sm()
-                    .justify_start()
-            }))
-    }
-
-    // -------------------------------------------------------------------
-    // Section helpers
-    // -------------------------------------------------------------------
-
-    fn section_header(text: impl Into<SharedString>) -> impl IntoElement {
-        div()
-            .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(text_primary()))
-            .child(text.into())
-    }
-
-    fn section_desc(text: impl Into<SharedString>) -> impl IntoElement {
-        div()
-            .text_xs()
-            .text_color(rgb(text_muted()))
-            .child(text.into())
-    }
-
-    // -------------------------------------------------------------------
-    // General pane
+    // General pane (declarative sections)
     // -------------------------------------------------------------------
 
     fn render_general_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -224,24 +181,18 @@ impl SettingsWindow {
             .flex_col()
             .p_6()
             .gap_6()
+            // --- Data directory section ---
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Self::section_header(t!(
-                        "window.settings.general.section_data"
-                    )))
-                    .child(Self::section_desc(t!(
-                        "window.settings.general.open_data_dir_desc"
-                    )))
-                    .child(
+                Section::new()
+                    .header(t!("window.settings.general.section_data"))
+                    .desc(t!("window.settings.general.open_data_dir_desc"))
+                    .bare(
                         div()
                             .text_xs()
                             .text_color(rgb(text_muted()))
                             .child(Label::new(store_path)),
                     )
-                    .child(
+                    .bare(
                         Button::new("settings-open-data-dir")
                             .child(t!("window.settings.general.open_data_dir").to_string())
                             .w_auto()
@@ -253,18 +204,12 @@ impl SettingsWindow {
                             }),
                     ),
             )
+            // --- Reset config section ---
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Self::section_header(t!(
-                        "window.settings.general.reset_config"
-                    )))
-                    .child(Self::section_desc(t!(
-                        "window.settings.general.reset_config_desc"
-                    )))
-                    .child({
+                Section::new()
+                    .header(t!("window.settings.general.reset_config"))
+                    .desc(t!("window.settings.general.reset_config_desc"))
+                    .bare({
                         let h = handle.clone();
                         Button::new("settings-reset-config")
                             .child(t!("window.settings.general.reset_config").to_string())
@@ -287,7 +232,7 @@ impl SettingsWindow {
     }
 
     // -------------------------------------------------------------------
-    // Appearance pane
+    // Appearance pane (declarative sections)
     // -------------------------------------------------------------------
 
     fn render_appearance_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -307,16 +252,126 @@ impl SettingsWindow {
             .position(|p| *p == current_name.as_str())
             .unwrap_or(0);
 
-        // Lazily build the font family list on first render. We query
-        // the OS for *every* installed font (not just monospace) so the
-        // user can pick any family; the terminal renderer measures the
-        // actual glyph advance width so non-monospace fonts still lay out
-        // on a grid.
+        // Lazily build the font family list on first render.
         if self.mono_font_names.is_empty() {
             self.mono_font_names = collect_monospace_fonts(cx);
         }
-        let mono_fonts = &self.mono_font_names;
+        let mono_fonts = self.mono_font_names.clone();
 
+        // --- Language dropdown ---
+        let locale_dropdown = {
+            let h = handle.clone();
+            Dropdown::new("settings-locale")
+                .item(t!("window.settings.appearance.language_en"))
+                .item(t!("window.settings.appearance.language_zh_cn"))
+                .selected(locale_idx)
+                .is_open(self.locale_dropdown_open)
+                .on_toggle(move |_w, cx| {
+                    h.update(cx, |view, cx| {
+                        view.locale_dropdown_open = !view.locale_dropdown_open;
+                        cx.notify();
+                    });
+                })
+                .on_change(move |idx, _w, cx| {
+                    let locale = if idx == 1 { "zh-CN" } else { "en" };
+                    let _ = config::update(|cfg| {
+                        cfg.appearance.locale = locale.to_string();
+                    });
+                    crate::set_locale(locale);
+                    cx.refresh_windows();
+                })
+        };
+
+        // --- Theme dropdown ---
+        let theme_dropdown = {
+            let h_for_toggle = handle.clone();
+            let h_for_change = handle.clone();
+            Dropdown::new("settings-theme")
+                .item(t!("window.settings.appearance.theme_modern_dark"))
+                .item(t!("window.settings.appearance.theme_mocha"))
+                .item(t!("window.settings.appearance.theme_tokyo_night"))
+                .selected(theme_idx)
+                .is_open(self.theme_dropdown_open)
+                .on_toggle(move |_w, cx| {
+                    h_for_toggle.update(cx, |view, cx| {
+                        view.theme_dropdown_open = !view.theme_dropdown_open;
+                        cx.notify();
+                    });
+                })
+                .on_change(move |idx, _w, cx| {
+                    let id = presets.get(idx).copied().unwrap_or("modern-dark");
+                    let _ = config::update(|cfg| {
+                        cfg.appearance.theme = crabport_core::config::ThemeConfig::preset(id);
+                    });
+                    crate::refresh_theme_with(cx);
+                    h_for_change.update(cx, |view, cx| {
+                        view.theme_dropdown_open = false;
+                        cx.notify();
+                    });
+                })
+        };
+
+        // --- Font family dropdown ---
+        let term_cfg = config::snapshot().appearance.terminal;
+        let current_family = term_cfg.effective_font_family().to_string();
+        let font_idx = mono_fonts
+            .iter()
+            .position(|f| *f == current_family)
+            .unwrap_or(0);
+
+        let font_family_dropdown = {
+            let h_for_toggle = handle.clone();
+            let h_for_change = handle.clone();
+            let search_for_toggle = self.font_search_input.clone();
+            let search_for_change = self.font_search_input.clone();
+            let names = mono_fonts.clone();
+            let mut dd = Dropdown::new("settings-term-font")
+                .is_open(self.font_family_dropdown_open)
+                .selected(font_idx)
+                .searchable(self.font_search_input.clone())
+                .on_toggle(move |_w, cx| {
+                    let search = search_for_toggle.clone();
+                    h_for_toggle.update(cx, |view, cx| {
+                        // Clear the search query on close so the next open
+                        // shows the full font list.
+                        if view.font_family_dropdown_open {
+                            search.update(cx, |s, cx| {
+                                s.set_value("", _w, cx);
+                            });
+                        }
+                        view.font_family_dropdown_open = !view.font_family_dropdown_open;
+                        cx.notify();
+                    });
+                });
+            for name in &mono_fonts {
+                dd = dd.item(name.clone());
+            }
+            dd.on_change(move |idx, _w, cx| {
+                if let Some(name) = names.get(idx) {
+                    let _ = config::update(|cfg| {
+                        cfg.appearance.terminal.font_family = name.clone();
+                    });
+                    cx.refresh_windows();
+                }
+                h_for_change.update(cx, |view, cx| {
+                    view.font_family_dropdown_open = false;
+                    search_for_change.update(cx, |s, cx| {
+                        s.set_value("", _w, cx);
+                    });
+                    cx.notify();
+                });
+            })
+        };
+
+        // --- Font size stepper ---
+        let font_size_stepper =
+            StyledNumberInput::new("settings-term-font-size", self.font_size_input.clone())
+                .focused(self.font_size_focused)
+                .min(8)
+                .max(32)
+                .step(1);
+
+        // Build the pane from declarative sections.
         div()
             .size_full()
             .flex()
@@ -325,232 +380,60 @@ impl SettingsWindow {
             .gap_6()
             // --- Language ---
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(Self::section_header(t!(
-                        "window.settings.appearance.section_language"
-                    )))
-                    .child(
-                        div().w(px(240.0)).child(
-                            Dropdown::new("settings-locale")
-                                .item(t!("window.settings.appearance.language_en"))
-                                .item(t!("window.settings.appearance.language_zh_cn"))
-                                .selected(locale_idx)
-                                .is_open(self.locale_dropdown_open)
-                                .on_toggle({
-                                    let h = handle.clone();
-                                    move |_w, cx| {
-                                        h.update(cx, |view, cx| {
-                                            view.locale_dropdown_open = !view.locale_dropdown_open;
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .on_change({
-                                    let h = handle.clone();
-                                    move |idx, _w, cx| {
-                                        let locale = if idx == 1 { "zh-CN" } else { "en" };
-                                        let _ = config::update(|cfg| {
-                                            cfg.appearance.locale = locale.to_string();
-                                        });
-                                        crate::set_locale(locale);
-                                        h.update(cx, |view, cx| {
-                                            view.locale_dropdown_open = false;
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                    ),
+                Section::new()
+                    .header(t!("window.settings.appearance.section_language"))
+                    .bare(div().w(px(240.0)).child(locale_dropdown)),
             )
             // --- Theme ---
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(Self::section_header(t!(
-                        "window.settings.appearance.section_theme"
-                    )))
-                    .child(Self::section_desc(t!(
-                        "window.settings.appearance.theme_desc"
-                    )))
-                    .child(
-                        div().w(px(240.0)).child(
-                            Dropdown::new("settings-theme")
-                                .item(t!("window.settings.appearance.theme_modern_dark"))
-                                .item(t!("window.settings.appearance.theme_mocha"))
-                                .item(t!("window.settings.appearance.theme_tokyo_night"))
-                                .selected(theme_idx)
-                                .is_open(self.theme_dropdown_open)
-                                .on_toggle({
-                                    let h = handle.clone();
-                                    move |_w, cx| {
-                                        h.update(cx, |view, cx| {
-                                            view.theme_dropdown_open = !view.theme_dropdown_open;
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                                .on_change({
-                                    let h = handle.clone();
-                                    move |idx, _w, cx| {
-                                        let id = presets.get(idx).copied().unwrap_or("modern-dark");
-                                        let _ = config::update(|cfg| {
-                                            cfg.appearance.theme =
-                                                crabport_core::config::ThemeConfig::preset(id);
-                                        });
-                                        // Reload the cached theme and repaint every
-                                        // open window so the new palette shows up
-                                        // everywhere, not just in Settings.
-                                        crate::refresh_theme_with(cx);
-                                        h.update(cx, |view, cx| {
-                                            view.theme_dropdown_open = false;
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                    ),
+                Section::new()
+                    .header(t!("window.settings.appearance.section_theme"))
+                    .desc(t!("window.settings.appearance.theme_desc"))
+                    .bare(div().w(px(240.0)).child(theme_dropdown)),
             )
             // --- Terminal font ---
-            .child({
-                // Resolve the configured font family for the dropdown.
-                let term_cfg = config::snapshot().appearance.terminal;
-                let current_family = term_cfg.effective_font_family().to_string();
-
-                // Index of the configured family in the candidate list. If the
-                // configured value isn't in the heuristic list, we prepend it
-                // (handled below by always including the configured family).
-                let font_idx = mono_fonts
-                    .iter()
-                    .position(|f| *f == current_family)
-                    .unwrap_or(0);
-
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(Self::section_header(t!(
-                        "window.settings.appearance.section_terminal"
-                    )))
-                    .child(Self::section_desc(t!(
-                        "window.settings.appearance.terminal_desc"
-                    )))
-                    // Font family dropdown
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xs().text_color(rgb(text_muted())).child(
-                                t!("window.settings.appearance.terminal_font_family").to_string(),
-                            ))
-                            .child(div().w(px(240.0)).child({
-                                let mut dd = Dropdown::new("settings-term-font")
-                                    .is_open(self.font_family_dropdown_open)
-                                    .selected(font_idx)
-                                    .searchable(self.font_search_input.clone())
-                                    .on_toggle({
-                                        let h = handle.clone();
-                                        let search = self.font_search_input.clone();
-                                        move |_w, cx| {
-                                            h.update(cx, |view, cx| {
-                                                // Clear the search query on
-                                                // close so the next open shows
-                                                // the full font list.
-                                                if view.font_family_dropdown_open {
-                                                    search.update(cx, |s, cx| {
-                                                        s.set_value("", _w, cx);
-                                                    });
-                                                }
-                                                view.font_family_dropdown_open =
-                                                    !view.font_family_dropdown_open;
-                                                cx.notify();
-                                            });
-                                        }
-                                    });
-                                for name in mono_fonts.iter() {
-                                    dd = dd.item(name.clone());
-                                }
-                                dd.on_change({
-                                    let h = handle.clone();
-                                    let names = mono_fonts.clone();
-                                    let search = self.font_search_input.clone();
-                                    move |idx, _w, cx| {
-                                        if let Some(name) = names.get(idx) {
-                                            let _ = config::update(|cfg| {
-                                                cfg.appearance.terminal.font_family = name.clone();
-                                            });
-                                            // Repaint every window so each
-                                            // terminal picks up the new font
-                                            // on its next render.
-                                            cx.refresh_windows();
-                                        }
-                                        h.update(cx, |view, cx| {
-                                            view.font_family_dropdown_open = false;
-                                            search.update(cx, |s, cx| {
-                                                s.set_value("", _w, cx);
-                                            });
-                                            cx.notify();
-                                        });
-                                    }
-                                })
-                            })),
+            .child(
+                Section::new()
+                    .header(t!("window.settings.appearance.section_terminal"))
+                    .desc(t!("window.settings.appearance.terminal_desc"))
+                    .field(
+                        t!("window.settings.appearance.terminal_font_family").to_string(),
+                        div().w(px(240.0)).child(font_family_dropdown),
                     )
-                    // Font size stepper input (digits-only, clamped 8–32).
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_xs().text_color(rgb(text_muted())).child(
-                                t!("window.settings.appearance.terminal_font_size").to_string(),
-                            ))
-                            .child(
-                                div().w(px(180.0)).child(
-                                    StyledNumberInput::new(
-                                        "settings-term-font-size",
-                                        self.font_size_input.clone(),
-                                    )
-                                    .focused(self.font_size_focused)
-                                    .min(8)
-                                    .max(32)
-                                    .step(1),
-                                ),
-                            ),
-                    )
-            })
+                    .field(
+                        t!("window.settings.appearance.terminal_font_size").to_string(),
+                        div().w(px(180.0)).child(font_size_stepper),
+                    ),
+            )
     }
 }
 
-// ---------------------------------------------------------------------------
-// Render
-// ---------------------------------------------------------------------------
-
 impl Render for SettingsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let selected_idx = SettingsTab::ALL
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0);
+
         let content: AnyElement = match self.tab {
             SettingsTab::General => self.render_general_pane(cx).into_any_element(),
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
         };
 
-        div()
-            .size_full()
-            .bg(rgb(bg_base()))
-            .flex()
-            .flex_row()
-            .child(self.render_sidebar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(content),
-            )
+        render_sidebar_window(
+            render_tab_sidebar(
+                SettingsTab::sidebar_entries(),
+                px(180.0),
+                selected_idx,
+                move |idx, _w, cx| {
+                    handle.update(cx, |view, _| {
+                        view.tab = SettingsTab::ALL[idx];
+                    });
+                },
+            ),
+            content,
+        )
     }
 }
 

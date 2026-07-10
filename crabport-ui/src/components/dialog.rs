@@ -44,6 +44,7 @@ use gpui_animation::{animation::TransitionExt, transition::general::Linear};
 
 use crate::color::*;
 use crate::components::button::Button;
+use crate::components::overlay::render_overlay;
 
 // ---------------------------------------------------------------------------
 // Severity
@@ -290,7 +291,7 @@ impl RenderOnce for AlertDialog {
             on_cancel.clone(),
         );
 
-        render_overlay(open, on_cancel, overlay_id, dialog)
+        render_overlay(overlay_id, open, on_cancel, dialog)
     }
 }
 
@@ -313,42 +314,6 @@ impl AlertDialog {
 // ---------------------------------------------------------------------------
 // Render helpers
 // ---------------------------------------------------------------------------
-
-fn render_overlay(
-    open: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    overlay_id: ElementId,
-    child: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .id(overlay_id.clone())
-        .absolute()
-        .size_full()
-        .top_0()
-        .left_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x00000000))
-        // Only occlude + capture clicks when actually open so the dialog
-        // doesn't block interaction while hidden / animating out.
-        .when(open, |el| {
-            el.occlude().on_click(move |_e, w, cx| {
-                if let Some(ref cb) = on_close {
-                    cb(w, cx);
-                }
-            })
-        })
-        .with_transition(overlay_id)
-        .transition_when_else(
-            open,
-            Duration::from_millis(150),
-            Linear,
-            |el| el.bg(rgba(0x00000080)),
-            |el| el.bg(rgba(0x00000000)),
-        )
-        .child(child)
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_dialog(

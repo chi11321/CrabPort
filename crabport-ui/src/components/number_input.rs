@@ -276,43 +276,9 @@ impl RenderOnce for StyledNumberInput {
             )
             .child(plus_btn);
 
-        div()
-            .id(col_id)
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w_full()
-            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
-            .when_some(self.label, |el, label| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(text_muted()))
-                        .child(label),
-                )
-            })
-            .child(shell)
-            .when_some(self.error, |el, msg| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            svg()
-                                .path("icons/circle-alert.svg")
-                                .size_3()
-                                .text_color(rgb(input_border_error())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(input_border_error()))
-                                .child(msg),
-                        ),
-                )
-            })
+        crate::components::input::labeled_error_column(
+            col_id, disabled, self.label, shell, self.error,
+        )
     }
 }
 

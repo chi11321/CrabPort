@@ -24,6 +24,7 @@ use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::input::StyledInput;
+use crate::components::overlay::render_overlay;
 
 // ---------------------------------------------------------------------------
 // Output passed to the save callback
@@ -175,6 +176,7 @@ impl RenderOnce for GroupFormView {
         let on_close_for_dialog = self.on_close.clone();
 
         render_overlay(
+            ElementId::Name("group-form-overlay".into()),
             self.open,
             self.on_close,
             render_dialog(
@@ -194,41 +196,6 @@ impl RenderOnce for GroupFormView {
 // ---------------------------------------------------------------------------
 // Render helpers
 // ---------------------------------------------------------------------------
-
-fn render_overlay(
-    open: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    child: impl IntoElement,
-) -> impl IntoElement {
-    let overlay_id = ElementId::Name("group-form-overlay".into());
-
-    div()
-        .id(overlay_id.clone())
-        .absolute()
-        .size_full()
-        .top_0()
-        .left_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x00000000))
-        .when(open, |el| {
-            el.occlude().on_click(move |_e, w, cx| {
-                if let Some(ref cb) = on_close {
-                    cb(w, cx);
-                }
-            })
-        })
-        .with_transition(overlay_id)
-        .transition_when_else(
-            open,
-            Duration::from_millis(150),
-            Linear,
-            |el| el.bg(rgba(0x00000080)),
-            |el| el.bg(rgba(0x00000000)),
-        )
-        .child(child)
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_dialog(

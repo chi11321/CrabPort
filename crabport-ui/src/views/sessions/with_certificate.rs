@@ -40,8 +40,7 @@ impl RenderOnce for WithCertificateForm {
                 div().child(
                     StyledPasswordInput::new("passphrase", self.passphrase_input)
                         .label(t!("connection_form.passphrase").to_string())
-                        .focused(self.passphrase_focused)
-                        .on_toggle(|_, _| {}),
+                        .focused(self.passphrase_focused),
                 ),
             )
             // Private Key file path (read-only input + Browse button).

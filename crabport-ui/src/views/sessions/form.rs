@@ -12,6 +12,7 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::input::{StyledInput, StyledPasswordInput};
+use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
 use crabport_core::credential::PrivateKeyKind;
 
@@ -463,6 +464,7 @@ impl RenderOnce for ConnectionFormView {
         let on_close_for_dialog = self.on_close.clone();
 
         render_overlay(
+            ElementId::Name("conn-form-overlay".into()),
             self.active,
             self.on_close,
             render_dialog(
@@ -505,41 +507,6 @@ impl RenderOnce for ConnectionFormView {
 // ---------------------------------------------------------------------------
 // Render helpers
 // ---------------------------------------------------------------------------
-
-fn render_overlay(
-    active: bool,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    child: impl IntoElement,
-) -> impl IntoElement {
-    let overlay_id = ElementId::Name("conn-form-overlay".into());
-
-    div()
-        .id(overlay_id.clone())
-        .absolute()
-        .size_full()
-        .top_0()
-        .left_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x00000000))
-        .when(active, |el| {
-            el.occlude().on_click(move |_e, w, cx| {
-                if let Some(ref cb) = on_close {
-                    cb(w, cx);
-                }
-            })
-        })
-        .with_transition(overlay_id)
-        .transition_when_else(
-            active,
-            Duration::from_millis(150),
-            Linear,
-            |el| el.bg(rgba(0x00000080)),
-            |el| el.bg(rgba(0x00000000)),
-        )
-        .child(child)
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_dialog(
@@ -683,8 +650,9 @@ fn render_dialog(
                                                 )
                                                 .label(t!("connection_form.password").to_string())
                                                 .focused(pass_focused)
-                                                .when_some(errors.pass.clone(), |el, e| el.error(e))
-                                                .on_toggle(|_, _| {}),
+                                                .when_some(errors.pass.clone(), |el, e| {
+                                                    el.error(e)
+                                                }),
                                             ),
                                         )
                                         .height(px({
@@ -843,8 +811,7 @@ fn render_dialog(
                                     StyledPasswordInput::new("telnet-password", pass_input.clone())
                                         .label(t!("connection_form.password").to_string())
                                         .focused(pass_focused)
-                                        .when_some(errors.pass.clone(), |el, e| el.error(e))
-                                        .on_toggle(|_, _| {}),
+                                        .when_some(errors.pass.clone(), |el, e| el.error(e)),
                                 ),
                             )
                             // Proxy tabs

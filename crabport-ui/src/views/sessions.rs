@@ -18,7 +18,7 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::group_header::group_header;
-use gpui_component::input::InputState;
+use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
 /// Sentinel id used for the virtual "Favorites" group in collapse state.
 /// Uses `i64::MAX` so it can never collide with a real group id.
@@ -86,12 +86,8 @@ pub struct SessionsView {
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Per-group collapse state for the grouped list.
     collapsed_groups: HashSet<i64>,
-    /// The group id currently being renamed inline, if any. While set, the
-    /// group header renders an inline `StyledInput` in place of its label.
-    renaming_group_id: Option<i64>,
-    /// `InputState` backing the inline group-rename editor. Lazily created
-    /// the first time the user triggers a rename; reused thereafter.
-    rename_input: Option<Entity<InputState>>,
+    /// Shared inline group-rename state (id + InputState).
+    group_rename: GroupRenameState,
 }
 
 impl SessionsView {
@@ -109,8 +105,7 @@ impl SessionsView {
             on_edit: None,
             on_remove: None,
             collapsed_groups: HashSet::new(),
-            renaming_group_id: None,
-            rename_input: None,
+            group_rename: GroupRenameState::new(),
         }
     }
 
@@ -149,12 +144,9 @@ impl SessionsView {
     }
 
     // -------------------------------------------------------------------
-    // Inline group rename
+    // Inline group rename (delegates to GroupRenameState)
     // -------------------------------------------------------------------
 
-    /// Begin renaming a group inline: stash the id, (re)seed the rename
-    /// `InputState` with the current name, and focus it. Called from the
-    /// group-header context menu's "Rename Group" item.
     fn start_group_rename(
         &mut self,
         group_id: i64,
@@ -162,70 +154,17 @@ impl SessionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.renaming_group_id = Some(group_id);
-        // Lazily create the InputState the first time.
-        if self.rename_input.is_none() {
-            let entity = cx.new(|cx| {
-                let state = InputState::new(window, cx).placeholder("new name");
-                state.focus(window, cx);
-                state
-            });
-            // Submit on Enter.
-            cx.subscribe(
-                &entity,
-                |this, _input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_group_rename(cx);
-                    }
-                },
-            )
-            .detach();
-            // Cancel on blur — the user clicked away.
-            let blur_handle = entity.read(cx).focus_handle(cx);
-            cx.on_blur(&blur_handle, window, |this, _window, cx| {
-                if this.renaming_group_id.is_some() {
-                    this.cancel_group_rename(cx);
-                }
-            })
-            .detach();
-            self.rename_input = Some(entity);
-        }
-        // Seed the input with the group's current name.
-        if let Some(ref input) = self.rename_input {
-            input.update(cx, |state, cx| {
-                state.set_value(current_name, window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
+        self.group_rename.start(group_id, current_name, window, cx);
+    }
+}
+
+impl GroupRenameView for SessionsView {
+    fn group_rename(&mut self) -> &mut GroupRenameState {
+        &mut self.group_rename
     }
 
-    /// Commit the inline rename: read the new name from `rename_input`,
-    /// persist via `CrabportApp::rename_group`, and close the editor.
-    fn commit_group_rename(&mut self, cx: &mut Context<Self>) {
-        let group_id = match self.renaming_group_id.take() {
-            Some(id) => id,
-            None => return,
-        };
-        let new_name = self.rename_input.as_ref().and_then(|input| {
-            let v = input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else {
-            cx.notify();
-            return;
-        };
-        let app = self.app.clone();
-        app.update(cx, |app, cx| {
-            app.rename_group(group_id, &new_name, cx);
-        });
-        cx.notify();
-    }
-
-    /// Abort the inline rename without persisting.
-    fn cancel_group_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming_group_id = None;
-        cx.notify();
+    fn app_entity(&self) -> &Entity<CrabportApp> {
+        &self.app
     }
 }
 
@@ -260,8 +199,8 @@ impl Render for SessionsView {
             self.context_menu_host_id = None;
         }
         let context_menu_host_id = self.context_menu_host_id;
-        let renaming_group_id = self.renaming_group_id;
-        let rename_input = self.rename_input.clone();
+        let renaming_group_id = self.group_rename.renaming_group_id;
+        let rename_input = self.group_rename.rename_input.clone();
 
         // Partition hosts: ungrouped (group_id is None) first, then one
         // bucket per group.
