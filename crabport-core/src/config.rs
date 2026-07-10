@@ -49,6 +49,15 @@ pub struct AppearanceConfig {
     /// Terminal font + size settings. Stored under `[appearance.terminal]`.
     #[serde(default)]
     pub terminal: TerminalConfig,
+
+    /// Right-hand panel width in CSS pixels. Clamped at use sites into a
+    /// sane range. Stored under `[appearance]` so it survives restarts.
+    #[serde(default = "default_panel_width")]
+    pub panel_width: f32,
+}
+
+fn default_panel_width() -> f32 {
+    220.0
 }
 
 fn default_locale() -> String {
@@ -61,6 +70,7 @@ impl Default for AppearanceConfig {
             locale: default_locale(),
             theme: ThemeConfig::default(),
             terminal: TerminalConfig::default(),
+            panel_width: default_panel_width(),
         }
     }
 }

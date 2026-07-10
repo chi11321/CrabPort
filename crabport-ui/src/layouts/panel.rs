@@ -9,7 +9,35 @@ use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
 
+/// Default panel width for a fresh install / reset.
 pub const PANEL_WIDTH: f32 = 220.0;
+/// Minimum draggable panel width — keeps the panel usable.
+pub const MIN_PANEL_WIDTH: f32 = 200.0;
+/// Maximum draggable panel width — prevents the panel from swallowing
+/// the terminal area on very wide windows.
+pub const MAX_PANEL_WIDTH: f32 = 600.0;
+
+/// Half-width of the grabbable band around the panel divider, in px.
+pub const PANEL_DIVIDER_HIT: f32 = 3.0;
+
+/// Effective maximum panel width for the given window width: the smaller
+/// of [`MAX_PANEL_WIDTH`] and 2/3 of the window width.
+pub fn effective_max_panel_width(window_width: f32) -> f32 {
+    MAX_PANEL_WIDTH
+        .min(window_width * 3.0 / 5.0)
+        .max(MIN_PANEL_WIDTH)
+}
+
+/// State held while dragging the panel resize divider.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelDrag {
+    /// Panel width at drag start, in px.
+    pub start_width: f32,
+    /// Cursor x at drag start, in window px.
+    pub start_x: f32,
+    /// Current live panel width, in px (updated each mouse-move).
+    pub width: f32,
+}
 
 /// Right-hand panel capability set for the active terminal backend. Each
 /// flag maps to a `CrabPortTerminal` capability method; the panel renders
@@ -31,6 +59,12 @@ pub fn render_panel(
     history_panel: Entity<HistoryCommandPanel>,
     tunnels_panel: Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
     on_change: Option<std::rc::Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    // Current panel width in px (live drag value or persisted config value).
+    width: f32,
+    // Whether a drag is in progress. When true the width is applied
+    // instantly without the show/hide transition so the panel tracks
+    // the cursor with zero latency.
+    dragging: bool,
 ) -> impl IntoElement {
     // Fixed pane order so the positional index is stable for a given
     // capability set. SFTP is first (only on SSH), then History, Snippets,
@@ -105,6 +139,15 @@ pub fn render_panel(
         tabs = tabs.pane(TabPane::new("", tunnels_panel).icon("icons/waypoints.svg"));
     }
 
+    // Always use the same `with_transition` element so the animation
+    // engine keeps a consistent identity across drag / non-drag frames.
+    // During a drag the duration is zero so width updates are instant;
+    // otherwise the 500ms duration drives the smooth show/hide.
+    let duration = if dragging {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(500)
+    };
     div()
         .id("panel-sidebar")
         .h_full()
@@ -114,18 +157,19 @@ pub fn render_panel(
         .with_transition("panel-sidebar-width")
         .transition_when_else(
             visible,
-            std::time::Duration::from_millis(500),
+            duration,
             EaseInOutCubic,
-            |el| el.w(px(PANEL_WIDTH)),
+            move |el| el.w(px(width)),
             |el| el.w_0(),
         )
         .child(
             div()
                 .h_full()
-                .w(px(PANEL_WIDTH))
+                .w(px(width))
                 .border_l_1()
                 .border_color(rgb(border()))
                 .bg(rgb(bg_sidebar()))
                 .child(tabs.h_full()),
         )
+        .into_any_element()
 }
