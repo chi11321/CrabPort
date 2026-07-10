@@ -30,6 +30,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
+use std::time::Duration;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
@@ -217,12 +218,30 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .tooltip(move |w, cx| {
+                                gpui_component::tooltip::Tooltip::new(
+                                    t!("panel.run_tooltip").to_string(),
+                                )
+                                .build(w, cx)
+                            })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_run_for_btn.as_ref() {
                                     cb(cmd_for_run.clone(), cx);
                                 }
                             })
+                            .with_transition(ElementId::Name(format!("snippet-run-{i}").into()))
+                            .transition_on_hover(
+                                Duration::from_millis(100),
+                                Linear,
+                                |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .child(
                                 svg()
                                     .path("icons/file-terminal.svg")
@@ -242,12 +261,30 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .tooltip(move |w, cx| {
+                                gpui_component::tooltip::Tooltip::new(
+                                    t!("panel.paste_tooltip").to_string(),
+                                )
+                                .build(w, cx)
+                            })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
                             })
+                            .with_transition(ElementId::Name(format!("snippet-paste-{i}").into()))
+                            .transition_on_hover(
+                                Duration::from_millis(100),
+                                Linear,
+                                |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .child(
                                 svg()
                                     .path("icons/clipboard-copy.svg")
@@ -359,47 +396,50 @@ impl Render for SnippetsPanel {
                 )
             })
             // List + scrollbar, or empty-state placeholder.
-            .when(is_empty, |el| {
-                el.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(text_muted()))
-                                .text_sm()
-                                .child(t!("sidebar.snippets").to_string()),
-                        ),
-                )
-            })
-            .when(!is_empty, |el| {
-                el.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(bg_tab_bar()))
-                        .rounded_md()
-                        .overflow_hidden()
-                        .child(list)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .w(px(12.0))
-                                .child(
-                                    Scrollbar::vertical(&scroll_handle)
-                                        .scrollbar_show(ScrollbarShow::Hover),
-                                ),
-                        ),
-                )
-            })
+            .when_else(
+                is_empty,
+                |el| {
+                    el.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_color(rgb(text_muted()))
+                                    .text_sm()
+                                    .child(t!("sidebar.snippets").to_string()),
+                            ),
+                    )
+                },
+                |el| {
+                    el.child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .border_1()
+                            .border_color(rgb(border()))
+                            .bg(rgb(bg_tab_bar()))
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(list)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(12.0))
+                                    .child(
+                                        Scrollbar::vertical(&scroll_handle)
+                                            .scrollbar_show(ScrollbarShow::Hover),
+                                    ),
+                            ),
+                    )
+                },
+            )
     }
 }

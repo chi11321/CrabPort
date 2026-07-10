@@ -371,7 +371,7 @@ impl RenderOnce for Dropdown {
                 let item_id = ElementId::Name(format!("{id_str}-item-{orig_i}").into());
 
                 div()
-                    .id(item_id)
+                    .id(item_id.clone())
                     .flex()
                     .items_center()
                     .h(ITEM_HEIGHT)
@@ -384,8 +384,19 @@ impl RenderOnce for Dropdown {
                     } else {
                         text_muted()
                     }))
-                    .bg(rgb(bg_base()))
-                    .hover(|s| s.bg(rgb(surface_active())))
+                    .bg(rgba(0x00000000))
+                    .with_transition(item_id)
+                    .transition_on_hover(
+                        Duration::from_millis(120),
+                        EaseInOutQuad,
+                        move |hovered, el| {
+                            if *hovered {
+                                el.bg(rgb(surface_active()))
+                            } else {
+                                el.bg(rgba(0x00000000))
+                            }
+                        },
+                    )
                     .child(item.label.clone())
                     .on_click(move |_e, w, cx| {
                         if let Some(ref f) = cb {
@@ -440,7 +451,19 @@ impl RenderOnce for Dropdown {
                     .rounded_sm()
                     .text_sm()
                     .text_color(rgb(term_blue()))
-                    .hover(|s| s.bg(rgb(surface_active())))
+                    .bg(rgba(0x00000000))
+                    .with_transition(ElementId::Name(format!("{id_str}-create").into()))
+                    .transition_on_hover(
+                        Duration::from_millis(120),
+                        EaseInOutQuad,
+                        move |hovered, el| {
+                            if *hovered {
+                                el.bg(rgb(surface_active()))
+                            } else {
+                                el.bg(rgba(0x00000000))
+                            }
+                        },
+                    )
                     .child(t!("groups.create", name = query_str.as_str()).to_string())
                     .on_click(move |_e, w, cx| {
                         on_create(query_str.clone(), w, cx);

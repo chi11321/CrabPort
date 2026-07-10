@@ -12,6 +12,9 @@ placeholder = "Type a command or search..."
 
 [panel]
 search = "Search"
+run_tooltip = "Run"
+paste_tooltip = "Paste"
+save_tooltip = "Save as snippet"
 
 [new_connection]
 title = "New Connection"
@@ -318,3 +321,8 @@ select_all = "Select All"
 window = "Window"
 minimize = "Minimize"
 zoom = "Zoom"
+
+[history]
+saved_title = "Saved as snippet"
+saved_msg = "Saved \"%{command}\" to snippets."
+save_failed_title = "Failed to save snippet"

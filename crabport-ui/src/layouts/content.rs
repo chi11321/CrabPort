@@ -590,7 +590,13 @@ pub fn render_content(
         None => (std::sync::Arc::new(Vec::new()), None),
     };
     history_panel.update(cx, |panel, cx| {
-        panel.set_state(history_commands, history_on_paste, window, cx);
+        panel.set_state(
+            history_commands,
+            history_on_paste,
+            ctx.notifications.clone(),
+            window,
+            cx,
+        );
     });
 
     // ---- Snippets panel ----
