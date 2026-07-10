@@ -13,6 +13,7 @@ use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::terminal_toolbar::render_terminal_toolbar;
 use crate::views::panel::PanelKind;
+use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
@@ -262,6 +263,10 @@ pub fn render_content(
         Some(TabKind::Terminal) => {
             if let Some(tab) = active_tab {
                 let tab_id = tab.id;
+                // Clone the terminal entity so the on_drop handler can
+                // trigger a download when the user drags an SFTP file row
+                // onto the terminal area.
+                let term_entity_for_drop = terminal_views.get(&tab_id).cloned();
                 // If this tab has a split tree, render the panes recursively;
                 // otherwise fall back to the single terminal view.
                 let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
@@ -289,11 +294,46 @@ pub fn render_content(
                     terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
+                // Clone the download callback + terminal entity so the
+                // on_drop handler can trigger a download when the user
+                // drags an SFTP file row onto the terminal area.
+                let on_download_for_drop = term_entity_for_drop.clone().map(|entity| {
+                    move |drag: &SftpDragValue, cx: &mut App| {
+                        let remote_path = drag.remote_path.clone();
+                        let name = drag.name.clone();
+                        let rx = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some(t!("sftp.download_prompt").to_string().into()),
+                        });
+                        let entity = entity.clone();
+                        cx.spawn(async move |cx| {
+                            let picked = match rx.await {
+                                Ok(Ok(Some(mut paths))) => paths.pop(),
+                                _ => None,
+                            };
+                            let Some(dest_dir) = picked else { return };
+                            let local_path = dest_dir.join(&name);
+                            let _ = cx.update(|cx| {
+                                entity.read_with(cx, |view, _cx| {
+                                    view.sftp_download(&remote_path, &local_path.to_string_lossy());
+                                });
+                            });
+                        })
+                        .detach();
+                    }
+                });
                 div()
                     .size_full()
                     .relative()
                     .key_context("Terminal")
                     .child(inner)
+                    .when_some(on_download_for_drop, |el, on_drop_cb| {
+                        el.on_drop::<SftpDragValue>(move |drag, _w, cx| {
+                            on_drop_cb(drag, cx);
+                        })
+                    })
                     .when(has_term, |el| {
                         el.child(
                             div()

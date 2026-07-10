@@ -185,6 +185,8 @@ notif_upload_done_title = "上传完成"
 notif_upload_done_msg = "%{message}"
 notif_upload_failed_title = "上传失败"
 notif_upload_failed_msg = "%{message}"
+drop_upload_hint = "拖放文件以上传"
+drag_download_hint = "拖动到终端以下载"
 
 [sftp.progress]
 download = "下载"
