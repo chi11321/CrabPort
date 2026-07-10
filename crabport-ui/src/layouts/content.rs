@@ -38,6 +38,11 @@ pub fn render_content(
     tunnel_list: Vec<crate::views::tunnels::TunnelView>,
     tunnel_form_state: Option<crate::views::tunnels::TunnelFormState>,
     snippet_form_state: Option<crate::views::snippets::SnippetFormState>,
+    // Current panel width in px (either the live drag value or the persisted
+    // config value). Drives the panel's rendered width.
+    panel_width: f32,
+    // Whether a panel resize drag is in progress.
+    panel_dragging: bool,
     ctx: &AppCtx,
     window: &mut Window,
     cx: &mut App,
@@ -764,7 +769,43 @@ pub fn render_content(
                 .flex()
                 .flex_row()
                 .overflow_hidden()
+                .relative()
                 .child(view)
+                .when(
+                    is_terminal && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
+                    |el| {
+                        // Resize divider handle between terminal and panel.
+                        // A narrow strip with negative margins so it overlaps
+                        // the panel border while remaining grabbable.
+                        let handle_for_resize = handle.clone();
+                        el.child(
+                            div()
+                                .id("panel-resize-handle")
+                                .flex_shrink_0()
+                                .h_full()
+                                .w(px(crate::layouts::panel::PANEL_DIVIDER_HIT * 2.0))
+                                .ml(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
+                                .mr(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
+                                .cursor_col_resize()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let handle = handle_for_resize.clone();
+                                    let pw = panel_width;
+                                    move |event, _window, cx| {
+                                        handle.update(cx, |app, cx| {
+                                            app.panel_drag =
+                                                Some(crate::layouts::panel::PanelDrag {
+                                                    start_width: pw,
+                                                    start_x: f32::from(event.position.x),
+                                                    width: pw,
+                                                });
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    },
+                )
                 .child({
                     let handle_for_panel = handle.clone();
                     // Capture the capability flags so the `on_change` closure
@@ -814,7 +855,74 @@ pub fn render_content(
                                 }
                             });
                         })),
+                        panel_width,
+                        panel_dragging,
                     )
+                })
+                // Transparent canvas whose paint callback registers
+                // window-level mouse listeners for the panel resize drag.
+                // `window.on_mouse_event` can only be called during paint,
+                // so we need this canvas to hook into the paint phase. The
+                // listeners are registered every frame but no-op when
+                // `panel_drag` is `None`.
+                .child({
+                    let handle_for_canvas = handle.clone();
+                    canvas(
+                        |_bounds, _window, _cx| {},
+                        move |_bounds, _state, window, _cx| {
+                            let handle_for_move = handle_for_canvas.clone();
+                            window.on_mouse_event({
+                                let handle = handle_for_move.clone();
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = handle.update(cx, |app, cx| {
+                                        if let Some(ref mut drag) = app.panel_drag {
+                                            let delta = drag.start_x - f32::from(event.position.x);
+                                            let eff_max =
+                                                crate::layouts::panel::effective_max_panel_width(
+                                                    f32::from(window.viewport_size().width),
+                                                );
+                                            let new_width = (drag.start_width + delta).clamp(
+                                                crate::layouts::panel::MIN_PANEL_WIDTH,
+                                                eff_max,
+                                            );
+                                            if (new_width - drag.width).abs() > 0.01 {
+                                                drag.width = new_width;
+                                                cx.notify();
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            window.on_mouse_event({
+                                let handle = handle_for_move.clone();
+                                move |_event: &MouseUpEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = handle.update(cx, |app, cx| {
+                                        if let Some(drag) = app.panel_drag.take() {
+                                            let eff_max =
+                                                crate::layouts::panel::effective_max_panel_width(
+                                                    f32::from(window.viewport_size().width),
+                                                );
+                                            let _ = crabport_core::config::update(|cfg| {
+                                                cfg.appearance.panel_width = drag.width.clamp(
+                                                    crate::layouts::panel::MIN_PANEL_WIDTH,
+                                                    eff_max,
+                                                );
+                                            });
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                    )
+                    .w_0()
+                    .h_0()
                 }),
         )
         .child(render_terminal_toolbar(
