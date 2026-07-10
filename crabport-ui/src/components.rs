@@ -1,6 +1,7 @@
 pub mod button;
 pub mod context_menu;
 pub mod dialog;
+pub mod drop_zone_overlay;
 pub mod dropdown;
 pub mod group_header;
 pub mod input;

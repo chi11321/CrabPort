@@ -13,7 +13,51 @@ use rustc_hash::FxHashSet;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
+use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
+
+/// Drag payload for an SFTP row being dragged within the app.
+/// Dropped onto a terminal area to trigger a download.
+#[derive(Clone, Debug)]
+pub struct SftpDragValue {
+    pub remote_path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+impl Render for SftpDragValue {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A small floating chip showing the file name + icon.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .bg(rgb(bg_base()))
+            .border_1()
+            .border_color(rgb(border()))
+            .shadow_sm()
+            .child(
+                svg()
+                    .path(if self.is_dir {
+                        "icons/folder.svg"
+                    } else {
+                        "icons/file.svg"
+                    })
+                    .size_3()
+                    .text_color(rgb(text_muted())),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_primary()))
+                    .child(self.name.clone()),
+            )
+    }
+}
 
 /// SFTP panel view.
 ///
@@ -79,6 +123,10 @@ pub struct SftpPanel {
     /// custom `Scrollbar::vertical` overlay so the scrollbar style stays
     /// consistent with the rest of the app.
     scroll_handle: VirtualListScrollHandle,
+    /// Whether external files are currently being dragged over this panel.
+    /// Drives a highlighted drop-zone border so the user knows a drop will
+    /// upload.
+    drag_over: bool,
 }
 
 impl SftpPanel {
@@ -102,6 +150,7 @@ impl SftpPanel {
             renaming_entry: None,
             rename_input: None,
             scroll_handle: VirtualListScrollHandle::new(),
+            drag_over: false,
         }
     }
 
@@ -409,6 +458,11 @@ impl Render for SftpPanel {
         let on_navigate = self.on_navigate.clone();
         let on_download = self.on_download.clone();
         let on_upload = self.on_upload.clone();
+        let on_upload_for_drop = on_upload.clone();
+        let cwd_for_drop = cwd.clone();
+        let drag_over = self.drag_over;
+        let entity_for_drop = _cx.entity().downgrade();
+        let entity_for_list = entity_for_drop.clone();
 
         div()
             .h_full()
@@ -419,6 +473,7 @@ impl Render for SftpPanel {
             .flex_col()
             .pt_1()
             .px_1()
+            .relative()
             .when_some(path_input, |el, input| {
                 el.child(
                     div().mb_1().child(
@@ -508,11 +563,63 @@ impl Render for SftpPanel {
                 // the scrollbar width. That way the rows' right-side rounded
                 // corners land to the left of the scrollbar track instead of
                 // being painted over by it.
+                //
+                // This container is also the drop target for external file
+                // drag-in uploads: `on_drop::<ExternalPaths>` fires when the
+                // user drops OS files onto the list, and `on_drag_move` tracks
+                // whether the cursor is inside the list bounds to drive the
+                // `DropZoneOverlay`.
                 div()
                     .relative()
                     .flex_1()
                     .h_full()
                     .overflow_hidden()
+                    // Drop zone for external file drag-in uploads.
+                    .when(on_upload.is_some(), |el| {
+                        el.on_drop::<ExternalPaths>(move |paths, _w, cx| {
+                            let on_upload = on_upload_for_drop.clone();
+                            let cwd = cwd_for_drop.clone();
+                            let entity = entity_for_drop.clone();
+                            if let Some(cwd) = cwd {
+                                let cwd_str = cwd.as_str().to_string();
+                                let _ = entity.update(cx, |view, cx| {
+                                    view.drag_over = false;
+                                    cx.notify();
+                                });
+                                for local in paths.paths() {
+                                    let name = local
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| local.to_string_lossy().into_owned());
+                                    let remote = if cwd_str.ends_with('/') {
+                                        format!("{}{}", cwd_str, name)
+                                    } else {
+                                        format!("{}/{}", cwd_str, name)
+                                    };
+                                    if let Some(ref cb) = on_upload {
+                                        cb(local.to_string_lossy().into_owned(), remote, cx);
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    // Track external drag-over for the drop-zone overlay.
+                    // `on_drag_move` fires for all move events while an
+                    // `ExternalPaths` drag is active (even outside this
+                    // element), so we can toggle `drag_over` based on
+                    // whether the cursor is inside the list bounds.
+                    .on_drag_move::<ExternalPaths>({
+                        let entity = entity_for_list.clone();
+                        move |e, _w, cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                let should = e.bounds.contains(&e.event.position);
+                                if view.drag_over != should {
+                                    view.drag_over = should;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
                     .child(
                         v_virtual_list(
                             _cx.entity(),
@@ -568,6 +675,15 @@ impl Render for SftpPanel {
                                         let row_rename_input = rename_input.clone();
                                         let row_id = ElementId::Name(format!("sftp-{i}").into());
                                         let row_id_for_transition = row_id.clone();
+                                        // Whether this row can be dragged (start a
+                                        // drag-out-to-download). `.` and `..` are
+                                        // navigation helpers, not real entries.
+                                        let draggable = name != "." && name != "..";
+                                        // Capture the drag value + download cb for
+                                        // the on_drag constructor.
+                                        let drag_remote_path = target_path.clone();
+                                        let drag_name = name.clone();
+                                        let drag_is_dir = is_dir;
 
                                         div()
                                             .id(row_id.clone())
@@ -579,6 +695,24 @@ impl Render for SftpPanel {
                                             .gap_1p5()
                                             .px_2()
                                             .rounded(px(4.0))
+                                            // Allow dragging real entries to
+                                            // initiate a drag-out download. The
+                                            // drag payload carries the remote
+                                            // path + name so a drop target
+                                            // (e.g. the terminal area) can
+                                            // trigger the download.
+                                            .when(draggable, |el| {
+                                                el.on_drag(
+                                                    SftpDragValue {
+                                                        remote_path: drag_remote_path.clone(),
+                                                        name: drag_name.clone(),
+                                                        is_dir: drag_is_dir,
+                                                    },
+                                                    |drag_value, _offset, _w, cx| {
+                                                        cx.new(|_| drag_value.clone())
+                                                    },
+                                                )
+                                            })
                                             // Left-click drives both navigation (double-click on
                                             // a dir) and multi-selection (cmd/ctrl-click on
                                             // any selectable row). `.` and `..` are excluded
@@ -1008,6 +1142,46 @@ impl Render for SftpPanel {
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
                             ),
                     )
+                    // Drop-zone overlay: shows a translucent hint with icon
+                    // when external files are dragged over the list. Fades
+                    // in/out with an eased transition.
+                    .child(
+                        DropZoneOverlay::new(drag_over)
+                            .hint(t!("sftp.drop_upload_hint").to_string())
+                            .id("sftp-panel-drop-overlay"),
+                    )
+                    // Zero-size canvas that registers a window-level
+                    // `FileDropEvent` listener during paint. When the OS
+                    // reports the drag has left the window entirely
+                    // (`Exited`), we clear `drag_over` so the overlay
+                    // doesn’t get stuck in the visible state — `on_drag_move`
+                    // can’t catch this because `Exited` is not a `MouseMoveEvent`.
+                    .child({
+                        let entity = entity_for_list.clone();
+                        canvas(
+                            |_bounds, _window, _cx| {},
+                            move |_bounds, _state, window, _cx| {
+                                window.on_mouse_event({
+                                    let entity = entity.clone();
+                                    move |event: &FileDropEvent, phase, _window, cx| {
+                                        if phase != DispatchPhase::Capture {
+                                            return;
+                                        }
+                                        if matches!(event, FileDropEvent::Exited) {
+                                            let _ = entity.update(cx, |view, cx| {
+                                                if view.drag_over {
+                                                    view.drag_over = false;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    }
+                                });
+                            },
+                        )
+                        .w_0()
+                        .h_0()
+                    })
             )
     }
 }
