@@ -1,5 +1,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -1053,6 +1054,7 @@ impl Render for SftpPanel {
                                                     });
                                                 }
                                             })
+                                            // Hover / context-menu highlight.
                                             .transition_when_else(
                                                 is_highlighted,
                                                 std::time::Duration::from_millis(120),
@@ -1061,28 +1063,31 @@ impl Render for SftpPanel {
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                                             )
                                             // Selected rows get a persistent blue accent bar
-                                            // on the left edge plus a subtle blue tint so the
-                                            // selection reads even when not hovered. We render
-                                            // this as an absolutely-positioned stripe inside
-                                            // the row so it doesn't affect the flex layout.
-                                            // The tint is applied only when not highlighted so
-                                            // the hover/menu colour takes precedence visually
-                                            // when the user is interacting with the row.
-                                            .when(is_selected, |el| {
-                                                el.relative().child(
-                                                    div()
-                                                        .absolute()
-                                                        .top(px(2.0))
-                                                        .bottom(px(2.0))
-                                                        .left_0()
-                                                        .w(px(2.0))
-                                                        .rounded(px(1.0))
-                                                        .bg(rgb(btn_primary_bg())),
-                                                )
-                                            })
-                                            .when(is_selected && !is_highlighted, |el| {
-                                                el.bg(rgba(input_selection()))
-                                            })
+                                            // on the left edge. The bar is always
+                                            // rendered but its opacity is eased in/out
+                                            // via a separate transition so selection
+                                            // changes animate smoothly.
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .id(ElementId::Name(format!("sftp-bar-{i}").into()))
+                                                    .absolute()
+                                                    .top(px(2.0))
+                                                    .bottom(px(2.0))
+                                                    .left_0()
+                                                    .w(px(2.0))
+                                                    .rounded(px(1.0))
+                                                    .bg(rgb(btn_primary_bg()))
+                                                    .opacity(0.0)
+                                                    .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
+                                                    .transition_when_else(
+                                                        is_selected,
+                                                        std::time::Duration::from_millis(120),
+                                                        Linear,
+                                                        |el| el.opacity(1.0),
+                                                        |el| el.opacity(0.0),
+                                                    ),
+                                            )
                                             .child(
                                                 svg()
                                                     .path(icon_path)
@@ -1299,7 +1304,10 @@ fn render_sftp_action_button(
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let color = if enabled { text_muted() } else { 0x45475a };
-    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let hover_bg = surface_hover();
+    let to_color = |c: u32| rgba(if c <= 0xFFFFFF { (c << 8) | 0xFF } else { c });
+    let rest_bg = to_color(0x00000000);
+    let hover_bg_rgba = to_color(hover_bg);
     div()
         .id(id)
         .flex()
@@ -1307,7 +1315,7 @@ fn render_sftp_action_button(
         .justify_center()
         .size(px(24.0))
         .rounded(px(4.0))
-        .when(enabled, |el| el.hover(move |s| s.bg(hover_bg)))
+        .bg(rest_bg)
         .when(!enabled, |el| el.cursor_not_allowed())
         .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
         .when(enabled, |el| {
@@ -1315,6 +1323,14 @@ fn render_sftp_action_button(
                 on_click(w, cx);
                 cx.stop_propagation();
             })
+        })
+        .with_transition(id)
+        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg_rgba)
+            } else {
+                el.bg(rest_bg)
+            }
         })
         .child(svg().path(icon).size(px(14.0)).text_color(rgb(color)))
 }
@@ -1432,6 +1448,10 @@ fn trigger_download_from_button(
     if entries.is_empty() {
         return;
     }
+    let _ = entity.update(cx, |view, cx| {
+        view.selected.clear();
+        cx.notify();
+    });
     let _ = cwd; // cwd is read from the entity above to stay fresh
     trigger_batch_download(entries, on_download, cx);
 }
