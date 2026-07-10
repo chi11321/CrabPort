@@ -1114,10 +1114,10 @@ impl Render for TerminalView {
         }
         if self.pending_copy {
             self.pending_copy = false;
-            let text = if let Some(ref sel) = *self.selection.lock() {
-                Self::copy_selected_text(&self.session, sel)
-            } else {
-                self.session.with_term(|term| {
+            let sel = self.selection.lock().clone();
+            let text = match sel {
+                Some(ref sel) if !sel.is_empty() => Self::copy_selected_text(&self.session, sel),
+                _ => self.session.with_term(|term| {
                     let grid = term.grid();
                     let display_offset = grid.display_offset();
                     let num_cols = grid.columns();
@@ -1140,7 +1140,7 @@ impl Render for TerminalView {
                         }
                     }
                     result
-                })
+                }),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -1261,7 +1261,6 @@ impl Render for TerminalView {
             .relative()
             .size_full()
             .overflow_hidden()
-            .cursor_text()
             .bg(rgb(term_bg()))
             .track_focus(&focus_handle)
             .key_context("CrabPortTerminal")
@@ -1543,37 +1542,42 @@ impl Render for TerminalView {
 
                             // Convert selection grid lines to viewport rows.
                             // viewport_row = grid_line + display_offset
-                            let (sel_start, sel_end) = if let Some(ref s) = sel {
-                                let (sr, er, sc, ec) = s.range();
-                                let vp_sr = sr + display_offset;
-                                let vp_er = er + display_offset;
-                                let ri = row_idx as i32;
-                                if ri < vp_sr || ri > vp_er {
-                                    (None, None)
-                                } else if vp_sr == vp_er {
-                                    let lo = sc.min(num_cols);
-                                    let hi = (ec + 1).min(num_cols).max(lo + 1);
-                                    (Some(lo), Some(hi))
-                                } else if ri == vp_sr {
-                                    let col = if s.start_row <= s.end_row {
-                                        s.start_col
+                            //
+                            // `is_empty()` hides the highlight for a clicked-but-
+                            // not-yet-dragged single cell so a plain click
+                            // doesn't visually select anything.
+                            let (sel_start, sel_end) =
+                                if let Some(ref s) = sel.as_ref().filter(|s| !s.is_empty()) {
+                                    let (sr, er, sc, ec) = s.range();
+                                    let vp_sr = sr + display_offset;
+                                    let vp_er = er + display_offset;
+                                    let ri = row_idx as i32;
+                                    if ri < vp_sr || ri > vp_er {
+                                        (None, None)
+                                    } else if vp_sr == vp_er {
+                                        let lo = sc.min(num_cols);
+                                        let hi = (ec + 1).min(num_cols).max(lo + 1);
+                                        (Some(lo), Some(hi))
+                                    } else if ri == vp_sr {
+                                        let col = if s.start_row <= s.end_row {
+                                            s.start_col
+                                        } else {
+                                            s.end_col
+                                        };
+                                        (Some(col.min(num_cols)), Some(num_cols))
+                                    } else if ri == vp_er {
+                                        let col = if s.start_row <= s.end_row {
+                                            s.end_col
+                                        } else {
+                                            s.start_col
+                                        };
+                                        (Some(0), Some(col.saturating_add(1).min(num_cols)))
                                     } else {
-                                        s.end_col
-                                    };
-                                    (Some(col.min(num_cols)), Some(num_cols))
-                                } else if ri == vp_er {
-                                    let col = if s.start_row <= s.end_row {
-                                        s.end_col
-                                    } else {
-                                        s.start_col
-                                    };
-                                    (Some(0), Some(col.saturating_add(1).min(num_cols)))
+                                        (Some(0), Some(num_cols))
+                                    }
                                 } else {
-                                    (Some(0), Some(num_cols))
-                                }
-                            } else {
-                                (None, None)
-                            };
+                                    (None, None)
+                                };
 
                             let row_selected = sel_start.is_some();
                             let row = &cache.rows[row_idx];
@@ -1786,6 +1790,7 @@ impl Render for TerminalView {
                         let line_height = line_height;
                         let display_offset_mouse = display_offset_mouse.clone();
                         let scrollbar_dragging_down = scrollbar_dragging.clone();
+                        let session_for_dblclick = session_c.clone();
                         move |event, _window, _cx| {
                             // If the click landed on the scrollbar area, skip selection.
                             if scrollbar_dragging_down.load(Ordering::Acquire) {
@@ -1806,7 +1811,26 @@ impl Render for TerminalView {
                                     line_height,
                                     offset,
                                 ) {
-                                    *selection.lock() = Some(Selection::new(col, row));
+                                    // Double-click selects the word at the click
+                                    // position; triple-click selects the whole line.
+                                    // Single click starts a normal drag selection.
+                                    let new_sel = if event.click_count >= 3 {
+                                        Some(select_line(
+                                            session_for_dblclick
+                                                .with_term(|term| term.grid().columns()),
+                                            row,
+                                        ))
+                                    } else if event.click_count == 2 {
+                                        session_for_dblclick.with_term(|term| {
+                                            let grid = term.grid();
+                                            select_word(grid, grid.columns(), col, row)
+                                        })
+                                    } else {
+                                        Some(Selection::new(col, row))
+                                    };
+                                    if let Some(sel) = new_sel {
+                                        *selection.lock() = Some(sel);
+                                    }
                                     needs_repaint.store(true, Ordering::Release);
                                 }
                             }
@@ -1834,7 +1858,17 @@ impl Render for TerminalView {
                                         line_height,
                                         offset,
                                     ) {
+                                        // Only extend an in-progress drag selection.
+                                        // Word/line selections from double/triple click
+                                        // have `active == false` and should not be
+                                        // mutated by a subsequent drag — otherwise
+                                        // dragging after a double-click would
+                                        // collapse the word selection back to a
+                                        // single cell.
                                         if let Some(ref mut sel) = *selection.lock() {
+                                            if !sel.active {
+                                                return;
+                                            }
                                             sel.end_col = col;
                                             sel.end_row = row;
                                             needs_repaint.store(true, Ordering::Release);
@@ -1862,8 +1896,17 @@ impl Render for TerminalView {
                                     offset,
                                 ) {
                                     let sel_guard = selection.lock();
+                                    // Only apply the "click without drag → clear"
+                                    // logic to in-progress drag selections
+                                    // (`active == true`). Word/line selections
+                                    // from double/triple click have
+                                    // `active == false` and must survive the
+                                    // mouse-up even when start == up (e.g.
+                                    // double-clicking a single-character word).
                                     let clear = if let Some(ref sel) = *sel_guard {
-                                        sel.start_col == up_col && sel.start_row == up_row
+                                        sel.active
+                                            && sel.start_col == up_col
+                                            && sel.start_row == up_row
                                     } else {
                                         false
                                     };
