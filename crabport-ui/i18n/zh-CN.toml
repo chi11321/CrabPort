@@ -12,6 +12,9 @@ placeholder = "输入命令或搜索..."
 
 [panel]
 search = "搜索"
+run_tooltip = "运行"
+paste_tooltip = "粘贴"
+save_tooltip = "保存为代码片段"
 
 [new_connection]
 title = "新建连接"
@@ -319,3 +322,8 @@ select_all = "全选"
 window = "窗口"
 minimize = "最小化"
 zoom = "缩放"
+
+[history]
+saved_title = "已保存为代码片段"
+saved_msg = "已将「%{command}」保存到代码片段。"
+save_failed_title = "保存代码片段失败"
