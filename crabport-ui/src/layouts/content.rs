@@ -594,6 +594,7 @@ pub fn render_content(
             history_commands,
             history_on_paste,
             ctx.notifications.clone(),
+            ctx.tooltip.clone(),
             window,
             cx,
         );
@@ -627,7 +628,13 @@ pub fn render_content(
         None => (None, None),
     };
     snippets_panel.update(cx, |panel, cx| {
-        panel.set_state(snippets_on_run, snippets_on_paste, window, cx);
+        panel.set_state(
+            snippets_on_run,
+            snippets_on_paste,
+            ctx.tooltip.clone(),
+            window,
+            cx,
+        );
     });
 
     // ---- Host-key prompt ----

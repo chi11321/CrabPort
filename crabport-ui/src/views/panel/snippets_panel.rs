@@ -45,24 +45,14 @@ pub struct Snippet {
 
 /// Snippets panel view.
 pub struct SnippetsPanel {
-    /// Current snippet list, most-recently-created first. Reloaded from
-    /// the Store on each `set_state` call.
     snippets: Arc<Vec<Snippet>>,
-    /// Run callback — invoked with `command + "\r"` when the user clicks
-    /// the "run" button. Writes the command into the active terminal and
-    /// executes it immediately.
     on_run: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Paste callback — invoked with the command text (no Enter) so the
-    /// user can edit before running. Uses `write_raw` to avoid
-    /// re-capturing the text as history.
     on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Search input state (lazily initialized on the first `set_state`).
+    /// Global tooltip host for button hover tooltips.
+    tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
     search_input: Option<Entity<InputState>>,
-    /// Current search query. Updated via `InputEvent::Change` subscription.
     search_query: String,
-    /// Scroll handle for the virtual list + custom scrollbar.
     scroll_handle: VirtualListScrollHandle,
-    /// Per-row hover state, keyed by snippet index in the filtered list.
     hovered_row: Option<usize>,
 }
 
@@ -72,6 +62,7 @@ impl SnippetsPanel {
             snippets: Arc::new(Vec::new()),
             on_run: None,
             on_paste: None,
+            tooltip: None,
             search_input: None,
             search_query: String::new(),
             scroll_handle: VirtualListScrollHandle::new(),
@@ -88,6 +79,7 @@ impl SnippetsPanel {
         &mut self,
         on_run: Option<Rc<dyn Fn(String, &mut App)>>,
         on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
+        tooltip: Entity<crate::components::tooltip::TooltipController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -129,6 +121,7 @@ impl SnippetsPanel {
         self.snippets = new_snippets;
         self.on_run = on_run;
         self.on_paste = on_paste;
+        self.tooltip = Some(tooltip);
         if changed {
             cx.notify();
         }
@@ -167,6 +160,7 @@ impl Render for SnippetsPanel {
         let search_input = self.search_input.clone();
         let on_run = self.on_run.clone();
         let on_paste = self.on_paste.clone();
+        let tooltip = self.tooltip.clone();
         let scroll_handle = self.scroll_handle.clone();
 
         // Compute the filtered list + per-row data once per render.
@@ -197,6 +191,7 @@ impl Render for SnippetsPanel {
                 let filtered = &filtered_for_list;
                 let on_run = on_run.clone();
                 let on_paste = on_paste.clone();
+                let tooltip = tooltip.clone();
                 let entity = cx.entity().downgrade();
                 range
                     .map(|i| {
@@ -211,6 +206,7 @@ impl Render for SnippetsPanel {
                         // terminal, executing it immediately.
                         let cmd_for_run = cmd.clone();
                         let on_run_for_btn = on_run.clone();
+                        let tooltip_run = tooltip.clone();
                         let run_btn = div()
                             .id(ElementId::Name(format!("snippet-run-{i}").into()))
                             .flex()
@@ -219,18 +215,29 @@ impl Render for SnippetsPanel {
                             .size(px(20.0))
                             .rounded(px(4.0))
                             .bg(rgba(0x00000000))
-                            .tooltip(move |w, cx| {
-                                gpui_component::tooltip::Tooltip::new(
-                                    t!("panel.run_tooltip").to_string(),
-                                )
-                                .build(w, cx)
+                            .with_transition(ElementId::Name(format!("snippet-run-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_run {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.run_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
                             })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_run_for_btn.as_ref() {
                                     cb(cmd_for_run.clone(), cx);
                                 }
                             })
-                            .with_transition(ElementId::Name(format!("snippet-run-{i}").into()))
                             .transition_on_hover(
                                 Duration::from_millis(100),
                                 Linear,
@@ -254,6 +261,7 @@ impl Render for SnippetsPanel {
                         // `write_raw` to avoid re-capturing as history.
                         let cmd_for_paste = cmd.clone();
                         let on_paste_for_btn = on_paste.clone();
+                        let tooltip_paste = tooltip.clone();
                         let paste_btn = div()
                             .id(ElementId::Name(format!("snippet-paste-{i}").into()))
                             .flex()
@@ -262,18 +270,29 @@ impl Render for SnippetsPanel {
                             .size(px(20.0))
                             .rounded(px(4.0))
                             .bg(rgba(0x00000000))
-                            .tooltip(move |w, cx| {
-                                gpui_component::tooltip::Tooltip::new(
-                                    t!("panel.paste_tooltip").to_string(),
-                                )
-                                .build(w, cx)
+                            .with_transition(ElementId::Name(format!("snippet-paste-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_paste {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.paste_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
                             })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
                             })
-                            .with_transition(ElementId::Name(format!("snippet-paste-{i}").into()))
                             .transition_on_hover(
                                 Duration::from_millis(100),
                                 Linear,

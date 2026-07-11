@@ -52,25 +52,14 @@ pub struct HistoryCommand {
 
 /// History-command panel view.
 pub struct HistoryCommandPanel {
-    /// Current history list, most-recent-first. Pushed in via `set_state`.
     history: Arc<Vec<HistoryCommand>>,
-    /// Paste callback — invoked with the command text when the user clicks
-    /// the "paste" button. Writes the command into the active terminal's
-    /// input line **without** re-capturing it as history (see
-    /// [`crate::views::terminal::TerminalView::write_raw`]).
     on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Global notification host, used to show a toast after saving a
-    /// command as a snippet.
     notifications: Option<Entity<crate::components::notification::NotificationController>>,
-    /// Search input state (lazily initialized on the first `set_state`).
+    /// Global tooltip host for button hover tooltips.
+    tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
     search_input: Option<Entity<InputState>>,
-    /// Current search query. Updated via `InputEvent::Change` subscription.
     search_query: String,
-    /// Scroll handle for the virtual list + custom scrollbar.
     scroll_handle: VirtualListScrollHandle,
-    /// Per-row hover state. Keyed by command index (the position in the
-    /// *filtered* list for the current render). Used to drive the
-    /// copy/paste buttons' fade-in transition.
     hovered_row: Option<usize>,
 }
 
@@ -80,6 +69,7 @@ impl HistoryCommandPanel {
             history: Arc::new(Vec::new()),
             on_paste: None,
             notifications: None,
+            tooltip: None,
             search_input: None,
             search_query: String::new(),
             scroll_handle: VirtualListScrollHandle::new(),
@@ -96,6 +86,7 @@ impl HistoryCommandPanel {
         history: Arc<Vec<HistoryCommand>>,
         on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
         notifications: Entity<crate::components::notification::NotificationController>,
+        tooltip: Entity<crate::components::tooltip::TooltipController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -122,6 +113,7 @@ impl HistoryCommandPanel {
         self.history = history;
         self.on_paste = on_paste;
         self.notifications = Some(notifications);
+        self.tooltip = Some(tooltip);
         if history_changed {
             // History changed (e.g. user ran a new command) — the filtered
             // list may grow, so a repaint is needed.
@@ -161,6 +153,7 @@ impl Render for HistoryCommandPanel {
         let search_input = self.search_input.clone();
         let on_paste = self.on_paste.clone();
         let notifications = self.notifications.clone();
+        let tooltip = self.tooltip.clone();
         let scroll_handle = self.scroll_handle.clone();
 
         // Compute the filtered list + per-row data once per render.
@@ -191,6 +184,8 @@ impl Render for HistoryCommandPanel {
                 let filtered = &filtered_for_list;
                 let on_paste = on_paste.clone();
                 let entity = cx.entity().downgrade();
+                let notifications = notifications.clone();
+                let tooltip = tooltip.clone();
                 range
                     .map(|i| {
                         let h = &filtered[i];
@@ -204,6 +199,7 @@ impl Render for HistoryCommandPanel {
                         // Snippets panel and survives restarts.
                         let cmd_for_save = cmd.clone();
                         let notifications = notifications.clone();
+                        let tooltip_save = tooltip.clone();
                         let save_btn = div()
                             .id(ElementId::Name(format!("history-save-{i}").into()))
                             .flex()
@@ -212,13 +208,24 @@ impl Render for HistoryCommandPanel {
                             .size(px(20.0))
                             .rounded(px(4.0))
                             .bg(rgba(0x00000000))
-                            .tooltip(move |w, cx| {
-                                gpui_component::tooltip::Tooltip::new(
-                                    t!("panel.save_tooltip").to_string(),
-                                )
-                                .build(w, cx)
-                            })
                             .with_transition(ElementId::Name(format!("history-save-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_save {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.save_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
                             .transition_on_hover(
                                 std::time::Duration::from_millis(100),
                                 Linear,
@@ -267,6 +274,7 @@ impl Render for HistoryCommandPanel {
                         // edit before running).
                         let cmd_for_paste = cmd.clone();
                         let on_paste_for_btn = on_paste.clone();
+                        let tooltip_paste = tooltip.clone();
                         let paste_btn = div()
                             .id(ElementId::Name(format!("history-paste-{i}").into()))
                             .flex()
@@ -275,13 +283,24 @@ impl Render for HistoryCommandPanel {
                             .size(px(20.0))
                             .rounded(px(4.0))
                             .bg(rgba(0x00000000))
-                            .tooltip(move |w, cx| {
-                                gpui_component::tooltip::Tooltip::new(
-                                    t!("panel.paste_tooltip").to_string(),
-                                )
-                                .build(w, cx)
-                            })
                             .with_transition(ElementId::Name(format!("history-paste-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_paste {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.paste_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
                             .transition_on_hover(
                                 std::time::Duration::from_millis(100),
                                 Linear,
