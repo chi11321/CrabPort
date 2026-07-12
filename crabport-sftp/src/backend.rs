@@ -58,13 +58,26 @@ impl CrabPortSftp for SftpBackend {
         Ok(())
     }
 
-    async fn read_dir(&self, remote_path: &str) -> Result<Vec<(String, bool)>> {
+    async fn read_dir(&self, remote_path: &str) -> Result<Vec<crate::FileEntry>> {
         let entries = self.session.read_dir(remote_path).await?;
         let mut result = Vec::new();
         for entry in entries {
             let name = entry.file_name();
-            let is_dir = entry.file_type().is_dir();
-            result.push((name, is_dir));
+            let metadata = entry.metadata();
+            let is_dir = metadata.is_dir();
+            let size = metadata.size;
+            let permissions = metadata
+                .permissions
+                .map(|mode| russh_sftp::protocol::FilePermissions::from(mode).to_string());
+            // mtime is u32 seconds since epoch; convert to i64.
+            let modified = metadata.mtime.map(|t| t as i64);
+            result.push(crate::FileEntry {
+                name,
+                is_dir,
+                size,
+                permissions,
+                modified,
+            });
         }
         Ok(result)
     }

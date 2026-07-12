@@ -72,7 +72,7 @@ pub struct SftpPanel {
     /// Current working directory, shown as the input's default value.
     cwd: Option<Arc<String>>,
     /// Current directory entries.
-    entries: Arc<Vec<(String, bool)>>,
+    entries: Arc<Vec<crabport_sftp::FileEntry>>,
     /// Navigate callback — invoked with the typed path on Enter.
     on_navigate: Option<Rc<dyn Fn(String, &mut App)>>,
     /// The tab id whose state is currently reflected in the input.
@@ -159,7 +159,7 @@ impl SftpPanel {
     /// Called by the content layout each render.
     pub fn set_state(
         &mut self,
-        entries: Arc<Vec<(String, bool)>>,
+        entries: Arc<Vec<crabport_sftp::FileEntry>>,
         cwd: Option<Arc<String>>,
         on_navigate: Option<Rc<dyn Fn(String, &mut App)>>,
         on_download: Option<Rc<dyn Fn(String, String, &mut App)>>,
@@ -282,9 +282,9 @@ impl SftpPanel {
             let prev = self
                 .entries
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|e| e.name.as_str())
                 .collect::<Vec<_>>();
-            let next = entries.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>();
+            let next = entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>();
             prev != next
         };
         self.entries = entries;
@@ -402,17 +402,23 @@ impl SftpPanel {
 impl Render for SftpPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Sort entries alphabetically, directories first
-        let mut sorted: Vec<(String, bool)> = self.entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
+        let mut sorted: Vec<crabport_sftp::FileEntry> = self.entries.iter().cloned().collect();
+        sorted.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
             (".", _) => std::cmp::Ordering::Less,
             (_, ".") => std::cmp::Ordering::Greater,
             ("..", _) => std::cmp::Ordering::Less,
             (_, "..") => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
 
         // Prepend .. entry
-        let mut all_entries: Vec<(String, bool)> = vec![("..".into(), true)];
+        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
+            name: "..".into(),
+            is_dir: true,
+            size: None,
+            permissions: None,
+            modified: None,
+        }];
         all_entries.extend(sorted);
 
         let path_input = self.path_input.clone();
@@ -630,9 +636,9 @@ impl Render for SftpPanel {
                                 let all_entries = &all_entries;
                                 range
                                     .map(|i| {
-                                        let (name, is_dir) = &all_entries[i];
-                                        let name = name.clone();
-                                        let is_dir = *is_dir;
+                                        let entry = &all_entries[i];
+                                        let name = entry.name.clone();
+                                        let is_dir = entry.is_dir;
                                         let icon_path = if is_dir {
                                             "icons/folder.svg"
                                         } else {
@@ -809,18 +815,18 @@ impl Render for SftpPanel {
                                                                 .unwrap_or("/");
                                                             view.entries
                                                                 .iter()
-                                                                .filter(|(n, _)| {
-                                                                    n != "."
-                                                                        && n != ".."
-                                                                        && view.selected.contains(n.as_str())
+                                                                .filter(|e| {
+                                                                    e.name != "."
+                                                                        && e.name != ".."
+                                                                        && view.selected.contains(e.name.as_str())
                                                                 })
-                                                                .map(|(n, d)| {
+                                                                .map(|e| {
                                                                     let p = if cwd_str.ends_with('/') {
-                                                                        format!("{}{}", cwd_str, n)
+                                                                        format!("{}{}", cwd_str, e.name)
                                                                     } else {
-                                                                        format!("{}/{}", cwd_str, n)
+                                                                        format!("{}/{}", cwd_str, e.name)
                                                                     };
-                                                                    (n.clone(), *d, p)
+                                                                    (e.name.clone(), e.is_dir, p)
                                                                 })
                                                                 .collect()
                                                         })
@@ -1431,14 +1437,14 @@ fn trigger_download_from_button(
         let cwd_str = view.cwd.as_ref().map(|s| s.as_str()).unwrap_or("/");
         view.entries
             .iter()
-            .filter(|(n, _)| n != "." && n != ".." && view.selected.contains(n.as_str()))
-            .map(|(n, d)| {
+            .filter(|e| e.name != "." && e.name != ".." && view.selected.contains(e.name.as_str()))
+            .map(|e| {
                 let p = if cwd_str.ends_with('/') {
-                    format!("{}{}", cwd_str, n)
+                    format!("{}{}", cwd_str, e.name)
                 } else {
-                    format!("{}/{}", cwd_str, n)
+                    format!("{}/{}", cwd_str, e.name)
                 };
-                (n.clone(), *d, p)
+                (e.name.clone(), e.is_dir, p)
             })
             .collect::<Vec<_>>()
     });

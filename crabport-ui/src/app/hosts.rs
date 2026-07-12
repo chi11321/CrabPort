@@ -8,6 +8,7 @@ use gpui::*;
 use rust_i18n::t;
 
 use crate::app_state::AppState;
+use crate::components::host_selector::PanelSide;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
@@ -120,6 +121,29 @@ impl CrabportApp {
                 );
             }
         }
+    }
+
+    /// Switch the SFTP tab's right panel to a different host (or Local).
+    /// Activates the SFTP tab (id=1) first, then calls
+    /// `switch_panel_host` on the shared `SftpTabView`. If the right panel
+    /// is already connected to the same host, just jumps to the SFTP tab.
+    pub fn switch_sftp_panel_host(
+        &mut self,
+        host_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(1);
+        let sftp_view = self.sftp_view.clone();
+        sftp_view.update(cx, |view, cx| {
+            // If the right panel is already connected to this host, just
+            // jump to the SFTP tab (already activated above). Otherwise,
+            // connect.
+            let already_connected = view.is_panel_connected_to(PanelSide::Right, host_id, cx);
+            if !already_connected {
+                view.switch_panel_host(PanelSide::Right, Some(host_id), window, cx);
+            }
+        });
     }
 
     // -----------------------------------------------------------------------

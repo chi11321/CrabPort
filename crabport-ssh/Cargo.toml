@@ -18,3 +18,5 @@ anyhow = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 dirs = "6"
+tar = "0.4"
+flate2 = "1"

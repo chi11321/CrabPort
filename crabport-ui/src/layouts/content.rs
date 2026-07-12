@@ -11,7 +11,7 @@ use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::layouts::terminal_toolbar::render_terminal_toolbar;
+use crate::layouts::toolbar::render_terminal_toolbar;
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
@@ -41,6 +41,7 @@ pub fn render_content(
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     split_trees: &HashMap<u64, crate::views::terminal::split::SplitTree>,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
+    sftp_view: &Entity<crate::views::sftp::SftpTabView>,
     hosts: &[ConnectionHost],
     form_entity: Option<&ConnectionFormState>,
     // Active panel pane the user last selected (semantic identity, not a
@@ -111,6 +112,12 @@ pub fn render_content(
                             app.connect_to_host(host_id, cx);
                         });
                     };
+                    let app_handle_sftp = handle.clone();
+                    let on_sftp_connect = move |host_id: i64, w: &mut Window, cx: &mut App| {
+                        app_handle_sftp.update(cx, |app, cx| {
+                            app.switch_sftp_panel_host(host_id, w, cx);
+                        });
+                    };
                     let app_handle_edit = handle.clone();
                     let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
                         app_handle_edit.update(cx, |app, cx| {
@@ -126,6 +133,8 @@ pub fn render_content(
 
                     let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
                     let on_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_connect);
+                    let on_sftp_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> =
+                        Rc::new(on_sftp_connect);
                     let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
                     let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
 
@@ -135,6 +144,7 @@ pub fn render_content(
                             form_entity.cloned(),
                             Some(on_new_rc),
                             Some(on_connect_rc),
+                            Some(on_sftp_connect_rc),
                             Some(on_edit_rc),
                             Some(on_remove_rc),
                             context_menu.clone(),
@@ -396,6 +406,24 @@ pub fn render_content(
                     .into_any_element()
             }
         }
+        Some(TabKind::Sftp) => {
+            // Full-screen dual-panel SFTP file browser tab.
+            //
+            // The SftpTabView owns its own TerminalView entities (one per
+            // remote panel). Host switching happens in-place — no new tabs.
+            sftp_view.update(cx, |view, cx| {
+                view.set_state(
+                    context_menu.clone(),
+                    alert_controller.clone(),
+                    ctx.tooltip.clone(),
+                    hosts.to_vec(),
+                    handle.clone(),
+                    window,
+                    cx,
+                );
+            });
+            sftp_view.clone().into_any_element()
+        }
         None => div()
             .size_full()
             .flex()
@@ -408,9 +436,17 @@ pub fn render_content(
     let is_terminal = active_tab
         .map(|t| t.kind == TabKind::Terminal)
         .unwrap_or(false);
+    let is_sftp_tab = active_tab.map(|t| t.kind == TabKind::Sftp).unwrap_or(false);
 
-    // Read monitor status & metrics from the active TerminalView's backend
-    let sftp_term = terminal_entity(is_terminal, active_tab, terminal_views);
+    // Read monitor status & metrics from the active TerminalView's backend.
+    // For terminal tabs this comes from `terminal_views`; SFTP tabs manage
+    // their own terminal entities internally so there's no single terminal
+    // entity to read here.
+    let sftp_term = if is_terminal {
+        terminal_entity(is_terminal, active_tab, terminal_views)
+    } else {
+        None
+    };
     let (status, metrics, sftp_progress) = match &sftp_term {
         Some(entity) => entity.read_with(cx, |view, _cx| {
             let (status, metrics) = if let Some(m) = view.monitor() {
@@ -429,14 +465,21 @@ pub fn render_content(
         None => (
             crabport_terminal::terminal::RemoteStatus::Local,
             crabport_terminal::terminal::RemoteMetrics::default(),
-            None,
+            // SFTP tab: read progress from whichever of the tab's two
+            // panels has an active transfer. This keeps the shared
+            // toolbar's animation alive across terminal ↔ SFTP switches.
+            if is_sftp_tab {
+                sftp_view.read_with(cx, |v, _cx| v.sftp_progress(cx))
+            } else {
+                None
+            },
         ),
     };
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.
     let (sftp_entries, sftp_cwd): (
-        std::sync::Arc<Vec<(String, bool)>>,
+        std::sync::Arc<Vec<crabport_sftp::FileEntry>>,
         Option<std::sync::Arc<String>>,
     ) = match &sftp_term {
         Some(entity) => entity.read_with(cx, |view, _cx| {

@@ -18,8 +18,8 @@ pub trait CrabPortSftp: Send + Sync {
     /// Delete a remote file.
     async fn remove_file(&self, remote_path: &str) -> Result<()>;
 
-    /// List directory entries. Returns a vec of (name, is_dir).
-    async fn read_dir(&self, remote_path: &str) -> Result<Vec<(String, bool)>>;
+    /// List directory entries. Returns a vec of [`crate::FileEntry`].
+    async fn read_dir(&self, remote_path: &str) -> Result<Vec<crate::FileEntry>>;
 
     /// Create a directory on the remote host.
     async fn create_dir(&self, remote_path: &str) -> Result<()>;

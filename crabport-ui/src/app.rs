@@ -29,6 +29,7 @@ use crate::layouts::sidebar::render_sidebar;
 use crate::views::groups::GroupFormState;
 use crate::views::sessions::ConnectionFormState;
 use crate::views::sessions::ConnectionHost;
+use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
 
@@ -64,6 +65,7 @@ pub struct Tab {
 pub enum TabKind {
     Home,
     Terminal,
+    Sftp,
 }
 
 pub struct CrabportApp {
@@ -73,6 +75,9 @@ pub struct CrabportApp {
     pub hovered_tab_id: Option<u64>,
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
+    /// Single persistent SFTP tab view (id=1). Both left and right panels
+    /// can independently connect to local or remote hosts.
+    pub sftp_view: Entity<SftpTabView>,
     /// Per-tab split layout. Each terminal tab owns a [`SplitTree`] describing
     /// how its panes are arranged. Absent for non-terminal tabs and terminal
     /// tabs that haven't been split (a single pane is still tracked here so
@@ -184,6 +189,15 @@ impl CrabportApp {
             kind: TabKind::Home,
             is_remote: false,
         };
+        let sftp_tab = Tab {
+            id: 1,
+            title: "SFTP".into(),
+            kind: TabKind::Sftp,
+            is_remote: false,
+        };
+
+        // Create the persistent SftpTabView (both panels start as Local).
+        let sftp_view = cx.new(|_cx| SftpTabView::new());
 
         // ---- Construct shared entities (all live in `AppCtx`) ----
         let command_palette = cx.new(|cx| CommandView::new(window, cx));
@@ -262,11 +276,12 @@ impl CrabportApp {
 
         Self {
             sidebar_item: SidebarItem::Sessions,
-            tabs: vec![home_tab],
+            tabs: vec![home_tab, sftp_tab],
             active_tab_id: 0,
             hovered_tab_id: None,
-            next_tab_id: 1,
+            next_tab_id: 2,
             terminal_views: HashMap::new(),
+            sftp_view,
             split_trees: HashMap::new(),
             pane_views: HashMap::new(),
             next_pane_id: 1,
@@ -322,6 +337,12 @@ impl CrabportApp {
                         ConnectionType::LocalTerminal => {
                             a.update(cx, |app, cx| {
                                 app.add_tab(cx);
+                            });
+                        }
+                        ConnectionType::SFTP => {
+                            a.update(cx, |app, cx| {
+                                app.activate_tab(1);
+                                cx.notify();
                             });
                         }
                         _ => {
@@ -412,6 +433,7 @@ impl Render for CrabportApp {
             &self.terminal_views,
             &self.split_trees,
             &self.pane_views,
+            &self.sftp_view,
             &self.hosts,
             self.connection_form.as_ref(),
             panel_active_tab,

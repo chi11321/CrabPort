@@ -39,7 +39,7 @@ impl CrabPortTerminal for SshBackend {
         true
     }
 
-    fn sftp_entries(&self) -> Option<Arc<Vec<(String, bool)>>> {
+    fn sftp_entries(&self) -> Option<Arc<Vec<crabport_sftp::FileEntry>>> {
         self.sftp_entries.read().clone()
     }
 
@@ -158,6 +158,30 @@ impl CrabPortTerminal for SshBackend {
         });
     }
 
+    fn sftp_upload_batch(&self, items: &[(String, String)]) {
+        let backend = SftpTransferHandle {
+            handle: self.handle.clone(),
+            sftp_session: self.sftp_session.clone(),
+            event_tx: Some(self.event_tx.clone()),
+        };
+        let event_tx = self.event_tx.clone();
+        let items = items.to_vec();
+        self.spawn_transfer(async move {
+            let result = crate::transfer::sftp_upload_batch_impl(&backend, &items).await;
+            let (success, message) = match result {
+                Ok(()) => (true, format!("uploaded {} files", items.len())),
+                Err(e) => (false, format!("batch upload failed: {e}")),
+            };
+            let _ = event_tx
+                .broadcast(BackendEvent::SftpTransferFinished {
+                    kind: SftpTransferKind::Upload,
+                    success,
+                    message,
+                })
+                .await;
+        });
+    }
+
     fn sftp_delete(&self, remote_path: &str) {
         // Reuse the SftpTransferHandle so we get the cached session + event
         // sink. There's no actual transfer, but we emit a `SftpTransferFinished`
@@ -179,7 +203,7 @@ impl CrabPortTerminal for SshBackend {
             };
             let _ = event_tx
                 .broadcast(BackendEvent::SftpTransferFinished {
-                    kind: SftpTransferKind::Download,
+                    kind: SftpTransferKind::Delete,
                     success,
                     message,
                 })
