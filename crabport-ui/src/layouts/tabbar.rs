@@ -74,7 +74,7 @@ pub fn render_tab_bar(
                                 app.activate_tab(tab_id);
                             });
                         });
-                    if !is_home_tab {
+                    if !is_home_tab && tab.kind != TabKind::Sftp {
                         let tab_id = tab.id;
                         let on_close = on_close.clone();
                         btn = btn.on_close(move |w, cx| {

@@ -97,7 +97,7 @@ pub struct SshBackend {
     pub(crate) monitor: Arc<RwLock<MonitorState>>,
     pub(crate) _on_status: Arc<dyn Fn(String) + Send + Sync>,
     pub(crate) handle: Arc<TokioMutex<Option<Arc<TokioMutex<client::Handle<SshHandler>>>>>>,
-    pub(crate) sftp_entries: Arc<RwLock<Option<Arc<Vec<(String, bool)>>>>>,
+    pub(crate) sftp_entries: Arc<RwLock<Option<Arc<Vec<crabport_sftp::FileEntry>>>>>,
     pub(crate) sftp_cwd: Arc<RwLock<Option<Arc<String>>>>,
     /// Cached SFTP subsystem session. Reused across navigations so we don't
     /// pay the cost of opening a fresh SFTP channel (and leaking the old
@@ -141,7 +141,7 @@ impl SshBackend {
         let handle: Arc<TokioMutex<Option<Arc<TokioMutex<client::Handle<SshHandler>>>>>> =
             Arc::new(TokioMutex::new(None));
 
-        let sftp_entries: Arc<RwLock<Option<Arc<Vec<(String, bool)>>>>> =
+        let sftp_entries: Arc<RwLock<Option<Arc<Vec<crabport_sftp::FileEntry>>>>> =
             Arc::new(RwLock::new(None));
         let sftp_entries2 = sftp_entries.clone();
         let sftp_cwd: Arc<RwLock<Option<Arc<String>>>> = Arc::new(RwLock::new(None));

@@ -18,5 +18,6 @@ gpui-component = "0.5"
 rust-i18n = "3"
 lru = "0.12"
 rustc-hash = "2"
+dirs = "6"
 tokio = { version = "1", features = ["sync"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

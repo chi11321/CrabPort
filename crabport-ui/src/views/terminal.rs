@@ -367,6 +367,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
+                            crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -604,7 +605,7 @@ impl TerminalView {
         self.host_id
     }
 
-    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         self.session.sftp_entries()
     }
 
@@ -622,6 +623,13 @@ impl TerminalView {
 
     pub fn sftp_upload(&self, local_path: &str, remote_path: &str) {
         self.session.sftp_upload(local_path, remote_path);
+    }
+
+    /// Upload multiple files in a single batch transfer. Falls back to
+    /// per-file upload if the remote doesn't support tar. Completion is
+    /// reported via the backend's event stream.
+    pub fn sftp_upload_batch(&self, items: &[(String, String)]) {
+        self.backend.sftp_upload_batch(items);
     }
 
     /// Snapshot of this session's command history, most-recent-first.
@@ -907,6 +915,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
+                            crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         let _ = entity.update(cx, |this, cx| {

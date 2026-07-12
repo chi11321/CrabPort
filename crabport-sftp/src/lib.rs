@@ -7,7 +7,9 @@
 mod api;
 mod archive;
 mod backend;
+mod entry;
 mod transfer;
 
 pub use api::CrabPortSftp;
 pub use backend::SftpBackend;
+pub use entry::FileEntry;

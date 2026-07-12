@@ -72,6 +72,9 @@ pub enum SftpTransferKind {
     /// "Open in editor": download → local edit → re-upload on save. Success
     /// is silent; only upload failures surface a notification.
     Edit,
+    /// Delete a remote file or directory. Success shows "deleted";
+    /// failure shows "delete failed".
+    Delete,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -134,7 +137,7 @@ pub trait CrabPortTerminal: Send + Sync {
     }
 
     /// Current SFTP directory entries. Returns None if not yet loaded.
-    fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         None
     }
 
@@ -159,6 +162,11 @@ pub trait CrabPortTerminal: Send + Sync {
     /// (see `SshBackend::sftp_upload`). Completion is reported via
     /// [`BackendEvent::SftpTransferFinished`].
     fn sftp_upload(&self, _local_path: &str, _remote_path: &str) {}
+
+    /// Upload multiple files in a single batch. Falls back to per-file upload
+    /// if the remote doesn't support tar. Completion is reported via
+    /// [`BackendEvent::SftpTransferFinished`] for the batch.
+    fn sftp_upload_batch(&self, _items: &[(String, String)]) {}
 
     /// Delete a remote file or directory at `remote_path`. The backend
     /// stats the path to decide between `remove_file` and `remove_dir`.
@@ -663,7 +671,7 @@ impl TerminalSession {
         self.backend.allow_tunnels()
     }
 
-    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         self.backend.sftp_entries()
     }
 
@@ -687,6 +695,13 @@ impl TerminalSession {
     /// `BackendEvent::SftpTransferFinished`.
     pub fn sftp_upload(&self, local_path: &str, remote_path: &str) {
         self.backend.sftp_upload(local_path, remote_path);
+    }
+
+    /// Upload multiple files in a single batch transfer.
+    /// Completion is reported via the backend's event stream as
+    /// `BackendEvent::SftpTransferFinished`.
+    pub fn sftp_upload_batch(&self, items: &[(String, String)]) {
+        self.backend.sftp_upload_batch(items);
     }
 
     /// Delete a remote file or directory.

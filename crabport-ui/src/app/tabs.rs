@@ -123,6 +123,20 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        (SftpTransferKind::Delete, true) => (
+                            t!("sftp.notif_delete_done_title").to_string(),
+                            t!("sftp.notif_delete_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Delete, false) => (
+                            t!("sftp.notif_delete_failed_title").to_string(),
+                            t!("sftp.notif_delete_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -306,6 +320,20 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        (SftpTransferKind::Delete, true) => (
+                            t!("sftp.notif_delete_done_title").to_string(),
+                            t!("sftp.notif_delete_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Delete, false) => (
+                            t!("sftp.notif_delete_failed_title").to_string(),
+                            t!("sftp.notif_delete_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -438,7 +466,8 @@ impl CrabportApp {
     }
 
     pub fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
-        if id == 0 {
+        if id == 0 || id == 1 {
+            // Home and SFTP tabs are permanent — never closeable.
             return;
         }
 

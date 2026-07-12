@@ -6,10 +6,12 @@ mod path;
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{BackendEvent, SftpTransferKind, SftpTransferStage};
 
+use crate::monitor::exec_with_status;
+use dir::RemoteCommandNotFound;
 pub(crate) use dir::{sftp_download_dir_impl, sftp_upload_dir_impl};
 pub(crate) use file::{sftp_download_file_impl, sftp_upload_file_impl};
 pub(crate) use handle::SftpTransferHandle;
-use path::join_remote_path;
+use path::{join_remote_path, remote_tmp_path, shell_quote, split_parent_basename};
 
 /// Download `remote_path` into `local_path`.
 ///
@@ -70,6 +72,191 @@ pub(crate) async fn sftp_upload_impl(
     } else {
         sftp_upload_file_impl(backend, local_path, remote_path).await
     }
+}
+
+/// Upload multiple local files to the remote in a single tar.gz transfer.
+///
+/// Steps:
+///   1. Check if remote has `tar` (exec `which tar`).
+///   2. If tar is available:
+///      a. Create a local tmp tar.gz containing all the files.
+///      b. Upload the tar.gz to a remote tmp path.
+///      c. Extract on the remote: `tar xzf tmp -C <dest_parent>` for each file.
+///      d. Clean up remote tmp.
+///   3. If tar is NOT available, fall back to per-file `sftp_upload_impl`.
+pub(crate) async fn sftp_upload_batch_impl(
+    backend: &SftpTransferHandle,
+    items: &[(String, String)],
+) -> anyhow::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    // Check if remote has `tar` available.
+    let tar_available = check_remote_tar(backend).await;
+
+    if !tar_available {
+        tracing::warn!(
+            "SFTP batch upload: remote tar unavailable, falling back to per-file upload"
+        );
+        for (local_path, remote_path) in items {
+            sftp_upload_impl(backend, local_path, remote_path).await?;
+        }
+        return Ok(());
+    }
+
+    sftp_upload_batch_via_tar(backend, items).await
+}
+
+/// Check if the remote has `tar` available by exec'ing `which tar`.
+/// Returns `true` if tar is found (exit 0), `false` otherwise.
+async fn check_remote_tar(backend: &SftpTransferHandle) -> bool {
+    let handle_guard = backend.handle.lock().await;
+    let Some(shared) = handle_guard.as_ref() else {
+        return false;
+    };
+    let shared = shared.clone();
+    drop(handle_guard);
+    let h = shared.lock().await;
+    let (code, _out) = exec_with_status(&h, "which tar").await;
+    code == 0
+}
+
+/// Batch upload via client `tar+gz` + remote `tar xzf`.
+///
+/// All files are packed into a single local tar.gz (each entry named with
+/// its remote basename), uploaded once via `upload_file`, then extracted
+/// remotely with `tar xzf tmp -C <remote_parent>`.
+async fn sftp_upload_batch_via_tar(
+    backend: &SftpTransferHandle,
+    items: &[(String, String)],
+) -> anyhow::Result<()> {
+    // All items share the same remote parent (the remote cwd). Extract the
+    // parent from the first item's remote_path.
+    let (remote_parent, _) = split_parent_basename(&items[0].1)?;
+    let remote_tmp = remote_tmp_path();
+
+    // 1. Build a local tmp tar.gz containing all files, each named with its
+    //    remote basename so `tar xzf` places them correctly.
+    backend
+        .emit_progress(
+            SftpTransferKind::Upload,
+            SftpTransferStage::Compress,
+            format!("batch upload ({} files)", items.len()),
+        )
+        .await;
+
+    let local_tmp = build_batch_tar_gz(items)?;
+
+    // 2. Upload the tar.gz via `upload_file` (data is already compressed,
+    //    so no `upload_file_gz`).
+    let total = std::fs::metadata(&local_tmp).map(|m| m.len()).unwrap_or(0);
+    let progress_cb = backend.make_byte_progress_cb(
+        SftpTransferKind::Upload,
+        SftpTransferStage::Transfer,
+        format!("batch upload ({} files)", items.len()),
+        total,
+    );
+    progress_cb(0);
+    let s = backend.take_or_open_sftp().await?;
+    let local_tmp_str = local_tmp.to_string_lossy().into_owned();
+    let res = s
+        .upload_file(&local_tmp_str, &remote_tmp, Some(progress_cb))
+        .await;
+    backend.return_sftp(s, res).await?;
+
+    // 3. Extract on the remote.
+    backend
+        .emit_progress(
+            SftpTransferKind::Upload,
+            SftpTransferStage::Decompress,
+            &remote_parent,
+        )
+        .await;
+    let handle_guard = backend.handle.lock().await;
+    let shared = handle_guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("SSH handle not available"))?
+        .clone();
+    drop(handle_guard);
+    let h = shared.lock().await;
+
+    let cmd = format!(
+        "mkdir -p {parent_q} && tar xzf {tmp_q} -C {parent_q} && rm -f -- {tmp_q} && printf ok",
+        parent_q = shell_quote(&remote_parent),
+        tmp_q = shell_quote(&remote_tmp),
+    );
+    let (code, out) = exec_with_status(&h, &cmd).await;
+    if code == 127 {
+        // Best-effort cleanup of the tmp file before falling back.
+        backend
+            .emit_progress(
+                SftpTransferKind::Upload,
+                SftpTransferStage::CleanUp,
+                &remote_tmp,
+            )
+            .await;
+        let _ = exec_with_status(&h, &format!("rm -f -- {}", shell_quote(&remote_tmp))).await;
+        return Err(RemoteCommandNotFound(out).into());
+    }
+    if code != 0 || !out.ends_with("ok") {
+        backend
+            .emit_progress(
+                SftpTransferKind::Upload,
+                SftpTransferStage::CleanUp,
+                &remote_tmp,
+            )
+            .await;
+        let _ = exec_with_status(&h, &format!("rm -f -- {}", shell_quote(&remote_tmp))).await;
+        return Err(anyhow::anyhow!(
+            "remote tar xzf failed (exit {code}): {out}"
+        ));
+    }
+
+    // 4. Clean up the local tmp file.
+    let _ = std::fs::remove_file(&local_tmp);
+    Ok(())
+}
+
+/// Build a local tar.gz containing multiple files from different local
+/// paths. Each entry is named with its remote basename so that `tar xzf`
+/// extracts them into the correct destination filenames.
+fn build_batch_tar_gz(items: &[(String, String)]) -> anyhow::Result<std::path::PathBuf> {
+    // Generate a unique local tmp path.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let token = nanos ^ ((pid as u64) << 32) ^ (n << 16);
+    let tmp = std::env::temp_dir().join(format!("crabport-batch-{token:016x}.tar.gz"));
+
+    let file = std::fs::File::create(&tmp)?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+
+    for (local_path, remote_path) in items {
+        let local = std::path::Path::new(local_path);
+        let basename = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+
+        let meta = std::fs::metadata(local)?;
+        if meta.is_dir() {
+            builder.append_dir_all(&basename, local)?;
+        } else {
+            let mut f = std::fs::File::open(local)?;
+            builder.append_file(&basename, &mut f)?;
+        }
+    }
+
+    let encoder = builder.into_inner()?;
+    encoder.finish()?;
+    Ok(tmp)
 }
 
 /// Delete a remote file or directory. Stats the path first to choose
@@ -335,12 +522,12 @@ async fn sftp_delete_dir_recursive(
         }
     };
 
-    for (name, is_dir) in entries {
-        if name == "." || name == ".." {
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
             continue;
         }
-        let child = join_remote_path(remote_path, &name);
-        if is_dir {
+        let child = join_remote_path(remote_path, &entry.name);
+        if entry.is_dir {
             Box::pin(sftp_delete_dir_recursive(backend, &child)).await?;
         } else {
             let s = backend.take_or_open_sftp().await?;

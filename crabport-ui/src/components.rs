@@ -4,6 +4,7 @@ pub mod dialog;
 pub mod drop_zone_overlay;
 pub mod dropdown;
 pub mod group_header;
+pub mod host_selector;
 pub mod input;
 pub mod notification;
 pub mod number_input;

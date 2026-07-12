@@ -82,6 +82,9 @@ pub struct SessionsView {
     // Callbacks
     on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    /// Connect to a host in SFTP-only mode (right-click → "Connect via SFTP").
+    /// Only called for SSH hosts.
+    on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Per-group collapse state for the grouped list.
@@ -102,6 +105,7 @@ impl SessionsView {
             alert_controller: None,
             on_new: None,
             on_connect: None,
+            on_sftp_connect: None,
             on_edit: None,
             on_remove: None,
             collapsed_groups: HashSet::new(),
@@ -116,6 +120,7 @@ impl SessionsView {
         form_state: Option<ConnectionFormState>,
         on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
         on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+        on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         context_menu: Entity<ContextMenuController>,
@@ -132,6 +137,7 @@ impl SessionsView {
         self.form_state = form_state;
         self.on_new = on_new;
         self.on_connect = on_connect;
+        self.on_sftp_connect = on_sftp_connect;
         self.on_edit = on_edit;
         self.on_remove = on_remove;
         self.context_menu = Some(context_menu);
@@ -175,6 +181,7 @@ impl Render for SessionsView {
         let app = self.app.clone();
         let on_new = self.on_new.clone();
         let on_connect = self.on_connect.clone();
+        let on_sftp_connect = self.on_sftp_connect.clone();
         let on_edit = self.on_edit.clone();
         let on_remove = self.on_remove.clone();
         let context_menu = self.context_menu.clone();
@@ -285,6 +292,7 @@ impl Render for SessionsView {
                                 .children(ungrouped.iter().map(|h| {
                                     let host = (*h).clone();
                                     let on_connect = on_connect.clone();
+                                    let on_sftp_connect = on_sftp_connect.clone();
                                     let on_edit = on_edit.clone();
                                     let on_remove = on_remove.clone();
                                     let context_menu = context_menu.clone();
@@ -304,6 +312,7 @@ impl Render for SessionsView {
                                         app.clone(),
                                         groups.clone(),
                                         on_connect.clone(),
+                                        on_sftp_connect.clone(),
                                         move |w, cx| {
                                             if let Some(ref cb) = on_edit {
                                                 cb(host.id, w, cx);
@@ -360,6 +369,7 @@ impl Render for SessionsView {
                                         .map(|h| {
                                             let host = (*h).clone();
                                             let on_connect = on_connect.clone();
+                                            let on_sftp_connect = on_sftp_connect.clone();
                                             let on_edit = on_edit.clone();
                                             let on_remove = on_remove.clone();
                                             let context_menu = context_menu.clone();
@@ -380,6 +390,7 @@ impl Render for SessionsView {
                                                 app.clone(),
                                                 groups.clone(),
                                                 on_connect.clone(),
+                                                on_sftp_connect.clone(),
                                                 move |w, cx| {
                                                     if let Some(ref cb) = on_edit {
                                                         cb(host.id, w, cx);
@@ -576,6 +587,7 @@ impl Render for SessionsView {
                                         .map(|h| {
                                             let host = (*h).clone();
                                             let on_connect = on_connect.clone();
+                                            let on_sftp_connect = on_sftp_connect.clone();
                                             let on_edit = on_edit.clone();
                                             let on_remove = on_remove.clone();
                                             let context_menu = context_menu.clone();
@@ -596,6 +608,7 @@ impl Render for SessionsView {
                                                 app.clone(),
                                                 groups.clone(),
                                                 on_connect.clone(),
+                                                on_sftp_connect.clone(),
                                                 move |w, cx| {
                                                     if let Some(ref cb) = on_edit {
                                                         cb(host.id, w, cx);
@@ -665,6 +678,7 @@ fn host_row(
     app: Entity<CrabportApp>,
     groups: Vec<crabport_core::credential::GroupEntry>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -714,8 +728,10 @@ fn host_row(
             let on_remove = Rc::new(on_remove);
             let entity = entity.clone();
             let on_connect = on_connect.clone();
+            let on_sftp_connect = on_sftp_connect.clone();
             let app = app.clone();
             let groups = groups.clone();
+            let host_kind = host.kind;
             move |event, _w, cx| {
                 let Some(ref cm) = context_menu else {
                     return;
@@ -730,6 +746,7 @@ fn host_row(
                 let on_edit = on_edit.clone();
                 let on_remove = on_remove.clone();
                 let on_connect = on_connect.clone();
+                let on_sftp_connect = on_sftp_connect.clone();
                 let app_for_menu = app.clone();
                 let _groups_for_menu = groups.clone();
                 let host_favorite_for_menu = host_favorite;
@@ -748,6 +765,21 @@ fn host_row(
                         })
                         .divider_after(),
                     );
+
+                    // Connect via SFTP (SSH hosts only)
+                    if host_kind == crate::views::sessions::ConnectionKind::SSH {
+                        items.push(
+                            ContextMenuItem::new(t!("hosts.connect_sftp").to_string(), {
+                                let on_sftp_connect = on_sftp_connect.clone();
+                                move |w, cx| {
+                                    if let Some(ref cb) = on_sftp_connect {
+                                        cb(host_id, w, cx);
+                                    }
+                                }
+                            })
+                            .divider_after(),
+                        );
+                    }
 
                     // Favorite toggle
                     let favorite_label = if host_favorite_for_menu {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crabport-sftp = { path = "../crabport-sftp" }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 parking_lot = "0.12"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
