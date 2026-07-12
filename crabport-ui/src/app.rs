@@ -527,6 +527,13 @@ pub fn open_main_window(cx: &mut App) {
             traffic_light_position: Some(point(px(12.0), px(14.0))),
             ..Default::default()
         }),
+        // On Windows, a `None` titlebar already hides the system title bar
+        // (GPUI defaults `hide_title_bar` to `true` when no titlebar is
+        // supplied). On Linux we request client-side decorations so the
+        // compositor stops drawing its server-side title bar, letting our
+        // in-app tab bar fill the full window height.
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(WindowDecorations::Client),
         window_min_size: Some(Size {
             width: px(560.0),
             height: px(340.0),

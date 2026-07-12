@@ -90,12 +90,15 @@ impl SettingsWindow {
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(720.0), px(820.0)), cx)),
+            #[cfg(target_os = "macos")]
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.settings.title").to_string().into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(Size {
                 width: px(560.0),
                 height: px(440.0),

@@ -66,7 +66,7 @@ pub fn render_tab_sidebar(
         .bg(rgb(bg_sidebar()))
         .flex()
         .flex_col()
-        .pt_11()
+        .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 0.0 }))
         .px_2()
         .gap_2()
         .children(entries.into_iter().enumerate().map(|(i, entry)| {
