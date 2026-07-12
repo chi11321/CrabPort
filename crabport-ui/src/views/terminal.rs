@@ -2043,12 +2043,22 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         // The only "document" text we expose is the current preedit text.
+        // `range` is in UTF-16 code units (the NSTextInputClient convention),
+        // so we must slice the UTF-16 representation — never the raw `String`
+        // bytes. Slicing a `String` by a UTF-16 index would land mid-character
+        // for CJK text and panic (`byte index … is not a char boundary`),
+        // which aborts the process under the panic=abort config. This is the
+        // crash triggered when switching IMEs: IMK re-queries the current
+        // character index with a stale range that doesn't align to byte
+        // boundaries.
         let marked = self.marked_text.lock().clone().unwrap_or_default();
-        let end = range.end.min(marked.len());
-        if range.start >= end {
+        let utf16: Vec<u16> = marked.encode_utf16().collect();
+        let start = range.start.min(utf16.len());
+        let end = range.end.min(utf16.len());
+        if start >= end {
             Some(String::new())
         } else {
-            Some(marked[range.start..end].to_string())
+            String::from_utf16(&utf16[start..end]).ok()
         }
     }
 
