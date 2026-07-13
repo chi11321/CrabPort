@@ -431,6 +431,12 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
+                    crabport_terminal::terminal::BackendEvent::HistoryLoaded(_) => {
+                        // The session's `start` loop already merged the
+                        // loaded commands into `command_history`. Repaint
+                        // so the History panel picks up the new list.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -440,6 +446,13 @@ impl TerminalView {
         let mut wakeup_rx = session.subscribe_wakeup();
         let dirty_wk = needs_repaint.clone();
         let status_entity = cx.entity().downgrade();
+        // Fires `refresh_history` once the backend reports Connected / Local
+        // so the History panel is seeded from the TTY history file instead
+        // of only from session-captured commands. One-shot — subsequent
+        // refreshes are user-triggered via the History panel's refresh button.
+        let history_refreshed = Arc::new(AtomicBool::new(false));
+        let history_refreshed_wk = history_refreshed.clone();
+        let session_for_refresh = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
                 let _ = status_entity.update(cx, |this, _cx| {
@@ -448,6 +461,16 @@ impl TerminalView {
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            // Trigger an initial TTY-history read when the
+                            // connection first reaches a ready state.
+                            if !history_refreshed_wk.swap(true, Ordering::AcqRel)
+                                && matches!(
+                                    new_status,
+                                    RemoteStatus::Connected | RemoteStatus::Local
+                                )
+                            {
+                                session_for_refresh.refresh_history();
+                            }
                         }
                     }
                 });
@@ -637,6 +660,14 @@ impl TerminalView {
     /// backend that tracks history.
     pub fn command_history(&self) -> Vec<String> {
         self.session.command_history()
+    }
+
+    /// Trigger a fresh read of the shell's TTY history file. The backend
+    /// broadcasts a `BackendEvent::HistoryLoaded` once the data is ready,
+    /// which the session forwards into `command_history` (and the next
+    /// render picks up via [`Self::command_history`]).
+    pub fn refresh_history(&self) {
+        self.session.refresh_history();
     }
 
     /// Cloned handle to the shared command-history buffer. Used when
@@ -965,6 +996,11 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
+                    crabport_terminal::terminal::BackendEvent::HistoryLoaded(_) => {
+                        // Repaint so the History panel picks up the
+                        // freshly-loaded command history.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -974,6 +1010,11 @@ impl TerminalView {
         let mut wakeup_rx = session.subscribe_wakeup();
         let dirty_wk = self.needs_repaint.clone();
         let status_entity = cx.entity().downgrade();
+        // One-shot initial TTY-history read on (re)connect — mirrors the
+        // constructor's wakeup loop.
+        let history_refreshed = Arc::new(AtomicBool::new(false));
+        let history_refreshed_wk = history_refreshed.clone();
+        let session_for_refresh = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
                 let _ = status_entity.update(cx, |this, _cx| {
@@ -982,6 +1023,14 @@ impl TerminalView {
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            if !history_refreshed_wk.swap(true, Ordering::AcqRel)
+                                && matches!(
+                                    new_status,
+                                    RemoteStatus::Connected | RemoteStatus::Local
+                                )
+                            {
+                                session_for_refresh.refresh_history();
+                            }
                         }
                     }
                 });

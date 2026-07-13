@@ -644,9 +644,15 @@ pub fn render_content(
     // that writes a selected command back into the terminal's input line
     // (via `write_raw`, which bypasses history capture so the pasted
     // command isn't re-recorded).
-    let (history_commands, history_on_paste): (
+    //
+    // `on_refresh` asks the backend to re-read the TTY history file
+    // (~/.bash_history / ~/.zsh_history) and broadcast a
+    // `HistoryLoaded` event, which the session forwards into
+    // `command_history` and the panel picks up on the next render.
+    let (history_commands, history_on_paste, history_on_refresh): (
         std::sync::Arc<Vec<crate::views::panel::history_command_panel::HistoryCommand>>,
         Option<Rc<dyn Fn(String, &mut App)>>,
+        Option<Rc<dyn Fn(&mut App)>>,
     ) = match &sftp_term {
         Some(entity) => {
             let cmds = entity.read_with(cx, |view, _cx| {
@@ -668,14 +674,21 @@ pub fn render_content(
                         view.write_raw(cmd.as_bytes());
                     });
                 });
-            (cmds, Some(on_paste))
+            let term_for_refresh = entity.clone();
+            let on_refresh: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                term_for_refresh.read_with(cx, |view, _cx| {
+                    view.refresh_history();
+                });
+            });
+            (cmds, Some(on_paste), Some(on_refresh))
         }
-        None => (std::sync::Arc::new(Vec::new()), None),
+        None => (std::sync::Arc::new(Vec::new()), None, None),
     };
     history_panel.update(cx, |panel, cx| {
         panel.set_state(
             history_commands,
             history_on_paste,
+            history_on_refresh,
             ctx.notifications.clone(),
             ctx.tooltip.clone(),
             window,

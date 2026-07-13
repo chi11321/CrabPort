@@ -15,6 +15,7 @@ search = "Search"
 run_tooltip = "Run"
 paste_tooltip = "Paste"
 save_tooltip = "Save as snippet"
+refresh_tooltip = "Reload history from shell"
 
 [new_connection]
 title = "New Connection"

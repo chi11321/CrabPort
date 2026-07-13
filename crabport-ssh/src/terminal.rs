@@ -39,6 +39,38 @@ impl CrabPortTerminal for SshBackend {
         true
     }
 
+    fn refresh_history(&self) {
+        let handle = self.handle.clone();
+        let event_tx = self.event_tx.clone();
+        TOKIO.spawn(async move {
+            // Acquire the shared SSH handle. If the session isn't ready yet
+            // (still connecting), bail silently — the caller can refresh
+            // again once the connection is up.
+            let hg = handle.lock().await;
+            let Some(h) = hg.as_ref() else {
+                return;
+            };
+            let h = h.lock().await;
+
+            // Pick the most-likely shell history file. We try zsh first
+            // (extended format) then bash (plain lines) then a generic
+            // `~/.history`. The remote shell writes to its own file as
+            // commands run, so this is reasonably live.
+            //
+            // We keep the command small and POSIX-portable: `for f in ...`
+            // loops aren't universally available in non-interactive sh,
+            // so we use explicit `[ -r ] && cat` fallbacks.
+            let cmd = "f=$HOME/.zsh_history; [ -r \"$f\" ] || f=$HOME/.bash_history; \
+                 [ -r \"$f\" ] || f=$HOME/.history; \
+                 [ -r \"$f\" ] && cat \"$f\"";
+            let Some(raw) = crate::monitor::exec_and_read(&h, cmd).await else {
+                return;
+            };
+            let cmds = parse_shell_history(&raw);
+            let _ = event_tx.broadcast(BackendEvent::HistoryLoaded(cmds)).await;
+        });
+    }
+
     fn sftp_entries(&self) -> Option<Arc<Vec<crabport_sftp::FileEntry>>> {
         self.sftp_entries.read().clone()
     }
@@ -298,5 +330,72 @@ impl CrabPortMonitor for SshBackend {
 impl Drop for SshBackend {
     fn drop(&mut self) {
         let _ = self.command_tx.try_send(Command::Close);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell-history parsing
+// ---------------------------------------------------------------------------
+
+/// Parse the contents of a shell history file into a list of commands,
+/// most-recent-first (the file's natural order is oldest-first, so we
+/// reverse at the end).
+///
+/// Handles both formats we are likely to encounter:
+///
+/// - **bash** (`~/.bash_history`): one command per line, no metadata.
+/// - **zsh** (`~/.zsh_history`): `: <epoch>:<duration>;<command>`, where
+///   `<command>` may itself contain embedded newlines (each continuation
+///   line is a raw command line, not prefixed with `:`).
+///
+/// Lines that fail to parse (or are empty after trimming) are skipped.
+/// The result is capped at [`MAX_HISTORY`] entries to keep the UI panel
+/// responsive on hosts with very large history files.
+const MAX_HISTORY: usize = 1000;
+
+fn parse_shell_history(raw: &str) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    // Accumulator for the current zsh multi-line command.
+    let mut current: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix(':') {
+            // Looks like a zsh meta line: `: <ts>:<dur>;<command>`.
+            // Find the first `;` *after* the second `:` so commands
+            // containing `;` aren't split.
+            if let Some(semicolon) = rest.find(';') {
+                // Flush any in-progress multi-line command first.
+                if let Some(c) = current.take() {
+                    push_cmd(&mut cmds, c);
+                }
+                let cmd = rest[semicolon + 1..].to_string();
+                current = Some(cmd);
+                continue;
+            }
+            // Malformed meta line — treat as plain text below.
+        }
+        if let Some(c) = current.as_mut() {
+            // Continuation of a multi-line zsh command.
+            c.push('\n');
+            c.push_str(line);
+        } else {
+            // Plain bash-style line.
+            push_cmd(&mut cmds, line.to_string());
+        }
+    }
+    if let Some(c) = current.take() {
+        push_cmd(&mut cmds, c);
+    }
+    // File is oldest-first; the UI wants most-recent-first.
+    cmds.reverse();
+    if cmds.len() > MAX_HISTORY {
+        cmds.truncate(MAX_HISTORY);
+    }
+    cmds
+}
+
+fn push_cmd(out: &mut Vec<String>, s: String) {
+    let trimmed = s.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
     }
 }

@@ -49,6 +49,12 @@ pub enum BackendEvent {
         /// determinate progress bar.
         bytes: Option<SftpTransferBytes>,
     },
+    /// Shell history loaded from the TTY's history file
+    /// (`~/.bash_history`, `~/.zsh_history`, …). Emitted by a backend in
+    /// response to [`CrabPortTerminal::refresh_history`]; the payload is
+    /// most-recent-first (already reversed by the backend) so the UI can
+    /// render it verbatim.
+    HistoryLoaded(Vec<String>),
 }
 
 /// Byte-level progress snapshot for a transfer stage.
@@ -122,6 +128,16 @@ pub trait CrabPortTerminal: Send + Sync {
     fn allow_history(&self) -> bool {
         true
     }
+
+    /// Ask the backend to (re)read the shell's history file and broadcast a
+    /// [`BackendEvent::HistoryLoaded`] event with the result. Backends that
+    /// can read a TTY history file (local PTY via `std::fs`, SSH via exec)
+    /// override this; the default implementation is a no-op so backends
+    /// without access to a history file (e.g. Telnet) silently keep whatever
+    /// the session-captured history already holds.
+    ///
+    /// Safe to call repeatedly — each call triggers a fresh read.
+    fn refresh_history(&self) {}
 
     /// Whether this backend supports the snippets panel (run / paste via
     /// `write_raw`). Defaults to `true` for the same reason as `allow_history`.
@@ -393,6 +409,7 @@ impl TerminalSession {
         let mut rx = self.backend.subscribe();
         let term = self.term.clone();
         let wakeup_tx = self.wakeup_tx.clone();
+        let command_history = self.command_history.clone();
 
         smol::spawn(async move {
             let mut parser = Processor::<StdSyncHandler>::new();
@@ -427,6 +444,10 @@ impl TerminalSession {
                                     Ok(BackendEvent::SftpTransferProgress { .. }) => {
                                         // UI-only event; ignore during batch drain.
                                     }
+                                    Ok(BackendEvent::HistoryLoaded(_)) => {
+                                        // Handled in the outer loop (not here,
+                                        // inside the term lock) — drain ignores it.
+                                    }
                                     Err(_) => break, // queue drained
                                 }
                             }
@@ -447,6 +468,20 @@ impl TerminalSession {
                         // terminal parser. Ignore them here.
                         BackendEvent::SftpTransferFinished { .. } => {}
                         BackendEvent::SftpTransferProgress { .. } => {}
+                        // Replace the in-memory command history with the
+                        // freshly-loaded TTY history file contents. The
+                        // backend delivers most-recent-first, so we assign
+                        // the deque front-to-back as given. A wake-up is
+                        // broadcast so the UI repaints with the new list.
+                        BackendEvent::HistoryLoaded(cmds) => {
+                            let mut history = command_history.lock();
+                            history.clear();
+                            for c in cmds {
+                                history.push_back(c);
+                            }
+                            drop(history);
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
                     },
                     Err(_e) => {
                         #[cfg(debug_assertions)]
@@ -661,6 +696,13 @@ impl TerminalSession {
 
     pub fn allow_history(&self) -> bool {
         self.backend.allow_history()
+    }
+
+    /// Trigger a fresh read of the shell's history file. The backend will
+    /// broadcast a [`BackendEvent::HistoryLoaded`] when the data is ready,
+    /// which [`TerminalSession::start`] forwards into `command_history`.
+    pub fn refresh_history(&self) {
+        self.backend.refresh_history();
     }
 
     pub fn allow_snippets(&self) -> bool {
