@@ -15,15 +15,13 @@ use crate::components::button::Button;
 ///
 /// `sidebar_width` lets each window pick its own width (Settings uses 180px,
 /// About uses 160px). The content pane is `flex_1` + `overflow_hidden`.
-pub fn render_sidebar_window(
-    sidebar: impl IntoElement,
-    content: impl IntoElement,
-) -> impl IntoElement {
+pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElement) -> Div {
     div()
         .size_full()
         .bg(rgb(bg_base()))
         .flex()
         .flex_row()
+        .relative()
         .child(sidebar)
         .child(
             div()
@@ -66,7 +64,7 @@ pub fn render_tab_sidebar(
         .bg(rgb(bg_sidebar()))
         .flex()
         .flex_col()
-        .pt_11()
+        .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 8.0 }))
         .px_2()
         .gap_2()
         .children(entries.into_iter().enumerate().map(|(i, entry)| {

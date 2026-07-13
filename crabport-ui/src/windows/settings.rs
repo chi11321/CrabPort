@@ -8,6 +8,7 @@
 //!
 //! Sections are built declaratively via [`crate::windows::settings_section::Section`].
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
@@ -20,6 +21,7 @@ use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
 use crate::components::settings_section::Section;
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
@@ -90,12 +92,15 @@ impl SettingsWindow {
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(720.0), px(820.0)), cx)),
+            #[cfg(target_os = "macos")]
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.settings.title").to_string().into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(Size {
                 width: px(560.0),
                 height: px(440.0),
@@ -434,6 +439,19 @@ impl Render for SettingsWindow {
             ),
             content,
         )
+        .when(HAS_CLIENT_CONTROLS, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_11()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(WindowControls::new("settings")),
+            )
+        })
     }
 }
 

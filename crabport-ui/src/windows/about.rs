@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
@@ -20,6 +21,7 @@ use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
@@ -84,12 +86,15 @@ impl AboutWindow {
         // tab has room for a scrollable text block + dependency list.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
+            #[cfg(target_os = "macos")]
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.about.title").to_string().into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(Size {
                 width: px(520.0),
                 height: px(360.0),
@@ -269,5 +274,18 @@ impl Render for AboutWindow {
             ),
             content,
         )
+        .when(HAS_CLIENT_CONTROLS, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_11()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(WindowControls::new("about")),
+            )
+        })
     }
 }
