@@ -687,46 +687,68 @@ impl SftpTabView {
 
     /// Resolve credentials for a host by ID. Returns all the info needed
     /// to create an `SshBackend` + `TerminalView`.
+    ///
+    /// Reads directly from the Store (not the `CrabportApp` entity) so this
+    /// method is safe to call from within `app.update` — e.g. when the
+    /// session right-click "Connect via SFTP" invokes
+    /// `switch_sftp_panel_host` inside an `app.update` callback.
     fn resolve_host_credentials(
         &self,
         host_id: i64,
         cx: &mut Context<Self>,
     ) -> Option<ResolvedHost> {
-        let app = self.app.clone()?;
-        let host = app.read_with(cx, |a, _| a.hosts.iter().find(|h| h.id == host_id).cloned())?;
+        let store = crate::app_state::AppState::store(cx);
+
+        let host = store.lock().find_host(host_id).ok().flatten()?;
 
         // Only SSH hosts support SFTP.
-        if host.kind != crate::views::sessions::ConnectionKind::SSH {
+        let host_kind = match host.kind {
+            CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
+            CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
+            CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
+        };
+        if host_kind != crate::views::sessions::ConnectionKind::SSH {
             return None;
         }
 
-        let store = crate::app_state::AppState::store(cx);
         let _ = store.lock().touch_host_login(host_id);
 
-        // Refresh hosts list in the app (mirrors connect_to_host_sftp)
+        // Refresh hosts list in the app. Deferred so we don't re-enter the
+        // `CrabportApp` entity lock when called from within `app.update`.
         if let Ok(all) = store.lock().hosts() {
-            app.update(cx, |a, _cx| {
-                a.hosts = all
-                    .into_iter()
-                    .map(|h| ConnectionHost {
-                        id: h.id,
-                        name: h.name,
-                        host: h.host,
-                        port: h.port,
-                        username: h.username,
-                        kind: match h.kind {
-                            CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-                            CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-                            CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-                        },
-                        credential_id: h.credential_id,
-                        last_login: h.last_login,
-                        favorite: h.favorite,
-                        proxy_id: h.proxy_id,
-                        group_id: h.group_id,
-                    })
-                    .collect();
-            });
+            if let Some(ref app) = self.app {
+                let app = app.clone();
+                cx.defer(move |cx| {
+                    app.update(cx, |a, _cx| {
+                        a.hosts = all
+                            .into_iter()
+                            .map(|h| ConnectionHost {
+                                id: h.id,
+                                name: h.name,
+                                host: h.host,
+                                port: h.port,
+                                username: h.username,
+                                kind: match h.kind {
+                                    CoreHostKind::Ssh => {
+                                        crate::views::sessions::ConnectionKind::SSH
+                                    }
+                                    CoreHostKind::Telnet => {
+                                        crate::views::sessions::ConnectionKind::Telnet
+                                    }
+                                    CoreHostKind::Serial => {
+                                        crate::views::sessions::ConnectionKind::Serial
+                                    }
+                                },
+                                credential_id: h.credential_id,
+                                last_login: h.last_login,
+                                favorite: h.favorite,
+                                proxy_id: h.proxy_id,
+                                group_id: h.group_id,
+                            })
+                            .collect();
+                    });
+                });
+            }
         }
 
         let cred = host
