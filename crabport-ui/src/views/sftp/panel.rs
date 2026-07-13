@@ -101,6 +101,7 @@ fn render_column_header(id_prefix: &str) -> impl IntoElement {
         .id(SharedString::from(format!("{id_prefix}-header")))
         .w_full()
         .h(px(26.0))
+        .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
@@ -481,11 +482,17 @@ impl SftpTabView {
                         },
                     )),
             )
+            // Column header — outside the scroll container so the
+            // scrollbar (absolute top_0..bottom_0 inside the container
+            // below) only spans the file-list area, not the header.
+            .child(render_column_header(id_prefix))
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .h_full()
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
                     // Drop zone for remote→local drag (download) or
                     // remote→remote drag (download to temp then upload).
@@ -527,7 +534,6 @@ impl SftpTabView {
                             });
                         }
                     })
-                    .child(render_column_header(id_prefix))
                     .child(
                         v_virtual_list(
                             cx.entity(),
@@ -919,13 +925,11 @@ impl SftpTabView {
                     )
                     .child(
                         div()
-                            .id(SharedString::from(format!("{id_prefix}-scrollbar")))
                             .absolute()
                             .top_0()
                             .right_0()
                             .bottom_0()
                             .w(px(10.0))
-                            .occlude()
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
@@ -1207,11 +1211,17 @@ impl SftpTabView {
                         },
                     )),
             )
+            // Column header — outside the scroll container so the
+            // scrollbar (absolute top_0..bottom_0 inside the container
+            // below) only spans the file-list area, not the header.
+            .child(render_column_header(id_prefix))
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .h_full()
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
                     // Drop zone for local→remote drag (upload) + external files.
                     .on_drop::<LocalFileDragValue>(move |drag, _w, cx| {
@@ -1357,7 +1367,6 @@ impl SftpTabView {
                     .when_some(terminal_entity.clone(), |el, term| {
                         el.child(div().w_0().h_0().overflow_hidden().child(term))
                     })
-                    .child(render_column_header(id_prefix))
                     .child(
                         v_virtual_list(
                             cx.entity(),
@@ -1834,13 +1843,11 @@ impl SftpTabView {
                     )
                     .child(
                         div()
-                            .id(SharedString::from(format!("{id_prefix}-scrollbar")))
                             .absolute()
                             .top_0()
                             .right_0()
                             .bottom_0()
                             .w(px(10.0))
-                            .occlude()
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),

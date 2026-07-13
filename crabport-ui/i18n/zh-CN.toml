@@ -15,6 +15,7 @@ search = "搜索"
 run_tooltip = "运行"
 paste_tooltip = "粘贴"
 save_tooltip = "保存为代码片段"
+refresh_tooltip = "从 shell 历史重新加载"
 
 [new_connection]
 title = "新建连接"

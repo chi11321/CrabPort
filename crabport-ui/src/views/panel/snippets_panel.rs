@@ -315,6 +315,7 @@ impl Render for SnippetsPanel {
                             .id(row_id.clone())
                             .h(px(ROW_HEIGHT))
                             .w_full()
+                            .relative()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -347,7 +348,9 @@ impl Render for SnippetsPanel {
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
-                            // Snippet name (flex-1 so buttons sit on the right).
+                            // Snippet name fills the full row width so long
+                            // names don't shift when the hover buttons fade
+                            // in — the buttons overlay on top (below).
                             .child(
                                 div()
                                     .flex_1()
@@ -363,14 +366,23 @@ impl Render for SnippetsPanel {
                                         name
                                     })),
                             )
-                            // Buttons: fade in on row hover.
+                            // Buttons: absolutely positioned over the right
+                            // edge of the row, layered above the snippet name
+                            // with a transparent background so they don't
+                            // displace the text when they fade in.
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("snippet-btns-{i}").into()))
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_0p5()
+                                    .pr_2()
+                                    .bg(rgba(0x00000000))
                                     .opacity(0.0)
                                     .with_transition(ElementId::Name(
                                         format!("snippet-btns-{i}").into(),
