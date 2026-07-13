@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
@@ -20,6 +21,7 @@ use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
@@ -272,5 +274,18 @@ impl Render for AboutWindow {
             ),
             content,
         )
+        .when(HAS_CLIENT_CONTROLS, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_11()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(WindowControls::new("about")),
+            )
+        })
     }
 }

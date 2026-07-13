@@ -32,7 +32,7 @@ pub fn render_sidebar(
                 .bg(rgb(bg_sidebar()))
                 .flex()
                 .flex_col()
-                .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 0.0 }))
+                .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 8.0 }))
                 .px_2()
                 .gap_2()
                 .children(SidebarItem::all().map(|item| {

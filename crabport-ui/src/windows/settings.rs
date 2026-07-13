@@ -8,6 +8,7 @@
 //!
 //! Sections are built declaratively via [`crate::windows::settings_section::Section`].
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
@@ -20,6 +21,7 @@ use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
 use crate::components::settings_section::Section;
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
@@ -437,6 +439,19 @@ impl Render for SettingsWindow {
             ),
             content,
         )
+        .when(HAS_CLIENT_CONTROLS, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_11()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(WindowControls::new("settings")),
+            )
+        })
     }
 }
 

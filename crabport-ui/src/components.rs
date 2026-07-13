@@ -14,4 +14,5 @@ pub mod settings_section;
 pub mod switch;
 pub mod tabs;
 pub mod tooltip;
+pub mod window_controls;
 pub mod window_layout;

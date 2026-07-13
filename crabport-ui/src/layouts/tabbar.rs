@@ -7,10 +7,7 @@ use gpui_animation::{animation::TransitionExt, transition::general::Linear};
 use crate::app::{CrabportApp, Tab, TabKind};
 use crate::color::*;
 use crate::components::button::Button;
-
-/// Whether the platform uses client-side window controls in the tab bar.
-/// macOS uses native traffic-light buttons, so we never render our own.
-const HAS_CLIENT_CONTROLS: bool = cfg!(not(target_os = "macos"));
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 
 pub fn render_tab_bar(
     handle: &Entity<CrabportApp>,
@@ -194,74 +191,8 @@ pub fn render_tab_bar(
                             });
                         }),
                 )
-                .when(HAS_CLIENT_CONTROLS, |el| el.child(render_window_controls())),
+                .when(HAS_CLIENT_CONTROLS, |el| {
+                    el.child(WindowControls::new("main"))
+                }),
         )
-}
-
-/// Minimize / maximize / close buttons rendered in the tab bar's top-right
-/// corner on Windows and Linux. On macOS the native traffic-light buttons are
-/// used instead, so this is never called there.
-///
-/// These reuse the project `Button` component (same as the `+` button) so they
-/// get the same built-in hover color transition for free — `bg_hover` is
-/// overridden per-button to give the close button its conventional red hover.
-fn render_window_controls() -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .ml_2()
-        .child(render_control_button(
-            "win-minimize",
-            "icons/minus.svg",
-            None,
-            |w, _cx| {
-                w.minimize_window();
-            },
-        ))
-        .child(render_control_button(
-            "win-maximize",
-            "icons/square.svg",
-            None,
-            |w, _cx| {
-                w.zoom_window();
-            },
-        ))
-        .child(render_control_button(
-            "win-close",
-            "icons/close.svg",
-            Some(0xE0_42_42), // red, matches Windows close-button hover
-            |w, _cx| {
-                w.remove_window();
-            },
-        ))
-}
-
-/// A single window-control button built on the project `Button` component.
-///
-/// `hover_color` — when `Some`, overrides the hover background to this color
-/// (used for the close button which gets a red hover, following the Windows /
-/// GNOME convention). When `None`, the default `tab_btn_bg_hover` is used.
-fn render_control_button(
-    id: &'static str,
-    icon_path: &'static str,
-    hover_color: Option<u32>,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let mut btn = Button::new(id)
-        .tab()
-        .centered(true)
-        .icon(icon_path)
-        .h_9()
-        .w_9()
-        .border_0()
-        .px_0()
-        .text_sm()
-        .on_click(move |_e, w, cx| {
-            on_click(w, cx);
-            cx.stop_propagation();
-        });
-    if let Some(c) = hover_color {
-        btn = btn.bg_hover(c);
-    }
-    btn
 }
