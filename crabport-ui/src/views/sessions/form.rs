@@ -947,6 +947,9 @@ fn render_group_selector(
         .unwrap_or_default();
 
     let label_div = div()
+        .flex()
+        .flex_col()
+        .gap_1()
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(text_muted()))
