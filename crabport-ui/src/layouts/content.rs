@@ -17,6 +17,7 @@ use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
+use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus};
 
 /// Clone the active terminal's `Entity` so a callback can forward calls to
 /// the backend without capturing a borrow on `terminal_views`.
@@ -452,10 +453,7 @@ pub fn render_content(
             let (status, metrics) = if let Some(m) = view.monitor() {
                 (m.status(), m.metrics())
             } else {
-                (
-                    crabport_terminal::terminal::RemoteStatus::Local,
-                    crabport_terminal::terminal::RemoteMetrics::default(),
-                )
+                (RemoteStatus::Local, RemoteMetrics::default())
             };
             // Clone the live SFTP progress snapshot so the toolbar can
             // render it without holding the entity lock across the
@@ -463,8 +461,8 @@ pub fn render_content(
             (status, metrics, view.sftp_progress().cloned())
         }),
         None => (
-            crabport_terminal::terminal::RemoteStatus::Local,
-            crabport_terminal::terminal::RemoteMetrics::default(),
+            RemoteStatus::Local,
+            RemoteMetrics::default(),
             // SFTP tab: read progress from whichever of the tab's two
             // panels has an active transfer. This keeps the shared
             // toolbar's animation alive across terminal ↔ SFTP switches.
@@ -475,6 +473,13 @@ pub fn render_content(
             },
         ),
     };
+
+    // Only expand the right-hand panel once the session is fully
+    // connected. Local PTY backends report `RemoteStatus::Local` and are
+    // considered ready immediately; remote (SSH / Telnet) backends cycle
+    // through `Connecting` -> `Connected` (or `Disconnected`), and the
+    // panel stays collapsed until they actually reach `Connected`.
+    let panel_show = is_terminal && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.
@@ -821,7 +826,7 @@ pub fn render_content(
                 .relative()
                 .child(view)
                 .when(
-                    is_terminal && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
+                    panel_show && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
                     |el| {
                         // Resize divider handle between terminal and panel.
                         // A narrow strip with negative margins so it overlaps
@@ -867,7 +872,7 @@ pub fn render_content(
                     let c_snippets = cap_snippets;
                     let c_tunnels = cap_tunnels;
                     render_panel(
-                        is_terminal,
+                        panel_show,
                         panel_active_tab,
                         PanelCaps {
                             sftp: c_sftp,
