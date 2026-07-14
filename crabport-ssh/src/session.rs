@@ -20,6 +20,10 @@ pub struct SshConnectionInfo {
     /// a tunnel to `host:port`, and the SSH handshake runs over that
     /// tunnelled stream.
     pub proxy: Option<ProxyConfig>,
+    /// Commands to run automatically once the SSH shell is ready. Each line
+    /// is sent verbatim followed by `\r`. Empty string means no startup
+    /// command.
+    pub startup_command: String,
 }
 
 impl SshConnectionInfo {
@@ -37,6 +41,7 @@ impl SshConnectionInfo {
             private_key: None,
             passphrase: None,
             proxy: None,
+            startup_command: String::new(),
         }
     }
 
@@ -60,6 +65,12 @@ impl SshConnectionInfo {
     /// Tunnel the TCP connection through a proxy (SOCKS5 / HTTP / HTTPS).
     pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Set the startup command to run once the shell is ready.
+    pub fn with_startup_command(mut self, command: impl Into<String>) -> Self {
+        self.startup_command = command.into();
         self
     }
 

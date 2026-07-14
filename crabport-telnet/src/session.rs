@@ -22,6 +22,10 @@ pub struct TelnetConnectionInfo {
     /// tunnel to `host:port`, and the raw Telnet byte stream runs over that
     /// tunnelled stream.
     pub proxy: Option<ProxyConfig>,
+    /// Commands to run automatically after the TCP connection is established
+    /// and login completes (if auto-login sends credentials). Each line is
+    /// sent verbatim followed by `\r`. Empty string means no startup command.
+    pub startup_command: String,
 }
 
 impl TelnetConnectionInfo {
@@ -37,6 +41,7 @@ impl TelnetConnectionInfo {
             username: username.into(),
             password: password.into(),
             proxy: None,
+            startup_command: String::new(),
         }
     }
 
@@ -49,6 +54,12 @@ impl TelnetConnectionInfo {
     /// Tunnel the TCP connection through a proxy (SOCKS5 / HTTP / HTTPS).
     pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Set the startup command to run after connect.
+    pub fn with_startup_command(mut self, command: impl Into<String>) -> Self {
+        self.startup_command = command.into();
         self
     }
 }

@@ -175,6 +175,7 @@ impl CrabportApp {
         private_key: Option<&str>,
         passphrase: Option<&str>,
         proxy: Option<crabport_core::credential::ProxyConfig>,
+        startup_command: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -192,6 +193,11 @@ impl CrabportApp {
         }
         if let Some(p) = proxy {
             info = info.with_proxy(p);
+        }
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
         }
         let info_for_view = info.clone();
         let cols: usize = 80;
@@ -383,6 +389,7 @@ impl CrabportApp {
         username: &str,
         password: &str,
         proxy: Option<crabport_core::credential::ProxyConfig>,
+        startup_command: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -397,6 +404,11 @@ impl CrabportApp {
         let mut info = TelnetConnectionInfo::new(host, username, password).with_port(port);
         if let Some(p) = proxy {
             info = info.with_proxy(p);
+        }
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
         }
         let info_for_view = info.clone();
 

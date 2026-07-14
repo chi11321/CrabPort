@@ -65,6 +65,8 @@ validation_title = "请填写必填字段"
 validation_message = "请在提交前填写高亮的必填字段。"
 group = "分组"
 group_none = "无"
+startup_command = "启动命令"
+startup_command_hint = "连接后自动执行（每行一条命令）"
 
 [sessions]
 new_button = "新建"

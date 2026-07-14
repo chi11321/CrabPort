@@ -786,6 +786,7 @@ impl SftpTabView {
             private_key: private_key.map(|s| s.to_string()),
             passphrase: passphrase.map(|s| s.to_string()),
             proxy: proxy_config,
+            startup_command: host.startup_command,
         })
     }
 
@@ -845,6 +846,9 @@ impl SftpTabView {
         }
         if let Some(p) = resolved.proxy {
             info = info.with_proxy(p);
+        }
+        if !resolved.startup_command.is_empty() {
+            info = info.with_startup_command(&resolved.startup_command);
         }
         let info_for_view = info.clone();
         let cols: usize = 80;
@@ -1127,6 +1131,7 @@ struct ResolvedHost {
     private_key: Option<String>,
     passphrase: Option<String>,
     proxy: Option<crabport_core::credential::ProxyConfig>,
+    startup_command: String,
 }
 
 impl CrabPortTab for SftpTabView {

@@ -65,6 +65,8 @@ validation_title = "Missing required fields"
 validation_message = "Please fill in the highlighted fields before submitting."
 group = "Group"
 group_none = "None"
+startup_command = "Startup Command"
+startup_command_hint = "Run on connect (one command per line)"
 
 [sessions]
 new_button = "New"
