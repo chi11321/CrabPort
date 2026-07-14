@@ -11,7 +11,7 @@ use russh::{
 use tokio::task::AbortHandle;
 use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
 
-use crabport_core::credential::ProxyConfig;
+use crabport_core::credential::{ProxyConfig, build_startup_command_bytes};
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{BackendEvent, RemoteMetrics, RemoteStatus};
 
@@ -374,6 +374,23 @@ impl SshBackend {
                 return;
             }
             on_status2("Shell started".into());
+
+            // ---- Send startup command (if any) ----
+            // Each line is sent followed by `\r` so the remote shell executes
+            // it. We do this before the event loop starts so the command is
+            // the first thing the shell receives.
+            if !info.startup_command.is_empty() {
+                let payload = build_startup_command_bytes(&info.startup_command);
+                #[cfg(debug_assertions)]
+                tracing::info!(
+                    "SSH: sending startup command ({} bytes)",
+                    payload.len()
+                );
+                if let Err(e) = channel.data(Cursor::new(payload)).await {
+                    #[cfg(debug_assertions)]
+                    tracing::warn!("SSH: startup command write error: {e}");
+                }
+            }
 
             // Mark as connected
             {

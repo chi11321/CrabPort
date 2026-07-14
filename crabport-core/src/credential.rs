@@ -404,6 +404,25 @@ pub fn parse_proxy_url(url: &str) -> Option<ProxyConfig> {
     })
 }
 
+/// Build the raw byte payload for a startup command.
+///
+/// Each line of the user's command is sent verbatim followed by `\r` so the
+/// remote shell executes it. Lines are split on `\n`; a trailing newline is
+/// optional. Empty lines are skipped to avoid sending bare carriage returns.
+/// Returns an empty `Vec` if `command` is empty or contains only whitespace.
+pub fn build_startup_command_bytes(command: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in command.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.extend_from_slice(trimmed.as_bytes());
+        out.push(b'\r');
+    }
+    out
+}
+
 /// A persisted proxy row in the `proxies` table.
 ///
 /// `ProxyConfig` is the lightweight in-memory shape used at connect time;
@@ -473,6 +492,12 @@ pub struct HostEntry {
     /// top level).
     #[serde(default)]
     pub group_id: Option<i64>,
+    /// Commands to run automatically once the shell/terminal session is
+    /// ready (after SSH shell starts or Telnet connects). Sent verbatim —
+    /// each line is terminated with `\r` so the remote shell executes it.
+    /// Empty string means no startup command.
+    #[serde(default)]
+    pub startup_command: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

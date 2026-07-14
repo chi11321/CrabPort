@@ -144,6 +144,10 @@ struct AutoLogin {
     /// Accumulated plain-text bytes since the last flush. We scan the
     /// trailing bytes for prompt patterns.
     buf: Vec<u8>,
+    /// Whether the startup command has been sent yet. It is dispatched once,
+    /// after auto-login completes (the no-credentials case is handled by
+    /// the caller before the event loop starts).
+    startup_sent: bool,
 }
 
 impl AutoLogin {
@@ -151,13 +155,25 @@ impl AutoLogin {
         Self {
             phase: LoginPhase::Idle,
             buf: Vec::new(),
+            startup_sent: false,
         }
     }
 
     /// Feed a chunk of plain-text data that *will* be displayed to the user.
     /// Returns `Some(reply)` when a prompt is detected and a credential
-    /// should be sent; `None` otherwise.
+    /// should be sent (or, once login completes, the startup command); `None`
+    /// otherwise.
     fn feed(&mut self, data: &[u8], info: &TelnetConnectionInfo) -> Option<Vec<u8>> {
+        // Once login is complete, dispatch the startup command exactly once.
+        if self.phase == LoginPhase::Done && !self.startup_sent {
+            self.startup_sent = true;
+            if !info.startup_command.is_empty() {
+                return Some(crabport_core::credential::build_startup_command_bytes(
+                    &info.startup_command,
+                ));
+            }
+        }
+
         self.buf.extend_from_slice(data);
         // Keep only the last 256 bytes — prompt detection only needs recent
         // output, and unbounded growth on long sessions would be wasteful.
@@ -326,6 +342,32 @@ impl TelnetBackend {
             }
             let _ = stream.flush().await;
 
+            // ---- Startup command (no-credentials case) ----
+            // When there are no credentials to auto-send, dispatch the
+            // startup command immediately after negotiation. The
+            // auto-login path also handles the post-credential case inside
+            // the event loop, so `startup_sent` prevents double-send.
+            let mut auto_login = AutoLogin::new();
+            if info.username.is_empty()
+                && info.password.is_empty()
+                && !info.startup_command.is_empty()
+            {
+                let payload =
+                    crabport_core::credential::build_startup_command_bytes(&info.startup_command);
+                if !payload.is_empty() {
+                    #[cfg(debug_assertions)]
+                    tracing::info!(
+                        "telnet: sending startup command ({} bytes, no-credentials path)",
+                        payload.len()
+                    );
+                    if let Err(e) = stream.write_all(&payload).await {
+                        tracing::warn!("telnet: startup command write error: {e}");
+                    }
+                    let _ = stream.flush().await;
+                }
+                auto_login.startup_sent = true;
+            }
+
             // ---- Combined read+write event loop ----
             // Single tokio::select! handles reading from the socket,
             // user commands (write/resize/close), and auto-login credential
@@ -334,7 +376,6 @@ impl TelnetBackend {
             let mut iac_state = IacState::Normal;
             let mut data_out: Vec<u8> = Vec::with_capacity(8192);
             let mut neg_out: Vec<u8> = Vec::with_capacity(256);
-            let mut auto_login = AutoLogin::new();
 
             loop {
                 select! {

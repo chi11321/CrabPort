@@ -67,6 +67,7 @@ impl CrabportApp {
                         private_key,
                         private_key_kind,
                         proxy_config,
+                        startup_command,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
                         let n = f.name_text(cx);
@@ -78,7 +79,8 @@ impl CrabportApp {
                         let ak = f.auth_kind;
                         let (pk, pk_kind) = f.private_key_value(cx);
                         let pc = f.proxy_config(cx);
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc)
+                        let sc = f.startup_command_text(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc)
                     };
                     app.close_connection_form(cx);
 
@@ -131,6 +133,7 @@ impl CrabportApp {
                         favorite: false,
                         proxy_id,
                         group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
+                        startup_command: startup_command.clone(),
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -175,6 +178,7 @@ impl CrabportApp {
                                 &username,
                                 &password,
                                 proxy_config,
+                                Some(&startup_command),
                                 cx,
                             );
                         }
@@ -192,6 +196,7 @@ impl CrabportApp {
                                 private_key_arg,
                                 passphrase_arg,
                                 proxy_config,
+                                Some(&startup_command),
                                 cx,
                             );
                         }

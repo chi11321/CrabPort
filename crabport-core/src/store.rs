@@ -337,8 +337,20 @@ impl Store {
                 .map_err(|e| StoreError::Db(e.to_string()))?;
         }
 
+        // Migration 11: add `startup_command` to `hosts`.
+        //
+        // Stores an optional command (or multi-line script) the user wants to
+        // run automatically once the shell/terminal session is ready — after
+        // the SSH shell starts or the Telnet TCP connection is established.
+        // Empty string (the column default) means no startup command.
+        if current < 11 {
+            let _ = self.db.execute_batch(
+                "ALTER TABLE hosts ADD COLUMN startup_command TEXT NOT NULL DEFAULT '';",
+            );
+        }
+
         // Record the latest migration version
-        let latest = 10;
+        let latest = 11;
         if current < latest {
             self.db
                 .execute(

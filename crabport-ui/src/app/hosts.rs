@@ -89,6 +89,15 @@ impl CrabportApp {
                 .flatten()
         });
 
+        // Resolve the startup command (if any) from the stored host entry.
+        let startup_command = AppState::store(cx)
+            .lock()
+            .find_host(host_id)
+            .ok()
+            .flatten()
+            .map(|h| h.startup_command)
+            .filter(|s| !s.is_empty());
+
         // Dispatch to the matching backend by connection kind. SSH keeps
         // its full auth (password / private key / passphrase); Telnet uses
         // password-only auth (credentials are sent via the terminal prompt
@@ -103,6 +112,7 @@ impl CrabportApp {
                     &host.username,
                     &password,
                     proxy_config,
+                    startup_command.as_deref(),
                     cx,
                 );
             }
@@ -117,6 +127,7 @@ impl CrabportApp {
                     private_key,
                     passphrase,
                     proxy_config,
+                    startup_command.as_deref(),
                     cx,
                 );
             }
@@ -178,6 +189,14 @@ impl CrabportApp {
                 .ok()
                 .flatten()
         });
+
+        // Fetch the full stored host entry (includes startup_command, which
+        // the in-memory ConnectionHost doesn't carry).
+        let stored_host = AppState::store(cx).lock().find_host(host_id).ok().flatten();
+        let startup_command = stored_host
+            .as_ref()
+            .map(|h| h.startup_command.clone())
+            .unwrap_or_default();
 
         let mut form = ConnectionFormState::new(window, cx);
 
@@ -259,6 +278,13 @@ impl CrabportApp {
             None => form.load_proxy(None, None, window, cx),
         }
 
+        // Restore the startup command (if any) so the user can edit it.
+        if !startup_command.is_empty() {
+            form.startup_command_input.update(cx, |state, cx| {
+                state.set_value(&startup_command, window, cx);
+            });
+        }
+
         let app = cx.entity().clone();
         let editing_host_id = h.id;
         let editing_cred_id = h.credential_id;
@@ -297,6 +323,7 @@ impl CrabportApp {
                         private_key,
                         private_key_kind,
                         proxy_config,
+                        startup_command,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
                         #[cfg(debug_assertions)]
@@ -315,7 +342,8 @@ impl CrabportApp {
                         let ak = f.auth_kind;
                         let (pk, pk_kind) = f.private_key_value(cx);
                         let pc = f.proxy_config(cx);
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc)
+                        let sc = f.startup_command_text(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc)
                     };
                     app.close_connection_form(cx);
 
@@ -373,6 +401,7 @@ impl CrabportApp {
                             .connection_form
                             .as_ref()
                             .and_then(|f| f.group_id),
+                        startup_command: startup_command.clone(),
                     };
                     #[cfg(debug_assertions)]
                     tracing::info!(
