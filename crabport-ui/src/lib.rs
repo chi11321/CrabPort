@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod assets;
 pub mod color;
 pub mod components;
+pub mod keybinds;
 pub mod layouts;
 pub mod menus;
 pub mod theme;

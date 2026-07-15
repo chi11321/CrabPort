@@ -49,7 +49,9 @@ actions!(
         TerminalShiftTab,
         TerminalIncreaseFont,
         TerminalDecreaseFont,
-        TerminalResetFont
+        TerminalResetFont,
+        SplitVertical,
+        SplitHorizontal,
     ]
 );
 
@@ -142,6 +144,10 @@ pub struct CrabportApp {
     /// actual tab switches instead of every render (which would steal focus
     /// from overlays like SFTP/command palette/connection form).
     last_focused_tab_id: Option<u64>,
+    /// Focus handle for the app root. Tracked on the root div so that
+    /// keyboard actions (e.g. ToggleCommand via Cmd+K) are dispatched even
+    /// when no child element has focus.
+    focus_handle: FocusHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -298,6 +304,7 @@ impl CrabportApp {
             app_ctx,
             wired: false,
             last_focused_tab_id: None,
+            focus_handle: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -479,6 +486,7 @@ impl Render for CrabportApp {
             .flex()
             .flex_row()
             .key_context("App")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_command))
             // -- Sidebar --
             .child(render_sidebar(self.sidebar_item, show_sidebar, &handle))

@@ -828,10 +828,23 @@ impl CrabportApp {
         cx: &mut Context<Self>,
     ) {
         let app_handle = cx.entity().downgrade();
+        let app_handle2 = cx.entity().downgrade();
         view.update(cx, |v, _cx| {
             v.set_on_focused(move |pane_id, cx| {
                 let _ = app_handle.update(cx, |app, cx| {
                     app.sync_active_pane_from_focus(pane_id, cx);
+                });
+            });
+            v.set_on_split_request(move |dir, cx| {
+                // Defer the split so it doesn't run while TerminalView is
+                // still being updated (the on_action handler holds a borrow
+                // on the entity). split_active_pane reads/writes pane_views
+                // and other entities, which would re-enter the borrow.
+                let h = app_handle2.clone();
+                cx.defer(move |cx| {
+                    let _ = h.update(cx, |app, cx| {
+                        app.split_active_pane(dir, cx);
+                    });
                 });
             });
         });

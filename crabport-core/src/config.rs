@@ -20,6 +20,7 @@
 //!   config.toml       — this module's persisted config
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -58,6 +59,38 @@ pub struct AppearanceConfig {
 
 fn default_panel_width() -> f32 {
     220.0
+}
+
+// ---------------------------------------------------------------------------
+// Keybind config
+// ---------------------------------------------------------------------------
+
+/// User-configurable keyboard shortcuts. Stored under `[keybinds]` in
+/// `config.toml` as a map of action-id → keystroke string (e.g.
+/// `"toggle_command" = "cmd-k"`).
+///
+/// Action IDs are stable strings defined by the app's keybind catalog
+/// (see `crabport-ui::keybinds`). Missing entries fall back to the
+/// built-in defaults registered in `main.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct KeybindConfig {
+    /// Map of action-id → GPUI keystroke string (e.g. "cmd-k", "ctrl-shift-c").
+    /// An empty string disables the binding.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, String>,
+}
+
+impl KeybindConfig {
+    /// Get the keystroke for an action id, if present.
+    pub fn get(&self, action_id: &str) -> Option<&str> {
+        self.bindings.get(action_id).map(|s| s.as_str())
+    }
+
+    /// Set or update the keystroke for an action id.
+    pub fn set(&mut self, action_id: &str, keystroke: &str) {
+        self.bindings
+            .insert(action_id.to_string(), keystroke.to_string());
+    }
 }
 
 fn default_locale() -> String {
@@ -538,6 +571,10 @@ impl Default for ThemeConfig {
 pub struct CrabPortConfig {
     #[serde(default)]
     pub appearance: AppearanceConfig,
+
+    /// User-configurable keyboard shortcuts. Stored under `[keybinds]`.
+    #[serde(default)]
+    pub keybinds: KeybindConfig,
 }
 
 // ---------------------------------------------------------------------------

@@ -312,6 +312,7 @@ placeholder = "Settings UI is under construction."
 [window.settings.tab]
 general = "General"
 appearance = "Appearance"
+keybinds = "Keybinds"
 
 [window.settings.general]
 section_startup = "Startup"
@@ -334,6 +335,30 @@ section_terminal = "Terminal"
 terminal_desc = "Choose the monospace font and size used by every terminal tab."
 terminal_font_family = "Font family"
 terminal_font_size = "Font size"
+
+[window.settings.keybinds]
+section_shortcuts = "Shortcuts"
+shortcuts_desc = "Click \"Rebind\" then press a key combination. Press Escape to cancel."
+unbound = "Unbound"
+listening = "Press keys…"
+reset = "Reset"
+reset_all = "Reset All to Defaults"
+reset_all_desc = "Restore the built-in keyboard shortcuts."
+conflict = "Conflict with"
+action_toggle_command = "Toggle Command Palette"
+action_open_settings = "Open Settings"
+action_open_about = "Open About"
+action_quit = "Quit"
+action_hide = "Hide"
+action_minimize = "Minimize"
+action_zoom = "Zoom"
+action_terminal_tab = "Terminal: Tab"
+action_terminal_shift_tab = "Terminal: Shift+Tab"
+action_terminal_increase_font = "Terminal: Increase Font Size"
+action_terminal_decrease_font = "Terminal: Decrease Font Size"
+action_terminal_reset_font = "Terminal: Reset Font Size"
+action_split_vertical = "Terminal: Split Pane Vertically"
+action_split_horizontal = "Terminal: Split Pane Horizontally"
 
 [menu]
 app_name = "CrabPort"

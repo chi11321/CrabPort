@@ -142,6 +142,9 @@ pub struct TerminalView {
     /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
     /// and the toolbar follow keyboard focus, not just mouse clicks.
     on_focused: Option<Rc<dyn Fn(u64, &mut App)>>,
+    /// Invoked when the user triggers a split via keyboard shortcut.
+    /// Receives the split direction. The app calls `split_active_pane`.
+    on_split_request: Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>>,
     /// Latest SFTP transfer progress pushed by the backend, or `None` when
     /// no transfer is in flight. Updated by the backend-event subscriber;
     /// read by the toolbar via [`Self::sftp_progress`].
@@ -594,6 +597,7 @@ impl TerminalView {
             telnet_info,
             on_backend_closed: None,
             on_focused: None,
+            on_split_request: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
@@ -753,6 +757,15 @@ impl TerminalView {
     /// mouse clicks). The callback receives this pane's id.
     pub fn set_on_focused(&mut self, f: impl Fn(u64, &mut App) + 'static) {
         self.on_focused = Some(Rc::new(f));
+    }
+
+    /// Set the callback invoked when the user triggers a split via keyboard
+    /// shortcut. The app calls `split_active_pane` with the given direction.
+    pub fn set_on_split_request(
+        &mut self,
+        f: impl Fn(crate::views::terminal::split::SplitDir, &mut App) + 'static,
+    ) {
+        self.on_split_request = Some(Rc::new(f));
     }
 
     /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
@@ -1356,6 +1369,20 @@ impl Render for TerminalView {
                 });
                 this.reload_font_settings(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::app::SplitVertical, _window, cx| {
+                    if let Some(cb) = &this.on_split_request {
+                        cb(crate::views::terminal::split::SplitDir::Vertical, cx);
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::app::SplitHorizontal, _window, cx| {
+                    if let Some(cb) = &this.on_split_request {
+                        cb(crate::views::terminal::split::SplitDir::Horizontal, cx);
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
