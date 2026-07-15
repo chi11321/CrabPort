@@ -41,6 +41,13 @@ fn main() {
             // Force dark theme regardless of system appearance.
             gpui_component::theme::Theme::change(gpui_component::theme::ThemeMode::Dark, None, cx);
 
+            // macOS: enable sidebar vibrancy (毛玻璃). Patches the gpui-component
+            // theme background to transparent so `gpui_component::Root` doesn't
+            // paint an opaque layer over the system vibrancy view. Main / Settings
+            // / About windows are opened with `WindowBackgroundAppearance::Blurred`.
+            #[cfg(target_os = "macos")]
+            crabport_ui::color::enable_vibrancy(cx);
+
             // Set the active locale early so the menu bar (built below) and
             // every window picks up the right translations. Read from the
             // persisted config.toml so the user's language choice survives

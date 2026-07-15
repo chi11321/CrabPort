@@ -480,9 +480,15 @@ impl Render for CrabportApp {
         }
 
         // ---- Root ----
+        // On macOS the window background is a vibrancy layer (see
+        // `open_main_window`). The root paints nothing here so the vibrancy
+        // reads through; each opaque surface (content area, tab bar, dialogs)
+        // supplies its own `opaque_base_bg()` to mask vibrancy where it isn't
+        // wanted. Only the sidebar paints a translucent tint so vibrancy shows
+        // there alone.
         div()
             .size_full()
-            .bg(rgb(bg_base()))
+            .when(cfg!(not(target_os = "macos")), |el| el.bg(rgb(bg_base())))
             .flex()
             .flex_row()
             .key_context("App")
@@ -535,6 +541,14 @@ pub fn open_main_window(cx: &mut App) {
             traffic_light_position: Some(point(px(12.0), px(14.0))),
             ..Default::default()
         }),
+        // macOS: request a blurred (vibrancy) window background so the
+        // sidebar can paint a translucent tint and let the system-provided
+        // `NSVisualEffectView` show through (Finder/Mail "毛玻璃" look). The
+        // content area stays opaque via `opaque_base_bg()` so vibrancy only
+        // reads from the sidebar. See `color::enable_vibrancy` /
+        // `color::sidebar_bg_color`.
+        #[cfg(target_os = "macos")]
+        window_background: WindowBackgroundAppearance::Blurred,
         // On Windows, a `None` titlebar already hides the system title bar
         // (GPUI defaults `hide_title_bar` to `true` when no titlebar is
         // supplied). On Linux we request client-side decorations so the

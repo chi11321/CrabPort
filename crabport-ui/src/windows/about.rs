@@ -93,6 +93,8 @@ impl AboutWindow {
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
+            #[cfg(target_os = "macos")]
+            window_background: WindowBackgroundAppearance::Blurred,
             #[cfg(target_os = "linux")]
             window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(Size {

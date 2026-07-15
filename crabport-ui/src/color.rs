@@ -15,6 +15,7 @@
 //! dark with an indigo accent and well-tuned neutrals. Other built-in
 //! presets (mocha, tokyo-night) are selectable from Settings.
 
+use gpui::{Rgba, rgb};
 use parking_lot::RwLock;
 use std::sync::LazyLock;
 
@@ -252,6 +253,96 @@ static THEME: LazyLock<RwLock<Theme>> =
 /// (struct-of-`u32` copy) — call freely from render paths.
 pub fn theme() -> Theme {
     *THEME.read()
+}
+
+/// Process-wide flag set once on macOS when the main / settings / about windows
+/// are opened with `WindowBackgroundAppearance::Blurred`. When true, sidebar
+/// surfaces paint a semi-transparent tint instead of an opaque fill so the
+/// system-provided vibrancy layer (an `NSVisualEffectView`) shows through,
+/// producing the macOS "sidebar 毛玻璃" look. On other platforms this is
+/// always false and sidebars stay fully opaque.
+#[cfg(target_os = "macos")]
+static VIBRANCY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark vibrancy as on. Called once from `main.rs` on macOS after the
+/// `gpui-component` theme is initialized.
+///
+/// This does two things:
+/// 1. Sets the process-wide flag so [`sidebar_bg_color`] returns a
+///    translucent tint on subsequent renders.
+/// 2. Patches the `gpui-component` global [`Theme`]'s `background` to be
+///    fully transparent. `gpui_component::Root` paints an opaque
+///    `.bg(cx.theme().background)` over the whole window on every frame,
+///    which would otherwise mask the system vibrancy layer. Since this app
+///    never re-calls `Theme::change` at runtime (it drives its own colors via
+///    the `crabport_ui::color` module), the patch persists for the process
+///    lifetime.
+#[cfg(target_os = "macos")]
+pub fn enable_vibrancy(cx: &mut gpui::App) {
+    VIBRANCY_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if cx.has_global::<gpui_component::Theme>() {
+        let theme = gpui_component::Theme::global_mut(cx);
+        theme.colors.background = theme.colors.background.alpha(0.3);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn enable_vibrancy(_cx: &mut gpui::App) {}
+
+/// Background color to use on sidebar-like surfaces.
+/// On macOS when vibrancy is enabled, returns the configured sidebar tint
+/// at ~55% alpha so the system vibrancy layer reads through (Finder/Mail
+/// sidebar style). Otherwise returns the opaque sidebar color as a GPUI
+/// `Rgba` ready for `.bg(...)`.
+///
+/// We go through `rgba()` (not `rgb()`) so the alpha byte is honored: GPUI's
+/// `rgb(hex)` discards the high byte, which would silently drop the alpha we
+/// pack in. Callers that previously wrote `.bg(rgb(bg_sidebar()))` should call
+/// `.bg(sidebar_bg_color())` instead.
+pub fn sidebar_bg_color() -> Rgba {
+    let t = theme();
+    #[cfg(target_os = "macos")]
+    if VIBRANCY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        // `bg_sidebar` is stored as `0x00RRGGBB` (6-digit form). Shift it into
+        // `0xRRGGBBAA` with alpha ~0.55 (0x8C) — enough tint to keep contrast
+        // for text while letting the vibrancy dominate.
+        use gpui::rgba;
+        let rgb_only = t.bg_sidebar & 0x00FF_FFFF;
+        return rgba((rgb_only << 8) | 0x8C);
+    }
+    let _ = t;
+    rgb(bg_sidebar())
+}
+
+/// Background color for the default (unselected / unhovered) state of a
+/// `.tab()` button.
+///
+/// On macOS when vibrancy is on, returns a fully transparent color so the
+/// button doesn't paint an opaque fill over the sidebar vibrancy — the
+/// "毛玻璃" reads straight through the button (Finder/Mail sidebar style).
+/// Hover / selected states keep their own colors, so the transition from
+/// transparent → opaque on hover reads as a fade-in, matching macOS native
+/// sidebar buttons.
+///
+/// On other platforms (or macOS with vibrancy off) this is just the opaque
+/// `tab_btn_bg`.
+pub fn tab_btn_bg_color() -> u32 {
+    #[cfg(target_os = "macos")]
+    if VIBRANCY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        // Pack RGB + alpha 0 into 0xRRGGBBAA. `Button::render` routes this
+        // through `rgba()` (via `to_color`), so the alpha byte is honored.
+        let rgb_only = tab_btn_bg() & 0x00FF_FFFF;
+        return (rgb_only << 8) | 0x00;
+    }
+    tab_btn_bg()
+}
+
+/// Fully-opaque base background, used for the content area so it masks the
+/// vibrancy layer everywhere *except* the sidebar. Kept as a helper (rather
+/// than inlining `rgb(bg_base())`) so the vibrancy boundary is greppable in
+/// one place.
+pub fn opaque_base_bg() -> Rgba {
+    rgb(bg_base())
 }
 
 /// Re-read the live `config.toml` theme into the cached [`Theme`]. Call this

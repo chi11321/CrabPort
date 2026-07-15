@@ -6,6 +6,7 @@
 //! [`render_sidebar_window`] + [`render_tab_sidebar`] encapsulate that
 //! pattern so each window only supplies its tab list + content element.
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::color::*;
@@ -18,7 +19,11 @@ use crate::components::button::Button;
 pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElement) -> Div {
     div()
         .size_full()
-        .bg(rgb(bg_base()))
+        // macOS: leave the root transparent so the window's vibrancy layer
+        // reads through the sidebar (which paints a translucent tint). The
+        // content pane caller supplies an opaque background to mask vibrancy
+        // outside the sidebar.
+        .when(cfg!(not(target_os = "macos")), |el| el.bg(rgb(bg_base())))
         .flex()
         .flex_row()
         .relative()
@@ -29,6 +34,7 @@ pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElemen
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
+                .when(cfg!(target_os = "macos"), |el| el.bg(opaque_base_bg()))
                 .child(content),
         )
 }
@@ -61,7 +67,7 @@ pub fn render_tab_sidebar(
         .flex_shrink_0()
         .border_r_1()
         .border_color(rgb(border()))
-        .bg(rgb(bg_sidebar()))
+        .bg(sidebar_bg_color())
         .flex()
         .flex_col()
         .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 8.0 }))
@@ -72,6 +78,7 @@ pub fn render_tab_sidebar(
             let on_select = on_select.clone();
             let mut btn = Button::new(entry.id)
                 .tab()
+                .bg(tab_btn_bg_color())
                 .selected(is_selected)
                 .child(entry.label)
                 .on_click(move |_e, w, cx| {

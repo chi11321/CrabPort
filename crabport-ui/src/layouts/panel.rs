@@ -168,7 +168,7 @@ pub fn render_panel(
                 .w(px(width))
                 .border_l_1()
                 .border_color(rgb(border()))
-                .bg(rgb(bg_sidebar()))
+                .bg(sidebar_bg_color())
                 .child(tabs.h_full()),
         )
         .into_any_element()
