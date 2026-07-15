@@ -34,15 +34,21 @@ use crate::components::window_layout::{
 pub enum SettingsTab {
     General,
     Appearance,
+    Keybinds,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 2] = [SettingsTab::General, SettingsTab::Appearance];
+    const ALL: [SettingsTab; 3] = [
+        SettingsTab::General,
+        SettingsTab::Appearance,
+        SettingsTab::Keybinds,
+    ];
 
     fn label(self) -> SharedString {
         match self {
             SettingsTab::General => t!("window.settings.tab.general").into(),
             SettingsTab::Appearance => t!("window.settings.tab.appearance").into(),
+            SettingsTab::Keybinds => t!("window.settings.tab.keybinds").into(),
         }
     }
 
@@ -83,6 +89,15 @@ pub struct SettingsWindow {
     /// Terminal section's font dropdown. Built lazily on first render of the
     /// Appearance pane.
     mono_font_names: Vec<String>,
+    /// The action_id currently capturing a keystroke, or `None` when idle.
+    /// When `Some`, the next key press is recorded as the new binding for
+    /// that action instead of being dispatched normally.
+    recording_action: Option<String>,
+    /// Focus handle used to capture keyboard input while recording a keybind.
+    focus_handle: FocusHandle,
+    /// Error message for the action currently being recorded, if any
+    /// (e.g. conflict with another binding).
+    keybind_error: Option<String>,
 }
 
 impl SettingsWindow {
@@ -167,6 +182,9 @@ impl SettingsWindow {
             font_size_input,
             font_size_focused: false,
             mono_font_names: Vec::new(),
+            recording_action: None,
+            focus_handle: cx.focus_handle(),
+            keybind_error: None,
         }
     }
 
@@ -411,6 +429,232 @@ impl SettingsWindow {
                     ),
             )
     }
+
+    // -------------------------------------------------------------------
+    // Keybinds pane
+    // -------------------------------------------------------------------
+
+    fn render_keybinds_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_component::kbd::Kbd;
+
+        let handle = cx.entity().clone();
+        let bindings = crate::keybinds::resolve_all();
+        let recording = self.recording_action.clone();
+        let error_msg = self.keybind_error.clone();
+
+        let mut section = Section::new()
+            .header(t!("window.settings.keybinds.section_shortcuts"))
+            .desc(t!("window.settings.keybinds.shortcuts_desc"));
+
+        for rb in &bindings {
+            // Skip non-configurable entries (Quit, Hide, Tab, etc.) — they
+            // are still registered but not shown in the settings UI.
+            if !rb.entry.configurable {
+                continue;
+            }
+            let action_id = rb.entry.action_id;
+            let label = t!(rb.entry.label_key).to_string();
+            let keystroke = rb.keystroke.clone();
+            let is_recording = recording.as_deref() == Some(action_id);
+            let has_error = error_msg.as_ref().is_some_and(|e| !e.is_empty()) && is_recording;
+
+            // Build the Kbd display element.
+            let kbd_el: AnyElement = if keystroke.is_empty() {
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_muted()))
+                    .child(t!("window.settings.keybinds.unbound").to_string())
+                    .into_any_element()
+            } else if let Ok(stroke) = gpui::Keystroke::parse(&keystroke) {
+                Kbd::new(stroke).into_any_element()
+            } else {
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_muted()))
+                    .child(keystroke.clone())
+                    .into_any_element()
+            };
+
+            // Chip label: "Press keys…" while recording, otherwise the kbd.
+            let chip_child: AnyElement = if is_recording {
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_primary()))
+                    .child(t!("window.settings.keybinds.listening").to_string())
+                    .into_any_element()
+            } else {
+                kbd_el
+            };
+
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .gap_4()
+                // Label + optional error message
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_sm().text_color(rgb(text_primary())).child(label))
+                        .when_some(
+                            if has_error { error_msg.clone() } else { None },
+                            |el, msg| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(input_border_error()))
+                                        .child(msg),
+                                )
+                            },
+                        ),
+                )
+                // Clickable Kbd chip (left-click = rebind, right-click = clear)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("keybind-chip-{action_id}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(72.0))
+                        .h(px(28.0))
+                        .px_3()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(rgb(if is_recording {
+                            text_primary()
+                        } else {
+                            border()
+                        }))
+                        .bg(rgb(if is_recording {
+                            surface_active()
+                        } else {
+                            surface_hover()
+                        }))
+                        .hover(|s| {
+                            s.bg(rgb(if is_recording {
+                                surface_active()
+                            } else {
+                                border()
+                            }))
+                        })
+                        .child(chip_child)
+                        // Left-click: start recording a new binding
+                        .on_click({
+                            let h = handle.clone();
+                            let aid = action_id.to_string();
+                            move |_e, w, cx| {
+                                h.update(cx, |view, cx| {
+                                    view.keybind_error = None;
+                                    if view.recording_action.as_deref() == Some(&aid) {
+                                        view.recording_action = None;
+                                    } else {
+                                        view.recording_action = Some(aid.clone());
+                                        view.focus_handle.focus(w);
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        // Right-click: clear binding (set to empty = disabled)
+                        .on_mouse_down(MouseButton::Right, {
+                            let h = handle.clone();
+                            let aid = action_id.to_string();
+                            move |_e, _w, cx| {
+                                cx.stop_propagation();
+                                h.update(cx, |view, cx| {
+                                    crate::keybinds::set_binding(&aid, "", cx);
+                                    view.recording_action = None;
+                                    view.keybind_error = None;
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                );
+
+            section = section.bare(row);
+        }
+
+        let reset_all = Section::new()
+            .header(t!("window.settings.keybinds.reset_all"))
+            .desc(t!("window.settings.keybinds.reset_all_desc"))
+            .bare(
+                Button::new("settings-reset-all-keybinds")
+                    .child(t!("window.settings.keybinds.reset_all").to_string())
+                    .w_auto()
+                    .centered(true)
+                    .on_click({
+                        let h = handle.clone();
+                        move |_e, _w, cx| {
+                            h.update(cx, |view, cx| {
+                                crate::keybinds::reset_all_bindings(cx);
+                                view.recording_action = None;
+                                view.keybind_error = None;
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
+
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("keybinds-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .child(section)
+                .child(reset_all),
+        )
+    }
+
+    /// `on_key_down` handler attached to the view root while recording a
+    /// keybind. Normalizes the keystroke, checks for conflicts, then either
+    /// saves the binding or shows an error.
+    fn on_key_recording(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Escape cancels.
+        if event.keystroke.key.as_str() == "escape" {
+            self.recording_action = None;
+            self.keybind_error = None;
+            cx.notify();
+            return;
+        }
+
+        let Some(action_id) = self.recording_action.clone() else {
+            return;
+        };
+
+        let Some(ks) = crate::keybinds::normalize_recorded_keystroke(event) else {
+            return;
+        };
+
+        // Check for conflicts with other actions.
+        if let Some((_, conflicting_label_key)) = crate::keybinds::find_conflict(&action_id, &ks) {
+            self.keybind_error = Some(format!(
+                "{}: {}",
+                t!("window.settings.keybinds.conflict"),
+                t!(conflicting_label_key.as_str())
+            ));
+            cx.notify();
+            return;
+        }
+
+        crate::keybinds::set_binding(&action_id, &ks, cx);
+        self.recording_action = None;
+        self.keybind_error = None;
+        cx.notify();
+    }
 }
 
 impl Render for SettingsWindow {
@@ -424,6 +668,7 @@ impl Render for SettingsWindow {
         let content: AnyElement = match self.tab {
             SettingsTab::General => self.render_general_pane(cx).into_any_element(),
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
+            SettingsTab::Keybinds => self.render_keybinds_pane(cx).into_any_element(),
         };
 
         render_sidebar_window(
@@ -439,6 +684,11 @@ impl Render for SettingsWindow {
             ),
             content,
         )
+        .track_focus(&self.focus_handle)
+        // Intercept key presses while recording a keybind.
+        .when(self.recording_action.is_some(), |el| {
+            el.on_key_down(cx.listener(Self::on_key_recording))
+        })
         .when(HAS_CLIENT_CONTROLS, |el| {
             el.child(
                 div()
