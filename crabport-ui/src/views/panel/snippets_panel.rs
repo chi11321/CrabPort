@@ -401,8 +401,7 @@ impl Render for SnippetsPanel {
                     .collect::<Vec<_>>()
             },
         )
-        .track_scroll(&scroll_handle)
-        .pr(px(12.0));
+        .track_scroll(&scroll_handle);
 
         div()
             .h_full()
@@ -463,7 +462,7 @@ impl Render for SnippetsPanel {
                                     .top_0()
                                     .right_0()
                                     .bottom_0()
-                                    .w(px(12.0))
+                                    .w(px(16.0))
                                     .child(
                                         Scrollbar::vertical(&scroll_handle)
                                             .scrollbar_show(ScrollbarShow::Hover),

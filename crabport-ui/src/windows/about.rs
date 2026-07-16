@@ -186,8 +186,7 @@ impl AboutWindow {
                     .collect::<Vec<_>>()
             },
         )
-        .track_scroll(&deps_scroll)
-        .pr(px(12.0));
+        .track_scroll(&deps_scroll);
 
         div()
             .size_full()
@@ -240,7 +239,7 @@ impl AboutWindow {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(12.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&deps_scroll)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),

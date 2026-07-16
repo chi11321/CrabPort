@@ -920,8 +920,7 @@ impl SftpTabView {
                                     .collect::<Vec<_>>()
                             },
                         )
-                        .track_scroll(&scroll_handle)
-                        .pr(px(10.0)),
+                        .track_scroll(&scroll_handle),
                     )
                     .child(
                         div()
@@ -929,7 +928,7 @@ impl SftpTabView {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(10.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
@@ -1838,8 +1837,7 @@ impl SftpTabView {
                                     .collect::<Vec<_>>()
                             },
                         )
-                        .track_scroll(&scroll_handle)
-                        .pr(px(10.0)),
+                        .track_scroll(&scroll_handle),
                     )
                     .child(
                         div()
@@ -1847,7 +1845,7 @@ impl SftpTabView {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(10.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),

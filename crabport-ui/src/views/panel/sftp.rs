@@ -564,12 +564,11 @@ impl Render for SftpPanel {
                     )),
             )
             .child(
-                // List + scrollbar. The scrollbar is absolutely positioned
-                // (Scrollbar's own layout is `position: absolute`), so we use
-                // a relative wrapper and give the list right-padding equal to
-                // the scrollbar width. That way the rows' right-side rounded
-                // corners land to the left of the scrollbar track instead of
-                // being painted over by it.
+                // List + scrollbar. The scrollbar is a pure overlay —
+                // absolutely positioned on top of the list's right edge,
+                // not reserving any layout width. The track is transparent
+                // and the thumb only appears on hover, so row content can
+                // use the full width.
                 //
                 // This container is also the drop target for external file
                 // drag-in uploads: `on_drop::<ExternalPaths>` fires when the
@@ -1138,8 +1137,7 @@ impl Render for SftpPanel {
                                     .collect::<Vec<_>>()
                             },
                         )
-                        .track_scroll(&scroll_handle)
-                        .pr(px(10.0)),
+                        .track_scroll(&scroll_handle),
                     )
                     .child(
                         div()
@@ -1147,7 +1145,7 @@ impl Render for SftpPanel {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(10.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
