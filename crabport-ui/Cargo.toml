@@ -21,3 +21,14 @@ rustc-hash = "2"
 dirs = "6"
 tokio = { version = "1", features = ["sync"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# Windows-only: needed by `components/window_controls.rs` to read the native
+# HWND out of a GPUI `Window` and call `ShowWindowAsync` for proper
+# maximize/restore toggling (gpui's `zoom_window()` only ever maximizes on
+# Windows, never restores).
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

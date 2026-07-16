@@ -64,7 +64,7 @@ impl RenderOnce for WindowControls {
                 "icons/square.svg",
                 None,
                 |w, _cx| {
-                    w.zoom_window();
+                    toggle_maximize(w);
                 },
             ))
             .child(render_control_button(
@@ -76,6 +76,61 @@ impl RenderOnce for WindowControls {
                 },
             ))
             .into_any_element()
+    }
+}
+
+/// Toggle the window between maximized and its pre-maximize (restored) state.
+///
+/// On Windows, GPUI's `Window::zoom_window()` unconditionally sends
+/// `SW_MAXIMIZE`, so clicking the maximize button a second time does nothing
+/// — the window stays maximized forever. To get proper toggle behavior we
+/// call `ShowWindowAsync(hwnd, SW_RESTORE)` directly when the window is
+/// already maximized, and fall back to `zoom_window()` (which maximizes) when
+/// it isn't.
+///
+/// On Linux, GPUI's `zoom()` already toggles correctly (Wayland checks
+/// `state.maximized`, X11 sends `_NET_WM_STATE_MAXIMIZED_*` with
+/// `_NET_WM_STATE_TOGGLE`), so we can just delegate.
+///
+/// macOS uses native traffic lights and never reaches here (see
+/// [`HAS_CLIENT_CONTROLS`]).
+fn toggle_maximize(window: &mut Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, Win32WindowHandle};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindowAsync};
+
+        if window.is_maximized() {
+            // Restore to the pre-maximize bounds.
+            let raw = match window.window_handle() {
+                Ok(h) => h,
+                Err(_) => {
+                    window.zoom_window();
+                    return;
+                }
+            };
+            let win32: Win32WindowHandle = match raw.as_raw() {
+                raw_window_handle::RawWindowHandle::Win32(h) => h,
+                _ => {
+                    window.zoom_window();
+                    return;
+                }
+            };
+            // `Win32WindowHandle::hwnd` is a `NonZeroIsize`; cast it to the
+            // pointer-sized `HWND` type expected by Win32.
+            let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+            unsafe {
+                let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+            }
+        } else {
+            window.zoom_window();
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        window.zoom_window();
     }
 }
 

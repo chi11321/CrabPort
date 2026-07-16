@@ -36,6 +36,21 @@ fn main() {
     Application::new()
         .with_assets(CrabportAssets::new())
         .run(|cx| {
+            // Register all keybinds from the catalog (reads config.toml
+            // overrides, falls back to platform defaults).
+            //
+            // This MUST run before `gpui_component::init` because
+            // `apply_bindings` calls `cx.clear_key_bindings()`, which
+            // wipes the entire keymap — including any bindings that
+            // gpui-component registered earlier (notably the `Input`
+            // widget's `backspace` / `delete` / `enter` / `escape`
+            // bindings under the `Input` context). Registering our
+            // bindings first and then calling `gpui_component::init`
+            // leaves the input bindings intact, so text fields work
+            // correctly (without this, Backspace does nothing in
+            // StyledInput on Windows / Linux).
+            keybinds::apply_bindings(cx);
+
             gpui_component::init(cx);
 
             // Force dark theme regardless of system appearance.
@@ -54,10 +69,6 @@ fn main() {
             // app restarts.
             let locale = crabport_core::config::snapshot().appearance.locale;
             crabport_ui::set_locale(&locale);
-
-            // Register all keybinds from the catalog (reads config.toml
-            // overrides, falls back to platform defaults).
-            keybinds::apply_bindings(cx);
 
             // Initialize process-wide shared state (store, window registry)
             // before opening any window. `CrabportApp::new` reads from this

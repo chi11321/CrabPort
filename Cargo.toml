@@ -16,6 +16,13 @@ crabport-core = {path = "crabport-core"}
 gpui = { version = "0.2", default-features = false, features = ["font-kit"] }
 gpui-component = "0.5"
 
+[build-dependencies]
+# Embed `app-icon.ico` into the .exe so Windows shows our icon in the
+# taskbar / explorer / alt-tab switcher instead of the default Rust logo.
+# On non-Windows targets `build.rs` is a no-op and embed-resource is unused,
+# but it's cheap to keep in the build-dep list.
+embed-resource = "3.0"
+
 [profile.release]
 opt-level = 3
 lto = true

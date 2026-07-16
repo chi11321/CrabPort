@@ -8,6 +8,7 @@ version = "0.1.2"
 dependencies = [
  "crabport-core",
  "crabport-ui",
+ "embed-resource",
  "gpui",
  "gpui-component",
 ]
@@ -1447,11 +1448,13 @@ dependencies = [
  "gpui-component",
  "lru",
  "parking_lot",
+ "raw-window-handle",
  "rust-i18n",
  "rustc-hash 2.1.2",
  "smol",
  "tokio",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]
