@@ -93,8 +93,23 @@ impl KeybindConfig {
     }
 }
 
+/// Default UI locale used when `config.toml` doesn't pin one yet
+/// (fresh install, or the field was removed). Resolves to the current OS
+/// locale when it's a Chinese variant, otherwise falls back to `en` —
+/// the two locales CrabPort ships translations for.
+///
+/// This only runs for *missing* `locale` fields thanks to the
+/// `#[serde(default = "default_locale")]` attribute, so an explicit user
+/// choice in Settings (which is persisted immediately) always wins, and
+/// existing `config.toml` files that already pin `locale = "en"` are left
+/// untouched.
 fn default_locale() -> String {
-    "en".to_string()
+    let sys = sys_locale::get_locale().unwrap_or_default();
+    if sys.to_lowercase().starts_with("zh") {
+        "zh-CN".to_string()
+    } else {
+        "en".to_string()
+    }
 }
 
 impl Default for AppearanceConfig {

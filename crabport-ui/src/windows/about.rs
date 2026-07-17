@@ -86,10 +86,18 @@ impl AboutWindow {
         // tab has room for a scrollable text block + dependency list.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
-            #[cfg(target_os = "macos")]
+            // See `app::open_main_window` for the per-platform titlebar
+            // rationale. `appears_transparent: true` is required on Windows
+            // (not just macOS) to actually strip the system title bar;
+            // the GPUI default leaves it visible.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             titlebar: Some(TitlebarOptions {
+                #[cfg(target_os = "macos")]
                 title: Some(t!("window.about.title").to_string().into()),
+                #[cfg(target_os = "windows")]
+                title: None,
                 appears_transparent: true,
+                #[cfg(target_os = "macos")]
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),

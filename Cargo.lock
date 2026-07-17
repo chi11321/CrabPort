@@ -1371,6 +1371,7 @@ dependencies = [
  "parking_lot",
  "rusqlite",
  "serde",
+ "sys-locale",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",

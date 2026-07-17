@@ -539,10 +539,25 @@ impl Render for CrabportApp {
 pub fn open_main_window(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
-        #[cfg(target_os = "macos")]
+        // Hide the system title bar on every platform so our in-app tab
+        // bar fills the full window height:
+        //
+        // - **macOS**: `appears_transparent: true` makes the system title
+        //   bar transparent (we draw our own) and `traffic_light_position`
+        //   offsets the close/min/max buttons over our tab bar.
+        // - **Windows**: `appears_transparent: true` flips GPUI's internal
+        //   `hide_title_bar` flag (see `platform/windows/window.rs`), which
+        //   strips the `WS_CAPTION`/`WS_SYSMENU` styling so Windows draws
+        //   no title bar at all. The default (`titlebar: Some(..)` with
+        //   `appears_transparent: false`) keeps the native title bar —
+        //   so we must set this explicitly on Windows, not just on macOS.
+        // - **Linux**: the title bar field is ignored for Wayland/X11;
+        //   we use `window_decorations` below instead.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
+            #[cfg(target_os = "macos")]
             traffic_light_position: Some(point(px(12.0), px(14.0))),
             ..Default::default()
         }),
@@ -554,11 +569,9 @@ pub fn open_main_window(cx: &mut App) {
         // `color::sidebar_bg_color`.
         #[cfg(target_os = "macos")]
         window_background: WindowBackgroundAppearance::Blurred,
-        // On Windows, a `None` titlebar already hides the system title bar
-        // (GPUI defaults `hide_title_bar` to `true` when no titlebar is
-        // supplied). On Linux we request client-side decorations so the
-        // compositor stops drawing its server-side title bar, letting our
-        // in-app tab bar fill the full window height.
+        // On Linux we request client-side decorations so the compositor
+        // stops drawing its server-side title bar, letting our in-app
+        // tab bar fill the full window height.
         #[cfg(target_os = "linux")]
         window_decorations: Some(WindowDecorations::Client),
         window_min_size: Some(Size {
