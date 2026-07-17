@@ -108,7 +108,6 @@ async fn sftp_download_dir_via_tar(
         parent_q = shell_quote(&remote_parent),
         base_q = shell_quote(&remote_base),
     );
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP download dir: tar czf cmd={cmd}");
     let (code, out) = exec_with_status(&h, &cmd).await;
     if code == EXIT_COMMAND_NOT_FOUND {

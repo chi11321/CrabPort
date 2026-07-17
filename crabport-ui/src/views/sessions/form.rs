@@ -348,7 +348,6 @@ impl ConnectionFormState {
                 crabport_core::credential::parse_proxy_url(&url)
             }
         };
-        #[cfg(debug_assertions)]
         tracing::info!(
             "connection_form: proxy_config — kind={:?}, editing_proxy_id={:?}, resolved={:?}",
             self.proxy_kind,
@@ -368,7 +367,6 @@ impl ConnectionFormState {
         window: &mut Window,
         cx: &mut App,
     ) {
-        #[cfg(debug_assertions)]
         tracing::info!(
             "connection_form: load_proxy — proxy_id={:?}, has_config={}",
             proxy_id,
@@ -379,7 +377,6 @@ impl ConnectionFormState {
             Some(cfg) if cfg.is_enabled() => {
                 self.proxy_kind = ProxyKind::Custom;
                 let url = cfg.to_url();
-                #[cfg(debug_assertions)]
                 tracing::info!(
                     "connection_form: load_proxy — restoring Custom url={:?}",
                     url
@@ -389,7 +386,6 @@ impl ConnectionFormState {
                 });
             }
             _ => {
-                #[cfg(debug_assertions)]
                 tracing::info!("connection_form: load_proxy — no proxy, selecting None");
                 self.proxy_kind = ProxyKind::None;
             }

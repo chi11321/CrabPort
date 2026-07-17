@@ -30,7 +30,9 @@ fn main() {
     #[cfg(target_os = "linux")]
     workaround_wsl2_wayland_version();
 
-    #[cfg(debug_assertions)]
+    // Initialize process-wide tracing. Runs in BOTH debug and release builds
+    // (no `debug_assertions` gate) so field-reported issues leave a trail in
+    // `{data_dir}/crabport/latest.log`. Debug builds ALSO log to stderr.
     crabport_core::log::init();
 
     Application::new()

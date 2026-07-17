@@ -280,7 +280,6 @@ pub(super) fn upsert_proxy_for_host(
     existing_id: Option<i64>,
     cx: &mut App,
 ) -> Option<i64> {
-    #[cfg(debug_assertions)]
     tracing::info!(
         "upsert_proxy_for_host: existing_id={:?}, has_config={}",
         existing_id,
@@ -290,7 +289,6 @@ pub(super) fn upsert_proxy_for_host(
     let proxy_config = proxy_config.as_ref()?;
     // Only persist enabled proxies (kind != None and host non-empty).
     if !proxy_config.is_enabled() {
-        #[cfg(debug_assertions)]
         tracing::info!(
             "upsert_proxy_for_host: config not enabled (kind={:?}, host={:?}) — removing if set",
             proxy_config.kind,
@@ -302,7 +300,6 @@ pub(super) fn upsert_proxy_for_host(
         return None;
     }
 
-    #[cfg(debug_assertions)]
     tracing::info!(
         "upsert_proxy_for_host: persisting kind={:?} {}:{} has_user={} has_pass={}",
         proxy_config.kind,
@@ -332,7 +329,6 @@ pub(super) fn upsert_proxy_for_host(
     match existing_id {
         Some(id) => {
             let res = store.update_proxy(&entry);
-            #[cfg(debug_assertions)]
             tracing::info!(
                 "upsert_proxy_for_host: update_proxy({}) result={:?}",
                 id,
@@ -343,7 +339,6 @@ pub(super) fn upsert_proxy_for_host(
         }
         None => {
             let res = store.add_proxy(&entry);
-            #[cfg(debug_assertions)]
             tracing::info!(
                 "upsert_proxy_for_host: add_proxy result={:?}",
                 res.as_ref().err()

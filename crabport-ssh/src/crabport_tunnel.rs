@@ -225,7 +225,6 @@ impl TunnelManager {
                 let (tcp, peer) = match listener.accept().await {
                     Ok(p) => p,
                     Err(e) => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!("SSH: local tunnel accept error: {e}");
                         continue;
                     }
@@ -236,7 +235,6 @@ impl TunnelManager {
                 let handle = match source.handle().await {
                     Some(h) => h,
                     None => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!(
                             "SSH: local tunnel inbound conn from {peer_addr} but session is down — dropping"
                         );
@@ -264,7 +262,6 @@ impl TunnelManager {
                         {
                             Ok(ch) => ch,
                             Err(e) => {
-                                #[cfg(debug_assertions)]
                                 tracing::warn!(
                                     "SSH: local tunnel channel_open_direct_tcpip to {th}:{tp} failed: {e}"
                                 );
@@ -421,7 +418,6 @@ impl TunnelManager {
                 let (tcp, peer) = match listener.accept().await {
                     Ok(p) => p,
                     Err(e) => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!("SSH: dynamic tunnel accept error: {e}");
                         continue;
                     }
@@ -431,7 +427,6 @@ impl TunnelManager {
                 let handle = match source.handle().await {
                     Some(h) => h,
                     None => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!(
                             "SSH: dynamic tunnel inbound conn from {peer_addr} but session is down — dropping"
                         );
@@ -446,7 +441,6 @@ impl TunnelManager {
                         match socks5_handshake(tcp).await {
                             Ok(t) => t,
                             Err((mut tcp, reason)) => {
-                                #[cfg(debug_assertions)]
                                 tracing::debug!(
                                     "SSH: socks5 handshake failed ({reason}) from {peer_addr}"
                                 );
@@ -470,7 +464,6 @@ impl TunnelManager {
                         {
                             Ok(ch) => ch,
                             Err(e) => {
-                                #[cfg(debug_assertions)]
                                 tracing::warn!(
                                     "SSH: dynamic tunnel channel_open_direct_tcpip to {target_host}:{target_port} failed: {e}"
                                 );
@@ -515,7 +508,6 @@ impl TunnelManager {
                     if let Some(handle) = self.source.handle().await {
                         let h = handle.lock().await;
                         if let Err(e) = h.cancel_tcpip_forward(&addr, port).await {
-                            #[cfg(debug_assertions)]
                             tracing::warn!("SSH: cancel_tcpip_forward({addr}:{port}) failed: {e}");
                         }
                     }

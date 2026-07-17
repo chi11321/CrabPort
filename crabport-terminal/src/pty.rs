@@ -103,14 +103,12 @@ impl PtyBackend {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
-                            #[cfg(debug_assertions)]
                             tracing::info!("pty reader: EOF");
                             let _ = smol::block_on(event_tx.broadcast(BackendEvent::Closed));
                             break;
                         }
 
                         Ok(n) => {
-                            #[cfg(debug_assertions)]
                             tracing::debug!("pty reader: {} bytes", n);
                             let _ = smol::block_on(
                                 event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())),

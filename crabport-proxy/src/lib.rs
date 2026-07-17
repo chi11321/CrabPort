@@ -91,7 +91,6 @@ async fn connect_socks5(
     let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
     let target = format!("{target_host}:{target_port}");
 
-    #[cfg(debug_assertions)]
     tracing::info!("SOCKS5: connecting via {proxy_addr} to {target}");
 
     let stream = match (proxy.username.as_deref(), proxy.password.as_deref()) {
@@ -126,7 +125,6 @@ async fn connect_http_connect(
     let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
     let target = format!("{target_host}:{target_port}");
 
-    #[cfg(debug_assertions)]
     tracing::info!("{:?}: connecting via {proxy_addr} to {target}", proxy.kind);
 
     // Open TCP to the proxy server.
