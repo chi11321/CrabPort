@@ -13,3 +13,8 @@ smol = "2.0.2"
 async-channel = "2.5.0"
 async-broadcast = "0.7.2"
 sysinfo = { version = "0.35", default-features = false, features = ["system", "network"] }
+
+# Windows-only: alacritty_terminal's `tty::windows` module (which we
+# use via `alacritty_terminal::tty::new`) pulls in windows-sys transitively
+# for the ConPTY API. No direct windows-sys dep needed here.
+[target.'cfg(windows)'.dependencies]

@@ -17,7 +17,7 @@ use crabport_ssh::backend::HostKeyInfo;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_telnet::backend::TelnetBackend;
 use crabport_telnet::session::TelnetConnectionInfo;
-use crabport_terminal::pty::PtyBackend;
+use crabport_terminal::pty::{FailedPtyBackend, PtyBackend};
 use crabport_terminal::terminal::{
     CrabPortMonitor, RemoteStatus, SftpTransferBytes, SftpTransferKind, SftpTransferStage,
     TerminalSession,
@@ -172,10 +172,20 @@ impl TerminalView {
     pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        let backend = Arc::new(
-            PtyBackend::new(cols as u16, rows as u16)
-                .expect("failed to create pty backend (local PTY is not supported on Windows)"),
-        );
+        // Local PTY creation can fail on platforms without a usable
+        // pseudoterminal (e.g. older Windows builds without ConPTY, or
+        // headless CI hosts without a controlling TTY). Rather than panic
+        // — which aborts the whole app under the `panic = abort` release
+        // profile — surface the error in the connection overlay so the
+        // user sees what went wrong and can still use remote sessions.
+        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
+            match PtyBackend::new(cols as u16, rows as u16) {
+                Ok(b) => Arc::new(b),
+                Err(e) => {
+                    tracing::error!("failed to create local PTY backend: {e}");
+                    Arc::new(FailedPtyBackend::new(e.to_string()))
+                }
+            };
         Self::with_backend(backend, cols, rows, None, None, count, cx)
     }
 

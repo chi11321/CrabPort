@@ -1,18 +1,38 @@
 //! Local PTY backend.
 //!
-//! Fully implemented on Unix (`#[cfg(unix)]`) where `alacritty_terminal`'s
-//! `tty::Pty` exposes `file()` / `child()` and we can drive `ioctl(TIOCSWINSZ)`
-//! + `waitpid` directly.
+//! Drives a child shell process attached to a pseudoterminal, pumping PTY
+//! output into the [`BackendEvent`] broadcast channel as `Data` chunks so
+//! the `TerminalSession` can parse them into its own alacritty `Term`.
 //!
-//! On Windows (`#[cfg(windows)]`) this module compiles but is a **stub**:
-//! `PtyBackend::new` always returns an error. The alacritty `Pty` API on
-//! Windows differs significantly (ConPTY, no `file()`/`child()` accessors,
-//! resize goes through the `OnResize` trait) and is not wired up here. Callers
-//! that hit this path on Windows will surface the error — remote SSH sessions
-//! (the app's primary use case) are unaffected since they use `SshBackend`.
+//! On both platforms the high-level structure is the same:
+//!
+//! 1. Create the PTY + child shell process via `alacritty_terminal::tty::new`.
+//! 2. A reader thread pumps PTY output into the [`BackendEvent`] broadcast
+//!    channel (`Data` for every chunk, `Closed` on EOF / read error).
+//! 3. A writer task drains a command channel into the PTY's writer handle.
+//! 4. A child-exit watcher broadcasts `BackendEvent::Closed` once the child
+//!    shell terminates.
+//!
+//! The Unix implementation uses `alacritty_terminal::tty::new` (which wraps
+//! `openpty` + `fork`) and `libc::waitpid` to watch the child, since
+//! `alacritty_terminal`'s Unix `Pty` exposes `file()` / `child()` accessors.
+//!
+//! The Windows implementation also uses `alacritty_terminal::tty::new`,
+//! which on Windows calls `conpty::new` — this auto-detects Windows
+//! Terminal's improved `conpty.dll`/`OpenConsole.exe` if available, and
+//! falls back to the inbox Windows ConPTY API. We do NOT use
+//! `alacritty_terminal`'s `EventLoop` even though it exists and Zed uses
+//! it — that loop consumes bytes into its own `Term`, but our architecture
+//! has `TerminalSession` own the `Term` and parse `BackendEvent::Data`
+//! chunks itself. Driving the `Pty` directly (via its `EventedReadWrite`
+//! `reader()`/`writer()` methods, wrapped in `Arc<Mutex<Pty>>`) keeps the
+//! Windows path on the same byte-broadcast model as Unix.
+//!
+//! Shell selection on Windows cascades `pwsh.exe` → `powershell.exe` →
+//! `cmd.exe` (see `default_shell`). On Unix, `alacritty_terminal` resolves
+//! the login shell from `passwd`/`$SHELL`.
 
-// Imports used only by the Unix implementation. Everything shared across
-// platforms (struct fields, trait impls) is imported unconditionally below.
+// Imports used only by the Unix implementation.
 #[cfg(unix)]
 use std::{
     io::{Read, Write},
@@ -27,6 +47,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
+#[cfg(windows)]
+use alacritty_terminal::tty::Pty;
 #[cfg(unix)]
 use alacritty_terminal::{
     event::WindowSize,
@@ -34,12 +56,12 @@ use alacritty_terminal::{
 };
 #[cfg(unix)]
 use async_broadcast::broadcast;
-// `BroadcastReceiver` is the return type of `CrabPortTerminal::subscribe`,
-// which is implemented for all platforms (including the Windows stub).
-use async_broadcast::Receiver as BroadcastReceiver;
-use async_channel::{Sender as MpscSender, unbounded};
 #[cfg(unix)]
 use libc::{TIOCSWINSZ, ioctl, winsize};
+// `BroadcastReceiver` is the return type of `CrabPortTerminal::subscribe`,
+// which is implemented for all platforms.
+use async_broadcast::Receiver as BroadcastReceiver;
+use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
 use crate::terminal::{
@@ -47,12 +69,100 @@ use crate::terminal::{
     RemoteStatus,
 };
 
+// ===========================================================================
+// Platform-agnostic shell selection
+// ===========================================================================
+
+/// Pick the default local shell for this platform, mirroring alacritty's
+/// own `tty::windows::cmdline` default (which is `powershell`) plus a
+/// fallback cascade through modern PowerShell Core to the legacy
+/// command prompt.
+///
+/// - **Windows**: prefer `pwsh.exe` (PowerShell 7+, the modern Core
+///   build) when installed, then `powershell.exe` (the inbox Windows
+///   PowerShell 5.x that's always present on Windows 10+), then
+///   `cmd.exe` as the ultimate fallback. We do NOT shell out to
+///   `wt.exe` (Windows Terminal) — that's a *launcher* that opens its
+///   own GUI window, not a shell that can run inside our ConPTY.
+///   Alacritty's own default is `powershell`, so we match that when
+///   `pwsh.exe` isn't available.
+/// - **Unix**: `None` — `alacritty_terminal` already resolves the user's
+///   login shell from `passwd` / `$SHELL`, which is what we want.
+fn default_shell() -> Option<(String, Vec<String>)> {
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer PowerShell 7+ (`pwsh.exe`) when the user has installed
+        // it — it's a noticeable upgrade over the inbox Windows
+        // PowerShell (faster, cross-platform, better Unicode handling).
+        if which_executable("pwsh.exe").is_some() {
+            return Some(("pwsh.exe".to_string(), vec![]));
+        }
+        // Fall back to inbox Windows PowerShell — always present on
+        // Windows 10+. This matches alacritty's own `tty::windows::cmdline`
+        // default (`Shell::new("powershell".to_owned(), Vec::new())`).
+        if which_executable("powershell.exe").is_some() {
+            return Some(("powershell.exe".to_string(), vec![]));
+        }
+        // Last resort: the legacy Windows command prompt. Always present.
+        Some(("cmd.exe".to_string(), vec![]))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Let alacritty_terminal pick the login shell from passwd/$SHELL.
+        None
+    }
+}
+
+/// Return `Some(())` if `program` resolves on `PATH` (or is an absolute
+/// path that exists), `None` otherwise. On Windows we also try the
+/// PATHEXT extensions (`.EXE`, `.CMD`, …) when looking up a bare name.
+#[cfg(windows)]
+fn which_executable(program: &str) -> Option<()> {
+    // Absolute / relative path with a separator → check the file directly.
+    if program.contains('\\') || program.contains('/') {
+        return std::path::Path::new(program).is_file().then_some(());
+    }
+    // Bare program name → PATHEXT-aware PATH walk.
+    let path = std::env::var("PATH").ok()?;
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".to_string());
+    for ext in pathext.split(';') {
+        for dir in path.split(';') {
+            let candidate = std::path::Path::new(dir).join(format!("{}{}", program, ext));
+            if candidate.is_file() {
+                return Some(());
+            }
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// Command enum — shared between platforms
+// ===========================================================================
+
+enum Command {
+    Write(Vec<u8>),
+    Resize(u16, u16),
+    Close,
+}
+
+// ===========================================================================
+// PtyBackend — common fields
+// ===========================================================================
+
 pub struct PtyBackend {
-    #[cfg(unix)]
-    _pty: Arc<Mutex<Pty>>,
     command_tx: MpscSender<Command>,
     event_tx: async_broadcast::Sender<BackendEvent>,
-    #[cfg(unix)]
+    // `Arc<Mutex<Pty>>` — kept alive for the lifetime of the backend so
+    // the reader/writer/resize worker threads (which hold clones) can
+    // reach the underlying PTY. On Unix this is `alacritty_terminal::tty::Pty`
+    // (wrapping `openpty`+`fork`); on Windows it's the same type wrapping
+    // ConPTY. Both expose `file()`/`child()` (Unix) or `reader()`/`writer()`/`on_resize()`
+    // (Windows) through the traits `tty::EventedReadWrite` / `tty::EventedPty`.
+    _pty: Arc<Mutex<Pty>>,
+    /// Inactive receiver that keeps the broadcast channel alive even when
+    /// there are no active subscribers. Without holding one receiver the
+    /// channel reports `Closed` to new subscribers immediately.
     _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
     sys: RwLock<sysinfo::System>,
     networks: RwLock<sysinfo::Networks>,
@@ -65,14 +175,12 @@ pub struct PtyBackend {
     prev_net_recv: AtomicU64,
 }
 
-enum Command {
-    Write(Vec<u8>),
-    Resize(u16, u16),
-    Close,
-}
+// ===========================================================================
+// Unix implementation
+// ===========================================================================
 
+#[cfg(unix)]
 impl PtyBackend {
-    #[cfg(unix)]
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
         tty::setup_env();
 
@@ -83,7 +191,16 @@ impl PtyBackend {
             cell_height: 0,
         };
 
-        let pty = Arc::new(Mutex::new(tty::new(&Options::default(), window_size, 0)?));
+        // Build alacritty `Options` with our default shell selection.
+        // `default_shell()` returns `None` on Unix so alacritty picks the
+        // login shell itself; on Windows it returns a `(program, args)`
+        // tuple selecting `pwsh` → `powershell` → `cmd`.
+        let mut options = Options::default();
+        if let Some((program, args)) = default_shell() {
+            options.shell = Some(tty::Shell::new(program, args));
+        }
+
+        let pty = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
 
         let reader = pty.lock().file().try_clone()?;
         let mut writer = pty.lock().file().try_clone()?;
@@ -196,17 +313,187 @@ impl PtyBackend {
             prev_net_recv: AtomicU64::new(0),
         })
     }
+}
 
-    /// Windows stub: local PTY is not supported on Windows. Remote SSH
-    /// sessions are unaffected (they use `SshBackend`, not `PtyBackend`).
-    #[cfg(not(unix))]
-    pub fn new(_cols: u16, _rows: u16) -> std::io::Result<Self> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "local PTY backend is not supported on Windows; use a remote SSH session instead",
-        ))
+// ===========================================================================
+// Windows implementation — alacritty's ConPTY `Pty` + manual reader/writer
+// ===========================================================================
+//
+// We use `alacritty_terminal::tty::new` to create the ConPTY + child shell,
+// which gives us automatic `conpty.dll`/`OpenConsole.exe` detection (the
+// Windows Terminal project's improved ConPTY host) for free — matching
+// alacritty's and Zed's behavior. The shell selection (`pwsh.exe` →
+// `powershell.exe` → `cmd.exe`) is handled by our `default_shell()` above.
+//
+// We do NOT use alacritty's `EventLoop` here, even though it exists and
+// Zed uses it. The reason is architectural: our `TerminalSession` owns
+// its own `Term` and parses `BackendEvent::Data` byte chunks into it
+// (see `TerminalSession::start`). alacritty's `EventLoop`, by contrast,
+// owns the `Pty` *and* advances bytes into a `Term` it also owns — so
+// the session would never see the raw bytes and its grid would stay
+// empty. Zed solves this by sharing the `Term` between the event loop
+// and the renderer; we don't want to refactor `TerminalSession` to that
+// model just for Windows, so instead we drive the `Pty` directly with
+// the same reader-thread / writer-task / child-watcher layout the Unix
+// path uses.
+//
+// The `Pty` on Windows doesn't expose `file()` / `child()` (the ConPTY
+// reader/writer are IOCP-backed pipes, not file descriptors), so we
+// access them through the `EventedReadWrite` trait's `reader()` /
+// `writer()` methods. Because those take `&mut self`, we wrap the `Pty`
+// in `Arc<Mutex<Pty>>` and lock it briefly for each I/O operation —
+// the same approach the Unix path takes for resize. The lock is never
+// held across a blocking read/write syscall that could stall the other
+// side, because alacritty's Windows `UnblockedReader`/`UnblockedWriter`
+// use background threads + async pipes internally, so `read()`/`write()`
+// return immediately with whatever is buffered.
+
+#[cfg(windows)]
+impl PtyBackend {
+    pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        use alacritty_terminal::{
+            event::WindowSize,
+            tty::{self, Options, Pty},
+        };
+
+        // Build alacritty `Options` with our default shell selection.
+        // `default_shell()` returns `Some((program, args))` on Windows,
+        // cascading `pwsh.exe` → `powershell.exe` → `cmd.exe`.
+        let mut options = Options::default();
+        if let Some((program, args)) = default_shell() {
+            options.shell = Some(tty::Shell::new(program, args));
+        }
+        options.drain_on_exit = true;
+
+        let window_size = WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: 0,
+            cell_height: 0,
+        };
+
+        // `tty::new` on Windows calls `conpty::new`, which auto-detects
+        // `conpty.dll` (Windows Terminal's improved ConPTY) and falls
+        // back to the inbox Windows API. The returned `Pty` owns the
+        // ConPTY handle + child process + reader/writer pipes.
+        let pty: Arc<Mutex<Pty>> = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
+
+        // Broadcast channel for backend events.
+        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+
+        // --- Reader thread: lock `pty`, call `reader().read()`, broadcast `Data` ---
+        //
+        // alacritty's Windows `UnblockedReader` runs a background thread
+        // that drains the ConPTY conout pipe into an async `piper` pipe.
+        // Our `read()` call here pulls from that pipe, so it returns
+        // quickly (0 bytes if nothing is buffered yet). When we get a
+        // 0-byte read we poll `next_child_event()` (set up by alacritty's
+        // `ChildExitWatcher` via `RegisterWaitForSingleObject`) to detect
+        // shell exit, then sleep briefly before retrying.
+        //
+        // The 5ms back-off is a pragmatic trade-off: a shorter interval
+        // burns more CPU, a longer one adds latency. The proper fix would
+        // be to use alacritty's `EventLoop` (which polls via IOCP), but
+        // that consumes bytes into its own `Term`, breaking our
+        // `BackendEvent::Data` broadcast model. 200Hz idle polling is
+        // cheap and keeps the latency below human perception.
+        {
+            let event_tx = event_tx.clone();
+            let pty_for_reader = pty.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = {
+                        let mut guard = pty_for_reader.lock();
+                        use alacritty_terminal::tty::EventedReadWrite;
+                        use std::io::Read;
+                        match guard.reader().read(&mut buf) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::error!("conpty reader error: {}", e);
+                                let _ = smol::block_on(
+                                    event_tx.broadcast(BackendEvent::Error(e.to_string())),
+                                );
+                                let _ = smol::block_on(event_tx.broadcast(BackendEvent::Closed));
+                                return;
+                            }
+                        }
+                    };
+                    if n == 0 {
+                        // No data buffered right now. Check if the child
+                        // has exited; if so, broadcast `Closed` and exit.
+                        // Otherwise back off briefly.
+                        let child_exited = {
+                            let mut guard = pty_for_reader.lock();
+                            use alacritty_terminal::tty::EventedPty;
+                            guard.next_child_event().is_some()
+                        };
+                        if child_exited {
+                            tracing::info!("conpty reader: child exited");
+                            let _ = smol::block_on(event_tx.broadcast(BackendEvent::Closed));
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    tracing::debug!("conpty reader: {} bytes", n);
+                    let _ =
+                        smol::block_on(event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())));
+                }
+            });
+        }
+
+        // --- Command pump: writes + resizes + close → ConPTY ---
+        let (command_tx, command_rx) = unbounded::<Command>();
+        let pty_for_writer = pty.clone();
+        let event_tx_for_writer = event_tx.clone();
+        smol::spawn(async move {
+            while let Ok(cmd) = command_rx.recv().await {
+                match cmd {
+                    Command::Write(data) => {
+                        let mut guard = pty_for_writer.lock();
+                        use alacritty_terminal::tty::EventedReadWrite;
+                        use std::io::Write;
+                        let _ = guard.writer().write_all(&data);
+                        let _ = guard.writer().flush();
+                    }
+                    Command::Resize(cols, rows) => {
+                        use alacritty_terminal::event::OnResize;
+                        pty_for_writer.lock().on_resize(WindowSize {
+                            num_lines: rows,
+                            num_cols: cols,
+                            cell_width: 0,
+                            cell_height: 0,
+                        });
+                    }
+                    Command::Close => {
+                        let _ = event_tx_for_writer.try_broadcast(BackendEvent::Closed);
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+
+        Ok(Self {
+            _pty: pty,
+            command_tx,
+            event_tx,
+            _event_rx,
+            sys: RwLock::new(sysinfo::System::new()),
+            networks: RwLock::new(sysinfo::Networks::new_with_refreshed_list()),
+            last_refresh_ms: AtomicU64::new(0),
+            cached_metrics: RwLock::new(RemoteMetrics::default()),
+            prev_net_sent: AtomicU64::new(0),
+            prev_net_recv: AtomicU64::new(0),
+        })
     }
 }
+
+// ===========================================================================
+// CrabPortTerminal impl — shared between platforms
+// ===========================================================================
 
 impl CrabPortTerminal for PtyBackend {
     fn write(&self, data: &[u8]) {
@@ -251,6 +538,10 @@ impl CrabPortTerminal for PtyBackend {
         });
     }
 }
+
+// ===========================================================================
+// CrabPortMonitor impl — shared between platforms
+// ===========================================================================
 
 impl CrabPortMonitor for PtyBackend {
     fn status(&self) -> RemoteStatus {
@@ -322,7 +613,86 @@ impl CrabPortMonitor for PtyBackend {
 
 impl Drop for PtyBackend {
     fn drop(&mut self) {
+        // Tell the writer task to shut down. `Command::Close` broadcasts
+        // `BackendEvent::Closed` and exits the writer task's loop. On Unix
+        // the reader thread then sees EOF on the cloned file descriptor
+        // (closed when the child exits) and exits on its own. On Windows
+        // the reader thread's `next_child_event()` poll picks up the exit
+        // and the loop terminates. The `Pty` itself is dropped when the
+        // last `Arc<Mutex<Pty>>` reference goes away — the writer task
+        // holds one clone, which is dropped when its loop exits.
         let _ = self.command_tx.try_send(Command::Close);
+    }
+}
+
+// ===========================================================================
+// FailedPtyBackend — local-PTY fallback used when `PtyBackend::new` errors
+// ===========================================================================
+
+/// Degenerate backend used when local PTY creation fails (e.g. on a Windows
+/// build without ConPTY, or on a headless host without a controlling TTY).
+///
+/// Instead of panicking — which would abort the whole app under the
+/// `panic = abort` release profile — we surface the error through the
+/// connection overlay so the user sees the message and can still open
+/// remote SSH / Telnet sessions. The backend immediately reports `Closed`
+/// on its first (and only) event, and writes / resizes are silently
+/// dropped.
+pub struct FailedPtyBackend {
+    event_tx: async_broadcast::Sender<BackendEvent>,
+    _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+}
+
+impl FailedPtyBackend {
+    pub fn new(message: String) -> Self {
+        let (event_tx, event_rx) = async_broadcast::broadcast(16);
+        let _event_rx = event_rx.deactivate();
+        // Fire an `Error` (so the overlay logs it) followed by `Closed`
+        // (so the session marks itself as done). Both are best-effort —
+        // if no subscriber is attached yet the broadcast silently drops.
+        let tx = event_tx.clone();
+        std::thread::spawn(move || {
+            let _ = smol::block_on(tx.broadcast(BackendEvent::Error(message)));
+            let _ = smol::block_on(tx.broadcast(BackendEvent::Closed));
+        });
+        Self {
+            event_tx,
+            _event_rx,
+        }
+    }
+}
+
+impl CrabPortTerminal for FailedPtyBackend {
+    fn write(&self, _data: &[u8]) {}
+    fn resize(&self, _cols: u16, _rows: u16) {}
+    fn close(&self) {}
+    fn subscribe(&self) -> BroadcastReceiver<BackendEvent> {
+        self.event_tx.new_receiver()
+    }
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        Some(self)
+    }
+    fn allow_history(&self) -> bool {
+        false
+    }
+    fn allow_snippets(&self) -> bool {
+        false
+    }
+    fn spawn_channel(
+        &self,
+        _cols: u16,
+        _rows: u16,
+    ) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        None
+    }
+}
+
+impl CrabPortMonitor for FailedPtyBackend {
+    fn status(&self) -> RemoteStatus {
+        RemoteStatus::Disconnected
+    }
+    fn metrics(&self) -> RemoteMetrics {
+        RemoteMetrics::default()
     }
 }
 
@@ -341,33 +711,46 @@ const MAX_LOCAL_HISTORY: usize = 1000;
 /// `~/.bash_history`), falling back to whichever of those exists. This
 /// isn't perfectly accurate (the user might run a different shell inside
 /// the PTY than `$SHELL` claims), but it covers the common case.
+///
+/// On Windows there is no equivalent shell history file (PowerShell stores
+/// its history in a registry / module-specific location, and `cmd.exe` has
+/// none), so we return an empty list and rely on the session's own
+/// in-memory capture.
 fn read_local_shell_history() -> Vec<String> {
-    let home = match std::env::var("HOME") {
-        Ok(h) => std::path::PathBuf::from(h),
-        Err(_) => return Vec::new(),
-    };
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let candidates: Vec<std::path::PathBuf> = if shell.contains("zsh") {
-        vec![home.join(".zsh_history"), home.join(".bash_history")]
-    } else if shell.contains("bash") {
-        vec![home.join(".bash_history"), home.join(".zsh_history")]
-    } else {
-        // Unknown shell — try both, preferring whichever is larger.
-        vec![home.join(".zsh_history"), home.join(".bash_history")]
-    };
-
-    for path in &candidates {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            return parse_local_shell_history(&contents);
-        }
+    #[cfg(windows)]
+    {
+        return Vec::new();
     }
-    Vec::new()
+    #[cfg(not(windows))]
+    {
+        let home = match std::env::var("HOME") {
+            Ok(h) => std::path::PathBuf::from(h),
+            Err(_) => return Vec::new(),
+        };
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let candidates: Vec<std::path::PathBuf> = if shell.contains("zsh") {
+            vec![home.join(".zsh_history"), home.join(".bash_history")]
+        } else if shell.contains("bash") {
+            vec![home.join(".bash_history"), home.join(".zsh_history")]
+        } else {
+            // Unknown shell — try both, preferring whichever is larger.
+            vec![home.join(".zsh_history"), home.join(".bash_history")]
+        };
+
+        for path in &candidates {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                return parse_local_shell_history(&contents);
+            }
+        }
+        Vec::new()
+    }
 }
 
 /// Parse the contents of a local shell history file. Same logic as the
 /// SSH-side parser (see `crabport_ssh::terminal::parse_shell_history`):
 /// zsh extended format is `: <ts>:<dur>;<command>` with possibly multi-line
 /// commands; bash is plain one-command-per-line.
+#[cfg(not(windows))]
 fn parse_local_shell_history(raw: &str) -> Vec<String> {
     let mut cmds: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
@@ -400,6 +783,7 @@ fn parse_local_shell_history(raw: &str) -> Vec<String> {
     cmds
 }
 
+#[cfg(not(windows))]
 fn push_local_cmd(out: &mut Vec<String>, s: String) {
     let trimmed = s.trim();
     if !trimmed.is_empty() {

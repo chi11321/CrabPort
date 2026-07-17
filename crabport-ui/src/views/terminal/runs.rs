@@ -48,7 +48,7 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
     let mut cur_underline = false;
     let mut cur_inverse = false;
 
-    for (ci, cell) in cells.iter().enumerate() {
+    for cell in cells.iter() {
         // Note: we intentionally do NOT skip `WIDE_CHAR_SPACER` /
         // `LEADING_WIDE_CHAR_SPACER` cells here. Those cells hold a space
         // and exist in the grid to mark the second column occupied by a
@@ -99,10 +99,22 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
         }
 
         if cell.c == '\t' {
-            let ns = ((ci / 8) + 1) * 8 - ci;
-            for _ in 0..ns {
-                line_text.push(' ');
-            }
+            // Alacritty's `put_tab` stores a `\t` in the cell where the
+            // tab started and advances the cursor to the next tab stop,
+            // leaving the in-between cells as `' '` (their default). We
+            // must NOT expand `\t` into `ns` spaces here — that would
+            // double-count the in-between cells (which we'll visit in
+            // subsequent iterations and push as spaces themselves),
+            // inflating the line text and pushing later glyphs past their
+            // grid slots under `force_width`.
+            //
+            // The visible "tab width" is just the count of blank cells
+            // between the `\t` and the next non-blank cell, which falls
+            // out naturally when each cell contributes exactly one char.
+            // Pushing a single space (matching the cell's visual width of
+            // one column) keeps `line_text.len() == num_cells_visited`,
+            // so `force_width` places glyph N at `N * cell_width` exactly.
+            line_text.push(' ');
         } else {
             line_text.push(cell.c);
         }
@@ -123,7 +135,7 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
 
     if line_text.len() < num_cols {
         let pad = num_cols - line_text.len();
-        line_text.extend(std::iter::repeat(' ').take(pad));
+        line_text.extend(std::iter::repeat_n(' ', pad));
         runs.push(TextRun {
             len: pad,
             font: pick_font(false, false),
