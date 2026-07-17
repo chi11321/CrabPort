@@ -363,12 +363,23 @@ impl RenderOnce for Dropdown {
         };
 
         // Build the item elements from the filtered list.
+        //
+        // NOTE: `text_color` is driven through `transition_when_else`
+        // (not a static `.text_color(...)`), because `with_transition`
+        // caches the element's style state and replays `state.cur` on each
+        // render — a statically-set color would be overwritten by the cached
+        // value and never follow `is_selected` changes after the first
+        // render. Without this, selecting a different item leaves the old
+        // item's color stuck and the new item's color never updates. See
+        // the same pattern in `segmented_control.rs`.
         let item_els: Vec<AnyElement> = filtered
             .into_iter()
             .map(|(orig_i, item)| {
                 let is_selected = selected == Some(orig_i);
                 let cb = on_change.clone();
                 let item_id = ElementId::Name(format!("{id_str}-item-{orig_i}").into());
+                let selected_color = text_primary();
+                let unselected_color = text_muted();
 
                 div()
                     .id(item_id.clone())
@@ -379,11 +390,6 @@ impl RenderOnce for Dropdown {
                     .w_full()
                     .rounded_sm()
                     .text_sm()
-                    .text_color(rgb(if is_selected {
-                        text_primary()
-                    } else {
-                        text_muted()
-                    }))
                     .bg(rgba(0x00000000))
                     .with_transition(item_id)
                     .transition_on_hover(
@@ -396,6 +402,13 @@ impl RenderOnce for Dropdown {
                                 el.bg(rgba(0x00000000))
                             }
                         },
+                    )
+                    .transition_when_else(
+                        is_selected,
+                        Duration::from_millis(120),
+                        EaseInOutQuad,
+                        move |state| state.text_color(rgb(selected_color)),
+                        move |state| state.text_color(rgb(unselected_color)),
                     )
                     .child(item.label.clone())
                     .on_click(move |_e, w, cx| {
