@@ -89,13 +89,11 @@ impl AboutWindow {
             // See `app::open_main_window` for the per-platform titlebar
             // rationale. `appears_transparent: true` is required on Windows
             // (not just macOS) to actually strip the system title bar;
-            // the GPUI default leaves it visible.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            // the GPUI default leaves it visible. The `title` is kept on
+            // every platform so the taskbar / window switcher / Expose all
+            // show "About CrabPort" instead of a blank name.
             titlebar: Some(TitlebarOptions {
-                #[cfg(target_os = "macos")]
                 title: Some(t!("window.about.title").to_string().into()),
-                #[cfg(target_os = "windows")]
-                title: None,
                 appears_transparent: true,
                 #[cfg(target_os = "macos")]
                 traffic_light_position: Some(point(px(12.0), px(14.0))),

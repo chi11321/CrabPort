@@ -540,7 +540,8 @@ pub fn open_main_window(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
         // Hide the system title bar on every platform so our in-app tab
-        // bar fills the full window height:
+        // bar fills the full window height, while still supplying a window
+        // title (used by the taskbar,Expose, window switcher, etc.).
         //
         // - **macOS**: `appears_transparent: true` makes the system title
         //   bar transparent (we draw our own) and `traffic_light_position`
@@ -551,11 +552,11 @@ pub fn open_main_window(cx: &mut App) {
         //   no title bar at all. The default (`titlebar: Some(..)` with
         //   `appears_transparent: false`) keeps the native title bar —
         //   so we must set this explicitly on Windows, not just on macOS.
-        // - **Linux**: the title bar field is ignored for Wayland/X11;
-        //   we use `window_decorations` below instead.
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        // - **Linux**: the `appears_transparent` field is ignored for
+        //   Wayland/X11; we use `window_decorations` below instead. The
+        //   `title` is still read and applied to the WM_NAME property.
         titlebar: Some(TitlebarOptions {
-            title: None,
+            title: Some(t!("tab_bar.title").to_string().into()),
             appears_transparent: true,
             #[cfg(target_os = "macos")]
             traffic_light_position: Some(point(px(12.0), px(14.0))),

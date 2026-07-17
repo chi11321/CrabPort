@@ -32,9 +32,15 @@ pub struct Button {
     border: u32,
     text_disabled: u32,
     /// Override for the icon's `text_color`. When `Some`, the svg uses this
-    /// instead of the default selected/muted heuristic — used by
-    /// `.primary()` so the icon stays light on a colored background.
+    /// instead of the default selected/muted heuristic — used by `.primary()`
+    /// so the icon stays light on a colored background.
     icon_color: Option<u32>,
+    /// Whether to call [`InteractiveElement::occlude_mouse`] on the root div.
+    /// See [`Self::occlude_mouse`].
+    occlude_mouse: bool,
+    /// Optional platform window-control area to register on the root div.
+    /// See [`Self::window_control_area`].
+    window_control: Option<gpui::WindowControlArea>,
 }
 
 impl Styled for Button {
@@ -70,6 +76,8 @@ impl Button {
             border: btn_border(),
             text_disabled: btn_text_disabled(),
             icon_color: None,
+            occlude_mouse: false,
+            window_control: None,
         }
     }
 
@@ -153,6 +161,33 @@ impl Button {
 
     pub fn icon(mut self, path: impl Into<SharedString>) -> Self {
         self.icon = Some(path.into());
+        self
+    }
+
+    /// Mark this button's hitbox as blocking the mouse for elements behind
+    /// it. Forwarded to the button's root `div` during render.
+    ///
+    /// Used by window-control buttons (and tab buttons) so they win the
+    /// hit-test over a window-drag region registered on a parent container
+    /// (see [`crate::layouts::tabbar::render_tab_bar`] and
+    /// [`crate::components::window_layout::render_sidebar_window`]). Without
+    /// this, Windows' `WM_NCHITTEST` would return `HTCAPTION` over the
+    /// button area and the button's `on_click` would never fire.
+    pub fn occlude_mouse(mut self) -> Self {
+        self.occlude_mouse = true;
+        self
+    }
+
+    /// Register this button's hitbox as a platform window-control area so
+    /// Windows' `WM_NCHITTEST` returns the matching `HT*BUTTON` code and the
+    /// OS handles the NC interaction (correct hover highlight, double-click
+    /// maximize, etc.). Forwarded to the button's root `div` during render.
+    ///
+    /// Only meaningful for the minimize / maximize / close buttons; the
+    /// auxiliary About/Settings launcher buttons do not register a control
+    /// area (they dispatch an app action via `on_click`).
+    pub fn window_control_area(mut self, area: gpui::WindowControlArea) -> Self {
+        self.window_control = Some(area);
         self
     }
 
@@ -252,7 +287,9 @@ impl RenderOnce for Button {
             .rounded_md()
             .h_8()
             .overflow_hidden()
-            .bg(to_color(bg));
+            .bg(to_color(bg))
+            .when(self.occlude_mouse, |el| el.occlude())
+            .when_some(self.window_control, |el, area| el.window_control_area(area));
         root.style().refine(&self.style);
 
         let multiline = self.multiline;
