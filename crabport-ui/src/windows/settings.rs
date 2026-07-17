@@ -673,6 +673,17 @@ impl Render for SettingsWindow {
             SettingsTab::Keybinds => self.render_keybinds_pane(cx).into_any_element(),
         };
 
+        // The content pane is overlapped at the top by the `h_11` (44px)
+        // client-side window controls strip on Windows/Linux. Push content
+        // down by that height so the first section header isn't hidden under
+        // the buttons. macOS uses the native title bar and renders no
+        // overlap, so no padding is added there.
+        let content = if HAS_CLIENT_CONTROLS {
+            div().pt_6().h_full().child(content).into_any_element()
+        } else {
+            content
+        };
+
         render_sidebar_window(
             render_tab_sidebar(
                 SettingsTab::sidebar_entries(),

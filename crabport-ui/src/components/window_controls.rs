@@ -1,13 +1,23 @@
-//! Client-side window control buttons (minimize / maximize / close).
+//! Client-side window control buttons (about / settings / minimize /
+//! maximize / close).
 //!
 //! Rendered in the top-right corner on Windows and Linux where the system
 //! title bar is disabled. On macOS the native traffic-light buttons are used
 //! instead, so [`WindowControls`] renders nothing.
+//!
+//! On Windows/Linux two extra auxiliary buttons (About, Settings) are
+//! prepended to the left of the standard minimize/maximize/close trio, since
+//! macOS gets those via the app menu bar but Windows/Linux has no such
+//! chrome. They dispatch the same `OpenAbout` / `OpenSettings` actions the
+//! macOS menu items and keybindings use, so the App-level `on_action`
+//! handlers open the singleton windows.
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::color::*;
 use crate::components::button::Button;
+use crate::menus::{OpenAbout, OpenSettings};
 
 /// Whether the platform uses client-side window controls.
 /// macOS uses native traffic-light buttons, so we never render our own.
@@ -24,9 +34,15 @@ pub const HAS_CLIENT_CONTROLS: bool = cfg!(not(target_os = "macos"));
 /// `prefix` is used to namespace the button element ids so that multiple
 /// windows (main + settings + about) don't share animation state in the
 /// global transition registry.
+///
+/// When `aux_buttons` is set (main window only), two extra buttons (About,
+/// Settings) are prepended to the left of minimize/maximize/close. Secondary
+/// windows don't render them — they already *are* the About/Settings windows,
+/// and macOS gets those via the app menu bar.
 #[derive(IntoElement)]
 pub struct WindowControls {
     prefix: &'static str,
+    aux_buttons: bool,
 }
 
 impl WindowControls {
@@ -35,8 +51,22 @@ impl WindowControls {
     /// The prefix should be unique per window (e.g. `"main"`, `"settings"`,
     /// `"about"`) so the generated button ids (`"{prefix}-win-minimize"`,
     /// etc.) don't collide with controls in other windows.
+    ///
+    /// Defaults to `aux_buttons = false`. Use [`.with_aux_buttons(true)`](
+    /// WindowControls::with_aux_buttons) on the main window to render the
+    /// About / Settings launcher buttons.
     pub fn new(prefix: &'static str) -> Self {
-        Self { prefix }
+        Self {
+            prefix,
+            aux_buttons: false,
+        }
+    }
+
+    /// Enable the auxiliary About / Settings launcher buttons on the left of
+    /// the minimize button. Intended for the main window only.
+    pub fn with_aux_buttons(mut self, enable: bool) -> Self {
+        self.aux_buttons = enable;
+        self
     }
 }
 
@@ -47,10 +77,29 @@ impl RenderOnce for WindowControls {
         }
 
         let prefix = self.prefix;
+        let aux = self.aux_buttons;
         div()
             .flex()
             .items_center()
             .gap_1()
+            .when(aux, |el| {
+                el.child(render_control_button(
+                    ElementId::Name(format!("{prefix}-win-about").into()),
+                    "icons/info.svg",
+                    None,
+                    |w, cx| {
+                        w.dispatch_action(Box::new(OpenAbout), cx);
+                    },
+                ))
+                .child(render_control_button(
+                    ElementId::Name(format!("{prefix}-win-settings").into()),
+                    "icons/settings.svg",
+                    None,
+                    |w, cx| {
+                        w.dispatch_action(Box::new(OpenSettings), cx);
+                    },
+                ))
+            })
             .child(render_control_button(
                 ElementId::Name(format!("{prefix}-win-minimize").into()),
                 "icons/minus.svg",

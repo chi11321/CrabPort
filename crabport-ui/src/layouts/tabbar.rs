@@ -192,7 +192,7 @@ pub fn render_tab_bar(
                         }),
                 )
                 .when(HAS_CLIENT_CONTROLS, |el| {
-                    el.child(WindowControls::new("main"))
+                    el.child(WindowControls::new("main").with_aux_buttons(true))
                 }),
         )
 }
