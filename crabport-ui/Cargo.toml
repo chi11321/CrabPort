@@ -1,7 +1,7 @@
 [package]
 name = "crabport-ui"
-version = "0.1.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 crabport-core = { path = "../crabport-core" }
@@ -21,6 +21,14 @@ rustc-hash = "2"
 dirs = "6"
 tokio = { version = "1", features = ["sync"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# Used by `version_check` to fetch the latest GitHub release. The check
+# runs in a background `cx.spawn` task so the sync API is fine. `serde`/
+# `serde_json` are used for `#[derive(Deserialize)]` on the GitHub API
+# response subset.
+ureq = { version = "3", features = ["json"] }
+semver = "1"
+serde = { version = "1", features = ["derive"], default-features = false }
+serde_json = "1"
 
 # Windows-only: needed by `components/window_controls.rs` to read the native
 # HWND out of a GPUI `Window` and call `ShowWindowAsync` for proper

@@ -9,6 +9,13 @@
 //! On macOS and Linux this is a no-op — the platform bundles (`.app` /
 //! `.AppImage`) carry the icon via `cargo-bundle` using
 //! `[package.metadata.bundle].icon`, not via the binary itself.
+//!
+//! No version-sync check is needed here: `[workspace.package].version` is the
+//! single source of truth, inherited by every member crate via
+//! `version.workspace = true`. `cargo-bundle` reads the package version via
+//! `cargo_metadata` (which resolves workspace inheritance), and since we
+//! intentionally do NOT set `bundle.version`, it falls back to the package
+//! version automatically — no duplication to drift out of sync.
 
 #[cfg(target_os = "windows")]
 fn main() {

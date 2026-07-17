@@ -379,6 +379,11 @@ impl CrabportApp {
                 }
             });
         });
+
+        // Kick off a background check for a newer GitHub release. If one
+        // exists, a non-auto-dismissing toast with a "详情" button (opens
+        // the release page) appears. Failures are silent.
+        crate::version_check::check_for_updates(self.app_ctx.notifications.clone(), cx);
     }
 
     // -- Helpers --

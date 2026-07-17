@@ -381,3 +381,10 @@ zoom = "缩放"
 saved_title = "已保存为代码片段"
 saved_msg = "已将「%{command}」保存到代码片段。"
 save_failed_title = "保存代码片段失败"
+
+[version_check.update_available]
+title = "有可用更新"
+message = "CrabPort 有新版本：%{current} → %{latest}。"
+
+[version_check.action]
+view_details = "详情"

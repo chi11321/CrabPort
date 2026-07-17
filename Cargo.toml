@@ -1,12 +1,16 @@
 [package]
 name = "CrabPort"
-version = "0.1.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [package.metadata.bundle]
 name = "CrabPort"
 identifier = "org.eu.tachibana-kanade.crabport"
-version = "0.1.2"
+# Note: no `version` here on purpose. `cargo-bundle` falls back to the
+# package version when this is unset, and it reads the package version
+# via `cargo_metadata` which DOES resolve `version.workspace = true`.
+# So omitting `version` here means bumping `[workspace.package].version`
+# is the single source of truth — no duplication, no build-time assert.
 copyright = "Copyright © 2026 ch1ll321"
 icon = ["app-icon.icns", "app-icon.png"]
 
@@ -41,3 +45,13 @@ members = [
     "crabport-proxy",
     "crabport-telnet",
 ]
+
+# Single source of truth for the project version. Every member crate
+# inherits this via `version.workspace = true` in its own `[package]` table,
+# and `cargo-bundle` (which uses `cargo_metadata` to read the package
+# version) picks it up automatically for the .app / .AppImage metadata —
+# we intentionally do NOT set `[package.metadata.bundle].version` so there
+# is nothing to keep in sync. Bumping a release only touches this one line.
+[workspace.package]
+version = "0.1.1"
+edition = "2024"

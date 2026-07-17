@@ -382,3 +382,10 @@ zoom = "Zoom"
 saved_title = "Saved as snippet"
 saved_msg = "Saved \"%{command}\" to snippets."
 save_failed_title = "Failed to save snippet"
+
+[version_check.update_available]
+title = "Update available"
+message = "A new version of CrabPort is available: %{current} → %{latest}."
+
+[version_check.action]
+view_details = "Details"

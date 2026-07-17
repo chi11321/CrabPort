@@ -7,6 +7,7 @@ pub mod keybinds;
 pub mod layouts;
 pub mod menus;
 pub mod theme;
+pub mod version_check;
 pub mod views;
 pub mod windows;
 
