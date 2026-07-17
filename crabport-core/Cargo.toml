@@ -15,3 +15,4 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 getrandom = "0.3"
 dirs = "6"
+sys-locale = "0.3"
