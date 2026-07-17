@@ -157,10 +157,6 @@ impl RenderOnce for WindowControls {
 ///   `state.maximized`, X11 sends `_NET_WM_STATE_MAXIMIZED_*` with
 ///   `_NET_WM_STATE_TOGGLE`), so we just delegate.
 pub(crate) fn toggle_maximize(window: &mut Window) {
-    tracing::info!(
-        "toggle_maximize called, is_maximized={}",
-        window.is_maximized()
-    );
     #[cfg(target_os = "macos")]
     {
         window.titlebar_double_click();
@@ -228,7 +224,6 @@ pub(crate) fn toggle_maximize(window: &mut Window) {
 ///   `_NET_WM_MOVERESIZE` (X11) / `xdg_toplevel._move` (Wayland) to let
 ///   the compositor take over the drag.
 pub(crate) fn start_window_move(window: &mut Window) {
-    tracing::info!("start_window_move called");
     #[cfg(target_os = "linux")]
     {
         window.start_window_move();
