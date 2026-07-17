@@ -30,6 +30,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
+use std::time::Duration;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
@@ -44,24 +45,14 @@ pub struct Snippet {
 
 /// Snippets panel view.
 pub struct SnippetsPanel {
-    /// Current snippet list, most-recently-created first. Reloaded from
-    /// the Store on each `set_state` call.
     snippets: Arc<Vec<Snippet>>,
-    /// Run callback — invoked with `command + "\r"` when the user clicks
-    /// the "run" button. Writes the command into the active terminal and
-    /// executes it immediately.
     on_run: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Paste callback — invoked with the command text (no Enter) so the
-    /// user can edit before running. Uses `write_raw` to avoid
-    /// re-capturing the text as history.
     on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Search input state (lazily initialized on the first `set_state`).
+    /// Global tooltip host for button hover tooltips.
+    tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
     search_input: Option<Entity<InputState>>,
-    /// Current search query. Updated via `InputEvent::Change` subscription.
     search_query: String,
-    /// Scroll handle for the virtual list + custom scrollbar.
     scroll_handle: VirtualListScrollHandle,
-    /// Per-row hover state, keyed by snippet index in the filtered list.
     hovered_row: Option<usize>,
 }
 
@@ -71,6 +62,7 @@ impl SnippetsPanel {
             snippets: Arc::new(Vec::new()),
             on_run: None,
             on_paste: None,
+            tooltip: None,
             search_input: None,
             search_query: String::new(),
             scroll_handle: VirtualListScrollHandle::new(),
@@ -87,6 +79,7 @@ impl SnippetsPanel {
         &mut self,
         on_run: Option<Rc<dyn Fn(String, &mut App)>>,
         on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
+        tooltip: Entity<crate::components::tooltip::TooltipController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -128,6 +121,7 @@ impl SnippetsPanel {
         self.snippets = new_snippets;
         self.on_run = on_run;
         self.on_paste = on_paste;
+        self.tooltip = Some(tooltip);
         if changed {
             cx.notify();
         }
@@ -166,6 +160,7 @@ impl Render for SnippetsPanel {
         let search_input = self.search_input.clone();
         let on_run = self.on_run.clone();
         let on_paste = self.on_paste.clone();
+        let tooltip = self.tooltip.clone();
         let scroll_handle = self.scroll_handle.clone();
 
         // Compute the filtered list + per-row data once per render.
@@ -196,6 +191,7 @@ impl Render for SnippetsPanel {
                 let filtered = &filtered_for_list;
                 let on_run = on_run.clone();
                 let on_paste = on_paste.clone();
+                let tooltip = tooltip.clone();
                 let entity = cx.entity().downgrade();
                 range
                     .map(|i| {
@@ -210,6 +206,7 @@ impl Render for SnippetsPanel {
                         // terminal, executing it immediately.
                         let cmd_for_run = cmd.clone();
                         let on_run_for_btn = on_run.clone();
+                        let tooltip_run = tooltip.clone();
                         let run_btn = div()
                             .id(ElementId::Name(format!("snippet-run-{i}").into()))
                             .flex()
@@ -217,12 +214,41 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .with_transition(ElementId::Name(format!("snippet-run-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_run {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.run_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_run_for_btn.as_ref() {
                                     cb(cmd_for_run.clone(), cx);
                                 }
                             })
+                            .transition_on_hover(
+                                Duration::from_millis(100),
+                                Linear,
+                                |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .child(
                                 svg()
                                     .path("icons/file-terminal.svg")
@@ -235,6 +261,7 @@ impl Render for SnippetsPanel {
                         // `write_raw` to avoid re-capturing as history.
                         let cmd_for_paste = cmd.clone();
                         let on_paste_for_btn = on_paste.clone();
+                        let tooltip_paste = tooltip.clone();
                         let paste_btn = div()
                             .id(ElementId::Name(format!("snippet-paste-{i}").into()))
                             .flex()
@@ -242,12 +269,41 @@ impl Render for SnippetsPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .with_transition(ElementId::Name(format!("snippet-paste-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_paste {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.paste_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
                             })
+                            .transition_on_hover(
+                                Duration::from_millis(100),
+                                Linear,
+                                |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .child(
                                 svg()
                                     .path("icons/clipboard-copy.svg")
@@ -259,6 +315,7 @@ impl Render for SnippetsPanel {
                             .id(row_id.clone())
                             .h(px(ROW_HEIGHT))
                             .w_full()
+                            .relative()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -291,7 +348,9 @@ impl Render for SnippetsPanel {
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
-                            // Snippet name (flex-1 so buttons sit on the right).
+                            // Snippet name fills the full row width so long
+                            // names don't shift when the hover buttons fade
+                            // in — the buttons overlay on top (below).
                             .child(
                                 div()
                                     .flex_1()
@@ -307,14 +366,23 @@ impl Render for SnippetsPanel {
                                         name
                                     })),
                             )
-                            // Buttons: fade in on row hover.
+                            // Buttons: absolutely positioned over the right
+                            // edge of the row, layered above the snippet name
+                            // with a transparent background so they don't
+                            // displace the text when they fade in.
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("snippet-btns-{i}").into()))
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_0p5()
+                                    .pr_2()
+                                    .bg(rgba(0x00000000))
                                     .opacity(0.0)
                                     .with_transition(ElementId::Name(
                                         format!("snippet-btns-{i}").into(),
@@ -333,8 +401,7 @@ impl Render for SnippetsPanel {
                     .collect::<Vec<_>>()
             },
         )
-        .track_scroll(&scroll_handle)
-        .pr(px(12.0));
+        .track_scroll(&scroll_handle);
 
         div()
             .h_full()
@@ -359,47 +426,50 @@ impl Render for SnippetsPanel {
                 )
             })
             // List + scrollbar, or empty-state placeholder.
-            .when(is_empty, |el| {
-                el.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(text_muted()))
-                                .text_sm()
-                                .child(t!("sidebar.snippets").to_string()),
-                        ),
-                )
-            })
-            .when(!is_empty, |el| {
-                el.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(bg_tab_bar()))
-                        .rounded_md()
-                        .overflow_hidden()
-                        .child(list)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .w(px(12.0))
-                                .child(
-                                    Scrollbar::vertical(&scroll_handle)
-                                        .scrollbar_show(ScrollbarShow::Hover),
-                                ),
-                        ),
-                )
-            })
+            .when_else(
+                is_empty,
+                |el| {
+                    el.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_color(rgb(text_muted()))
+                                    .text_sm()
+                                    .child(t!("sidebar.snippets").to_string()),
+                            ),
+                    )
+                },
+                |el| {
+                    el.child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .border_1()
+                            .border_color(rgb(border()))
+                            .bg(rgb(bg_tab_bar()))
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(list)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(16.0))
+                                    .child(
+                                        Scrollbar::vertical(&scroll_handle)
+                                            .scrollbar_show(ScrollbarShow::Hover),
+                                    ),
+                            ),
+                    )
+                },
+            )
     }
 }

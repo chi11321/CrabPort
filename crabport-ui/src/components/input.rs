@@ -51,6 +51,60 @@ use std::time::Duration;
 use crate::color::*;
 
 // ---------------------------------------------------------------------------
+// Shared label + shell + error column builder
+// ---------------------------------------------------------------------------
+
+/// Build the outer column (label · shell · error message) shared by
+/// [`StyledInput`] and [`StyledNumberInput`]. Both render the same
+/// structure around their inner shell: an optional label above, the shell,
+/// and an optional error row below with a leading alert icon.
+pub(crate) fn labeled_error_column(
+    col_id: impl Into<ElementId>,
+    disabled: bool,
+    label: Option<SharedString>,
+    shell: impl IntoElement,
+    error: Option<SharedString>,
+) -> impl IntoElement {
+    div()
+        .id(col_id.into())
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w_full()
+        .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
+        .when_some(label, |el, label| {
+            el.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(text_muted()))
+                    .child(label),
+            )
+        })
+        .child(shell)
+        .when_some(error, |el, msg| {
+            el.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path("icons/circle-alert.svg")
+                            .size_3()
+                            .text_color(rgb(input_border_error())),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(input_border_error()))
+                            .child(msg),
+                    ),
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
 // StyledInput
 // ---------------------------------------------------------------------------
 
@@ -294,45 +348,9 @@ impl RenderOnce for StyledInput {
             .when_some(suffix_el, |el, s| el.child(s));
 
         // ------------------------------------------------------------------
-        // Outer column: label · shell · error message
+        // Outer column: label · shell · error message (shared builder)
         // ------------------------------------------------------------------
-        div()
-            .id(col_id)
-            .flex()
-            .flex_col()
-            .gap_1()
-            .w_full()
-            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
-            .when_some(self.label, |el, label| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(text_muted()))
-                        .child(label),
-                )
-            })
-            .child(shell)
-            .when_some(self.error, |el, msg| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            svg()
-                                .path("icons/circle-alert.svg")
-                                .size_3()
-                                .text_color(rgb(input_border_error())),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(input_border_error()))
-                                .child(msg),
-                        ),
-                )
-            })
+        labeled_error_column(col_id, disabled, self.label, shell, self.error)
     }
 }
 
@@ -344,14 +362,12 @@ impl RenderOnce for StyledInput {
 #[derive(IntoElement)]
 pub struct StyledPasswordInput {
     inner: StyledInput,
-    on_toggle: Option<std::rc::Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
 
 impl StyledPasswordInput {
     pub fn new(id: impl Into<SharedString>, state: Entity<InputState>) -> Self {
         Self {
             inner: StyledInput::new(id, state),
-            on_toggle: None,
         }
     }
 
@@ -372,12 +388,6 @@ impl StyledPasswordInput {
 
     pub fn disabled(mut self, v: bool) -> Self {
         self.inner = self.inner.disabled(v);
-        self
-    }
-
-    /// Called when the user clicks the eye icon.
-    pub fn on_toggle(mut self, f: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        self.on_toggle = Some(std::rc::Rc::new(f));
         self
     }
 }

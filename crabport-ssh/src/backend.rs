@@ -11,7 +11,7 @@ use russh::{
 use tokio::task::AbortHandle;
 use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
 
-use crabport_core::credential::ProxyConfig;
+use crabport_core::credential::{ProxyConfig, build_startup_command_bytes};
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{BackendEvent, RemoteMetrics, RemoteStatus};
 
@@ -97,7 +97,7 @@ pub struct SshBackend {
     pub(crate) monitor: Arc<RwLock<MonitorState>>,
     pub(crate) _on_status: Arc<dyn Fn(String) + Send + Sync>,
     pub(crate) handle: Arc<TokioMutex<Option<Arc<TokioMutex<client::Handle<SshHandler>>>>>>,
-    pub(crate) sftp_entries: Arc<RwLock<Option<Arc<Vec<(String, bool)>>>>>,
+    pub(crate) sftp_entries: Arc<RwLock<Option<Arc<Vec<crabport_sftp::FileEntry>>>>>,
     pub(crate) sftp_cwd: Arc<RwLock<Option<Arc<String>>>>,
     /// Cached SFTP subsystem session. Reused across navigations so we don't
     /// pay the cost of opening a fresh SFTP channel (and leaking the old
@@ -141,7 +141,7 @@ impl SshBackend {
         let handle: Arc<TokioMutex<Option<Arc<TokioMutex<client::Handle<SshHandler>>>>>> =
             Arc::new(TokioMutex::new(None));
 
-        let sftp_entries: Arc<RwLock<Option<Arc<Vec<(String, bool)>>>>> =
+        let sftp_entries: Arc<RwLock<Option<Arc<Vec<crabport_sftp::FileEntry>>>>> =
             Arc::new(RwLock::new(None));
         let sftp_entries2 = sftp_entries.clone();
         let sftp_cwd: Arc<RwLock<Option<Arc<String>>>> = Arc::new(RwLock::new(None));
@@ -170,7 +170,6 @@ impl SshBackend {
         TOKIO.spawn(async move {
             // ---- Connect ----
             let addr = format!("{}:{}", info.host, info.port);
-            #[cfg(debug_assertions)]
             tracing::info!("SSH: connecting to {}", addr);
             on_status2(format!("Connecting to {}", addr));
 
@@ -211,7 +210,6 @@ impl SshBackend {
                 }
             };
 
-            #[cfg(debug_assertions)]
             tracing::info!(
                 "SSH: auth decision — uses_key_auth={}, private_key={}, has_passphrase={}, username={}",
                 info.uses_key_auth(),
@@ -223,7 +221,6 @@ impl SshBackend {
                 on_status2("Authenticating with public key...".into());
 
                 let key_str = info.private_key.as_deref().unwrap_or("");
-                #[cfg(debug_assertions)]
                 tracing::info!("SSH: private key length={}, starts_with_BEGIN={}", key_str.len(), key_str.contains("BEGIN"));
                 let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
                     Ok(kp) => kp,
@@ -246,7 +243,6 @@ impl SshBackend {
                     .authenticate_publickey(&info.username, Arc::new(key_pair))
                     .await;
 
-                #[cfg(debug_assertions)]
                 tracing::info!("SSH: publickey auth result = {:?}", auth_result);
                 match auth_result {
                     Ok(true) => {
@@ -280,7 +276,6 @@ impl SshBackend {
                     }
                 }
             } else {
-                #[cfg(debug_assertions)]
                 tracing::info!("SSH: using password auth (private_key is None)");
                 on_status2("Authenticating with password...".into());
                 match sh
@@ -288,7 +283,6 @@ impl SshBackend {
                     .await
                 {
                     Ok(true) => {
-                        #[cfg(debug_assertions)]
                         tracing::info!("SSH: password auth succeeded");
                         on_status2("Password authentication succeeded".into());
                     }
@@ -375,6 +369,21 @@ impl SshBackend {
             }
             on_status2("Shell started".into());
 
+            // ---- Send startup command (if any) ----
+            // Each line is sent followed by `\r` so the remote shell executes
+            // it. We do this before the event loop starts so the command is
+            // the first thing the shell receives.
+            if !info.startup_command.is_empty() {
+                let payload = build_startup_command_bytes(&info.startup_command);
+                tracing::info!(
+                    "SSH: sending startup command ({} bytes)",
+                    payload.len()
+                );
+                if let Err(e) = channel.data(Cursor::new(payload)).await {
+                    tracing::warn!("SSH: startup command write error: {e}");
+                }
+            }
+
             // Mark as connected
             {
                 let mut m = monitor2.write();
@@ -431,7 +440,6 @@ impl SshBackend {
                                     .await;
                             }
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                                #[cfg(debug_assertions)]
                                 tracing::info!("SSH: channel closed by remote");
                                 {
                                     let mut m = monitor2.write();
@@ -447,7 +455,6 @@ impl SshBackend {
                         match cmd {
                             Ok(Command::Write(data)) => {
                                 if let Err(_e) = channel.data(Cursor::new(data)).await {
-                                    #[cfg(debug_assertions)]
                                     tracing::warn!("SSH: write error: {_e}");
                                 }
                             }
@@ -456,7 +463,6 @@ impl SshBackend {
                                     .window_change(cols as u32, rows as u32, 0, 0)
                                     .await
                                 {
-                                    #[cfg(debug_assertions)]
                                     tracing::warn!("SSH: window change error: {_e}");
                                 }
                             }
@@ -477,7 +483,6 @@ impl SshBackend {
                                     let v = tasks.drain(..).collect::<Vec<_>>();
                                     v
                                 };
-                                #[cfg(debug_assertions)]
                                 tracing::info!(
                                     "SSH: close — aborting {} in-flight transfer task(s)",
                                     aborted.len()

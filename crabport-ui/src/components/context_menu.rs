@@ -336,8 +336,9 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         text_primary()
     };
 
+    let row_id = ElementId::Name(format!("ctx-item-{}", idx).into());
     let row = div()
-        .id(ElementId::Name(format!("ctx-item-{}", idx).into()))
+        .id(row_id.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -347,13 +348,13 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         .rounded(px(3.0))
         .text_xs()
         .text_color(rgb(label_color))
+        .bg(rgba(0x00000000))
         .when(!disabled, |el| {
-            el.hover(|s| s.bg(rgb(surface_hover())))
-                .when_some(on_click, |el, cb| {
-                    el.on_click(move |_e, w, cx| {
-                        cb(w, cx);
-                    })
+            el.when_some(on_click, |el, cb| {
+                el.on_click(move |_e, w, cx| {
+                    cb(w, cx);
                 })
+            })
         })
         .when(disabled, |el| el.cursor_not_allowed())
         .when_some(icon, |el, path| {
@@ -365,7 +366,19 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
                     .text_color(rgb(label_color)),
             )
         })
-        .child(div().flex_1().min_w_0().child(label.to_string()));
+        .child(div().flex_1().min_w_0().child(label.to_string()))
+        .with_transition(row_id)
+        .transition_on_hover(
+            Duration::from_millis(100),
+            EaseInOutCubic,
+            move |hovered, el| {
+                if *hovered {
+                    el.bg(rgb(surface_hover()))
+                } else {
+                    el.bg(rgba(0x00000000))
+                }
+            },
+        );
 
     if divider_after {
         div()

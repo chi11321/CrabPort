@@ -103,14 +103,12 @@ impl PtyBackend {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
-                            #[cfg(debug_assertions)]
                             tracing::info!("pty reader: EOF");
                             let _ = smol::block_on(event_tx.broadcast(BackendEvent::Closed));
                             break;
                         }
 
                         Ok(n) => {
-                            #[cfg(debug_assertions)]
                             tracing::debug!("pty reader: {} bytes", n);
                             let _ = smol::block_on(
                                 event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())),
@@ -242,6 +240,16 @@ impl CrabPortTerminal for PtyBackend {
             }
         }
     }
+
+    fn refresh_history(&self) {
+        let event_tx = self.event_tx.clone();
+        // Reading a couple of small files is cheap; do it on a background
+        // thread so we never block the UI thread on disk I/O.
+        std::thread::spawn(move || {
+            let cmds = read_local_shell_history();
+            let _ = event_tx.try_broadcast(BackendEvent::HistoryLoaded(cmds));
+        });
+    }
 }
 
 impl CrabPortMonitor for PtyBackend {
@@ -315,5 +323,86 @@ impl CrabPortMonitor for PtyBackend {
 impl Drop for PtyBackend {
     fn drop(&mut self) {
         let _ = self.command_tx.try_send(Command::Close);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local shell-history reading
+// ---------------------------------------------------------------------------
+
+/// Maximum number of history entries to surface in the UI panel. Mirrors
+/// the SSH-side cap so local + remote behave the same.
+const MAX_LOCAL_HISTORY: usize = 1000;
+
+/// Read the local user's shell history file and return its commands,
+/// most-recent-first.
+///
+/// We pick the file based on `$SHELL` (zsh → `~/.zsh_history`, bash →
+/// `~/.bash_history`), falling back to whichever of those exists. This
+/// isn't perfectly accurate (the user might run a different shell inside
+/// the PTY than `$SHELL` claims), but it covers the common case.
+fn read_local_shell_history() -> Vec<String> {
+    let home = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h),
+        Err(_) => return Vec::new(),
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let candidates: Vec<std::path::PathBuf> = if shell.contains("zsh") {
+        vec![home.join(".zsh_history"), home.join(".bash_history")]
+    } else if shell.contains("bash") {
+        vec![home.join(".bash_history"), home.join(".zsh_history")]
+    } else {
+        // Unknown shell — try both, preferring whichever is larger.
+        vec![home.join(".zsh_history"), home.join(".bash_history")]
+    };
+
+    for path in &candidates {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return parse_local_shell_history(&contents);
+        }
+    }
+    Vec::new()
+}
+
+/// Parse the contents of a local shell history file. Same logic as the
+/// SSH-side parser (see `crabport_ssh::terminal::parse_shell_history`):
+/// zsh extended format is `: <ts>:<dur>;<command>` with possibly multi-line
+/// commands; bash is plain one-command-per-line.
+fn parse_local_shell_history(raw: &str) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix(':') {
+            if let Some(semicolon) = rest.find(';') {
+                if let Some(c) = current.take() {
+                    push_local_cmd(&mut cmds, c);
+                }
+                current = Some(rest[semicolon + 1..].to_string());
+                continue;
+            }
+            // Malformed meta line — fall through to plain handling.
+        }
+        if let Some(c) = current.as_mut() {
+            c.push('\n');
+            c.push_str(line);
+        } else {
+            push_local_cmd(&mut cmds, line.to_string());
+        }
+    }
+    if let Some(c) = current.take() {
+        push_local_cmd(&mut cmds, c);
+    }
+    // File is oldest-first; UI wants most-recent-first.
+    cmds.reverse();
+    if cmds.len() > MAX_LOCAL_HISTORY {
+        cmds.truncate(MAX_LOCAL_HISTORY);
+    }
+    cmds
+}
+
+fn push_local_cmd(out: &mut Vec<String>, s: String) {
+    let trimmed = s.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
     }
 }

@@ -1,5 +1,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -13,7 +14,51 @@ use rustc_hash::FxHashSet;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
+use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
+
+/// Drag payload for an SFTP row being dragged within the app.
+/// Dropped onto a terminal area to trigger a download.
+#[derive(Clone, Debug)]
+pub struct SftpDragValue {
+    pub remote_path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+impl Render for SftpDragValue {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A small floating chip showing the file name + icon.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .bg(rgb(bg_base()))
+            .border_1()
+            .border_color(rgb(border()))
+            .shadow_sm()
+            .child(
+                svg()
+                    .path(if self.is_dir {
+                        "icons/folder.svg"
+                    } else {
+                        "icons/file.svg"
+                    })
+                    .size_3()
+                    .text_color(rgb(text_muted())),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_primary()))
+                    .child(self.name.clone()),
+            )
+    }
+}
 
 /// SFTP panel view.
 ///
@@ -27,7 +72,7 @@ pub struct SftpPanel {
     /// Current working directory, shown as the input's default value.
     cwd: Option<Arc<String>>,
     /// Current directory entries.
-    entries: Arc<Vec<(String, bool)>>,
+    entries: Arc<Vec<crabport_sftp::FileEntry>>,
     /// Navigate callback — invoked with the typed path on Enter.
     on_navigate: Option<Rc<dyn Fn(String, &mut App)>>,
     /// The tab id whose state is currently reflected in the input.
@@ -79,6 +124,10 @@ pub struct SftpPanel {
     /// custom `Scrollbar::vertical` overlay so the scrollbar style stays
     /// consistent with the rest of the app.
     scroll_handle: VirtualListScrollHandle,
+    /// Whether external files are currently being dragged over this panel.
+    /// Drives a highlighted drop-zone border so the user knows a drop will
+    /// upload.
+    drag_over: bool,
 }
 
 impl SftpPanel {
@@ -102,6 +151,7 @@ impl SftpPanel {
             renaming_entry: None,
             rename_input: None,
             scroll_handle: VirtualListScrollHandle::new(),
+            drag_over: false,
         }
     }
 
@@ -109,7 +159,7 @@ impl SftpPanel {
     /// Called by the content layout each render.
     pub fn set_state(
         &mut self,
-        entries: Arc<Vec<(String, bool)>>,
+        entries: Arc<Vec<crabport_sftp::FileEntry>>,
         cwd: Option<Arc<String>>,
         on_navigate: Option<Rc<dyn Fn(String, &mut App)>>,
         on_download: Option<Rc<dyn Fn(String, String, &mut App)>>,
@@ -232,9 +282,9 @@ impl SftpPanel {
             let prev = self
                 .entries
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|e| e.name.as_str())
                 .collect::<Vec<_>>();
-            let next = entries.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>();
+            let next = entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>();
             prev != next
         };
         self.entries = entries;
@@ -352,17 +402,23 @@ impl SftpPanel {
 impl Render for SftpPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Sort entries alphabetically, directories first
-        let mut sorted: Vec<(String, bool)> = self.entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
+        let mut sorted: Vec<crabport_sftp::FileEntry> = self.entries.iter().cloned().collect();
+        sorted.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
             (".", _) => std::cmp::Ordering::Less,
             (_, ".") => std::cmp::Ordering::Greater,
             ("..", _) => std::cmp::Ordering::Less,
             (_, "..") => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         });
 
         // Prepend .. entry
-        let mut all_entries: Vec<(String, bool)> = vec![("..".into(), true)];
+        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
+            name: "..".into(),
+            is_dir: true,
+            size: None,
+            permissions: None,
+            modified: None,
+        }];
         all_entries.extend(sorted);
 
         let path_input = self.path_input.clone();
@@ -409,6 +465,11 @@ impl Render for SftpPanel {
         let on_navigate = self.on_navigate.clone();
         let on_download = self.on_download.clone();
         let on_upload = self.on_upload.clone();
+        let on_upload_for_drop = on_upload.clone();
+        let cwd_for_drop = cwd.clone();
+        let drag_over = self.drag_over;
+        let entity_for_drop = _cx.entity().downgrade();
+        let entity_for_list = entity_for_drop.clone();
 
         div()
             .h_full()
@@ -419,6 +480,7 @@ impl Render for SftpPanel {
             .flex_col()
             .pt_1()
             .px_1()
+            .relative()
             .when_some(path_input, |el, input| {
                 el.child(
                     div().mb_1().child(
@@ -502,17 +564,68 @@ impl Render for SftpPanel {
                     )),
             )
             .child(
-                // List + scrollbar. The scrollbar is absolutely positioned
-                // (Scrollbar's own layout is `position: absolute`), so we use
-                // a relative wrapper and give the list right-padding equal to
-                // the scrollbar width. That way the rows' right-side rounded
-                // corners land to the left of the scrollbar track instead of
-                // being painted over by it.
+                // List + scrollbar. The scrollbar is a pure overlay —
+                // absolutely positioned on top of the list's right edge,
+                // not reserving any layout width. The track is transparent
+                // and the thumb only appears on hover, so row content can
+                // use the full width.
+                //
+                // This container is also the drop target for external file
+                // drag-in uploads: `on_drop::<ExternalPaths>` fires when the
+                // user drops OS files onto the list, and `on_drag_move` tracks
+                // whether the cursor is inside the list bounds to drive the
+                // `DropZoneOverlay`.
                 div()
                     .relative()
                     .flex_1()
                     .h_full()
                     .overflow_hidden()
+                    // Drop zone for external file drag-in uploads.
+                    .when(on_upload.is_some(), |el| {
+                        el.on_drop::<ExternalPaths>(move |paths, _w, cx| {
+                            let on_upload = on_upload_for_drop.clone();
+                            let cwd = cwd_for_drop.clone();
+                            let entity = entity_for_drop.clone();
+                            if let Some(cwd) = cwd {
+                                let cwd_str = cwd.as_str().to_string();
+                                let _ = entity.update(cx, |view, cx| {
+                                    view.drag_over = false;
+                                    cx.notify();
+                                });
+                                for local in paths.paths() {
+                                    let name = local
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| local.to_string_lossy().into_owned());
+                                    let remote = if cwd_str.ends_with('/') {
+                                        format!("{}{}", cwd_str, name)
+                                    } else {
+                                        format!("{}/{}", cwd_str, name)
+                                    };
+                                    if let Some(ref cb) = on_upload {
+                                        cb(local.to_string_lossy().into_owned(), remote, cx);
+                                    }
+                                }
+                            }
+                        })
+                    })
+                    // Track external drag-over for the drop-zone overlay.
+                    // `on_drag_move` fires for all move events while an
+                    // `ExternalPaths` drag is active (even outside this
+                    // element), so we can toggle `drag_over` based on
+                    // whether the cursor is inside the list bounds.
+                    .on_drag_move::<ExternalPaths>({
+                        let entity = entity_for_list.clone();
+                        move |e, _w, cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                let should = e.bounds.contains(&e.event.position);
+                                if view.drag_over != should {
+                                    view.drag_over = should;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
                     .child(
                         v_virtual_list(
                             _cx.entity(),
@@ -522,9 +635,9 @@ impl Render for SftpPanel {
                                 let all_entries = &all_entries;
                                 range
                                     .map(|i| {
-                                        let (name, is_dir) = &all_entries[i];
-                                        let name = name.clone();
-                                        let is_dir = *is_dir;
+                                        let entry = &all_entries[i];
+                                        let name = entry.name.clone();
+                                        let is_dir = entry.is_dir;
                                         let icon_path = if is_dir {
                                             "icons/folder.svg"
                                         } else {
@@ -568,6 +681,15 @@ impl Render for SftpPanel {
                                         let row_rename_input = rename_input.clone();
                                         let row_id = ElementId::Name(format!("sftp-{i}").into());
                                         let row_id_for_transition = row_id.clone();
+                                        // Whether this row can be dragged (start a
+                                        // drag-out-to-download). `.` and `..` are
+                                        // navigation helpers, not real entries.
+                                        let draggable = name != "." && name != "..";
+                                        // Capture the drag value + download cb for
+                                        // the on_drag constructor.
+                                        let drag_remote_path = target_path.clone();
+                                        let drag_name = name.clone();
+                                        let drag_is_dir = is_dir;
 
                                         div()
                                             .id(row_id.clone())
@@ -579,6 +701,24 @@ impl Render for SftpPanel {
                                             .gap_1p5()
                                             .px_2()
                                             .rounded(px(4.0))
+                                            // Allow dragging real entries to
+                                            // initiate a drag-out download. The
+                                            // drag payload carries the remote
+                                            // path + name so a drop target
+                                            // (e.g. the terminal area) can
+                                            // trigger the download.
+                                            .when(draggable, |el| {
+                                                el.on_drag(
+                                                    SftpDragValue {
+                                                        remote_path: drag_remote_path.clone(),
+                                                        name: drag_name.clone(),
+                                                        is_dir: drag_is_dir,
+                                                    },
+                                                    |drag_value, _offset, _w, cx| {
+                                                        cx.new(|_| drag_value.clone())
+                                                    },
+                                                )
+                                            })
                                             // Left-click drives both navigation (double-click on
                                             // a dir) and multi-selection (cmd/ctrl-click on
                                             // any selectable row). `.` and `..` are excluded
@@ -674,18 +814,18 @@ impl Render for SftpPanel {
                                                                 .unwrap_or("/");
                                                             view.entries
                                                                 .iter()
-                                                                .filter(|(n, _)| {
-                                                                    n != "."
-                                                                        && n != ".."
-                                                                        && view.selected.contains(n.as_str())
+                                                                .filter(|e| {
+                                                                    e.name != "."
+                                                                        && e.name != ".."
+                                                                        && view.selected.contains(e.name.as_str())
                                                                 })
-                                                                .map(|(n, d)| {
+                                                                .map(|e| {
                                                                     let p = if cwd_str.ends_with('/') {
-                                                                        format!("{}{}", cwd_str, n)
+                                                                        format!("{}{}", cwd_str, e.name)
                                                                     } else {
-                                                                        format!("{}/{}", cwd_str, n)
+                                                                        format!("{}/{}", cwd_str, e.name)
                                                                     };
-                                                                    (n.clone(), *d, p)
+                                                                    (e.name.clone(), e.is_dir, p)
                                                                 })
                                                                 .collect()
                                                         })
@@ -919,6 +1059,7 @@ impl Render for SftpPanel {
                                                     });
                                                 }
                                             })
+                                            // Hover / context-menu highlight.
                                             .transition_when_else(
                                                 is_highlighted,
                                                 std::time::Duration::from_millis(120),
@@ -927,28 +1068,31 @@ impl Render for SftpPanel {
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                                             )
                                             // Selected rows get a persistent blue accent bar
-                                            // on the left edge plus a subtle blue tint so the
-                                            // selection reads even when not hovered. We render
-                                            // this as an absolutely-positioned stripe inside
-                                            // the row so it doesn't affect the flex layout.
-                                            // The tint is applied only when not highlighted so
-                                            // the hover/menu colour takes precedence visually
-                                            // when the user is interacting with the row.
-                                            .when(is_selected, |el| {
-                                                el.relative().child(
-                                                    div()
-                                                        .absolute()
-                                                        .top(px(2.0))
-                                                        .bottom(px(2.0))
-                                                        .left_0()
-                                                        .w(px(2.0))
-                                                        .rounded(px(1.0))
-                                                        .bg(rgb(btn_primary_bg())),
-                                                )
-                                            })
-                                            .when(is_selected && !is_highlighted, |el| {
-                                                el.bg(rgba(input_selection()))
-                                            })
+                                            // on the left edge. The bar is always
+                                            // rendered but its opacity is eased in/out
+                                            // via a separate transition so selection
+                                            // changes animate smoothly.
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .id(ElementId::Name(format!("sftp-bar-{i}").into()))
+                                                    .absolute()
+                                                    .top(px(2.0))
+                                                    .bottom(px(2.0))
+                                                    .left_0()
+                                                    .w(px(2.0))
+                                                    .rounded(px(1.0))
+                                                    .bg(rgb(btn_primary_bg()))
+                                                    .opacity(0.0)
+                                                    .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
+                                                    .transition_when_else(
+                                                        is_selected,
+                                                        std::time::Duration::from_millis(120),
+                                                        Linear,
+                                                        |el| el.opacity(1.0),
+                                                        |el| el.opacity(0.0),
+                                                    ),
+                                            )
                                             .child(
                                                 svg()
                                                     .path(icon_path)
@@ -993,8 +1137,7 @@ impl Render for SftpPanel {
                                     .collect::<Vec<_>>()
                             },
                         )
-                        .track_scroll(&scroll_handle)
-                        .pr(px(10.0)),
+                        .track_scroll(&scroll_handle),
                     )
                     .child(
                         div()
@@ -1002,12 +1145,52 @@ impl Render for SftpPanel {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(10.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&scroll_handle)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
                             ),
                     )
+                    // Drop-zone overlay: shows a translucent hint with icon
+                    // when external files are dragged over the list. Fades
+                    // in/out with an eased transition.
+                    .child(
+                        DropZoneOverlay::new(drag_over)
+                            .hint(t!("sftp.drop_upload_hint").to_string())
+                            .id("sftp-panel-drop-overlay"),
+                    )
+                    // Zero-size canvas that registers a window-level
+                    // `FileDropEvent` listener during paint. When the OS
+                    // reports the drag has left the window entirely
+                    // (`Exited`), we clear `drag_over` so the overlay
+                    // doesn’t get stuck in the visible state — `on_drag_move`
+                    // can’t catch this because `Exited` is not a `MouseMoveEvent`.
+                    .child({
+                        let entity = entity_for_list.clone();
+                        canvas(
+                            |_bounds, _window, _cx| {},
+                            move |_bounds, _state, window, _cx| {
+                                window.on_mouse_event({
+                                    let entity = entity.clone();
+                                    move |event: &FileDropEvent, phase, _window, cx| {
+                                        if phase != DispatchPhase::Capture {
+                                            return;
+                                        }
+                                        if matches!(event, FileDropEvent::Exited) {
+                                            let _ = entity.update(cx, |view, cx| {
+                                                if view.drag_over {
+                                                    view.drag_over = false;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    }
+                                });
+                            },
+                        )
+                        .w_0()
+                        .h_0()
+                    })
             )
     }
 }
@@ -1125,7 +1308,10 @@ fn render_sftp_action_button(
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let color = if enabled { text_muted() } else { 0x45475a };
-    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let hover_bg = surface_hover();
+    let to_color = |c: u32| rgba(if c <= 0xFFFFFF { (c << 8) | 0xFF } else { c });
+    let rest_bg = to_color(0x00000000);
+    let hover_bg_rgba = to_color(hover_bg);
     div()
         .id(id)
         .flex()
@@ -1133,7 +1319,7 @@ fn render_sftp_action_button(
         .justify_center()
         .size(px(24.0))
         .rounded(px(4.0))
-        .when(enabled, |el| el.hover(move |s| s.bg(hover_bg)))
+        .bg(rest_bg)
         .when(!enabled, |el| el.cursor_not_allowed())
         .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
         .when(enabled, |el| {
@@ -1141,6 +1327,14 @@ fn render_sftp_action_button(
                 on_click(w, cx);
                 cx.stop_propagation();
             })
+        })
+        .with_transition(id)
+        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg_rgba)
+            } else {
+                el.bg(rest_bg)
+            }
         })
         .child(svg().path(icon).size(px(14.0)).text_color(rgb(color)))
 }
@@ -1181,12 +1375,10 @@ fn trigger_upload(
             Ok(Ok(Some(paths))) => Some(paths),
             Ok(Ok(None)) => None,
             Ok(Err(_e)) => {
-                #[cfg(debug_assertions)]
                 tracing::warn!("SFTP upload: file picker error: {_e}");
                 None
             }
             Err(_e) => {
-                #[cfg(debug_assertions)]
                 tracing::warn!("SFTP upload: picker channel closed: {_e}");
                 None
             }
@@ -1241,14 +1433,14 @@ fn trigger_download_from_button(
         let cwd_str = view.cwd.as_ref().map(|s| s.as_str()).unwrap_or("/");
         view.entries
             .iter()
-            .filter(|(n, _)| n != "." && n != ".." && view.selected.contains(n.as_str()))
-            .map(|(n, d)| {
+            .filter(|e| e.name != "." && e.name != ".." && view.selected.contains(e.name.as_str()))
+            .map(|e| {
                 let p = if cwd_str.ends_with('/') {
-                    format!("{}{}", cwd_str, n)
+                    format!("{}{}", cwd_str, e.name)
                 } else {
-                    format!("{}/{}", cwd_str, n)
+                    format!("{}/{}", cwd_str, e.name)
                 };
-                (n.clone(), *d, p)
+                (e.name.clone(), e.is_dir, p)
             })
             .collect::<Vec<_>>()
     });
@@ -1258,6 +1450,10 @@ fn trigger_download_from_button(
     if entries.is_empty() {
         return;
     }
+    let _ = entity.update(cx, |view, cx| {
+        view.selected.clear();
+        cx.notify();
+    });
     let _ = cwd; // cwd is read from the entity above to stay fresh
     trigger_batch_download(entries, on_download, cx);
 }

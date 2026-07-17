@@ -8,6 +8,7 @@ use gpui::*;
 use rust_i18n::t;
 
 use crate::app_state::AppState;
+use crate::components::host_selector::PanelSide;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
@@ -23,8 +24,19 @@ impl CrabportApp {
     pub fn connect_to_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
         let host = match self.hosts.iter().find(|h| h.id == host_id) {
             Some(h) => h.clone(),
-            None => return,
+            None => {
+                tracing::warn!("connect_to_host: host_id={host_id} not found in memory");
+                return;
+            }
         };
+        tracing::info!(
+            "connect_to_host: id={} name={:?} kind={:?} {}:{}",
+            host.id,
+            host.name,
+            host.kind,
+            host.host,
+            host.port
+        );
 
         // Update last_login timestamp
         let _ = AppState::store(cx).lock().touch_host_login(host_id);
@@ -88,6 +100,15 @@ impl CrabportApp {
                 .flatten()
         });
 
+        // Resolve the startup command (if any) from the stored host entry.
+        let startup_command = AppState::store(cx)
+            .lock()
+            .find_host(host_id)
+            .ok()
+            .flatten()
+            .map(|h| h.startup_command)
+            .filter(|s| !s.is_empty());
+
         // Dispatch to the matching backend by connection kind. SSH keeps
         // its full auth (password / private key / passphrase); Telnet uses
         // password-only auth (credentials are sent via the terminal prompt
@@ -102,6 +123,7 @@ impl CrabportApp {
                     &host.username,
                     &password,
                     proxy_config,
+                    startup_command.as_deref(),
                     cx,
                 );
             }
@@ -116,10 +138,34 @@ impl CrabportApp {
                     private_key,
                     passphrase,
                     proxy_config,
+                    startup_command.as_deref(),
                     cx,
                 );
             }
         }
+    }
+
+    /// Switch the SFTP tab's right panel to a different host (or Local).
+    /// Activates the SFTP tab (id=1) first, then calls
+    /// `switch_panel_host` on the shared `SftpTabView`. If the right panel
+    /// is already connected to the same host, just jumps to the SFTP tab.
+    pub fn switch_sftp_panel_host(
+        &mut self,
+        host_id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(1);
+        let sftp_view = self.sftp_view.clone();
+        sftp_view.update(cx, |view, cx| {
+            // If the right panel is already connected to this host, just
+            // jump to the SFTP tab (already activated above). Otherwise,
+            // connect.
+            let already_connected = view.is_panel_connected_to(PanelSide::Right, host_id, cx);
+            if !already_connected {
+                view.switch_panel_host(PanelSide::Right, Some(host_id), window, cx);
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -154,6 +200,14 @@ impl CrabportApp {
                 .ok()
                 .flatten()
         });
+
+        // Fetch the full stored host entry (includes startup_command, which
+        // the in-memory ConnectionHost doesn't carry).
+        let stored_host = AppState::store(cx).lock().find_host(host_id).ok().flatten();
+        let startup_command = stored_host
+            .as_ref()
+            .map(|h| h.startup_command.clone())
+            .unwrap_or_default();
 
         let mut form = ConnectionFormState::new(window, cx);
 
@@ -223,7 +277,6 @@ impl CrabportApp {
                 .flatten()
                 .map(|cfg| (pid, cfg))
         });
-        #[cfg(debug_assertions)]
         tracing::info!(
             "edit_host: host_id={}, host.proxy_id={:?}, resolved_saved_proxy={}",
             h.id,
@@ -233,6 +286,13 @@ impl CrabportApp {
         match saved_proxy {
             Some((pid, cfg)) => form.load_proxy(Some(pid), Some(&cfg), window, cx),
             None => form.load_proxy(None, None, window, cx),
+        }
+
+        // Restore the startup command (if any) so the user can edit it.
+        if !startup_command.is_empty() {
+            form.startup_command_input.update(cx, |state, cx| {
+                state.set_value(&startup_command, window, cx);
+            });
         }
 
         let app = cx.entity().clone();
@@ -250,7 +310,6 @@ impl CrabportApp {
         form.on_connect = Some(Rc::new({
             let app = app.clone();
             move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
-                #[cfg(debug_assertions)]
                 tracing::info!(
                     "edit_host: on_connect fired — editing_proxy_id={:?}",
                     editing_proxy_id
@@ -273,9 +332,9 @@ impl CrabportApp {
                         private_key,
                         private_key_kind,
                         proxy_config,
+                        startup_command,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
-                        #[cfg(debug_assertions)]
                         tracing::info!(
                             "edit_host: reading form — proxy_kind={:?}, form.proxy_id={:?}, proxy_url={:?}",
                             f.proxy_kind,
@@ -291,7 +350,8 @@ impl CrabportApp {
                         let ak = f.auth_kind;
                         let (pk, pk_kind) = f.private_key_value(cx);
                         let pc = f.proxy_config(cx);
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc)
+                        let sc = f.startup_command_text(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc)
                     };
                     app.close_connection_form(cx);
 
@@ -349,8 +409,8 @@ impl CrabportApp {
                             .connection_form
                             .as_ref()
                             .and_then(|f| f.group_id),
+                        startup_command: startup_command.clone(),
                     };
-                    #[cfg(debug_assertions)]
                     tracing::info!(
                         "edit_host: on_connect — editing_proxy_id={:?}, resolved_entry.proxy_id={:?}",
                         editing_proxy_id,

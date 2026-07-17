@@ -144,6 +144,10 @@ struct AutoLogin {
     /// Accumulated plain-text bytes since the last flush. We scan the
     /// trailing bytes for prompt patterns.
     buf: Vec<u8>,
+    /// Whether the startup command has been sent yet. It is dispatched once,
+    /// after auto-login completes (the no-credentials case is handled by
+    /// the caller before the event loop starts).
+    startup_sent: bool,
 }
 
 impl AutoLogin {
@@ -151,13 +155,25 @@ impl AutoLogin {
         Self {
             phase: LoginPhase::Idle,
             buf: Vec::new(),
+            startup_sent: false,
         }
     }
 
     /// Feed a chunk of plain-text data that *will* be displayed to the user.
     /// Returns `Some(reply)` when a prompt is detected and a credential
-    /// should be sent; `None` otherwise.
+    /// should be sent (or, once login completes, the startup command); `None`
+    /// otherwise.
     fn feed(&mut self, data: &[u8], info: &TelnetConnectionInfo) -> Option<Vec<u8>> {
+        // Once login is complete, dispatch the startup command exactly once.
+        if self.phase == LoginPhase::Done && !self.startup_sent {
+            self.startup_sent = true;
+            if !info.startup_command.is_empty() {
+                return Some(crabport_core::credential::build_startup_command_bytes(
+                    &info.startup_command,
+                ));
+            }
+        }
+
         self.buf.extend_from_slice(data);
         // Keep only the last 256 bytes — prompt detection only needs recent
         // output, and unbounded growth on long sessions would be wasteful.
@@ -263,14 +279,12 @@ impl TelnetBackend {
 
         TOKIO.spawn(async move {
             let addr = format!("{}:{}", info.host, info.port);
-            #[cfg(debug_assertions)]
             tracing::info!("telnet: connecting to {}", addr);
             on_status2(format!("Connecting to {}", addr));
 
             let mut stream = match crabport_proxy::connect(&info.proxy, &info.host, info.port).await
             {
                 Ok(s) => {
-                    #[cfg(debug_assertions)]
                     tracing::info!("telnet: TCP connected to {}", addr);
                     on_status2("TCP connection established".into());
                     {
@@ -326,6 +340,31 @@ impl TelnetBackend {
             }
             let _ = stream.flush().await;
 
+            // ---- Startup command (no-credentials case) ----
+            // When there are no credentials to auto-send, dispatch the
+            // startup command immediately after negotiation. The
+            // auto-login path also handles the post-credential case inside
+            // the event loop, so `startup_sent` prevents double-send.
+            let mut auto_login = AutoLogin::new();
+            if info.username.is_empty()
+                && info.password.is_empty()
+                && !info.startup_command.is_empty()
+            {
+                let payload =
+                    crabport_core::credential::build_startup_command_bytes(&info.startup_command);
+                if !payload.is_empty() {
+                    tracing::info!(
+                        "telnet: sending startup command ({} bytes, no-credentials path)",
+                        payload.len()
+                    );
+                    if let Err(e) = stream.write_all(&payload).await {
+                        tracing::warn!("telnet: startup command write error: {e}");
+                    }
+                    let _ = stream.flush().await;
+                }
+                auto_login.startup_sent = true;
+            }
+
             // ---- Combined read+write event loop ----
             // Single tokio::select! handles reading from the socket,
             // user commands (write/resize/close), and auto-login credential
@@ -334,7 +373,6 @@ impl TelnetBackend {
             let mut iac_state = IacState::Normal;
             let mut data_out: Vec<u8> = Vec::with_capacity(8192);
             let mut neg_out: Vec<u8> = Vec::with_capacity(256);
-            let mut auto_login = AutoLogin::new();
 
             loop {
                 select! {
@@ -342,7 +380,6 @@ impl TelnetBackend {
                     result = stream.read(&mut buf) => {
                         match result {
                             Ok(0) => {
-                                #[cfg(debug_assertions)]
                                 tracing::info!("telnet: EOF from server");
                                 flush_data(&event_tx2, &mut data_out).await;
                                 {
@@ -363,7 +400,6 @@ impl TelnetBackend {
                                 // first — they are raw IAC bytes, NOT visible
                                 // terminal output.
                                 if !neg_out.is_empty() {
-                                    #[cfg(debug_assertions)]
                                     tracing::debug!(
                                         "telnet: sending {} negotiation bytes",
                                         neg_out.len()
@@ -382,7 +418,6 @@ impl TelnetBackend {
                                     // output. If detected, send credentials
                                     // inline.
                                     if let Some(reply) = auto_login.feed(&chunk, &info) {
-                                        #[cfg(debug_assertions)]
                                         tracing::debug!(
                                             "telnet: auto-login sending (phase={:?})",
                                             auto_login.phase
@@ -392,7 +427,6 @@ impl TelnetBackend {
                                         }
                                         let _ = stream.flush().await;
                                     }
-                                    #[cfg(debug_assertions)]
                                     tracing::debug!("telnet read: {} data bytes", chunk.len());
                                     let _ = event_tx2.broadcast(BackendEvent::Data(chunk)).await;
                                 }
@@ -417,7 +451,6 @@ impl TelnetBackend {
                         match cmd {
                             Ok(Command::Write(data)) => {
                                 if let Err(e) = stream.write_all(&data).await {
-                                    #[cfg(debug_assertions)]
                                     tracing::warn!("telnet: write error: {e}");
                                 }
                                 let _ = stream.flush().await;
@@ -425,13 +458,11 @@ impl TelnetBackend {
                             Ok(Command::Resize(cols, rows)) => {
                                 let naws = naws_payload(cols, rows);
                                 if let Err(e) = stream.write_all(&naws).await {
-                                    #[cfg(debug_assertions)]
                                     tracing::warn!("telnet: NAWS write error: {e}");
                                 }
                                 let _ = stream.flush().await;
                             }
                             Ok(Command::Close) | Err(_) => {
-                                #[cfg(debug_assertions)]
                                 tracing::info!("telnet: closing connection");
                                 let _ = stream.shutdown().await;
                                 {

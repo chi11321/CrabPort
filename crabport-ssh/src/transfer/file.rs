@@ -53,7 +53,6 @@ pub(crate) async fn sftp_download_file_impl(
         remote_q = shell_quote(remote_path),
         tmp_q = shell_quote(&tmp),
     );
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP download file: compress cmd={cmd}");
     let (code, out) = exec_with_status(&h, &cmd).await;
     if code != 0 || !out.ends_with("ok") {
@@ -83,7 +82,6 @@ pub(crate) async fn sftp_download_file_impl(
     let res = s
         .download_file_gz(&tmp, local_path, Some(progress_cb))
         .await;
-    #[cfg(debug_assertions)]
     if let Err(ref e) = res {
         tracing::warn!("SFTP download file: transfer failed: {e}");
     }
@@ -126,7 +124,6 @@ pub(crate) async fn sftp_upload_file_impl(
     progress_cb(0);
 
     // 1. Stream-compress the local file up to the remote tmp .gz.
-    #[cfg(debug_assertions)]
     tracing::info!(
         "SFTP upload file: step 1 transfer+compress local={local_path} -> remote_tmp={tmp} total={total}"
     );

@@ -19,7 +19,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id FROM hosts ORDER BY favorite DESC, last_login DESC, id",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command FROM hosts ORDER BY favorite DESC, last_login DESC, id",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -30,6 +30,7 @@ impl Store {
                 let favorite: i64 = row.get(8)?;
                 let proxy_id: Option<i64> = row.get(9)?;
                 let group_id: Option<i64> = row.get(10)?;
+                let startup_command: String = row.get(11)?;
                 Ok(HostEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -42,6 +43,7 @@ impl Store {
                     favorite: favorite != 0,
                     proxy_id,
                     group_id,
+                    startup_command,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -56,7 +58,7 @@ impl Store {
     pub fn add_host(&self, host: &HostEntry) -> Result<i64, StoreError> {
         self.db
             .execute(
-                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     host.name,
                     host.host,
@@ -68,6 +70,7 @@ impl Store {
                     host.favorite as i64,
                     host.proxy_id,
                     host.group_id,
+                    host.startup_command,
                 ],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -84,7 +87,7 @@ impl Store {
     pub fn update_host(&self, host: &HostEntry) -> Result<(), StoreError> {
         self.db
             .execute(
-                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8, proxy_id=?9, group_id=?10 WHERE id=?11",
+                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8, proxy_id=?9, group_id=?10, startup_command=?11 WHERE id=?12",
                 params![
                     host.name,
                     host.host,
@@ -96,6 +99,7 @@ impl Store {
                     host.favorite as i64,
                     host.proxy_id,
                     host.group_id,
+                    host.startup_command,
                     host.id,
                 ],
             )
@@ -107,7 +111,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id FROM hosts WHERE id=?1",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command FROM hosts WHERE id=?1",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -117,6 +121,7 @@ impl Store {
             let favorite: i64 = row.get(8)?;
             let proxy_id: Option<i64> = row.get(9)?;
             let group_id: Option<i64> = row.get(10)?;
+            let startup_command: String = row.get(11)?;
             Ok(HostEntry {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -129,6 +134,7 @@ impl Store {
                 favorite: favorite != 0,
                 proxy_id,
                 group_id,
+                startup_command,
             })
         })
         .optional()

@@ -30,19 +30,15 @@ impl SftpBackend {
         local_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()> {
-        #[cfg(debug_assertions)]
         tracing::info!("SFTP download_file: remote={remote_path} local={local_path}");
         let session = self.session();
 
         // Stat first — we need the size to split into segments, and we want
         // to reject directories / unknown-size files early.
-        #[cfg(debug_assertions)]
         let meta = session.metadata(remote_path).await?;
-        #[cfg(debug_assertions)]
         let size = meta
             .size
             .ok_or_else(|| anyhow!("remote file size unknown; cannot segmented-download"))?;
-        #[cfg(debug_assertions)]
         tracing::info!("SFTP download_file: remote size={size}");
 
         let mut local = tokio::fs::File::create(local_path).await?;
@@ -66,7 +62,6 @@ impl SftpBackend {
             }
         }
         local.flush().await?;
-        #[cfg(debug_assertions)]
         tracing::info!(
             "SFTP download_file: wrote {} bytes",
             done.load(std::sync::atomic::Ordering::Relaxed)
@@ -167,7 +162,6 @@ impl SftpBackend {
         local_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()> {
-        #[cfg(debug_assertions)]
         tracing::info!("SFTP download_file_gz: remote={remote_path} local={local_path}");
         // 1. Download the .gz into a local tmp file.
         let tmp = local_tmp_path(".gz");
@@ -180,7 +174,6 @@ impl SftpBackend {
         // 2. Decompress the local tmp .gz into the final target. Pure local
         //    I/O + CPU — no network round-trips.
         let decompress_result = self.decompress_local_gz(&tmp, local_path).await;
-        #[cfg(debug_assertions)]
         if let Err(ref e) = decompress_result {
             tracing::warn!("SFTP download_file_gz: decompress failed: {e}");
         }
@@ -274,7 +267,6 @@ impl SftpBackend {
         local_dir: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<()> {
-        #[cfg(debug_assertions)]
         tracing::info!("SFTP download_dir: remote_tar_gz={remote_tar_gz} local_dir={local_dir}");
         // 1. Download the remote tar.gz into a local tmp file.
         let tmp = local_tmp_path(".tar.gz");
@@ -308,7 +300,6 @@ impl SftpBackend {
             let _ = std::fs::remove_file(&tar_tmp);
             Ok(())
         })();
-        #[cfg(debug_assertions)]
         if let Err(ref e) = unpack_result {
             tracing::warn!("SFTP download_dir: unpack failed: {e:#}");
         }

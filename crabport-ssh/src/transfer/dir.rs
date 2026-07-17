@@ -63,7 +63,7 @@ pub(crate) async fn sftp_upload_dir_impl(
 /// manually (rather than pulling in `thiserror`) so the dependency surface
 /// stays minimal.
 #[derive(Debug)]
-pub(crate) struct RemoteCommandNotFound(String);
+pub(crate) struct RemoteCommandNotFound(pub String);
 
 impl std::fmt::Display for RemoteCommandNotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,7 +108,6 @@ async fn sftp_download_dir_via_tar(
         parent_q = shell_quote(&remote_parent),
         base_q = shell_quote(&remote_base),
     );
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP download dir: tar czf cmd={cmd}");
     let (code, out) = exec_with_status(&h, &cmd).await;
     if code == EXIT_COMMAND_NOT_FOUND {
@@ -261,13 +260,13 @@ async fn sftp_download_dir_recursive(
         }
     };
 
-    for (name, is_dir) in entries {
-        if name == "." || name == ".." {
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." {
             continue;
         }
-        let remote_child = join_remote_path(remote_path, &name);
-        let local_child = std::path::Path::new(local_path).join(&name);
-        if is_dir {
+        let remote_child = join_remote_path(remote_path, &entry.name);
+        let local_child = std::path::Path::new(local_path).join(&entry.name);
+        if entry.is_dir {
             Box::pin(sftp_download_dir_recursive(
                 backend,
                 &remote_child,

@@ -20,6 +20,7 @@
 //!   config.toml       — this module's persisted config
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -49,6 +50,47 @@ pub struct AppearanceConfig {
     /// Terminal font + size settings. Stored under `[appearance.terminal]`.
     #[serde(default)]
     pub terminal: TerminalConfig,
+
+    /// Right-hand panel width in CSS pixels. Clamped at use sites into a
+    /// sane range. Stored under `[appearance]` so it survives restarts.
+    #[serde(default = "default_panel_width")]
+    pub panel_width: f32,
+}
+
+fn default_panel_width() -> f32 {
+    220.0
+}
+
+// ---------------------------------------------------------------------------
+// Keybind config
+// ---------------------------------------------------------------------------
+
+/// User-configurable keyboard shortcuts. Stored under `[keybinds]` in
+/// `config.toml` as a map of action-id → keystroke string (e.g.
+/// `"toggle_command" = "cmd-k"`).
+///
+/// Action IDs are stable strings defined by the app's keybind catalog
+/// (see `crabport-ui::keybinds`). Missing entries fall back to the
+/// built-in defaults registered in `main.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct KeybindConfig {
+    /// Map of action-id → GPUI keystroke string (e.g. "cmd-k", "ctrl-shift-c").
+    /// An empty string disables the binding.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, String>,
+}
+
+impl KeybindConfig {
+    /// Get the keystroke for an action id, if present.
+    pub fn get(&self, action_id: &str) -> Option<&str> {
+        self.bindings.get(action_id).map(|s| s.as_str())
+    }
+
+    /// Set or update the keystroke for an action id.
+    pub fn set(&mut self, action_id: &str, keystroke: &str) {
+        self.bindings
+            .insert(action_id.to_string(), keystroke.to_string());
+    }
 }
 
 fn default_locale() -> String {
@@ -61,6 +103,7 @@ impl Default for AppearanceConfig {
             locale: default_locale(),
             theme: ThemeConfig::default(),
             terminal: TerminalConfig::default(),
+            panel_width: default_panel_width(),
         }
     }
 }
@@ -528,6 +571,10 @@ impl Default for ThemeConfig {
 pub struct CrabPortConfig {
     #[serde(default)]
     pub appearance: AppearanceConfig,
+
+    /// User-configurable keyboard shortcuts. Stored under `[keybinds]`.
+    #[serde(default)]
+    pub keybinds: KeybindConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,8 +618,17 @@ impl From<toml::ser::Error> for ConfigError {
 
 /// Process-wide configuration handle. Initialized on first access from the
 /// on-disk `config.toml` (or defaults if the file does not exist yet).
-pub static CONFIG: LazyLock<Arc<RwLock<CrabPortConfig>>> =
-    LazyLock::new(|| Arc::new(RwLock::new(load().unwrap_or_default())));
+pub static CONFIG: LazyLock<Arc<RwLock<CrabPortConfig>>> = LazyLock::new(|| {
+    match load() {
+        Ok(cfg) => Arc::new(RwLock::new(cfg)),
+        Err(e) => {
+            // Don't panic — the app can still run on defaults. Log so the
+            // user has a chance to notice a corrupted config.toml.
+            tracing::warn!("config: failed to load config.toml ({e}) — using defaults");
+            Arc::new(RwLock::new(CrabPortConfig::default()))
+        }
+    }
+});
 
 // ---------------------------------------------------------------------------
 // Path helpers

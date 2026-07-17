@@ -48,6 +48,7 @@ mod color;
 mod fonts;
 mod render_cache;
 mod runs;
+mod scrollbar_handle;
 mod selection;
 
 // ---- TerminalView ----
@@ -102,14 +103,17 @@ pub struct TerminalView {
     /// Used by mouse handlers to convert viewport rows to grid lines.
     display_offset: Arc<std::sync::atomic::AtomicI32>,
     /// Latest history_size from the alacritty grid, updated each prepaint.
-    /// Used by the scrollbar overlay to compute thumb position/size.
+    /// Shared with [`TerminalScrollbarHandle`] so the scrollbar widget can
+    /// size / position its thumb without reading the term lock on its own.
     history_size: Arc<std::sync::atomic::AtomicI32>,
-    /// Latest visible row count, updated each prepaint.
+    /// Latest visible row count, updated each prepaint. Shared with the
+    /// scrollbar handle.
     visible_rows: Arc<std::sync::atomic::AtomicI32>,
-    /// Whether the scrollbar thumb is currently being dragged.
-    scrollbar_dragging: Arc<std::sync::atomic::AtomicBool>,
-    /// Y offset (in px) from the thumb top to the mouse cursor at drag start.
-    scrollbar_drag_offset: Arc<Mutex<f32>>,
+    /// The scrollbar handle driving the terminal's vertical scrollbar.
+    /// Adapts the pixel-based `gpui_component::Scrollbar` widget to the
+    /// alacritty grid's row-based scroll model. Cloned into the render
+    /// closure and passed to `Scrollbar::vertical`.
+    scrollbar_handle: scrollbar_handle::TerminalScrollbarHandle,
     /// Current IME marked (preedit) text, if any. Set by the platform's IME
     /// system via [`EntityInputHandler::replace_and_mark_text_in_range`] and
     /// committed (written to the PTY) via `replace_text_in_range`. Rendered
@@ -142,6 +146,9 @@ pub struct TerminalView {
     /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
     /// and the toolbar follow keyboard focus, not just mouse clicks.
     on_focused: Option<Rc<dyn Fn(u64, &mut App)>>,
+    /// Invoked when the user triggers a split via keyboard shortcut.
+    /// Receives the split direction. The app calls `split_active_pane`.
+    on_split_request: Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>>,
     /// Latest SFTP transfer progress pushed by the backend, or `None` when
     /// no transfer is in flight. Updated by the backend-event subscriber;
     /// read by the toolbar via [`Self::sftp_progress`].
@@ -367,6 +374,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
+                            crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -430,6 +438,12 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
+                    crabport_terminal::terminal::BackendEvent::HistoryLoaded(_) => {
+                        // The session's `start` loop already merged the
+                        // loaded commands into `command_history`. Repaint
+                        // so the History panel picks up the new list.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -439,6 +453,13 @@ impl TerminalView {
         let mut wakeup_rx = session.subscribe_wakeup();
         let dirty_wk = needs_repaint.clone();
         let status_entity = cx.entity().downgrade();
+        // Fires `refresh_history` once the backend reports Connected / Local
+        // so the History panel is seeded from the TTY history file instead
+        // of only from session-captured commands. One-shot — subsequent
+        // refreshes are user-triggered via the History panel's refresh button.
+        let history_refreshed = Arc::new(AtomicBool::new(false));
+        let history_refreshed_wk = history_refreshed.clone();
+        let session_for_refresh = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
                 let _ = status_entity.update(cx, |this, _cx| {
@@ -447,6 +468,16 @@ impl TerminalView {
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            // Trigger an initial TTY-history read when the
+                            // connection first reaches a ready state.
+                            if !history_refreshed_wk.swap(true, Ordering::AcqRel)
+                                && matches!(
+                                    new_status,
+                                    RemoteStatus::Connected | RemoteStatus::Local
+                                )
+                            {
+                                session_for_refresh.refresh_history();
+                            }
                         }
                     }
                 });
@@ -534,6 +565,20 @@ impl TerminalView {
             .detach();
         }
 
+        // Shared atomics for the terminal grid scroll state. These are kept
+        // fresh by the prepaint loop (`display_offset_atomic`, …) and are also
+        // handed to the scrollbar handle so the `gpui_component::Scrollbar`
+        // widget can compute thumb size/position without taking the term lock.
+        let display_offset = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let history_size = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let visible_rows = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let scrollbar_handle = scrollbar_handle::TerminalScrollbarHandle::new_from_atomics(
+            session.clone(),
+            display_offset.clone(),
+            history_size.clone(),
+            visible_rows.clone(),
+        );
+
         Self {
             session,
             backend,
@@ -550,11 +595,10 @@ impl TerminalView {
             pending_paste: false,
             pending_copy: false,
             scroll_accumulator: 0.0,
-            display_offset: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-            history_size: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-            visible_rows: Arc::new(std::sync::atomic::AtomicI32::new(0)),
-            scrollbar_dragging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            scrollbar_drag_offset: Arc::new(Mutex::new(0.0)),
+            display_offset,
+            history_size,
+            visible_rows,
+            scrollbar_handle,
             marked_text: Arc::new(Mutex::new(None)),
             cursor_bounds: Arc::new(Mutex::new(Bounds::new(
                 point(px(0.0), px(0.0)),
@@ -570,6 +614,7 @@ impl TerminalView {
             telnet_info,
             on_backend_closed: None,
             on_focused: None,
+            on_split_request: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
@@ -604,7 +649,7 @@ impl TerminalView {
         self.host_id
     }
 
-    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         self.session.sftp_entries()
     }
 
@@ -624,11 +669,26 @@ impl TerminalView {
         self.session.sftp_upload(local_path, remote_path);
     }
 
+    /// Upload multiple files in a single batch transfer. Falls back to
+    /// per-file upload if the remote doesn't support tar. Completion is
+    /// reported via the backend's event stream.
+    pub fn sftp_upload_batch(&self, items: &[(String, String)]) {
+        self.backend.sftp_upload_batch(items);
+    }
+
     /// Snapshot of this session's command history, most-recent-first.
     /// Returns an empty vec for local terminals or sessions without a
     /// backend that tracks history.
     pub fn command_history(&self) -> Vec<String> {
         self.session.command_history()
+    }
+
+    /// Trigger a fresh read of the shell's TTY history file. The backend
+    /// broadcasts a `BackendEvent::HistoryLoaded` once the data is ready,
+    /// which the session forwards into `command_history` (and the next
+    /// render picks up via [`Self::command_history`]).
+    pub fn refresh_history(&self) {
+        self.session.refresh_history();
     }
 
     /// Cloned handle to the shared command-history buffer. Used when
@@ -714,6 +774,15 @@ impl TerminalView {
     /// mouse clicks). The callback receives this pane's id.
     pub fn set_on_focused(&mut self, f: impl Fn(u64, &mut App) + 'static) {
         self.on_focused = Some(Rc::new(f));
+    }
+
+    /// Set the callback invoked when the user triggers a split via keyboard
+    /// shortcut. The app calls `split_active_pane` with the given direction.
+    pub fn set_on_split_request(
+        &mut self,
+        f: impl Fn(crate::views::terminal::split::SplitDir, &mut App) + 'static,
+    ) {
+        self.on_split_request = Some(Rc::new(f));
     }
 
     /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
@@ -907,6 +976,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
+                            crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         let _ = entity.update(cx, |this, cx| {
@@ -956,6 +1026,11 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Data(_) => {}
+                    crabport_terminal::terminal::BackendEvent::HistoryLoaded(_) => {
+                        // Repaint so the History panel picks up the
+                        // freshly-loaded command history.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -965,6 +1040,11 @@ impl TerminalView {
         let mut wakeup_rx = session.subscribe_wakeup();
         let dirty_wk = self.needs_repaint.clone();
         let status_entity = cx.entity().downgrade();
+        // One-shot initial TTY-history read on (re)connect — mirrors the
+        // constructor's wakeup loop.
+        let history_refreshed = Arc::new(AtomicBool::new(false));
+        let history_refreshed_wk = history_refreshed.clone();
+        let session_for_refresh = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
                 let _ = status_entity.update(cx, |this, _cx| {
@@ -973,6 +1053,14 @@ impl TerminalView {
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            if !history_refreshed_wk.swap(true, Ordering::AcqRel)
+                                && matches!(
+                                    new_status,
+                                    RemoteStatus::Connected | RemoteStatus::Local
+                                )
+                            {
+                                session_for_refresh.refresh_history();
+                            }
                         }
                     }
                 });
@@ -1114,10 +1202,10 @@ impl Render for TerminalView {
         }
         if self.pending_copy {
             self.pending_copy = false;
-            let text = if let Some(ref sel) = *self.selection.lock() {
-                Self::copy_selected_text(&self.session, sel)
-            } else {
-                self.session.with_term(|term| {
+            let sel = self.selection.lock().clone();
+            let text = match sel {
+                Some(ref sel) if !sel.is_empty() => Self::copy_selected_text(&self.session, sel),
+                _ => self.session.with_term(|term| {
                     let grid = term.grid();
                     let display_offset = grid.display_offset();
                     let num_cols = grid.columns();
@@ -1140,7 +1228,7 @@ impl Render for TerminalView {
                         }
                     }
                     result
-                })
+                }),
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -1210,25 +1298,7 @@ impl Render for TerminalView {
         let history_size_atomic = self.history_size.clone();
         let visible_rows_atomic = self.visible_rows.clone();
         let history_size_sb = self.history_size.clone();
-        let visible_rows_sb = self.visible_rows.clone();
-        let display_offset_sb = self.display_offset.clone();
-        let scrollbar_dragging = self.scrollbar_dragging.clone();
-        let scrollbar_drag_offset = self.scrollbar_drag_offset.clone();
-        // Clones used by the paint closure to register global mouse capture
-        // while the scrollbar thumb is being dragged. Registering via
-        // `window.on_mouse_event` (instead of a child overlay div) means the
-        // drag keeps receiving move/up events even when the cursor leaves the
-        // terminal bounds — so dragging the scrollbar and moving the mouse
-        // over the tab bar or SFTP panel no longer aborts the drag or loses
-        // focus.
-        let scrollbar_dragging_paint = self.scrollbar_dragging.clone();
-        let scrollbar_drag_offset_paint = self.scrollbar_drag_offset.clone();
-        let last_bounds_paint = self.last_bounds.clone();
-        let session_paint = self.session.clone();
-        let needs_repaint_paint = self.needs_repaint.clone();
-        let display_offset_paint = self.display_offset.clone();
-        let history_size_paint = self.history_size.clone();
-        let visible_rows_paint = self.visible_rows.clone();
+        let scrollbar_handle = self.scrollbar_handle.clone();
         // Clones used by the paint closure to (a) register the IME input
         // handler so the platform can route composition events (Chinese /
         // Japanese / Korean input) to the terminal, and (b) refresh the
@@ -1261,7 +1331,6 @@ impl Render for TerminalView {
             .relative()
             .size_full()
             .overflow_hidden()
-            .cursor_text()
             .bg(rgb(term_bg()))
             .track_focus(&focus_handle)
             .key_context("CrabPortTerminal")
@@ -1299,6 +1368,20 @@ impl Render for TerminalView {
                 });
                 this.reload_font_settings(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::app::SplitVertical, _window, cx| {
+                    if let Some(cb) = &this.on_split_request {
+                        cb(crate::views::terminal::split::SplitDir::Vertical, cx);
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::app::SplitHorizontal, _window, cx| {
+                    if let Some(cb) = &this.on_split_request {
+                        cb(crate::views::terminal::split::SplitDir::Horizontal, cx);
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
@@ -1454,77 +1537,6 @@ impl Render for TerminalView {
                         // cursor is Option<(Point, CursorShape)>
                         let text_system = window.text_system().clone();
 
-                        // While the scrollbar thumb is being dragged, register
-                        // global (window-level) capture-phase listeners for
-                        // mouse-move and mouse-up. These fire regardless of
-                        // which element is currently under the cursor, so the
-                        // drag continues smoothly even if the mouse leaves the
-                        // terminal area. The listeners are registered per-frame
-                        // and only while dragging, so there is zero overhead in
-                        // the common (non-dragging) case.
-                        if scrollbar_dragging_paint.load(Ordering::Acquire)
-                            && history_size_paint.load(Ordering::Relaxed) > 0
-                        {
-                            window.on_mouse_event({
-                                let dragging = scrollbar_dragging_paint.clone();
-                                let drag_offset = scrollbar_drag_offset_paint.clone();
-                                let last_bounds = last_bounds_paint.clone();
-                                let session = session_paint.clone();
-                                let needs_repaint = needs_repaint_paint.clone();
-                                let display_offset_atomic = display_offset_paint.clone();
-                                let history = history_size_paint.clone();
-                                let visible = visible_rows_paint.clone();
-                                move |event: &MouseMoveEvent, phase, _window, _cx| {
-                                    if phase != DispatchPhase::Capture
-                                        || !dragging.load(Ordering::Acquire)
-                                    {
-                                        return;
-                                    }
-                                    let Some(bounds) = *last_bounds.lock() else {
-                                        return;
-                                    };
-                                    let history = history.load(Ordering::Relaxed) as f32;
-                                    let visible = visible.load(Ordering::Relaxed) as f32;
-                                    if history <= 0.0 {
-                                        return;
-                                    }
-                                    let drag_offset = *drag_offset.lock();
-                                    let track_h = (f32::from(bounds.size.height) - 4.0).max(0.0);
-                                    let thumb_h = track_h * (visible / (history + visible));
-                                    let new_thumb_top = ((f32::from(event.position.y)
-                                        - f32::from(bounds.origin.y))
-                                        - drag_offset)
-                                        .clamp(0.0, (track_h - thumb_h).max(0.0));
-                                    let new_y_frac = if track_h > 0.0 {
-                                        new_thumb_top / track_h
-                                    } else {
-                                        0.0
-                                    };
-                                    let total = history + visible;
-                                    let new_offset = (history - new_y_frac * total).round() as i32;
-                                    let cur_offset = display_offset_atomic.load(Ordering::Relaxed);
-                                    let delta = new_offset - cur_offset;
-                                    if delta != 0 {
-                                        // Immediately update the atomic so the
-                                        // next move event sees the new offset,
-                                        // preventing repeated scrolls with a
-                                        // stale cur_offset.
-                                        display_offset_atomic.store(new_offset, Ordering::Relaxed);
-                                        session.scroll(delta);
-                                        needs_repaint.store(true, Ordering::Release);
-                                    }
-                                }
-                            });
-                            window.on_mouse_event({
-                                let dragging = scrollbar_dragging_paint.clone();
-                                move |_event: &MouseUpEvent, phase, _window, _cx| {
-                                    if phase == DispatchPhase::Capture {
-                                        dragging.store(false, Ordering::Release);
-                                    }
-                                }
-                            });
-                        }
-
                         let sel_guard = selection.lock();
                         let sel: Option<Selection> = sel_guard.clone();
                         drop(sel_guard);
@@ -1543,37 +1555,42 @@ impl Render for TerminalView {
 
                             // Convert selection grid lines to viewport rows.
                             // viewport_row = grid_line + display_offset
-                            let (sel_start, sel_end) = if let Some(ref s) = sel {
-                                let (sr, er, sc, ec) = s.range();
-                                let vp_sr = sr + display_offset;
-                                let vp_er = er + display_offset;
-                                let ri = row_idx as i32;
-                                if ri < vp_sr || ri > vp_er {
-                                    (None, None)
-                                } else if vp_sr == vp_er {
-                                    let lo = sc.min(num_cols);
-                                    let hi = (ec + 1).min(num_cols).max(lo + 1);
-                                    (Some(lo), Some(hi))
-                                } else if ri == vp_sr {
-                                    let col = if s.start_row <= s.end_row {
-                                        s.start_col
+                            //
+                            // `is_empty()` hides the highlight for a clicked-but-
+                            // not-yet-dragged single cell so a plain click
+                            // doesn't visually select anything.
+                            let (sel_start, sel_end) =
+                                if let Some(ref s) = sel.as_ref().filter(|s| !s.is_empty()) {
+                                    let (sr, er, sc, ec) = s.range();
+                                    let vp_sr = sr + display_offset;
+                                    let vp_er = er + display_offset;
+                                    let ri = row_idx as i32;
+                                    if ri < vp_sr || ri > vp_er {
+                                        (None, None)
+                                    } else if vp_sr == vp_er {
+                                        let lo = sc.min(num_cols);
+                                        let hi = (ec + 1).min(num_cols).max(lo + 1);
+                                        (Some(lo), Some(hi))
+                                    } else if ri == vp_sr {
+                                        let col = if s.start_row <= s.end_row {
+                                            s.start_col
+                                        } else {
+                                            s.end_col
+                                        };
+                                        (Some(col.min(num_cols)), Some(num_cols))
+                                    } else if ri == vp_er {
+                                        let col = if s.start_row <= s.end_row {
+                                            s.end_col
+                                        } else {
+                                            s.start_col
+                                        };
+                                        (Some(0), Some(col.saturating_add(1).min(num_cols)))
                                     } else {
-                                        s.end_col
-                                    };
-                                    (Some(col.min(num_cols)), Some(num_cols))
-                                } else if ri == vp_er {
-                                    let col = if s.start_row <= s.end_row {
-                                        s.end_col
-                                    } else {
-                                        s.start_col
-                                    };
-                                    (Some(0), Some(col.saturating_add(1).min(num_cols)))
+                                        (Some(0), Some(num_cols))
+                                    }
                                 } else {
-                                    (Some(0), Some(num_cols))
-                                }
-                            } else {
-                                (None, None)
-                            };
+                                    (None, None)
+                                };
 
                             let row_selected = sel_start.is_some();
                             let row = &cache.rows[row_idx];
@@ -1785,16 +1802,21 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse = display_offset_mouse.clone();
-                        let scrollbar_dragging_down = scrollbar_dragging.clone();
+                        let session_for_dblclick = session_c.clone();
                         move |event, _window, _cx| {
-                            // If the click landed on the scrollbar area, skip selection.
-                            if scrollbar_dragging_down.load(Ordering::Acquire) {
-                                return;
-                            }
                             if let Some(bounds) = *last_bounds.lock() {
-                                // Skip if click is in the scrollbar region (right 10px).
+                                // Skip if click is in the scrollbar region
+                                // (rightmost WIDTH px). The `Scrollbar`
+                                // widget overlays that strip and calls
+                                // `cx.stop_propagation()` on its own click
+                                // handler, but we also guard here in case the
+                                // scrollbar is hidden (no history) — in which
+                                // case the strip is empty and we want normal
+                                // selection. Scrollbar::WIDTH is private, so we
+                                // hardcode the gpui-component value
+                                // (THUMB_ACTIVE_INSET*2 + THUMB_ACTIVE_WIDTH).
                                 let in_scrollbar = event.position.x
-                                    > bounds.origin.x + bounds.size.width - px(10.0);
+                                    > bounds.origin.x + bounds.size.width - px(16.0);
                                 if in_scrollbar {
                                     return;
                                 }
@@ -1806,7 +1828,26 @@ impl Render for TerminalView {
                                     line_height,
                                     offset,
                                 ) {
-                                    *selection.lock() = Some(Selection::new(col, row));
+                                    // Double-click selects the word at the click
+                                    // position; triple-click selects the whole line.
+                                    // Single click starts a normal drag selection.
+                                    let new_sel = if event.click_count >= 3 {
+                                        Some(select_line(
+                                            session_for_dblclick
+                                                .with_term(|term| term.grid().columns()),
+                                            row,
+                                        ))
+                                    } else if event.click_count == 2 {
+                                        session_for_dblclick.with_term(|term| {
+                                            let grid = term.grid();
+                                            select_word(grid, grid.columns(), col, row)
+                                        })
+                                    } else {
+                                        Some(Selection::new(col, row))
+                                    };
+                                    if let Some(sel) = new_sel {
+                                        *selection.lock() = Some(sel);
+                                    }
                                     needs_repaint.store(true, Ordering::Release);
                                 }
                             }
@@ -1819,11 +1860,7 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse_move = display_offset_mouse_move.clone();
-                        let scrollbar_dragging_move = scrollbar_dragging.clone();
                         move |event, _window, _cx| {
-                            if scrollbar_dragging_move.load(Ordering::Acquire) {
-                                return;
-                            }
                             if event.dragging() {
                                 if let Some(bounds) = *last_bounds.lock() {
                                     let offset = display_offset_mouse_move.load(Ordering::Relaxed);
@@ -1834,7 +1871,17 @@ impl Render for TerminalView {
                                         line_height,
                                         offset,
                                     ) {
+                                        // Only extend an in-progress drag selection.
+                                        // Word/line selections from double/triple click
+                                        // have `active == false` and should not be
+                                        // mutated by a subsequent drag — otherwise
+                                        // dragging after a double-click would
+                                        // collapse the word selection back to a
+                                        // single cell.
                                         if let Some(ref mut sel) = *selection.lock() {
+                                            if !sel.active {
+                                                return;
+                                            }
                                             sel.end_col = col;
                                             sel.end_row = row;
                                             needs_repaint.store(true, Ordering::Release);
@@ -1862,8 +1909,17 @@ impl Render for TerminalView {
                                     offset,
                                 ) {
                                     let sel_guard = selection.lock();
+                                    // Only apply the "click without drag → clear"
+                                    // logic to in-progress drag selections
+                                    // (`active == true`). Word/line selections
+                                    // from double/triple click have
+                                    // `active == false` and must survive the
+                                    // mouse-up even when start == up (e.g.
+                                    // double-clicking a single-character word).
                                     let clear = if let Some(ref sel) = *sel_guard {
-                                        sel.start_col == up_col && sel.start_row == up_row
+                                        sel.active
+                                            && sel.start_col == up_col
+                                            && sel.start_row == up_row
                                     } else {
                                         false
                                     };
@@ -1880,60 +1936,27 @@ impl Render for TerminalView {
                     }),
             )
             // Scrollbar overlay: only visible when there is scrollback history.
-            // The thumb is draggable to scroll.
+            // Uses the same `gpui_component::Scrollbar` widget as the rest of
+            // the app (History / SFTP / Snippets / Tunnels panels, About
+            // window, …) so styling, hover/drag, and fade animations stay
+            // consistent. The handle (`TerminalScrollbarHandle`) bridges the
+            // pixel-based `ScrollbarHandle` API to the alacritty grid's
+            // row-based scroll model.
             .when(history_size_sb.load(Ordering::Relaxed) > 0, |el| {
-                let history = history_size_sb.load(Ordering::Relaxed) as f32;
-                let visible = visible_rows_sb.load(Ordering::Relaxed) as f32;
-                let offset = display_offset_sb.load(Ordering::Relaxed) as f32;
-                let total = history + visible;
-                let thumb_h_frac = (visible / total).clamp(0.04, 1.0);
-                // display_offset=0 → viewport at bottom (newest) → thumb at bottom.
-                // display_offset=history → viewport at top → thumb at top.
-                // thumb_y_frac: 0=top, 1=bottom. So thumb_y_frac = 1 - offset/history ... but
-                // we also account for thumb height. Position the thumb so its top represents
-                // the fraction of content scrolled past at the top.
-                //
-                // content above viewport top = history - offset
-                // fraction of total content above viewport top = (history - offset) / total
-                // thumb_top_frac = (history - offset) / total, clamped.
-                let thumb_y_frac = ((history - offset) / total).clamp(0.0, 1.0 - thumb_h_frac);
-
-                let scrollbar_dragging_c = scrollbar_dragging.clone();
-                let scrollbar_drag_offset_c = scrollbar_drag_offset.clone();
-                let last_bounds_sb = last_bounds_c.clone();
-
+                // Keep the handle's line_height fresh so its `offset()` /
+                // `content_size()` math agrees with the latest font metrics.
+                scrollbar_handle.set_line_height(line_height);
                 el.child(
                     div()
-                        .id("terminal-scrollbar")
+                        .id("terminal-scrollbar-overlay")
                         .absolute()
                         .top_0()
                         .right_0()
                         .bottom_0()
-                        .w(px(10.0))
+                        .w(px(16.0))
                         .child(
-                            div()
-                                .id("terminal-scrollbar-thumb")
-                                .absolute()
-                                .top(DefiniteLength::Fraction(thumb_y_frac))
-                                .right_1()
-                                .h(DefiniteLength::Fraction(thumb_h_frac))
-                                .w(px(6.0))
-                                .rounded_full()
-                                .bg(rgb(0x4d4e50))
-                                .on_mouse_down(MouseButton::Left, {
-                                    let scrollbar_drag_offset_c = scrollbar_drag_offset_c.clone();
-                                    let scrollbar_dragging_c = scrollbar_dragging_c.clone();
-                                    let last_bounds_sb = last_bounds_sb.clone();
-                                    move |event, _window, _cx| {
-                                        scrollbar_dragging_c.store(true, Ordering::Release);
-                                        if let Some(bounds) = *last_bounds_sb.lock() {
-                                            let thumb_top =
-                                                bounds.origin.y + bounds.size.height * thumb_y_frac;
-                                            *scrollbar_drag_offset_c.lock() =
-                                                (event.position.y - thumb_top) / px(1.0);
-                                        }
-                                    }
-                                }),
+                            gpui_component::scroll::Scrollbar::vertical(&scrollbar_handle)
+                                .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
                         ),
                 )
             })
@@ -1991,12 +2014,22 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         // The only "document" text we expose is the current preedit text.
+        // `range` is in UTF-16 code units (the NSTextInputClient convention),
+        // so we must slice the UTF-16 representation — never the raw `String`
+        // bytes. Slicing a `String` by a UTF-16 index would land mid-character
+        // for CJK text and panic (`byte index … is not a char boundary`),
+        // which aborts the process under the panic=abort config. This is the
+        // crash triggered when switching IMEs: IMK re-queries the current
+        // character index with a stale range that doesn't align to byte
+        // boundaries.
         let marked = self.marked_text.lock().clone().unwrap_or_default();
-        let end = range.end.min(marked.len());
-        if range.start >= end {
+        let utf16: Vec<u16> = marked.encode_utf16().collect();
+        let start = range.start.min(utf16.len());
+        let end = range.end.min(utf16.len());
+        if start >= end {
             Some(String::new())
         } else {
-            Some(marked[range.start..end].to_string())
+            String::from_utf16(&utf16[start..end]).ok()
         }
     }
 

@@ -1,10 +1,11 @@
 [package]
 name = "crabport-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "ansi", "registry"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "ansi", "registry", "env-filter"] }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 gpui = { version = "0.2", default-features = false }
 serde = { version = "1", features = ["derive"] }

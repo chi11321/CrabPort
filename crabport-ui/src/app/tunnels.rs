@@ -281,7 +281,7 @@ impl CrabportApp {
         // executors reliably).
         let tunnel_id_for_set = tunnel_id;
         let (tx, rx) = tokio::sync::oneshot::channel::<
-            Option<(std::sync::Arc<OwnedSession>, std::sync::Arc<TunnelManager>)>,
+            Result<(std::sync::Arc<OwnedSession>, std::sync::Arc<TunnelManager>), String>,
         >();
 
         crabport_ssh::TOKIO.spawn(async move {
@@ -291,7 +291,7 @@ impl CrabportApp {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("owned session connect failed: {e}");
-                    let _ = tx.send(None);
+                    let _ = tx.send(Err(e.to_string()));
                     return;
                 }
             };
@@ -328,10 +328,10 @@ impl CrabportApp {
                 }
             };
             let _ = tx.send(match start_result {
-                Ok(_) => Some((session, manager)),
+                Ok(_) => Ok((session, manager)),
                 Err(e) => {
                     tracing::error!("tunnel start failed: {e}");
-                    None
+                    Err(e.to_string())
                 }
             });
         });
@@ -339,7 +339,7 @@ impl CrabportApp {
         cx.spawn(async move |this, cx| {
             let tunnel_name = tunnel_name.clone();
             match rx.await {
-                Ok(Some((session, manager))) => {
+                Ok(Ok((session, manager))) => {
                     let _ = this.update(cx, |app, cx| {
                         app.app_ctx
                             .tunnels
@@ -359,7 +359,30 @@ impl CrabportApp {
                         cx.notify();
                     });
                 }
-                _ => {
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |app, cx| {
+                        app.app_ctx.notifications.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(
+                                    t!("tunnels.notif_start_failed_title").to_string(),
+                                )
+                                .level(NotificationLevel::Danger)
+                                .message(format!(
+                                    "{}: {}",
+                                    t!(
+                                        "tunnels.notif_start_failed_msg",
+                                        name = tunnel_name.as_str()
+                                    ),
+                                    e
+                                ))
+                                .duration(std::time::Duration::from_secs(5)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
+                Err(_) => {
                     let _ = this.update(cx, |app, cx| {
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(
@@ -497,7 +520,7 @@ impl CrabportApp {
             .set_borrowed(tunnel_id, tab_id, manager.clone());
 
         let tunnel_id_for_set = tunnel_id;
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         crabport_ssh::TOKIO.spawn(async move {
             let start_result = match entry.kind {
                 TunnelKind::Local => {
@@ -528,7 +551,10 @@ impl CrabportApp {
                         .await
                 }
             };
-            let _ = tx.send(start_result.is_ok());
+            let _ = tx.send(start_result.map(|_| ()).map_err(|e| {
+                tracing::error!("tunnel start failed: {e}");
+                e.to_string()
+            }));
             // `manager` (the spawn's clone) drops here — the registry's clone
             // keeps the live tunnels alive.
         });
@@ -536,7 +562,7 @@ impl CrabportApp {
         cx.spawn(async move |this, cx| {
             let tunnel_name = tunnel_name.clone();
             match rx.await {
-                Ok(true) => {
+                Ok(Ok(())) => {
                     let _ = this.update(cx, |app, cx| {
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(
@@ -553,10 +579,34 @@ impl CrabportApp {
                         cx.notify();
                     });
                 }
-                _ => {
+                Ok(Err(e)) => {
                     let _ = this.update(cx, |app, cx| {
                         // Start failed — tear down the borrowed runtime we
                         // optimistically registered above.
+                        app.app_ctx.tunnels.clear_runtime(tunnel_id_for_set);
+                        app.app_ctx.notifications.update(cx, |c, cx| {
+                            c.show(
+                                Notification::new(
+                                    t!("tunnels.notif_start_failed_title").to_string(),
+                                )
+                                .level(NotificationLevel::Danger)
+                                .message(format!(
+                                    "{}: {}",
+                                    t!(
+                                        "tunnels.notif_start_failed_msg",
+                                        name = tunnel_name.as_str()
+                                    ),
+                                    e
+                                ))
+                                .duration(std::time::Duration::from_secs(5)),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                }
+                Err(_) => {
+                    let _ = this.update(cx, |app, cx| {
                         app.app_ctx.tunnels.clear_runtime(tunnel_id_for_set);
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(

@@ -11,11 +11,28 @@ use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::layouts::terminal_toolbar::render_terminal_toolbar;
+use crate::layouts::toolbar::render_terminal_toolbar;
 use crate::views::panel::PanelKind;
+use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
+use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus};
+
+/// Clone the active terminal's `Entity` so a callback can forward calls to
+/// the backend without capturing a borrow on `terminal_views`.
+fn terminal_entity(
+    is_terminal: bool,
+    active_tab: Option<&Tab>,
+    terminal_views: &HashMap<u64, Entity<TerminalView>>,
+) -> Option<Entity<TerminalView>> {
+    if !is_terminal {
+        return None;
+    }
+    active_tab
+        .and_then(|tab| terminal_views.get(&tab.id))
+        .cloned()
+}
 
 pub fn render_content(
     selected: SidebarItem,
@@ -25,6 +42,7 @@ pub fn render_content(
     terminal_views: &HashMap<u64, Entity<TerminalView>>,
     split_trees: &HashMap<u64, crate::views::terminal::split::SplitTree>,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
+    sftp_view: &Entity<crate::views::sftp::SftpTabView>,
     hosts: &[ConnectionHost],
     form_entity: Option<&ConnectionFormState>,
     // Active panel pane the user last selected (semantic identity, not a
@@ -38,6 +56,11 @@ pub fn render_content(
     tunnel_list: Vec<crate::views::tunnels::TunnelView>,
     tunnel_form_state: Option<crate::views::tunnels::TunnelFormState>,
     snippet_form_state: Option<crate::views::snippets::SnippetFormState>,
+    // Current panel width in px (either the live drag value or the persisted
+    // config value). Drives the panel's rendered width.
+    panel_width: f32,
+    // Whether a panel resize drag is in progress.
+    panel_dragging: bool,
     ctx: &AppCtx,
     window: &mut Window,
     cx: &mut App,
@@ -90,6 +113,12 @@ pub fn render_content(
                             app.connect_to_host(host_id, cx);
                         });
                     };
+                    let app_handle_sftp = handle.clone();
+                    let on_sftp_connect = move |host_id: i64, w: &mut Window, cx: &mut App| {
+                        app_handle_sftp.update(cx, |app, cx| {
+                            app.switch_sftp_panel_host(host_id, w, cx);
+                        });
+                    };
                     let app_handle_edit = handle.clone();
                     let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
                         app_handle_edit.update(cx, |app, cx| {
@@ -105,6 +134,8 @@ pub fn render_content(
 
                     let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
                     let on_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_connect);
+                    let on_sftp_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> =
+                        Rc::new(on_sftp_connect);
                     let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
                     let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
 
@@ -114,6 +145,7 @@ pub fn render_content(
                             form_entity.cloned(),
                             Some(on_new_rc),
                             Some(on_connect_rc),
+                            Some(on_sftp_connect_rc),
                             Some(on_edit_rc),
                             Some(on_remove_rc),
                             context_menu.clone(),
@@ -242,6 +274,10 @@ pub fn render_content(
         Some(TabKind::Terminal) => {
             if let Some(tab) = active_tab {
                 let tab_id = tab.id;
+                // Clone the terminal entity so the on_drop handler can
+                // trigger a download when the user drags an SFTP file row
+                // onto the terminal area.
+                let term_entity_for_drop = terminal_views.get(&tab_id).cloned();
                 // If this tab has a split tree, render the panes recursively;
                 // otherwise fall back to the single terminal view.
                 let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
@@ -269,11 +305,46 @@ pub fn render_content(
                     terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
+                // Clone the download callback + terminal entity so the
+                // on_drop handler can trigger a download when the user
+                // drags an SFTP file row onto the terminal area.
+                let on_download_for_drop = term_entity_for_drop.clone().map(|entity| {
+                    move |drag: &SftpDragValue, cx: &mut App| {
+                        let remote_path = drag.remote_path.clone();
+                        let name = drag.name.clone();
+                        let rx = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some(t!("sftp.download_prompt").to_string().into()),
+                        });
+                        let entity = entity.clone();
+                        cx.spawn(async move |cx| {
+                            let picked = match rx.await {
+                                Ok(Ok(Some(mut paths))) => paths.pop(),
+                                _ => None,
+                            };
+                            let Some(dest_dir) = picked else { return };
+                            let local_path = dest_dir.join(&name);
+                            let _ = cx.update(|cx| {
+                                entity.read_with(cx, |view, _cx| {
+                                    view.sftp_download(&remote_path, &local_path.to_string_lossy());
+                                });
+                            });
+                        })
+                        .detach();
+                    }
+                });
                 div()
                     .size_full()
                     .relative()
                     .key_context("Terminal")
                     .child(inner)
+                    .when_some(on_download_for_drop, |el, on_drop_cb| {
+                        el.on_drop::<SftpDragValue>(move |drag, _w, cx| {
+                            on_drop_cb(drag, cx);
+                        })
+                    })
                     .when(has_term, |el| {
                         el.child(
                             div()
@@ -336,6 +407,24 @@ pub fn render_content(
                     .into_any_element()
             }
         }
+        Some(TabKind::Sftp) => {
+            // Full-screen dual-panel SFTP file browser tab.
+            //
+            // The SftpTabView owns its own TerminalView entities (one per
+            // remote panel). Host switching happens in-place — no new tabs.
+            sftp_view.update(cx, |view, cx| {
+                view.set_state(
+                    context_menu.clone(),
+                    alert_controller.clone(),
+                    ctx.tooltip.clone(),
+                    hosts.to_vec(),
+                    handle.clone(),
+                    window,
+                    cx,
+                );
+            });
+            sftp_view.clone().into_any_element()
+        }
         None => div()
             .size_full()
             .flex()
@@ -348,170 +437,126 @@ pub fn render_content(
     let is_terminal = active_tab
         .map(|t| t.kind == TabKind::Terminal)
         .unwrap_or(false);
+    let is_sftp_tab = active_tab.map(|t| t.kind == TabKind::Sftp).unwrap_or(false);
 
-    // Read monitor status & metrics from the active TerminalView's backend
-    let (status, metrics, sftp_progress) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            terminal_entity.read_with(cx, |view, _cx| {
-                let (status, metrics) = if let Some(m) = view.monitor() {
-                    (m.status(), m.metrics())
-                } else {
-                    (
-                        crabport_terminal::terminal::RemoteStatus::Local,
-                        crabport_terminal::terminal::RemoteMetrics::default(),
-                    )
-                };
-                // Clone the live SFTP progress snapshot so the toolbar can
-                // render it without holding the entity lock across the
-                // render call. `None` when no transfer is in flight.
-                (status, metrics, view.sftp_progress().cloned())
-            })
-        } else {
-            (
-                crabport_terminal::terminal::RemoteStatus::Local,
-                crabport_terminal::terminal::RemoteMetrics::default(),
-                None,
-            )
-        }
+    // Read monitor status & metrics from the active TerminalView's backend.
+    // For terminal tabs this comes from `terminal_views`; SFTP tabs manage
+    // their own terminal entities internally so there's no single terminal
+    // entity to read here.
+    let sftp_term = if is_terminal {
+        terminal_entity(is_terminal, active_tab, terminal_views)
     } else {
-        (
-            crabport_terminal::terminal::RemoteStatus::Local,
-            crabport_terminal::terminal::RemoteMetrics::default(),
-            None,
-        )
+        None
     };
+    let (status, metrics, sftp_progress) = match &sftp_term {
+        Some(entity) => entity.read_with(cx, |view, _cx| {
+            let (status, metrics) = if let Some(m) = view.monitor() {
+                (m.status(), m.metrics())
+            } else {
+                (RemoteStatus::Local, RemoteMetrics::default())
+            };
+            // Clone the live SFTP progress snapshot so the toolbar can
+            // render it without holding the entity lock across the
+            // render call. `None` when no transfer is in flight.
+            (status, metrics, view.sftp_progress().cloned())
+        }),
+        None => (
+            RemoteStatus::Local,
+            RemoteMetrics::default(),
+            // SFTP tab: read progress from whichever of the tab's two
+            // panels has an active transfer. This keeps the shared
+            // toolbar's animation alive across terminal ↔ SFTP switches.
+            if is_sftp_tab {
+                sftp_view.read_with(cx, |v, _cx| v.sftp_progress(cx))
+            } else {
+                None
+            },
+        ),
+    };
+
+    // Only expand the right-hand panel once the session is fully
+    // connected. Local PTY backends report `RemoteStatus::Local` and are
+    // considered ready immediately; remote (SSH / Telnet) backends cycle
+    // through `Connecting` -> `Connected` (or `Disconnected`), and the
+    // panel stays collapsed until they actually reach `Connected`.
+    let panel_show = is_terminal && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.
     let (sftp_entries, sftp_cwd): (
-        std::sync::Arc<Vec<(String, bool)>>,
+        std::sync::Arc<Vec<crabport_sftp::FileEntry>>,
         Option<std::sync::Arc<String>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            terminal_entity.read_with(cx, |view, _cx| {
-                if view.allow_sftp() {
-                    (view.sftp_entries().unwrap_or_default(), view.sftp_cwd())
-                } else {
-                    (std::sync::Arc::new(Vec::new()), None)
-                }
-            })
-        } else {
-            (std::sync::Arc::new(Vec::new()), None)
-        }
-    } else {
-        (std::sync::Arc::new(Vec::new()), None)
+    ) = match &sftp_term {
+        Some(entity) => entity.read_with(cx, |view, _cx| {
+            if view.allow_sftp() {
+                (view.sftp_entries().unwrap_or_default(), view.sftp_cwd())
+            } else {
+                (std::sync::Arc::new(Vec::new()), None)
+            }
+        }),
+        None => (std::sync::Arc::new(Vec::new()), None),
     };
 
-    // Build SFTP navigate callback
-    let sftp_navigate: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |path: String, cx: &mut App| {
+    // ---- SFTP callbacks ----
+    //
+    // Each callback clones the active terminal entity and forwards a call to
+    // the matching `view.sftp_*` method. The callbacks are `None` when the
+    // active tab isn't a terminal or has no terminal entity.
+
+    let sftp_navigate: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_navigate(&path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
+
+    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(
+                move |remote_path: String, local_path: String, cx: &mut App| {
                     entity.read_with(cx, |view, _cx| {
-                        view.sftp_navigate(&path);
+                        view.sftp_download(&remote_path, &local_path);
                     });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
 
-    // Build SFTP download callback. Mirrors `sftp_navigate`'s shape: a thin
-    // closure that forwards `(remote_path, local_path)` to the active
-    // terminal's backend. The backend reports completion asynchronously via
-    // `BackendEvent::SftpTransferFinished`, which `TerminalView` already
-    // surfaces as a status line — no extra plumbing needed here.
-    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(
-                    move |remote_path: String, local_path: String, cx: &mut App| {
-                        entity.read_with(cx, |view, _cx| {
-                            view.sftp_download(&remote_path, &local_path);
-                        });
-                    },
-                ) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
-
-    // Build SFTP upload callback. Same shape as `sftp_download` but with the
-    // argument order swapped to match `view.sftp_upload(local, remote)`.
-    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(
-                    move |local_path: String, remote_path: String, cx: &mut App| {
-                        entity.read_with(cx, |view, _cx| {
-                            view.sftp_upload(&local_path, &remote_path);
-                        });
-                    },
-                ) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
-
-    // Build SFTP delete callback. Forwards the remote path to the backend's
-    // `sftp_delete`, which stats the path to choose `remove_file` vs
-    // recursive `remove_dir`.
-    let sftp_delete: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |remote_path: String, cx: &mut App| {
+    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(
+                move |local_path: String, remote_path: String, cx: &mut App| {
                     entity.read_with(cx, |view, _cx| {
-                        view.sftp_delete(&remote_path);
+                        view.sftp_upload(&local_path, &remote_path);
                     });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
 
-    // Build SFTP rename callback. Forwards `(old_remote_path, new_remote_path)`
-    // to the backend's `sftp_rename`. Completion is reported via
-    // `BackendEvent::SftpTransferFinished`, same as the other SFTP ops.
-    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_rename(&old_path, &new_path);
-                    });
-                }) as Rc<dyn Fn(String, String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+    let sftp_delete: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |remote_path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_delete(&remote_path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
 
-    // Build SFTP open-in-editor callback. Forwards the remote path to the
-    // backend's `sftp_open_in_editor`, which downloads to a local tmp path
-    // and launches the OS default editor.
-    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = if is_terminal {
-        active_tab.and_then(|tab| {
-            terminal_views.get(&tab.id).map(|entity| {
-                let entity = entity.clone();
-                Rc::new(move |remote_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_open_in_editor(&remote_path);
-                    });
-                }) as Rc<dyn Fn(String, &mut App)>
-            })
-        })
-    } else {
-        None
-    };
+    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
+                entity.read_with(cx, |view, _cx| {
+                    view.sftp_rename(&old_path, &new_path);
+                });
+            }) as Rc<dyn Fn(String, String, &mut App)>
+        });
+
+    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |remote_path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_open_in_editor(&remote_path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
 
     // ---- Panel capability flags ----
     //
@@ -524,23 +569,19 @@ pub fn render_content(
     // longer gates panel visibility — `cap_tunnels` (from the backend's
     // `allow_tunnels()`) is the source of truth now.
     let _is_remote = active_tab.map(|t| t.is_remote).unwrap_or(false);
-    let (cap_sftp, cap_history, cap_snippets, cap_tunnels) = if is_terminal {
-        active_tab
-            .and_then(|tab| terminal_views.get(&tab.id))
-            .map(|entity| {
-                entity.read_with(cx, |view, _cx| {
-                    (
-                        view.allow_sftp(),
-                        view.allow_history(),
-                        view.allow_snippets(),
-                        view.allow_tunnels(),
-                    )
-                })
+    let (cap_sftp, cap_history, cap_snippets, cap_tunnels) = sftp_term
+        .as_ref()
+        .map(|entity| {
+            entity.read_with(cx, |view, _cx| {
+                (
+                    view.allow_sftp(),
+                    view.allow_history(),
+                    view.allow_snippets(),
+                    view.allow_tunnels(),
+                )
             })
-            .unwrap_or((false, false, false, false))
-    } else {
-        (false, false, false, false)
-    };
+        })
+        .unwrap_or((false, false, false, false));
     // SFTP panel visibility follows the backend's capability (`cap_sftp`),
     // used directly below — no separate `has_sftp` alias needed.
     sftp_panel.update(cx, |panel, cx| {
@@ -569,7 +610,7 @@ pub fn render_content(
     // `app.stop_tunnel`. Only wire `on_start` for backends that can lend
     // their connection (`cap_tunnels`) — a local PTY or Telnet backend
     // exposes no tunnel source, so borrowed tunnels can't start.
-    let tunnels_on_start: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal && cap_tunnels {
+    let tunnels_on_start: Option<Rc<dyn Fn(i64, &mut App)>> = if cap_tunnels {
         let handle_for_start = handle.clone();
         let tab_id = active_tab_id;
         Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
@@ -580,7 +621,7 @@ pub fn render_content(
     } else {
         None
     };
-    let tunnels_on_stop: Option<Rc<dyn Fn(i64, &mut App)>> = if is_terminal {
+    let tunnels_on_stop: Option<Rc<dyn Fn(i64, &mut App)>> = if sftp_term.is_some() {
         let handle_for_stop = handle.clone();
         Some(Rc::new(move |tunnel_id: i64, cx: &mut App| {
             handle_for_stop.update(cx, |app, cx| {
@@ -608,12 +649,18 @@ pub fn render_content(
     // that writes a selected command back into the terminal's input line
     // (via `write_raw`, which bypasses history capture so the pasted
     // command isn't re-recorded).
-    let (history_commands, history_on_paste): (
+    //
+    // `on_refresh` asks the backend to re-read the TTY history file
+    // (~/.bash_history / ~/.zsh_history) and broadcast a
+    // `HistoryLoaded` event, which the session forwards into
+    // `command_history` and the panel picks up on the next render.
+    let (history_commands, history_on_paste, history_on_refresh): (
         std::sync::Arc<Vec<crate::views::panel::history_command_panel::HistoryCommand>>,
         Option<Rc<dyn Fn(String, &mut App)>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let cmds = terminal_entity.read_with(cx, |view, _cx| {
+        Option<Rc<dyn Fn(&mut App)>>,
+    ) = match &sftp_term {
+        Some(entity) => {
+            let cmds = entity.read_with(cx, |view, _cx| {
                 view.command_history()
                     .into_iter()
                     .map(
@@ -625,22 +672,33 @@ pub fn render_content(
                     .collect::<Vec<_>>()
             });
             let cmds = std::sync::Arc::new(cmds);
-            let term_for_paste = terminal_entity.clone();
+            let term_for_paste = entity.clone();
             let on_paste: Rc<dyn Fn(String, &mut App)> =
                 Rc::new(move |cmd: String, cx: &mut App| {
                     term_for_paste.read_with(cx, |view, _cx| {
                         view.write_raw(cmd.as_bytes());
                     });
                 });
-            (cmds, Some(on_paste))
-        } else {
-            (std::sync::Arc::new(Vec::new()), None)
+            let term_for_refresh = entity.clone();
+            let on_refresh: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+                term_for_refresh.read_with(cx, |view, _cx| {
+                    view.refresh_history();
+                });
+            });
+            (cmds, Some(on_paste), Some(on_refresh))
         }
-    } else {
-        (std::sync::Arc::new(Vec::new()), None)
+        None => (std::sync::Arc::new(Vec::new()), None, None),
     };
     history_panel.update(cx, |panel, cx| {
-        panel.set_state(history_commands, history_on_paste, window, cx);
+        panel.set_state(
+            history_commands,
+            history_on_paste,
+            history_on_refresh,
+            ctx.notifications.clone(),
+            ctx.tooltip.clone(),
+            window,
+            cx,
+        );
     });
 
     // ---- Snippets panel ----
@@ -651,15 +709,15 @@ pub fn render_content(
     let (snippets_on_run, snippets_on_paste): (
         Option<Rc<dyn Fn(String, &mut App)>>,
         Option<Rc<dyn Fn(String, &mut App)>>,
-    ) = if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let term_for_run = terminal_entity.clone();
+    ) = match &sftp_term {
+        Some(entity) => {
+            let term_for_run = entity.clone();
             let on_run: Rc<dyn Fn(String, &mut App)> = Rc::new(move |cmd: String, cx: &mut App| {
                 term_for_run.read_with(cx, |view, _cx| {
                     view.write_raw(format!("{}\r", cmd).as_bytes());
                 });
             });
-            let term_for_paste = terminal_entity.clone();
+            let term_for_paste = entity.clone();
             let on_paste: Rc<dyn Fn(String, &mut App)> =
                 Rc::new(move |cmd: String, cx: &mut App| {
                     term_for_paste.read_with(cx, |view, _cx| {
@@ -667,14 +725,17 @@ pub fn render_content(
                     });
                 });
             (Some(on_run), Some(on_paste))
-        } else {
-            (None, None)
         }
-    } else {
-        (None, None)
+        None => (None, None),
     };
     snippets_panel.update(cx, |panel, cx| {
-        panel.set_state(snippets_on_run, snippets_on_paste, window, cx);
+        panel.set_state(
+            snippets_on_run,
+            snippets_on_paste,
+            ctx.tooltip.clone(),
+            window,
+            cx,
+        );
     });
 
     // ---- Host-key prompt ----
@@ -686,61 +747,59 @@ pub fn render_content(
     // already showing — the overlay retains the `PendingHostKey` until the
     // user resolves it (the alert's confirm/cancel callbacks call
     // `TerminalView::resolve_pending_host_key`).
-    if is_terminal {
-        if let Some(terminal_entity) = active_tab.and_then(|tab| terminal_views.get(&tab.id)) {
-            let pending = terminal_entity.read_with(cx, |view, _| view.pending_host_key_info());
-            if let Some(info) = pending {
-                let controller_busy = alert_controller.read_with(cx, |c, _| c.is_active());
-                if !controller_busy {
-                    let term_for_confirm = terminal_entity.clone();
-                    let on_confirm = Rc::new(move |_w: &mut Window, cx: &mut App| {
-                        term_for_confirm.update(cx, |view, _cx| {
-                            view.resolve_pending_host_key(true);
-                        });
+    if let Some(terminal_entity) = &sftp_term {
+        let pending = terminal_entity.read_with(cx, |view, _| view.pending_host_key_info());
+        if let Some(info) = pending {
+            let controller_busy = alert_controller.read_with(cx, |c, _| c.is_active());
+            if !controller_busy {
+                let term_for_confirm = terminal_entity.clone();
+                let on_confirm = Rc::new(move |_w: &mut Window, cx: &mut App| {
+                    term_for_confirm.update(cx, |view, _cx| {
+                        view.resolve_pending_host_key(true);
                     });
-                    let term_for_cancel = terminal_entity.clone();
-                    let on_cancel = Rc::new(move |_w: &mut Window, cx: &mut App| {
-                        term_for_cancel.update(cx, |view, _cx| {
-                            view.resolve_pending_host_key(false);
-                        });
+                });
+                let term_for_cancel = terminal_entity.clone();
+                let on_cancel = Rc::new(move |_w: &mut Window, cx: &mut App| {
+                    term_for_cancel.update(cx, |view, _cx| {
+                        view.resolve_pending_host_key(false);
                     });
-                    alert_controller.update(cx, |c, cx| {
-                        c.show(
-                            AlertState {
-                                severity: AlertSeverity::Warning,
-                                title: t!("terminal.host_key_unknown").to_string().into(),
-                                description: {
-                                    let host_port = if info.port == 22 {
-                                        info.host.clone()
-                                    } else {
-                                        format!("{}:{}", info.host, info.port)
-                                    };
-                                    Some(
-                                        t!("terminal.host_key_prompt", host = host_port.as_str())
-                                            .to_string()
-                                            .into(),
-                                    )
-                                },
-                                details: vec![
-                                    (
-                                        t!("terminal.host_key_algo").to_string().into(),
-                                        info.algo.clone().into(),
-                                    ),
-                                    (
-                                        t!("terminal.host_key_fingerprint").to_string().into(),
-                                        info.fingerprint.clone().into(),
-                                    ),
-                                ],
-                                confirm_label: t!("terminal.host_key_accept").to_string().into(),
-                                cancel_label: t!("terminal.host_key_cancel").to_string().into(),
-                                open: true,
-                                on_confirm: Some(on_confirm),
-                                on_cancel: Some(on_cancel),
+                });
+                alert_controller.update(cx, |c, cx| {
+                    c.show(
+                        AlertState {
+                            severity: AlertSeverity::Warning,
+                            title: t!("terminal.host_key_unknown").to_string().into(),
+                            description: {
+                                let host_port = if info.port == 22 {
+                                    info.host.clone()
+                                } else {
+                                    format!("{}:{}", info.host, info.port)
+                                };
+                                Some(
+                                    t!("terminal.host_key_prompt", host = host_port.as_str())
+                                        .to_string()
+                                        .into(),
+                                )
                             },
-                            cx,
-                        );
-                    });
-                }
+                            details: vec![
+                                (
+                                    t!("terminal.host_key_algo").to_string().into(),
+                                    info.algo.clone().into(),
+                                ),
+                                (
+                                    t!("terminal.host_key_fingerprint").to_string().into(),
+                                    info.fingerprint.clone().into(),
+                                ),
+                            ],
+                            confirm_label: t!("terminal.host_key_accept").to_string().into(),
+                            cancel_label: t!("terminal.host_key_cancel").to_string().into(),
+                            open: true,
+                            on_confirm: Some(on_confirm),
+                            on_cancel: Some(on_cancel),
+                        },
+                        cx,
+                    );
+                });
             }
         }
     }
@@ -764,7 +823,43 @@ pub fn render_content(
                 .flex()
                 .flex_row()
                 .overflow_hidden()
+                .relative()
                 .child(view)
+                .when(
+                    panel_show && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
+                    |el| {
+                        // Resize divider handle between terminal and panel.
+                        // A narrow strip with negative margins so it overlaps
+                        // the panel border while remaining grabbable.
+                        let handle_for_resize = handle.clone();
+                        el.child(
+                            div()
+                                .id("panel-resize-handle")
+                                .flex_shrink_0()
+                                .h_full()
+                                .w(px(crate::layouts::panel::PANEL_DIVIDER_HIT * 2.0))
+                                .ml(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
+                                .mr(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
+                                .cursor_col_resize()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let handle = handle_for_resize.clone();
+                                    let pw = panel_width;
+                                    move |event, _window, cx| {
+                                        handle.update(cx, |app, cx| {
+                                            app.panel_drag =
+                                                Some(crate::layouts::panel::PanelDrag {
+                                                    start_width: pw,
+                                                    start_x: f32::from(event.position.x),
+                                                    width: pw,
+                                                });
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    },
+                )
                 .child({
                     let handle_for_panel = handle.clone();
                     // Capture the capability flags so the `on_change` closure
@@ -777,7 +872,7 @@ pub fn render_content(
                     let c_snippets = cap_snippets;
                     let c_tunnels = cap_tunnels;
                     render_panel(
-                        is_terminal,
+                        panel_show,
                         panel_active_tab,
                         PanelCaps {
                             sftp: c_sftp,
@@ -814,7 +909,74 @@ pub fn render_content(
                                 }
                             });
                         })),
+                        panel_width,
+                        panel_dragging,
                     )
+                })
+                // Transparent canvas whose paint callback registers
+                // window-level mouse listeners for the panel resize drag.
+                // `window.on_mouse_event` can only be called during paint,
+                // so we need this canvas to hook into the paint phase. The
+                // listeners are registered every frame but no-op when
+                // `panel_drag` is `None`.
+                .child({
+                    let handle_for_canvas = handle.clone();
+                    canvas(
+                        |_bounds, _window, _cx| {},
+                        move |_bounds, _state, window, _cx| {
+                            let handle_for_move = handle_for_canvas.clone();
+                            window.on_mouse_event({
+                                let handle = handle_for_move.clone();
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = handle.update(cx, |app, cx| {
+                                        if let Some(ref mut drag) = app.panel_drag {
+                                            let delta = drag.start_x - f32::from(event.position.x);
+                                            let eff_max =
+                                                crate::layouts::panel::effective_max_panel_width(
+                                                    f32::from(window.viewport_size().width),
+                                                );
+                                            let new_width = (drag.start_width + delta).clamp(
+                                                crate::layouts::panel::MIN_PANEL_WIDTH,
+                                                eff_max,
+                                            );
+                                            if (new_width - drag.width).abs() > 0.01 {
+                                                drag.width = new_width;
+                                                cx.notify();
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            window.on_mouse_event({
+                                let handle = handle_for_move.clone();
+                                move |_event: &MouseUpEvent, phase, window, cx| {
+                                    if phase != DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    let _ = handle.update(cx, |app, cx| {
+                                        if let Some(drag) = app.panel_drag.take() {
+                                            let eff_max =
+                                                crate::layouts::panel::effective_max_panel_width(
+                                                    f32::from(window.viewport_size().width),
+                                                );
+                                            let _ = crabport_core::config::update(|cfg| {
+                                                cfg.appearance.panel_width = drag.width.clamp(
+                                                    crate::layouts::panel::MIN_PANEL_WIDTH,
+                                                    eff_max,
+                                                );
+                                            });
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            });
+                        },
+                    )
+                    .w_0()
+                    .h_0()
                 }),
         )
         .child(render_terminal_toolbar(

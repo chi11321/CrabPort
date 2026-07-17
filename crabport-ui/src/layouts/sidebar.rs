@@ -29,10 +29,10 @@ pub fn render_sidebar(
                 .h_full()
                 .border_r_1()
                 .border_color(rgb(border()))
-                .bg(rgb(bg_sidebar()))
+                .bg(sidebar_bg_color())
                 .flex()
                 .flex_col()
-                .pt_11()
+                .pt(px(if cfg!(target_os = "macos") { 44.0 } else { 8.0 }))
                 .px_2()
                 .gap_2()
                 .children(SidebarItem::all().map(|item| {
@@ -40,6 +40,10 @@ pub fn render_sidebar(
                     let h = handle.clone();
                     Button::new(ElementId::Name(format!("sidebar-{item:?}").into()))
                         .tab()
+                        // Overide the .tab() default bg with the vibrancy-aware color:
+                        // fully transparent on macOS so the sidebar 毛玻璃 reads
+                        // through the button; hover / selected keep their colors.
+                        .bg(tab_btn_bg_color())
                         .selected(is_selected)
                         .icon(item.icon())
                         .child(item.label())

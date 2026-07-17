@@ -24,10 +24,12 @@ use crate::components::context_menu::ContextMenuController;
 use crate::components::dialog::AlertController;
 use crate::components::notification::{NotificationController, NotificationPosition};
 use crate::layouts::command_palette::{CommandView, ConnectionType};
+use crate::layouts::panel::PanelDrag;
 use crate::layouts::sidebar::render_sidebar;
 use crate::views::groups::GroupFormState;
 use crate::views::sessions::ConnectionFormState;
 use crate::views::sessions::ConnectionHost;
+use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
 
@@ -47,7 +49,9 @@ actions!(
         TerminalShiftTab,
         TerminalIncreaseFont,
         TerminalDecreaseFont,
-        TerminalResetFont
+        TerminalResetFont,
+        SplitVertical,
+        SplitHorizontal,
     ]
 );
 
@@ -63,6 +67,7 @@ pub struct Tab {
 pub enum TabKind {
     Home,
     Terminal,
+    Sftp,
 }
 
 pub struct CrabportApp {
@@ -72,6 +77,9 @@ pub struct CrabportApp {
     pub hovered_tab_id: Option<u64>,
     pub next_tab_id: u64,
     pub terminal_views: HashMap<u64, Entity<TerminalView>>,
+    /// Single persistent SFTP tab view (id=1). Both left and right panels
+    /// can independently connect to local or remote hosts.
+    pub sftp_view: Entity<SftpTabView>,
     /// Per-tab split layout. Each terminal tab owns a [`SplitTree`] describing
     /// how its panes are arranged. Absent for non-terminal tabs and terminal
     /// tabs that haven't been split (a single pane is still tracked here so
@@ -112,6 +120,10 @@ pub struct CrabportApp {
     /// shows all four; Telnet shows only History + Snippets). Lookups fall
     /// back to the default [`PanelKind`] for tabs that haven't been visited.
     pub panel_active_tab: HashMap<u64, crate::views::panel::PanelKind>,
+    /// Live panel resize drag state. When `Some`, the panel width tracks the
+    /// cursor. On mouse-up the final width is persisted to config and this
+    /// is cleared.
+    pub panel_drag: Option<PanelDrag>,
     /// Tunnel form window state (singleton dialog for creating/editing a
     /// tunnel config). `None` when the dialog is closed.
     pub tunnel_form: Option<crate::views::tunnels::TunnelFormState>,
@@ -132,6 +144,10 @@ pub struct CrabportApp {
     /// actual tab switches instead of every render (which would steal focus
     /// from overlays like SFTP/command palette/connection form).
     last_focused_tab_id: Option<u64>,
+    /// Focus handle for the app root. Tracked on the root div so that
+    /// keyboard actions (e.g. ToggleCommand via Cmd+K) are dispatched even
+    /// when no child element has focus.
+    focus_handle: FocusHandle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -179,6 +195,15 @@ impl CrabportApp {
             kind: TabKind::Home,
             is_remote: false,
         };
+        let sftp_tab = Tab {
+            id: 1,
+            title: "SFTP".into(),
+            kind: TabKind::Sftp,
+            is_remote: false,
+        };
+
+        // Create the persistent SftpTabView (both panels start as Local).
+        let sftp_view = cx.new(|_cx| SftpTabView::new());
 
         // ---- Construct shared entities (all live in `AppCtx`) ----
         let command_palette = cx.new(|cx| CommandView::new(window, cx));
@@ -257,11 +282,12 @@ impl CrabportApp {
 
         Self {
             sidebar_item: SidebarItem::Sessions,
-            tabs: vec![home_tab],
+            tabs: vec![home_tab, sftp_tab],
             active_tab_id: 0,
             hovered_tab_id: None,
-            next_tab_id: 1,
+            next_tab_id: 2,
             terminal_views: HashMap::new(),
+            sftp_view,
             split_trees: HashMap::new(),
             pane_views: HashMap::new(),
             next_pane_id: 1,
@@ -271,12 +297,14 @@ impl CrabportApp {
             hosts,
             connection_form: None,
             panel_active_tab: HashMap::new(),
+            panel_drag: None,
             tunnel_form: None,
             snippet_form: None,
             group_form: None,
             app_ctx,
             wired: false,
             last_focused_tab_id: None,
+            focus_handle: cx.focus_handle().tab_stop(true),
         }
     }
 
@@ -318,6 +346,12 @@ impl CrabportApp {
                                 app.add_tab(cx);
                             });
                         }
+                        ConnectionType::SFTP => {
+                            a.update(cx, |app, cx| {
+                                app.activate_tab(1);
+                                cx.notify();
+                            });
+                        }
                         _ => {
                             a.update(cx, |app, _cx| {
                                 app.activate_tab(0);
@@ -345,6 +379,11 @@ impl CrabportApp {
                 }
             });
         });
+
+        // Kick off a background check for a newer GitHub release. If one
+        // exists, a non-auto-dismissing toast with a "详情" button (opens
+        // the release page) appears. Failures are silent.
+        crate::version_check::check_for_updates(self.app_ctx.notifications.clone(), cx);
     }
 
     // -- Helpers --
@@ -382,6 +421,21 @@ impl Render for CrabportApp {
             .get(&self.active_tab_id)
             .copied()
             .unwrap_or_default();
+        // Panel width: live drag value takes priority; otherwise read the
+        // persisted config value (clamped to a sane range). The max is also
+        // bounded by 2/3 of the window width so the terminal stays usable.
+        let win_w = f32::from(_window.viewport_size().width);
+        let eff_max = crate::layouts::panel::effective_max_panel_width(win_w);
+        let panel_width = self.panel_drag.map_or_else(
+            || {
+                crabport_core::config::snapshot()
+                    .appearance
+                    .panel_width
+                    .clamp(crate::layouts::panel::MIN_PANEL_WIDTH, eff_max)
+            },
+            |drag| drag.width,
+        );
+        let panel_dragging = self.panel_drag.is_some();
 
         let content = crate::layouts::content::render_content(
             self.sidebar_item,
@@ -391,12 +445,15 @@ impl Render for CrabportApp {
             &self.terminal_views,
             &self.split_trees,
             &self.pane_views,
+            &self.sftp_view,
             &self.hosts,
             self.connection_form.as_ref(),
             panel_active_tab,
             tunnel_list,
             tunnel_form_state,
             snippet_form_state,
+            panel_width,
+            panel_dragging,
             &self.app_ctx,
             _window,
             cx,
@@ -428,12 +485,19 @@ impl Render for CrabportApp {
         }
 
         // ---- Root ----
+        // On macOS the window background is a vibrancy layer (see
+        // `open_main_window`). The root paints nothing here so the vibrancy
+        // reads through; each opaque surface (content area, tab bar, dialogs)
+        // supplies its own `opaque_base_bg()` to mask vibrancy where it isn't
+        // wanted. Only the sidebar paints a translucent tint so vibrancy shows
+        // there alone.
         div()
             .size_full()
-            .bg(rgb(bg_base()))
+            .when(cfg!(not(target_os = "macos")), |el| el.bg(rgb(bg_base())))
             .flex()
             .flex_row()
             .key_context("App")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_command))
             // -- Sidebar --
             .child(render_sidebar(self.sidebar_item, show_sidebar, &handle))
@@ -482,6 +546,21 @@ pub fn open_main_window(cx: &mut App) {
             traffic_light_position: Some(point(px(12.0), px(14.0))),
             ..Default::default()
         }),
+        // macOS: request a blurred (vibrancy) window background so the
+        // sidebar can paint a translucent tint and let the system-provided
+        // `NSVisualEffectView` show through (Finder/Mail "毛玻璃" look). The
+        // content area stays opaque via `opaque_base_bg()` so vibrancy only
+        // reads from the sidebar. See `color::enable_vibrancy` /
+        // `color::sidebar_bg_color`.
+        #[cfg(target_os = "macos")]
+        window_background: WindowBackgroundAppearance::Blurred,
+        // On Windows, a `None` titlebar already hides the system title bar
+        // (GPUI defaults `hide_title_bar` to `true` when no titlebar is
+        // supplied). On Linux we request client-side decorations so the
+        // compositor stops drawing its server-side title bar, letting our
+        // in-app tab bar fill the full window height.
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(WindowDecorations::Client),
         window_min_size: Some(Size {
             width: px(560.0),
             height: px(340.0),

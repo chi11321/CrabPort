@@ -18,7 +18,7 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::group_header::group_header;
-use gpui_component::input::InputState;
+use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
 /// Sentinel id used for the virtual "Favorites" group in collapse state.
 /// Uses `i64::MAX` so it can never collide with a real group id.
@@ -82,16 +82,15 @@ pub struct SessionsView {
     // Callbacks
     on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    /// Connect to a host in SFTP-only mode (right-click → "Connect via SFTP").
+    /// Only called for SSH hosts.
+    on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Per-group collapse state for the grouped list.
     collapsed_groups: HashSet<i64>,
-    /// The group id currently being renamed inline, if any. While set, the
-    /// group header renders an inline `StyledInput` in place of its label.
-    renaming_group_id: Option<i64>,
-    /// `InputState` backing the inline group-rename editor. Lazily created
-    /// the first time the user triggers a rename; reused thereafter.
-    rename_input: Option<Entity<InputState>>,
+    /// Shared inline group-rename state (id + InputState).
+    group_rename: GroupRenameState,
 }
 
 impl SessionsView {
@@ -106,11 +105,11 @@ impl SessionsView {
             alert_controller: None,
             on_new: None,
             on_connect: None,
+            on_sftp_connect: None,
             on_edit: None,
             on_remove: None,
             collapsed_groups: HashSet::new(),
-            renaming_group_id: None,
-            rename_input: None,
+            group_rename: GroupRenameState::new(),
         }
     }
 
@@ -121,6 +120,7 @@ impl SessionsView {
         form_state: Option<ConnectionFormState>,
         on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
         on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+        on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         context_menu: Entity<ContextMenuController>,
@@ -137,6 +137,7 @@ impl SessionsView {
         self.form_state = form_state;
         self.on_new = on_new;
         self.on_connect = on_connect;
+        self.on_sftp_connect = on_sftp_connect;
         self.on_edit = on_edit;
         self.on_remove = on_remove;
         self.context_menu = Some(context_menu);
@@ -149,12 +150,9 @@ impl SessionsView {
     }
 
     // -------------------------------------------------------------------
-    // Inline group rename
+    // Inline group rename (delegates to GroupRenameState)
     // -------------------------------------------------------------------
 
-    /// Begin renaming a group inline: stash the id, (re)seed the rename
-    /// `InputState` with the current name, and focus it. Called from the
-    /// group-header context menu's "Rename Group" item.
     fn start_group_rename(
         &mut self,
         group_id: i64,
@@ -162,70 +160,17 @@ impl SessionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.renaming_group_id = Some(group_id);
-        // Lazily create the InputState the first time.
-        if self.rename_input.is_none() {
-            let entity = cx.new(|cx| {
-                let state = InputState::new(window, cx).placeholder("new name");
-                state.focus(window, cx);
-                state
-            });
-            // Submit on Enter.
-            cx.subscribe(
-                &entity,
-                |this, _input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_group_rename(cx);
-                    }
-                },
-            )
-            .detach();
-            // Cancel on blur — the user clicked away.
-            let blur_handle = entity.read(cx).focus_handle(cx);
-            cx.on_blur(&blur_handle, window, |this, _window, cx| {
-                if this.renaming_group_id.is_some() {
-                    this.cancel_group_rename(cx);
-                }
-            })
-            .detach();
-            self.rename_input = Some(entity);
-        }
-        // Seed the input with the group's current name.
-        if let Some(ref input) = self.rename_input {
-            input.update(cx, |state, cx| {
-                state.set_value(current_name, window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
+        self.group_rename.start(group_id, current_name, window, cx);
+    }
+}
+
+impl GroupRenameView for SessionsView {
+    fn group_rename(&mut self) -> &mut GroupRenameState {
+        &mut self.group_rename
     }
 
-    /// Commit the inline rename: read the new name from `rename_input`,
-    /// persist via `CrabportApp::rename_group`, and close the editor.
-    fn commit_group_rename(&mut self, cx: &mut Context<Self>) {
-        let group_id = match self.renaming_group_id.take() {
-            Some(id) => id,
-            None => return,
-        };
-        let new_name = self.rename_input.as_ref().and_then(|input| {
-            let v = input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else {
-            cx.notify();
-            return;
-        };
-        let app = self.app.clone();
-        app.update(cx, |app, cx| {
-            app.rename_group(group_id, &new_name, cx);
-        });
-        cx.notify();
-    }
-
-    /// Abort the inline rename without persisting.
-    fn cancel_group_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming_group_id = None;
-        cx.notify();
+    fn app_entity(&self) -> &Entity<CrabportApp> {
+        &self.app
     }
 }
 
@@ -236,6 +181,7 @@ impl Render for SessionsView {
         let app = self.app.clone();
         let on_new = self.on_new.clone();
         let on_connect = self.on_connect.clone();
+        let on_sftp_connect = self.on_sftp_connect.clone();
         let on_edit = self.on_edit.clone();
         let on_remove = self.on_remove.clone();
         let context_menu = self.context_menu.clone();
@@ -260,8 +206,8 @@ impl Render for SessionsView {
             self.context_menu_host_id = None;
         }
         let context_menu_host_id = self.context_menu_host_id;
-        let renaming_group_id = self.renaming_group_id;
-        let rename_input = self.rename_input.clone();
+        let renaming_group_id = self.group_rename.renaming_group_id;
+        let rename_input = self.group_rename.rename_input.clone();
 
         // Partition hosts: ungrouped (group_id is None) first, then one
         // bucket per group.
@@ -346,6 +292,7 @@ impl Render for SessionsView {
                                 .children(ungrouped.iter().map(|h| {
                                     let host = (*h).clone();
                                     let on_connect = on_connect.clone();
+                                    let on_sftp_connect = on_sftp_connect.clone();
                                     let on_edit = on_edit.clone();
                                     let on_remove = on_remove.clone();
                                     let context_menu = context_menu.clone();
@@ -365,6 +312,7 @@ impl Render for SessionsView {
                                         app.clone(),
                                         groups.clone(),
                                         on_connect.clone(),
+                                        on_sftp_connect.clone(),
                                         move |w, cx| {
                                             if let Some(ref cb) = on_edit {
                                                 cb(host.id, w, cx);
@@ -421,6 +369,7 @@ impl Render for SessionsView {
                                         .map(|h| {
                                             let host = (*h).clone();
                                             let on_connect = on_connect.clone();
+                                            let on_sftp_connect = on_sftp_connect.clone();
                                             let on_edit = on_edit.clone();
                                             let on_remove = on_remove.clone();
                                             let context_menu = context_menu.clone();
@@ -441,6 +390,7 @@ impl Render for SessionsView {
                                                 app.clone(),
                                                 groups.clone(),
                                                 on_connect.clone(),
+                                                on_sftp_connect.clone(),
                                                 move |w, cx| {
                                                     if let Some(ref cb) = on_edit {
                                                         cb(host.id, w, cx);
@@ -637,6 +587,7 @@ impl Render for SessionsView {
                                         .map(|h| {
                                             let host = (*h).clone();
                                             let on_connect = on_connect.clone();
+                                            let on_sftp_connect = on_sftp_connect.clone();
                                             let on_edit = on_edit.clone();
                                             let on_remove = on_remove.clone();
                                             let context_menu = context_menu.clone();
@@ -657,6 +608,7 @@ impl Render for SessionsView {
                                                 app.clone(),
                                                 groups.clone(),
                                                 on_connect.clone(),
+                                                on_sftp_connect.clone(),
                                                 move |w, cx| {
                                                     if let Some(ref cb) = on_edit {
                                                         cb(host.id, w, cx);
@@ -726,6 +678,7 @@ fn host_row(
     app: Entity<CrabportApp>,
     groups: Vec<crabport_core::credential::GroupEntry>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -775,8 +728,10 @@ fn host_row(
             let on_remove = Rc::new(on_remove);
             let entity = entity.clone();
             let on_connect = on_connect.clone();
+            let on_sftp_connect = on_sftp_connect.clone();
             let app = app.clone();
             let groups = groups.clone();
+            let host_kind = host.kind;
             move |event, _w, cx| {
                 let Some(ref cm) = context_menu else {
                     return;
@@ -791,6 +746,7 @@ fn host_row(
                 let on_edit = on_edit.clone();
                 let on_remove = on_remove.clone();
                 let on_connect = on_connect.clone();
+                let on_sftp_connect = on_sftp_connect.clone();
                 let app_for_menu = app.clone();
                 let _groups_for_menu = groups.clone();
                 let host_favorite_for_menu = host_favorite;
@@ -809,6 +765,21 @@ fn host_row(
                         })
                         .divider_after(),
                     );
+
+                    // Connect via SFTP (SSH hosts only)
+                    if host_kind == crate::views::sessions::ConnectionKind::SSH {
+                        items.push(
+                            ContextMenuItem::new(t!("hosts.connect_sftp").to_string(), {
+                                let on_sftp_connect = on_sftp_connect.clone();
+                                move |w, cx| {
+                                    if let Some(ref cb) = on_sftp_connect {
+                                        cb(host_id, w, cx);
+                                    }
+                                }
+                            })
+                            .divider_after(),
+                        );
+                    }
 
                     // Favorite toggle
                     let favorite_label = if host_favorite_for_menu {

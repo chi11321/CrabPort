@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
@@ -20,7 +21,10 @@ use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 
 use crate::color::*;
-use crate::components::button::Button;
+use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
+use crate::components::window_layout::{
+    SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
+};
 
 // The project is licensed under Apache 2.0. We show the license name as
 // plain text rather than embedding the full LICENSE text (200+ lines) —
@@ -39,15 +43,25 @@ pub enum AboutTab {
 }
 
 impl AboutTab {
-    fn all() -> [AboutTab; 2] {
-        [AboutTab::Version, AboutTab::License]
-    }
+    const ALL: [AboutTab; 2] = [AboutTab::Version, AboutTab::License];
 
     fn label(self) -> SharedString {
         match self {
             AboutTab::Version => t!("window.about.tab.version").into(),
             AboutTab::License => t!("window.about.tab.license").into(),
         }
+    }
+
+    fn sidebar_entries() -> Vec<SidebarTabEntry> {
+        Self::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| SidebarTabEntry {
+                id: ElementId::Name(format!("about-tab-{i}").into()),
+                label: tab.label(),
+                icon: None,
+            })
+            .collect()
     }
 }
 
@@ -72,12 +86,17 @@ impl AboutWindow {
         // tab has room for a scrollable text block + dependency list.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
+            #[cfg(target_os = "macos")]
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.about.title").to_string().into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
+            #[cfg(target_os = "macos")]
+            window_background: WindowBackgroundAppearance::Blurred,
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
             window_min_size: Some(Size {
                 width: px(520.0),
                 height: px(360.0),
@@ -98,41 +117,6 @@ impl AboutWindow {
             })
         })
         .expect("Failed to open About window")
-    }
-}
-
-impl AboutWindow {
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let handle = cx.entity().clone();
-        div()
-            .h_full()
-            .w(px(160.0))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(rgb(border()))
-            .bg(rgb(bg_sidebar()))
-            .flex()
-            .flex_col()
-            .pt_11()
-            .px_2()
-            .gap_2()
-            .children(AboutTab::all().map(|item| {
-                let is_selected = item == self.tab;
-                let h = handle.clone();
-                Button::new(ElementId::Name(format!("about-tab-{item:?}").into()))
-                    .tab()
-                    .selected(is_selected)
-                    .child(item.label())
-                    .on_click(move |_e, _w, cx| {
-                        h.update(cx, |view, _| {
-                            view.tab = item;
-                        });
-                    })
-                    .h_9()
-                    .border_0()
-                    .px_2()
-                    .text_sm()
-            }))
     }
 
     fn render_version_pane(&self) -> impl IntoElement {
@@ -202,8 +186,7 @@ impl AboutWindow {
                     .collect::<Vec<_>>()
             },
         )
-        .track_scroll(&deps_scroll)
-        .pr(px(12.0));
+        .track_scroll(&deps_scroll);
 
         div()
             .size_full()
@@ -256,7 +239,7 @@ impl AboutWindow {
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .w(px(12.0))
+                            .w(px(16.0))
                             .child(
                                 Scrollbar::vertical(&deps_scroll)
                                     .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
@@ -268,24 +251,42 @@ impl AboutWindow {
 
 impl Render for AboutWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let selected_idx = AboutTab::ALL
+            .iter()
+            .position(|t| *t == self.tab)
+            .unwrap_or(0);
+
         let content: AnyElement = match self.tab {
             AboutTab::Version => self.render_version_pane().into_any_element(),
             AboutTab::License => self.render_license_pane(cx).into_any_element(),
         };
 
-        div()
-            .size_full()
-            .bg(rgb(bg_base()))
-            .flex()
-            .flex_row()
-            .child(self.render_sidebar(cx))
-            .child(
+        render_sidebar_window(
+            render_tab_sidebar(
+                AboutTab::sidebar_entries(),
+                px(160.0),
+                selected_idx,
+                move |idx, _w, cx| {
+                    handle.update(cx, |view, _| {
+                        view.tab = AboutTab::ALL[idx];
+                    });
+                },
+            ),
+            content,
+        )
+        .when(HAS_CLIENT_CONTROLS, |el| {
+            el.child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(content),
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_11()
+                    .flex()
+                    .items_center()
+                    .pr_2()
+                    .child(WindowControls::new("about")),
             )
+        })
     }
 }

@@ -12,6 +12,8 @@ use crate::color::*;
 use crate::views::terminal::SftpProgress;
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
+const BAR_WIDTH: f32 = 80.0;
+const BAR_HEIGHT: f32 = 6.0;
 
 // ---------------------------------------------------------------------------
 // Status colors
@@ -26,16 +28,21 @@ fn status_color(status: RemoteStatus) -> u32 {
     }
 }
 
-// Progress bar dimensions
-const BAR_WIDTH: f32 = 80.0;
-const BAR_HEIGHT: f32 = 6.0;
+/// Accent color for progress bar fills — read live so theme changes are
+/// picked up without a recompile.
+fn color_accent() -> u32 {
+    term_blue()
+}
 
 // ---------------------------------------------------------------------------
-// Main render
+// Terminal toolbar (connection / memory / network / sftp progress)
 // ---------------------------------------------------------------------------
 
 pub fn render_terminal_toolbar(
-    is_terminal: bool,
+    // Whether to show the connection / memory / network chips. Only terminal
+    // tabs have a monitor; SFTP tabs pass `false` and rely solely on the
+    // SFTP progress chip.
+    show_metrics: bool,
     status: RemoteStatus,
     metrics: RemoteMetrics,
     sftp_progress: Option<SftpProgress>,
@@ -45,10 +52,12 @@ pub fn render_terminal_toolbar(
     //
     // We also keep the toolbar open while an SFTP transfer is in flight so
     // the progress log stays visible even if metrics haven't loaded yet
-    // (e.g. on a freshly connected host before the first monitor tick).
-    let has_metrics = is_terminal
+    // (e.g. on a freshly connected host before the first monitor tick),
+    // or when the active tab is the SFTP tab (which has no monitor but
+    // still drives transfers via its dual panels).
+    let has_metrics = show_metrics
         && (metrics.latency_ms.is_some() || metrics.memory.is_some() || metrics.network.is_some());
-    let has_progress = is_terminal && sftp_progress.is_some();
+    let has_progress = sftp_progress.is_some();
     let show_toolbar = has_metrics || has_progress;
 
     div()
@@ -84,7 +93,7 @@ pub fn render_terminal_toolbar(
                     // Flexible spacer pushes the SFTP progress log to the
                     // far right edge of the toolbar.
                     .child(div().flex_1())
-                    .children(render_sftp_progress(sftp_progress)),
+                    .children(render_sftp_progress_chip(sftp_progress)),
             )
         })
 }
@@ -198,6 +207,155 @@ fn render_network(network: Option<NetworkStats>) -> Option<impl IntoElement> {
 }
 
 // ---------------------------------------------------------------------------
+// SFTP transfer progress rendering
+// ---------------------------------------------------------------------------
+
+/// Common display data computed from an [`SftpProgress`] snapshot.
+///
+/// Both the inline chip (terminal toolbar) and the standalone bar (SFTP
+/// tab) derive their visual state from this struct, avoiding duplicated
+/// match arms for `kind` / `stage` / `icon`.
+struct SftpProgressDisplay {
+    kind_label: String,
+    stage_label: String,
+    stage_color: u32,
+    icon_path: &'static str,
+    detail: String,
+}
+
+impl SftpProgressDisplay {
+    fn new(p: &SftpProgress) -> Self {
+        let kind_label = match p.kind {
+            SftpTransferKind::Download => t!("sftp.progress.download").to_string(),
+            SftpTransferKind::Upload => t!("sftp.progress.upload").to_string(),
+            SftpTransferKind::Rename => t!("sftp.rename").to_string(),
+            SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
+            SftpTransferKind::Delete => t!("sftp.delete").to_string(),
+        };
+        let (stage_label, stage_color) = match p.stage {
+            SftpTransferStage::Compress => {
+                (t!("sftp.progress.compress").to_string(), term_yellow())
+            }
+            SftpTransferStage::Transfer => {
+                (t!("sftp.progress.transfer").to_string(), color_accent())
+            }
+            SftpTransferStage::Decompress => {
+                (t!("sftp.progress.decompress").to_string(), term_yellow())
+            }
+            SftpTransferStage::CleanUp => (t!("sftp.progress.cleanup").to_string(), text_muted()),
+        };
+        let icon_path = match p.kind {
+            SftpTransferKind::Download => "icons/terminal-toolbar/arrow-down-to-line.svg",
+            SftpTransferKind::Upload => "icons/terminal-toolbar/arrow-up-to-line.svg",
+            SftpTransferKind::Rename => "icons/terminal-toolbar/edit.svg",
+            SftpTransferKind::Edit => "icons/terminal-toolbar/arrow-up-to-line.svg",
+            SftpTransferKind::Delete => "icons/terminal-toolbar/arrow-up-to-line.svg",
+        };
+        let detail = truncate_path_middle(&p.message, 40);
+        Self {
+            kind_label,
+            stage_label,
+            stage_color,
+            icon_path,
+            detail,
+        }
+    }
+}
+
+/// Render the right-aligned SFTP progress chip for the terminal toolbar.
+///
+/// Returns `None` when there's no in-flight transfer, so the caller's
+/// `.children(...)` renders nothing.
+fn render_sftp_progress_chip(progress: Option<SftpProgress>) -> Option<impl IntoElement> {
+    let p = progress?;
+    let d = SftpProgressDisplay::new(&p);
+    let bar = render_progress_bar(p.bytes, d.stage_color, "sftp-progress-bar-fill");
+
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .child(
+                svg()
+                    .path(d.icon_path)
+                    .size(px(12.0))
+                    .flex_shrink_0()
+                    .text_color(rgb(d.stage_color)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(d.stage_color))
+                    .child(d.stage_label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_muted()))
+                    .min_w_0()
+                    .truncate()
+                    .child(format!("{}: {}", d.kind_label, d.detail)),
+            )
+            .when_some(bar, |el, bar| {
+                el.child(bar).when_some(p.bytes, |el, b| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(text_muted()))
+                            .flex_shrink_0()
+                            .child(format_byte_ratio(b.done, b.total)),
+                    )
+                })
+            }),
+    )
+}
+
+/// Render a thin determinate progress bar when byte counts are available.
+/// Returns `None` for indeterminate stages (no `bytes` field).
+///
+/// Uses `gpui-animation`'s `transition_when` with a stable element id so the
+/// fill width eases between updates — same pattern as the memory-usage bar.
+/// Without this, each progress event would snap the fill to its new width.
+fn render_progress_bar(
+    bytes: Option<SftpTransferBytes>,
+    color: u32,
+    fill_id: &'static str,
+) -> Option<impl IntoElement> {
+    let b = bytes?;
+    let ratio = if b.total == 0 {
+        0.0
+    } else {
+        (b.done as f64 / b.total as f64).clamp(0.0, 1.0)
+    };
+    let filled_w = BAR_WIDTH * ratio as f32;
+    Some(
+        div()
+            .w(px(BAR_WIDTH))
+            .h(px(BAR_HEIGHT))
+            .rounded(px(3.0))
+            .bg(rgb(border()))
+            .flex_shrink_0()
+            .child(
+                div()
+                    .id(fill_id)
+                    .h_full()
+                    .rounded(px(3.0))
+                    .bg(rgb(color))
+                    .with_transition(fill_id)
+                    .transition_when(
+                        true,
+                        Duration::from_millis(300),
+                        EaseInOutCubic,
+                        move |el| el.w(px(filled_w)),
+                    ),
+            ),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
@@ -232,158 +390,15 @@ fn format_rate(bytes_per_sec: u64) -> String {
     format!("{:.1}{}/s", val, unit)
 }
 
-// ---------------------------------------------------------------------------
-// SFTP transfer progress log
-// ---------------------------------------------------------------------------
-
-/// Render the right-aligned SFTP progress chip.
-///
-/// Returns `None` when there's no in-flight transfer, so the caller's
-/// `.children(...)` renders nothing.
-///
-/// Layout: direction icon + stage label + path, all in muted text so it
-/// reads as ambient status rather than a primary control. We deliberately
-/// don't animate a spinner here — the toolbar re-renders on every progress
-/// event (compress → transfer → decompress → cleanup), so the changing
-/// stage label itself conveys activity without the cost of a continuous
-/// animation loop on the app-level render path.
-fn render_sftp_progress(progress: Option<SftpProgress>) -> Option<impl IntoElement> {
-    let p = progress?;
-    let kind_label = match p.kind {
-        SftpTransferKind::Download => t!("sftp.progress.download").to_string(),
-        SftpTransferKind::Upload => t!("sftp.progress.upload").to_string(),
-        SftpTransferKind::Rename => t!("sftp.rename").to_string(),
-        SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
-    };
-    let (stage_label, stage_color) = match p.stage {
-        SftpTransferStage::Compress => (t!("sftp.progress.compress").to_string(), term_yellow()),
-        SftpTransferStage::Transfer => (t!("sftp.progress.transfer").to_string(), color_accent()),
-        SftpTransferStage::Decompress => {
-            (t!("sftp.progress.decompress").to_string(), term_yellow())
-        }
-        SftpTransferStage::CleanUp => (t!("sftp.progress.cleanup").to_string(), text_muted()),
-    };
-    let icon_path = match p.kind {
-        SftpTransferKind::Download => "icons/terminal-toolbar/arrow-down-to-line.svg",
-        SftpTransferKind::Upload => "icons/terminal-toolbar/arrow-up-to-line.svg",
-        SftpTransferKind::Rename => "icons/terminal-toolbar/edit.svg",
-        SftpTransferKind::Edit => "icons/terminal-toolbar/arrow-up-to-line.svg",
-    };
-    // Middle-truncate long paths so the head (top-level dir) and tail
-    // (filename) stay visible — e.g. "/home/user/.../deeply/nested/file.txt".
-    let detail = truncate_path_middle(&p.message, 40);
-
-    // Optional determinate progress bar, shown only when the backend
-    // reports byte counts (currently the Transfer stage). Indeterminate
-    // stages (Compress/Decompress/CleanUp run via opaque remote exec) get
-    // no bar — the changing stage label conveys activity.
-    let bar = render_progress_bar(p.bytes, stage_color);
-
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .min_w_0()
-            .child(
-                svg()
-                    .path(icon_path)
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(rgb(stage_color)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(stage_color))
-                    .child(stage_label),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_muted()))
-                    .min_w_0()
-                    .truncate()
-                    .child(format!("{kind_label}: {detail}")),
-            )
-            .when_some(bar, |el, bar| {
-                el.child(bar).when_some(p.bytes, |el, b| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(text_muted()))
-                            .flex_shrink_0()
-                            .child(format_byte_ratio(b.done, b.total)),
-                    )
-                })
-            }),
-    )
-}
-
-/// Render a thin determinate progress bar when byte counts are available.
-/// Returns `None` for indeterminate stages (no `bytes` field).
-///
-/// Uses `gpui-animation`'s `transition_when` with a stable element id so the
-/// fill width eases between updates — same pattern as the memory-usage bar.
-/// Without this, each progress event would snap the fill to its new width.
-fn render_progress_bar(bytes: Option<SftpTransferBytes>, color: u32) -> Option<impl IntoElement> {
-    let b = bytes?;
-    let ratio = if b.total == 0 {
-        0.0
-    } else {
-        (b.done as f64 / b.total as f64).clamp(0.0, 1.0)
-    };
-    let filled_w = BAR_WIDTH * ratio as f32;
-    Some(
-        div()
-            .w(px(BAR_WIDTH))
-            .h(px(BAR_HEIGHT))
-            .rounded(px(3.0))
-            .bg(rgb(border()))
-            .flex_shrink_0()
-            .child(
-                div()
-                    .id("sftp-progress-bar-fill")
-                    .h_full()
-                    .rounded(px(3.0))
-                    .bg(rgb(color))
-                    .with_transition("sftp-progress-bar-fill")
-                    .transition_when(
-                        true,
-                        Duration::from_millis(300),
-                        EaseInOutCubic,
-                        move |el| el.w(px(filled_w)),
-                    ),
-            ),
-    )
-}
-
 /// Format a `done / total` byte ratio for display, e.g. "2.1M / 8.0M".
 fn format_byte_ratio(done: u64, total: u64) -> String {
     if total == 0 {
-        let (d, du) = human_bytes_simple(done);
+        let (d, du) = human_bytes(done);
         format!("{:.1}{}", d, du)
     } else {
-        let (d, du) = human_bytes_simple(done);
-        let (t, tu) = human_bytes_simple(total);
+        let (d, du) = human_bytes(done);
+        let (t, tu) = human_bytes(total);
         format!("{:.1}{} / {:.1}{}", d, du, t, tu)
-    }
-}
-
-fn human_bytes_simple(bytes: u64) -> (f64, &'static str) {
-    let b = bytes as f64;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const KB: f64 = 1024.0;
-    if b >= GB {
-        (b / GB, "G")
-    } else if b >= MB {
-        (b / MB, "M")
-    } else if b >= KB {
-        (b / KB, "K")
-    } else {
-        (b, "B")
     }
 }
 
@@ -470,10 +485,4 @@ fn truncate_path(path: &str, max: usize) -> String {
     } else {
         format!("…/{}", base)
     }
-}
-
-// Accent color for the memory progress bar fill — read live so theme
-// changes are picked up without a recompile.
-fn color_accent() -> u32 {
-    term_blue()
 }

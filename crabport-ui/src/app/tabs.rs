@@ -123,6 +123,20 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        (SftpTransferKind::Delete, true) => (
+                            t!("sftp.notif_delete_done_title").to_string(),
+                            t!("sftp.notif_delete_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Delete, false) => (
+                            t!("sftp.notif_delete_failed_title").to_string(),
+                            t!("sftp.notif_delete_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -161,6 +175,7 @@ impl CrabportApp {
         private_key: Option<&str>,
         passphrase: Option<&str>,
         proxy: Option<crabport_core::credential::ProxyConfig>,
+        startup_command: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -178,6 +193,11 @@ impl CrabportApp {
         }
         if let Some(p) = proxy {
             info = info.with_proxy(p);
+        }
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
         }
         let info_for_view = info.clone();
         let cols: usize = 80;
@@ -306,6 +326,20 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        (SftpTransferKind::Delete, true) => (
+                            t!("sftp.notif_delete_done_title").to_string(),
+                            t!("sftp.notif_delete_done_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Success,
+                            std::time::Duration::from_secs(3),
+                        ),
+                        (SftpTransferKind::Delete, false) => (
+                            t!("sftp.notif_delete_failed_title").to_string(),
+                            t!("sftp.notif_delete_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -355,6 +389,7 @@ impl CrabportApp {
         username: &str,
         password: &str,
         proxy: Option<crabport_core::credential::ProxyConfig>,
+        startup_command: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -369,6 +404,11 @@ impl CrabportApp {
         let mut info = TelnetConnectionInfo::new(host, username, password).with_port(port);
         if let Some(p) = proxy {
             info = info.with_proxy(p);
+        }
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
         }
         let info_for_view = info.clone();
 
@@ -438,7 +478,8 @@ impl CrabportApp {
     }
 
     pub fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
-        if id == 0 {
+        if id == 0 || id == 1 {
+            // Home and SFTP tabs are permanent — never closeable.
             return;
         }
 
@@ -787,10 +828,23 @@ impl CrabportApp {
         cx: &mut Context<Self>,
     ) {
         let app_handle = cx.entity().downgrade();
+        let app_handle2 = cx.entity().downgrade();
         view.update(cx, |v, _cx| {
             v.set_on_focused(move |pane_id, cx| {
                 let _ = app_handle.update(cx, |app, cx| {
                     app.sync_active_pane_from_focus(pane_id, cx);
+                });
+            });
+            v.set_on_split_request(move |dir, cx| {
+                // Defer the split so it doesn't run while TerminalView is
+                // still being updated (the on_action handler holds a borrow
+                // on the entity). split_active_pane reads/writes pane_views
+                // and other entities, which would re-enter the borrow.
+                let h = app_handle2.clone();
+                cx.defer(move |cx| {
+                    let _ = h.update(cx, |app, cx| {
+                        app.split_active_pane(dir, cx);
+                    });
                 });
             });
         });

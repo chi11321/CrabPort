@@ -42,8 +42,8 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::group_header::group_header;
+use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 use crate::views::sessions::ConnectionHost;
-use gpui_component::input::InputState;
 
 use crabport_core::credential::{GroupEntry, GroupKind, TunnelKind};
 
@@ -86,10 +86,7 @@ pub struct TunnelsView {
     // External data pushed in before each render.
     tunnels: Vec<TunnelView>,
     hosts: Vec<ConnectionHost>,
-    /// Held for the context-menu/alert wiring (mirrors `SessionsView`). Not yet
-    /// read inside render — kept so future versions can reach the app entity
-    /// without changing the public API.
-    #[allow(dead_code)]
+    /// Held for the context-menu/alert wiring (mirrors `SessionsView`).
     app: Entity<CrabportApp>,
     // Global context menu host, used for the right-click menu on each row.
     context_menu: Option<Entity<ContextMenuController>>,
@@ -113,10 +110,8 @@ pub struct TunnelsView {
     /// Collapsed group ids (collapsible group headers). Ungrouped tunnels
     // are always shown.
     collapsed_groups: HashSet<i64>,
-    /// The group id currently being renamed inline, if any.
-    renaming_group_id: Option<i64>,
-    /// `InputState` backing the inline group-rename editor.
-    rename_input: Option<Entity<InputState>>,
+    /// Shared inline group-rename state (id + InputState).
+    group_rename: GroupRenameState,
 }
 
 impl TunnelsView {
@@ -137,8 +132,7 @@ impl TunnelsView {
             form_state: None,
             groups: Vec::new(),
             collapsed_groups: HashSet::new(),
-            renaming_group_id: None,
-            rename_input: None,
+            group_rename: GroupRenameState::new(),
         }
     }
 
@@ -181,11 +175,9 @@ impl TunnelsView {
     }
 
     // -------------------------------------------------------------------
-    // Inline group rename
+    // Inline group rename (delegates to GroupRenameState)
     // -------------------------------------------------------------------
 
-    /// Begin renaming a group inline: stash the id, (re)seed the rename
-    /// `InputState` with the current name, and focus it.
     fn start_group_rename(
         &mut self,
         group_id: i64,
@@ -193,65 +185,17 @@ impl TunnelsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.renaming_group_id = Some(group_id);
-        if self.rename_input.is_none() {
-            let entity = cx.new(|cx| {
-                let state = InputState::new(window, cx).placeholder("new name");
-                state.focus(window, cx);
-                state
-            });
-            cx.subscribe(
-                &entity,
-                |this, _input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_group_rename(cx);
-                    }
-                },
-            )
-            .detach();
-            let blur_handle = entity.read(cx).focus_handle(cx);
-            cx.on_blur(&blur_handle, window, |this, _window, cx| {
-                if this.renaming_group_id.is_some() {
-                    this.cancel_group_rename(cx);
-                }
-            })
-            .detach();
-            self.rename_input = Some(entity);
-        }
-        if let Some(ref input) = self.rename_input {
-            input.update(cx, |state, cx| {
-                state.set_value(current_name, window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
+        self.group_rename.start(group_id, current_name, window, cx);
+    }
+}
+
+impl GroupRenameView for TunnelsView {
+    fn group_rename(&mut self) -> &mut GroupRenameState {
+        &mut self.group_rename
     }
 
-    /// Commit the inline rename.
-    fn commit_group_rename(&mut self, cx: &mut Context<Self>) {
-        let group_id = match self.renaming_group_id.take() {
-            Some(id) => id,
-            None => return,
-        };
-        let new_name = self.rename_input.as_ref().and_then(|input| {
-            let v = input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else {
-            cx.notify();
-            return;
-        };
-        let app = self.app.clone();
-        app.update(cx, |app, cx| {
-            app.rename_group(group_id, &new_name, cx);
-        });
-        cx.notify();
-    }
-
-    /// Abort the inline rename without persisting.
-    fn cancel_group_rename(&mut self, cx: &mut Context<Self>) {
-        self.renaming_group_id = None;
-        cx.notify();
+    fn app_entity(&self) -> &Entity<CrabportApp> {
+        &self.app
     }
 }
 
@@ -289,8 +233,8 @@ impl Render for TunnelsView {
             self.context_menu_tunnel_id = None;
         }
         let context_menu_tunnel_id = self.context_menu_tunnel_id;
-        let renaming_group_id = self.renaming_group_id;
-        let rename_input = self.rename_input.clone();
+        let renaming_group_id = self.group_rename.renaming_group_id;
+        let rename_input = self.group_rename.rename_input.clone();
         let collapsed_groups = self.collapsed_groups.clone();
         let entity = _cx.entity().downgrade();
 

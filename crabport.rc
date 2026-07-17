@@ -1,0 +1,14 @@
+// Windows resource script for the CrabPort .exe.
+//
+// Embeds `app-icon.ico` as the application icon (resource ID 1). GPUI's
+// platform layer calls `LoadImageW(.., PCWSTR(1), IMAGE_ICON, ..)` to fetch
+// the window-class icon, so the icon *must* live at resource ID 1 — that's
+// also what Windows uses for the taskbar / Alt-Tab / Explorer icon of the
+// .exe itself.
+//
+// GPUI's own `gpui.rc` only embeds a manifest; it doesn't ship an icon, so
+// without this script the .exe shows the default Rust cargo icon.
+//
+// `embed-resource` (invoked from `build.rs`) compiles this with `rc.exe`
+// from the Windows SDK / MSVC toolchain.
+1 ICON "app-icon.ico"

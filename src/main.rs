@@ -1,12 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use crabport_ui::app::{
-    TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab, TerminalTab,
-    open_main_window,
-};
+use crabport_ui::app::open_main_window;
 use crabport_ui::app_state::AppState;
 use crabport_ui::assets::CrabportAssets;
-use crabport_ui::menus::{Hide, Minimize, OpenAbout, OpenSettings, Quit, Zoom};
-use crabport_ui::windows::AuxWindowKind;
+use crabport_ui::keybinds;
 use gpui::*;
 
 /// Work around a crash on WSL2.
@@ -34,16 +30,40 @@ fn main() {
     #[cfg(target_os = "linux")]
     workaround_wsl2_wayland_version();
 
-    #[cfg(debug_assertions)]
+    // Initialize process-wide tracing. Runs in BOTH debug and release builds
+    // (no `debug_assertions` gate) so field-reported issues leave a trail in
+    // `{data_dir}/crabport/latest.log`. Debug builds ALSO log to stderr.
     crabport_core::log::init();
 
     Application::new()
         .with_assets(CrabportAssets::new())
         .run(|cx| {
+            // Register all keybinds from the catalog (reads config.toml
+            // overrides, falls back to platform defaults).
+            //
+            // This MUST run before `gpui_component::init` because
+            // `apply_bindings` calls `cx.clear_key_bindings()`, which
+            // wipes the entire keymap — including any bindings that
+            // gpui-component registered earlier (notably the `Input`
+            // widget's `backspace` / `delete` / `enter` / `escape`
+            // bindings under the `Input` context). Registering our
+            // bindings first and then calling `gpui_component::init`
+            // leaves the input bindings intact, so text fields work
+            // correctly (without this, Backspace does nothing in
+            // StyledInput on Windows / Linux).
+            keybinds::apply_bindings(cx);
+
             gpui_component::init(cx);
 
             // Force dark theme regardless of system appearance.
             gpui_component::theme::Theme::change(gpui_component::theme::ThemeMode::Dark, None, cx);
+
+            // macOS: enable sidebar vibrancy (毛玻璃). Patches the gpui-component
+            // theme background to transparent so `gpui_component::Root` doesn't
+            // paint an opaque layer over the system vibrancy view. Main / Settings
+            // / About windows are opened with `WindowBackgroundAppearance::Blurred`.
+            #[cfg(target_os = "macos")]
+            crabport_ui::color::enable_vibrancy(cx);
 
             // Set the active locale early so the menu bar (built below) and
             // every window picks up the right translations. Read from the
@@ -51,31 +71,6 @@ fn main() {
             // app restarts.
             let locale = crabport_core::config::snapshot().appearance.locale;
             crabport_ui::set_locale(&locale);
-
-            cx.bind_keys([
-                KeyBinding::new("tab", TerminalTab, Some("CrabPortTerminal")),
-                KeyBinding::new("shift-tab", TerminalShiftTab, Some("CrabPortTerminal")),
-                // Terminal font zoom shortcuts. macOS uses cmd; other
-                // platforms use ctrl. The actions clamp the persisted size
-                // into [8, 32] and re-derive cell metrics.
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd-=", TerminalIncreaseFont, Some("CrabPortTerminal")),
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd--", TerminalDecreaseFont, Some("CrabPortTerminal")),
-                #[cfg(target_os = "macos")]
-                KeyBinding::new("cmd-0", TerminalResetFont, Some("CrabPortTerminal")),
-                #[cfg(not(target_os = "macos"))]
-                KeyBinding::new("ctrl-=", TerminalIncreaseFont, Some("CrabPortTerminal")),
-                #[cfg(not(target_os = "macos"))]
-                KeyBinding::new("ctrl--", TerminalDecreaseFont, Some("CrabPortTerminal")),
-                #[cfg(not(target_os = "macos"))]
-                KeyBinding::new("ctrl-0", TerminalResetFont, Some("CrabPortTerminal")),
-                // macOS-standard shortcuts for the app menu items.
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("cmd-h", Hide, None),
-                KeyBinding::new("cmd-,", OpenSettings, None),
-                KeyBinding::new("cmd-m", Minimize, None),
-            ]);
 
             // Initialize process-wide shared state (store, window registry)
             // before opening any window. `CrabportApp::new` reads from this
@@ -85,26 +80,26 @@ fn main() {
             // Global actions for opening secondary windows. These are app-
             // level (no window context required) so they work from any
             // focused window.
-            cx.on_action::<OpenSettings>(|_a, cx| {
-                AppState::focus_or_open(AuxWindowKind::Settings, cx);
+            cx.on_action::<crabport_ui::menus::OpenSettings>(|_a, cx| {
+                AppState::focus_or_open(crabport_ui::windows::AuxWindowKind::Settings, cx);
             });
-            cx.on_action::<OpenAbout>(|_a, cx| {
-                AppState::focus_or_open(AuxWindowKind::About, cx);
+            cx.on_action::<crabport_ui::menus::OpenAbout>(|_a, cx| {
+                AppState::focus_or_open(crabport_ui::windows::AuxWindowKind::About, cx);
             });
 
             // Menu-bar actions backed by App-level platform calls.
-            cx.on_action::<Quit>(|_a, cx| cx.quit());
-            cx.on_action::<Hide>(|_a, cx| cx.hide());
+            cx.on_action::<crabport_ui::menus::Quit>(|_a, cx| cx.quit());
+            cx.on_action::<crabport_ui::menus::Hide>(|_a, cx| cx.hide());
 
             // Window menu: act on the currently-focused window. Menu actions
             // dispatch globally, so we resolve the active window handle here
             // and run the platform call inside its window context.
-            cx.on_action::<Minimize>(|_a, cx| {
+            cx.on_action::<crabport_ui::menus::Minimize>(|_a, cx| {
                 if let Some(handle) = cx.active_window() {
                     let _ = handle.update(cx, |_, window, _cx| window.minimize_window());
                 }
             });
-            cx.on_action::<Zoom>(|_a, cx| {
+            cx.on_action::<crabport_ui::menus::Zoom>(|_a, cx| {
                 if let Some(handle) = cx.active_window() {
                     let _ = handle.update(cx, |_, window, _cx| window.zoom_window());
                 }

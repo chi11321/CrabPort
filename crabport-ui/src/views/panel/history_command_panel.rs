@@ -36,6 +36,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
+use crate::components::notification::{Notification, NotificationLevel};
 
 /// A single previously-run terminal command entry.
 ///
@@ -51,22 +52,18 @@ pub struct HistoryCommand {
 
 /// History-command panel view.
 pub struct HistoryCommandPanel {
-    /// Current history list, most-recent-first. Pushed in via `set_state`.
     history: Arc<Vec<HistoryCommand>>,
-    /// Paste callback — invoked with the command text when the user clicks
-    /// the "paste" button. Writes the command into the active terminal's
-    /// input line **without** re-capturing it as history (see
-    /// [`crate::views::terminal::TerminalView::write_raw`]).
     on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
-    /// Search input state (lazily initialized on the first `set_state`).
+    /// Triggered by the toolbar refresh button — asks the active terminal's
+    /// backend to re-read the TTY history file and broadcast a
+    /// `HistoryLoaded` event.
+    on_refresh: Option<Rc<dyn Fn(&mut App)>>,
+    notifications: Option<Entity<crate::components::notification::NotificationController>>,
+    /// Global tooltip host for button hover tooltips.
+    tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
     search_input: Option<Entity<InputState>>,
-    /// Current search query. Updated via `InputEvent::Change` subscription.
     search_query: String,
-    /// Scroll handle for the virtual list + custom scrollbar.
     scroll_handle: VirtualListScrollHandle,
-    /// Per-row hover state. Keyed by command index (the position in the
-    /// *filtered* list for the current render). Used to drive the
-    /// copy/paste buttons' fade-in transition.
     hovered_row: Option<usize>,
 }
 
@@ -75,6 +72,9 @@ impl HistoryCommandPanel {
         Self {
             history: Arc::new(Vec::new()),
             on_paste: None,
+            on_refresh: None,
+            notifications: None,
+            tooltip: None,
             search_input: None,
             search_query: String::new(),
             scroll_handle: VirtualListScrollHandle::new(),
@@ -90,6 +90,9 @@ impl HistoryCommandPanel {
         &mut self,
         history: Arc<Vec<HistoryCommand>>,
         on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
+        on_refresh: Option<Rc<dyn Fn(&mut App)>>,
+        notifications: Entity<crate::components::notification::NotificationController>,
+        tooltip: Entity<crate::components::tooltip::TooltipController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -115,6 +118,9 @@ impl HistoryCommandPanel {
 
         self.history = history;
         self.on_paste = on_paste;
+        self.on_refresh = on_refresh;
+        self.notifications = Some(notifications);
+        self.tooltip = Some(tooltip);
         if history_changed {
             // History changed (e.g. user ran a new command) — the filtered
             // list may grow, so a repaint is needed.
@@ -153,6 +159,9 @@ impl Render for HistoryCommandPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let search_input = self.search_input.clone();
         let on_paste = self.on_paste.clone();
+        let on_refresh = self.on_refresh.clone();
+        let notifications = self.notifications.clone();
+        let tooltip = self.tooltip.clone();
         let scroll_handle = self.scroll_handle.clone();
 
         // Compute the filtered list + per-row data once per render.
@@ -175,6 +184,10 @@ impl Render for HistoryCommandPanel {
         let filtered_for_list = Arc::new(filtered);
         let is_empty = filtered_for_list.is_empty();
 
+        // Clone for the search-bar refresh button (the list closure below
+        // moves the outer `tooltip`).
+        let tooltip_for_search = tooltip.clone();
+
         let list = v_virtual_list(
             cx.entity(),
             "history-cmd-list",
@@ -183,6 +196,8 @@ impl Render for HistoryCommandPanel {
                 let filtered = &filtered_for_list;
                 let on_paste = on_paste.clone();
                 let entity = cx.entity().downgrade();
+                let notifications = notifications.clone();
+                let tooltip = tooltip.clone();
                 range
                     .map(|i| {
                         let h = &filtered[i];
@@ -195,6 +210,8 @@ impl Render for HistoryCommandPanel {
                         // into the global Store so it shows up in the
                         // Snippets panel and survives restarts.
                         let cmd_for_save = cmd.clone();
+                        let notifications = notifications.clone();
+                        let tooltip_save = tooltip.clone();
                         let save_btn = div()
                             .id(ElementId::Name(format!("history-save-{i}").into()))
                             .flex()
@@ -202,10 +219,60 @@ impl Render for HistoryCommandPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .with_transition(ElementId::Name(format!("history-save-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_save {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.save_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
+                            .transition_on_hover(
+                                std::time::Duration::from_millis(100),
+                                Linear,
+                                move |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .on_click(move |_e, _w, cx| {
                                 let store = crate::app_state::AppState::store(cx);
-                                let _ = store.lock().add_snippet("", &cmd_for_save, false, None);
+                                let result =
+                                    store.lock().add_snippet("", &cmd_for_save, false, None);
+                                if let Some(ref nc) = notifications {
+                                    let notif = match result {
+                                        Ok(_) => {
+                                            Notification::new(t!("history.saved_title").to_string())
+                                                .level(NotificationLevel::Success)
+                                                .message(
+                                                    t!(
+                                                        "history.saved_msg",
+                                                        command = cmd_for_save.as_str()
+                                                    )
+                                                    .to_string(),
+                                                )
+                                        }
+                                        Err(_) => Notification::new(
+                                            t!("history.save_failed_title").to_string(),
+                                        )
+                                        .level(NotificationLevel::Danger),
+                                    };
+                                    nc.update(cx, |c, cx| c.show(notif, cx));
+                                }
                             })
                             .child(
                                 svg()
@@ -219,6 +286,7 @@ impl Render for HistoryCommandPanel {
                         // edit before running).
                         let cmd_for_paste = cmd.clone();
                         let on_paste_for_btn = on_paste.clone();
+                        let tooltip_paste = tooltip.clone();
                         let paste_btn = div()
                             .id(ElementId::Name(format!("history-paste-{i}").into()))
                             .flex()
@@ -226,7 +294,36 @@ impl Render for HistoryCommandPanel {
                             .justify_center()
                             .size(px(20.0))
                             .rounded(px(4.0))
-                            .hover(|s| s.bg(rgb(surface_hover())))
+                            .bg(rgba(0x00000000))
+                            .with_transition(ElementId::Name(format!("history-paste-{i}").into()))
+                            .on_hover(move |hovered, w, cx| {
+                                if let Some(ref tc) = tooltip_paste {
+                                    if *hovered {
+                                        tc.update(cx, |t, cx| {
+                                            t.show(
+                                                t!("panel.paste_tooltip").to_string(),
+                                                w.mouse_position(),
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        tc.update(cx, |t, cx| {
+                                            t.hide(cx);
+                                        });
+                                    }
+                                }
+                            })
+                            .transition_on_hover(
+                                std::time::Duration::from_millis(100),
+                                Linear,
+                                move |hovered, el| {
+                                    if *hovered {
+                                        el.bg(rgb(surface_hover()))
+                                    } else {
+                                        el.bg(rgba(0x00000000))
+                                    }
+                                },
+                            )
                             .on_click(move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {
                                     cb(cmd_for_paste.clone(), cx);
@@ -243,6 +340,7 @@ impl Render for HistoryCommandPanel {
                             .id(row_id.clone())
                             .h(px(ROW_HEIGHT))
                             .w_full()
+                            .relative()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -281,7 +379,9 @@ impl Render for HistoryCommandPanel {
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
-                            // Command text (flex-1 so buttons sit on the right).
+                            // Command text fills the full row width so long
+                            // commands don't shift when the hover buttons fade
+                            // in — the buttons overlay on top (below).
                             .child(
                                 div()
                                     .flex_1()
@@ -293,17 +393,26 @@ impl Render for HistoryCommandPanel {
                                     .text_ellipsis()
                                     .child(Label::new(cmd)),
                             )
-                            // Buttons: fade in on row hover. The container
+                            // Buttons: absolutely positioned over the right
+                            // edge of the row, layered above the command text
+                            // with a transparent background so they don't
+                            // displace the text when they fade in. The container
                             // is a `Stateful<Div>` (has an id) so it supports
                             // `with_transition` + `transition_when_else` for
                             // a smooth opacity ease.
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("history-btns-{i}").into()))
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_0p5()
+                                    .pr_2()
+                                    .bg(rgba(0x00000000))
                                     .opacity(0.0)
                                     .with_transition(ElementId::Name(
                                         format!("history-btns-{i}").into(),
@@ -322,8 +431,7 @@ impl Render for HistoryCommandPanel {
                     .collect::<Vec<_>>()
             },
         )
-        .track_scroll(&scroll_handle)
-        .pr(px(12.0));
+        .track_scroll(&scroll_handle);
 
         div()
             .h_full()
@@ -334,61 +442,126 @@ impl Render for HistoryCommandPanel {
             .flex_col()
             .pt_1()
             .px_1()
-            // Search input
+            // Search input + refresh button
             .when_some(search_input, |el, input| {
                 el.child(
-                    div().mb_1().child(
-                        StyledInput::new("history-search", input).xsmall().prefix(
-                            svg()
-                                .path("icons/search.svg")
-                                .size(px(12.0))
-                                .text_color(rgb(text_muted())),
-                        ),
-                    ),
+                    div()
+                        .mb_1()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                StyledInput::new("history-search", input).xsmall().prefix(
+                                    svg()
+                                        .path("icons/search.svg")
+                                        .size(px(12.0))
+                                        .text_color(rgb(text_muted())),
+                                ),
+                            ),
+                        )
+                        .when_some(on_refresh, |el, cb| {
+                            el.child(
+                                div()
+                                    .id("history-refresh")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(24.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(4.0))
+                                    .bg(rgba(0x00000000))
+                                    .with_transition(ElementId::Name(
+                                        "history-refresh".to_string().into(),
+                                    ))
+                                    .on_hover({
+                                        let tooltip = tooltip_for_search.clone();
+                                        move |hovered, w, cx| {
+                                            if let Some(ref tc) = tooltip {
+                                                if *hovered {
+                                                    tc.update(cx, |t, cx| {
+                                                        t.show(
+                                                            t!("panel.refresh_tooltip").to_string(),
+                                                            w.mouse_position(),
+                                                            cx,
+                                                        );
+                                                    });
+                                                } else {
+                                                    tc.update(cx, |t, cx| {
+                                                        t.hide(cx);
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .transition_on_hover(
+                                        std::time::Duration::from_millis(100),
+                                        Linear,
+                                        |hovered, el| {
+                                            if *hovered {
+                                                el.bg(rgb(surface_hover()))
+                                            } else {
+                                                el.bg(rgba(0x00000000))
+                                            }
+                                        },
+                                    )
+                                    .on_click(move |_e, _w, cx| cb(cx))
+                                    .child(
+                                        svg()
+                                            .path("icons/refresh-cw.svg")
+                                            .size(px(13.0))
+                                            .text_color(rgb(text_muted())),
+                                    ),
+                            )
+                        }),
                 )
             })
             // List + scrollbar, or empty-state placeholder.
-            .when(is_empty, |el| {
-                el.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_color(rgb(text_muted()))
-                                .text_sm()
-                                .child(t!("sidebar.history").to_string()),
-                        ),
-                )
-            })
-            .when(!is_empty, |el| {
-                el.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(bg_tab_bar()))
-                        .rounded_md()
-                        .overflow_hidden()
-                        .child(list)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .w(px(12.0))
-                                .child(
-                                    Scrollbar::vertical(&scroll_handle)
-                                        .scrollbar_show(ScrollbarShow::Hover),
-                                ),
-                        ),
-                )
-            })
+            .when_else(
+                is_empty,
+                |el| {
+                    el.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_color(rgb(text_muted()))
+                                    .text_sm()
+                                    .child(t!("sidebar.history").to_string()),
+                            ),
+                    )
+                },
+                |el| {
+                    el.child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .border_1()
+                            .border_color(rgb(border()))
+                            .bg(rgb(bg_tab_bar()))
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(list)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(px(16.0))
+                                    .child(
+                                        Scrollbar::vertical(&scroll_handle)
+                                            .scrollbar_show(ScrollbarShow::Hover),
+                                    ),
+                            ),
+                    )
+                },
+            )
     }
 }

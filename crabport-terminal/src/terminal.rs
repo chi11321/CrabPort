@@ -49,6 +49,12 @@ pub enum BackendEvent {
         /// determinate progress bar.
         bytes: Option<SftpTransferBytes>,
     },
+    /// Shell history loaded from the TTY's history file
+    /// (`~/.bash_history`, `~/.zsh_history`, …). Emitted by a backend in
+    /// response to [`CrabPortTerminal::refresh_history`]; the payload is
+    /// most-recent-first (already reversed by the backend) so the UI can
+    /// render it verbatim.
+    HistoryLoaded(Vec<String>),
 }
 
 /// Byte-level progress snapshot for a transfer stage.
@@ -72,6 +78,9 @@ pub enum SftpTransferKind {
     /// "Open in editor": download → local edit → re-upload on save. Success
     /// is silent; only upload failures surface a notification.
     Edit,
+    /// Delete a remote file or directory. Success shows "deleted";
+    /// failure shows "delete failed".
+    Delete,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -120,6 +129,16 @@ pub trait CrabPortTerminal: Send + Sync {
         true
     }
 
+    /// Ask the backend to (re)read the shell's history file and broadcast a
+    /// [`BackendEvent::HistoryLoaded`] event with the result. Backends that
+    /// can read a TTY history file (local PTY via `std::fs`, SSH via exec)
+    /// override this; the default implementation is a no-op so backends
+    /// without access to a history file (e.g. Telnet) silently keep whatever
+    /// the session-captured history already holds.
+    ///
+    /// Safe to call repeatedly — each call triggers a fresh read.
+    fn refresh_history(&self) {}
+
     /// Whether this backend supports the snippets panel (run / paste via
     /// `write_raw`). Defaults to `true` for the same reason as `allow_history`.
     fn allow_snippets(&self) -> bool {
@@ -134,7 +153,7 @@ pub trait CrabPortTerminal: Send + Sync {
     }
 
     /// Current SFTP directory entries. Returns None if not yet loaded.
-    fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         None
     }
 
@@ -159,6 +178,11 @@ pub trait CrabPortTerminal: Send + Sync {
     /// (see `SshBackend::sftp_upload`). Completion is reported via
     /// [`BackendEvent::SftpTransferFinished`].
     fn sftp_upload(&self, _local_path: &str, _remote_path: &str) {}
+
+    /// Upload multiple files in a single batch. Falls back to per-file upload
+    /// if the remote doesn't support tar. Completion is reported via
+    /// [`BackendEvent::SftpTransferFinished`] for the batch.
+    fn sftp_upload_batch(&self, _items: &[(String, String)]) {}
 
     /// Delete a remote file or directory at `remote_path`. The backend
     /// stats the path to decide between `remove_file` and `remove_dir`.
@@ -252,12 +276,10 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
             Event::Wakeup => {
-                #[cfg(debug_assertions)]
                 tracing::debug!("EventProxy: Wakeup event received");
                 let _ = self.wakeup_tx.try_broadcast(());
             }
             _ => {
-                #[cfg(debug_assertions)]
                 tracing::debug!("EventProxy: Other event {:?}", event);
                 let _ = self.wakeup_tx.try_broadcast(());
             }
@@ -385,6 +407,7 @@ impl TerminalSession {
         let mut rx = self.backend.subscribe();
         let term = self.term.clone();
         let wakeup_tx = self.wakeup_tx.clone();
+        let command_history = self.command_history.clone();
 
         smol::spawn(async move {
             let mut parser = Processor::<StdSyncHandler>::new();
@@ -393,7 +416,6 @@ impl TerminalSession {
                 match rx.recv().await {
                     Ok(event) => match event {
                         BackendEvent::Data(data) => {
-                            #[cfg(debug_assertions)]
                             tracing::debug!("session: received {} bytes", data.len());
                             // Batch-drain: hold the term lock once and advance all
                             // currently-queued chunks. Cuts lock churn and wakeup
@@ -419,6 +441,10 @@ impl TerminalSession {
                                     Ok(BackendEvent::SftpTransferProgress { .. }) => {
                                         // UI-only event; ignore during batch drain.
                                     }
+                                    Ok(BackendEvent::HistoryLoaded(_)) => {
+                                        // Handled in the outer loop (not here,
+                                        // inside the term lock) — drain ignores it.
+                                    }
                                     Err(_) => break, // queue drained
                                 }
                             }
@@ -426,7 +452,6 @@ impl TerminalSession {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                         BackendEvent::Closed => {
-                            #[cfg(debug_assertions)]
                             tracing::info!("session: backend closed");
                             let _ = wakeup_tx.try_broadcast(());
                             break;
@@ -439,9 +464,22 @@ impl TerminalSession {
                         // terminal parser. Ignore them here.
                         BackendEvent::SftpTransferFinished { .. } => {}
                         BackendEvent::SftpTransferProgress { .. } => {}
+                        // Replace the in-memory command history with the
+                        // freshly-loaded TTY history file contents. The
+                        // backend delivers most-recent-first, so we assign
+                        // the deque front-to-back as given. A wake-up is
+                        // broadcast so the UI repaints with the new list.
+                        BackendEvent::HistoryLoaded(cmds) => {
+                            let mut history = command_history.lock();
+                            history.clear();
+                            for c in cmds {
+                                history.push_back(c);
+                            }
+                            drop(history);
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
                     },
                     Err(_e) => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!("session: recv error: {:?}", _e);
                         let _ = wakeup_tx.try_broadcast(());
                         break;
@@ -655,6 +693,13 @@ impl TerminalSession {
         self.backend.allow_history()
     }
 
+    /// Trigger a fresh read of the shell's history file. The backend will
+    /// broadcast a [`BackendEvent::HistoryLoaded`] when the data is ready,
+    /// which [`TerminalSession::start`] forwards into `command_history`.
+    pub fn refresh_history(&self) {
+        self.backend.refresh_history();
+    }
+
     pub fn allow_snippets(&self) -> bool {
         self.backend.allow_snippets()
     }
@@ -663,7 +708,7 @@ impl TerminalSession {
         self.backend.allow_tunnels()
     }
 
-    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<(String, bool)>>> {
+    pub fn sftp_entries(&self) -> Option<std::sync::Arc<Vec<crabport_sftp::FileEntry>>> {
         self.backend.sftp_entries()
     }
 
@@ -687,6 +732,13 @@ impl TerminalSession {
     /// `BackendEvent::SftpTransferFinished`.
     pub fn sftp_upload(&self, local_path: &str, remote_path: &str) {
         self.backend.sftp_upload(local_path, remote_path);
+    }
+
+    /// Upload multiple files in a single batch transfer.
+    /// Completion is reported via the backend's event stream as
+    /// `BackendEvent::SftpTransferFinished`.
+    pub fn sftp_upload_batch(&self, items: &[(String, String)]) {
+        self.backend.sftp_upload_batch(items);
     }
 
     /// Delete a remote file or directory.

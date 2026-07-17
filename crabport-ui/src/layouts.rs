@@ -3,4 +3,4 @@ pub mod content;
 pub mod panel;
 pub mod sidebar;
 pub mod tabbar;
-pub mod terminal_toolbar;
+pub mod toolbar;
