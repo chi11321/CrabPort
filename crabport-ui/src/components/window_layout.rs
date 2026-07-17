@@ -17,13 +17,14 @@ use crate::components::button::Button;
 /// `sidebar_width` lets each window pick its own width (Settings uses 180px,
 /// About uses 160px). The content pane is `flex_1` + `overflow_hidden`.
 ///
-/// On Windows/Linux a full-width `h_11` overlay at the top of the window is
-/// registered as a window-drag region (see [`WindowControlArea::Drag`]) so
-/// the user can move the window by grabbing any empty area of that strip,
-/// mirroring a native title bar. The window-control buttons (rendered by
-/// each window on top of this strip) call [`InteractiveElement::occlude_mouse`]
-/// so they keep working under Windows' `WM_NCHITTEST`. macOS is excluded —
-/// it already provides drag via the transparent system title bar.
+/// On Windows/Linux a `h_11` overlay at the top of the **content pane**
+/// (right of the sidebar — not full-width) is registered as a window-drag
+/// region (see [`WindowControlArea::Drag`]) so the user can move the window
+/// by grabbing any empty area of that strip, mirroring a native title bar.
+/// The window-control buttons (rendered by each window on top of this strip)
+/// call [`InteractiveElement::occlude_mouse`] so they keep working under
+/// Windows' `WM_NCHITTEST`. macOS is excluded — it already provides drag via
+/// the transparent system title bar.
 pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElement) -> Div {
     div()
         .size_full()
@@ -42,41 +43,44 @@ pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElemen
                 .min_w_0()
                 .h_full()
                 .overflow_hidden()
+                .relative()
                 .when(cfg!(target_os = "macos"), |el| el.bg(opaque_base_bg()))
-                .child(content),
+                .child(content)
+                // Top drag strip (Windows/Linux only), scoped to the
+                // content pane so the sidebar stays fully interactive.
+                // Painted behind the window-control buttons that each
+                // window overlays on top of it; those buttons
+                // `occlude_mouse` so their clicks win over this drag region
+                // under Windows' `WM_NCHITTEST`.
+                //
+                // `on_mouse_down`/`on_mouse_up` are only used on Linux
+                // (via `start_window_move` / `toggle_maximize`) — Windows
+                // handles drag + double-click-maximize natively once
+                // `WM_NCHITTEST` returns `HTCAPTION`. macOS isn't reached
+                // at all (see the `cfg` below).
+                .when(cfg!(not(target_os = "macos")), |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h_11()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |_: &MouseDownEvent, window, _cx| {
+                                    crate::components::window_controls::start_window_move(window);
+                                },
+                            )
+                            .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
+                                if event.click_count == 2 {
+                                    crate::components::window_controls::toggle_maximize(window);
+                                }
+                            }),
+                    )
+                }),
         )
-        // Top drag strip (Windows/Linux only). Painted behind the
-        // window-control buttons that each window overlays on top of it;
-        // those buttons `occlude_mouse` so their clicks win over this drag
-        // region under Windows' `WM_NCHITTEST`.
-        //
-        // Drag + double-click are wired to the cross-platform helpers in
-        // [`crate::components::window_controls`] — `start_window_move` is a
-        // no-op on macOS/Windows (those handle drag natively) and fires the
-        // compositor hand-off on Linux; `toggle_maximize` delegates to
-        // `titlebar_double_click` on macOS and to our explicit maximize/
-        // restore toggle on Windows/Linux. This strip isn't rendered on
-        // macOS at all (see the `cfg` below), so the macOS branch in those
-        // helpers only matters for the tab bar's drag region.
-        .when(cfg!(not(target_os = "macos")), |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h_11()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, _cx| {
-                        crate::components::window_controls::start_window_move(window);
-                    })
-                    .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
-                        if event.click_count == 2 {
-                            crate::components::window_controls::toggle_maximize(window);
-                        }
-                    }),
-            )
-        })
 }
 
 /// One tab entry in a sidebar — a label + an icon path (optional).
