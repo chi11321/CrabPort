@@ -53,5 +53,5 @@ members = [
 # we intentionally do NOT set `[package.metadata.bundle].version` so there
 # is nothing to keep in sync. Bumping a release only touches this one line.
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"

@@ -31,7 +31,14 @@ impl AppState {
     /// Open the store at the platform data directory and register the global.
     /// Called once from `main` during app bootstrap.
     pub fn init(cx: &mut App) {
-        let store = Store::open().expect("failed to open store");
+        tracing::info!("app_state: initializing store");
+        let store = match Store::open() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("app_state: failed to open store: {e}");
+                panic!("failed to open store: {e}");
+            }
+        };
         cx.set_global(Self {
             store: Arc::new(Mutex::new(store)),
         });

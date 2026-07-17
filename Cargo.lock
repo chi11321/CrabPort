@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "CrabPort"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crabport-core",
  "crabport-ui",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -1372,12 +1372,13 @@ dependencies = [
  "rusqlite",
  "serde",
  "toml 0.8.23",
+ "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "crabport-proxy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crabport-core",
  "rustls-pki-types",
@@ -1390,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-sftp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1404,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-ssh"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1426,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-telnet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
@@ -1440,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-terminal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
  "async-broadcast",
@@ -1455,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-tunnel"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crabport-core",
  "parking_lot",
@@ -1463,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
  "crabport-core",
@@ -3947,6 +3948,15 @@ dependencies = [
  "markup5ever",
  "tendril",
  "xml5ever",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -7286,9 +7296,13 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "thread_local",
+ "tracing",
  "tracing-core",
 ]
 

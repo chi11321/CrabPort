@@ -24,7 +24,6 @@ pub(crate) async fn sftp_download_impl(
     remote_path: &str,
     local_path: &str,
 ) -> anyhow::Result<()> {
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP download impl: remote={remote_path} local={local_path}");
     let (is_dir, original_size) = {
         let s = backend.take_or_open_sftp().await?;
@@ -267,7 +266,6 @@ pub(crate) async fn sftp_delete_impl(
     backend: &SftpTransferHandle,
     remote_path: &str,
 ) -> anyhow::Result<()> {
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP delete: remote={remote_path}");
     let s = backend.take_or_open_sftp().await?;
     let meta_res = s.metadata(remote_path).await;
@@ -309,7 +307,6 @@ pub(crate) async fn sftp_rename_impl(
     old_path: &str,
     new_path: &str,
 ) -> anyhow::Result<()> {
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP rename: old={old_path} new={new_path}");
     let s = backend.take_or_open_sftp().await?;
     let res = s.rename(old_path, new_path).await;
@@ -329,7 +326,6 @@ pub(crate) async fn sftp_edit_impl(
     backend: &SftpTransferHandle,
     remote_path: &str,
 ) -> anyhow::Result<()> {
-    #[cfg(debug_assertions)]
     tracing::info!("SFTP edit: remote={remote_path}");
 
     // Derive a unique local temp path that preserves the file's extension so
@@ -398,7 +394,6 @@ pub(crate) async fn sftp_edit_impl(
         };
         if cur_mtime != last_mtime {
             last_mtime = cur_mtime;
-            #[cfg(debug_assertions)]
             tracing::info!("SFTP edit: re-uploading {remote_path}");
             // Emit a Transfer-stage progress event so the toolbar shows
             // "uploading" while the save is in flight.
@@ -427,7 +422,6 @@ pub(crate) async fn sftp_edit_impl(
                     .await;
             }
             if let Err(e) = upload_result {
-                #[cfg(debug_assertions)]
                 tracing::warn!("SFTP edit: re-upload failed: {e}");
             }
         }
@@ -455,7 +449,6 @@ fn spawn_open(path: &str) {
             _ => false,
         };
         if !opened {
-            #[cfg(debug_assertions)]
             tracing::info!("SFTP edit: default open failed, trying text editor");
             // 2. `open -t` opens the file in the default text editor.
             let text = std::process::Command::new("open")
@@ -467,7 +460,6 @@ fn spawn_open(path: &str) {
                 _ => false,
             };
             if !opened {
-                #[cfg(debug_assertions)]
                 tracing::info!("SFTP edit: text editor open failed, trying TextEdit");
                 // 3. Last resort: explicitly use TextEdit.
                 let te = std::process::Command::new("open")
@@ -475,7 +467,6 @@ fn spawn_open(path: &str) {
                     .arg(path)
                     .status();
                 if let Err(e) = te {
-                    #[cfg(debug_assertions)]
                     tracing::warn!("SFTP edit: failed to launch TextEdit: {e}");
                 }
             }
@@ -496,7 +487,6 @@ fn spawn_open(path: &str) {
 
     #[cfg(not(target_os = "macos"))]
     if let Err(e) = spawn_result {
-        #[cfg(debug_assertions)]
         tracing::warn!("SFTP edit: failed to launch editor: {e}");
     }
 }

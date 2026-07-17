@@ -90,6 +90,7 @@ impl Store {
 
     /// Open (or create) the store at a custom directory.
     pub fn open_at(dir: PathBuf) -> Result<Self, StoreError> {
+        tracing::info!("store: opening at {}", dir.display());
         fs::create_dir_all(&dir).map_err(|e| StoreError::Io(e.to_string()))?;
 
         let db_path = dir.join("crabport.db");
@@ -107,6 +108,7 @@ impl Store {
             enc_key,
         };
         store.migrate()?;
+        tracing::info!("store: opened {}", db_path.display());
         Ok(store)
     }
 
@@ -222,9 +224,15 @@ impl Store {
             // if the column already exists (e.g. a fresh DB that ran
             // migration 3 with the column included), this errors and we
             // ignore it.
-            let _ = self.db.execute_batch(
-                "ALTER TABLE command_history ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
-            );
+            let _ = self
+                .db
+                .execute_batch(
+                    "ALTER TABLE command_history ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+                )
+                .map_err(|e| {
+                    tracing::warn!("store: migration 5 (command_history.updated_at) failed: {e}");
+                    e
+                });
         }
 
         // Migration 6: add `proxies` table + `proxy_id` FK on `hosts`.
@@ -287,7 +295,10 @@ impl Store {
         if current < 8 {
             let _ = self.db.execute_batch(
                 "ALTER TABLE credentials ADD COLUMN private_key_kind TEXT NOT NULL DEFAULT 'Content';",
-            );
+            ).map_err(|e| {
+                tracing::warn!("store: migration 8 (credentials.private_key_kind) failed: {e}");
+                e
+            });
         }
 
         // Migration 9: favorites + grouping.
@@ -344,9 +355,15 @@ impl Store {
         // the SSH shell starts or the Telnet TCP connection is established.
         // Empty string (the column default) means no startup command.
         if current < 11 {
-            let _ = self.db.execute_batch(
-                "ALTER TABLE hosts ADD COLUMN startup_command TEXT NOT NULL DEFAULT '';",
-            );
+            let _ = self
+                .db
+                .execute_batch(
+                    "ALTER TABLE hosts ADD COLUMN startup_command TEXT NOT NULL DEFAULT '';",
+                )
+                .map_err(|e| {
+                    tracing::warn!("store: migration 11 (hosts.startup_command) failed: {e}");
+                    e
+                });
         }
 
         // Record the latest migration version

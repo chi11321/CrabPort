@@ -276,12 +276,10 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         match event {
             Event::Wakeup => {
-                #[cfg(debug_assertions)]
                 tracing::debug!("EventProxy: Wakeup event received");
                 let _ = self.wakeup_tx.try_broadcast(());
             }
             _ => {
-                #[cfg(debug_assertions)]
                 tracing::debug!("EventProxy: Other event {:?}", event);
                 let _ = self.wakeup_tx.try_broadcast(());
             }
@@ -418,7 +416,6 @@ impl TerminalSession {
                 match rx.recv().await {
                     Ok(event) => match event {
                         BackendEvent::Data(data) => {
-                            #[cfg(debug_assertions)]
                             tracing::debug!("session: received {} bytes", data.len());
                             // Batch-drain: hold the term lock once and advance all
                             // currently-queued chunks. Cuts lock churn and wakeup
@@ -455,7 +452,6 @@ impl TerminalSession {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                         BackendEvent::Closed => {
-                            #[cfg(debug_assertions)]
                             tracing::info!("session: backend closed");
                             let _ = wakeup_tx.try_broadcast(());
                             break;
@@ -484,7 +480,6 @@ impl TerminalSession {
                         }
                     },
                     Err(_e) => {
-                        #[cfg(debug_assertions)]
                         tracing::warn!("session: recv error: {:?}", _e);
                         let _ = wakeup_tx.try_broadcast(());
                         break;

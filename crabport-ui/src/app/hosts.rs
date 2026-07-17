@@ -24,8 +24,19 @@ impl CrabportApp {
     pub fn connect_to_host(&mut self, host_id: i64, cx: &mut Context<Self>) {
         let host = match self.hosts.iter().find(|h| h.id == host_id) {
             Some(h) => h.clone(),
-            None => return,
+            None => {
+                tracing::warn!("connect_to_host: host_id={host_id} not found in memory");
+                return;
+            }
         };
+        tracing::info!(
+            "connect_to_host: id={} name={:?} kind={:?} {}:{}",
+            host.id,
+            host.name,
+            host.kind,
+            host.host,
+            host.port
+        );
 
         // Update last_login timestamp
         let _ = AppState::store(cx).lock().touch_host_login(host_id);
@@ -266,7 +277,6 @@ impl CrabportApp {
                 .flatten()
                 .map(|cfg| (pid, cfg))
         });
-        #[cfg(debug_assertions)]
         tracing::info!(
             "edit_host: host_id={}, host.proxy_id={:?}, resolved_saved_proxy={}",
             h.id,
@@ -300,7 +310,6 @@ impl CrabportApp {
         form.on_connect = Some(Rc::new({
             let app = app.clone();
             move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
-                #[cfg(debug_assertions)]
                 tracing::info!(
                     "edit_host: on_connect fired — editing_proxy_id={:?}",
                     editing_proxy_id
@@ -326,7 +335,6 @@ impl CrabportApp {
                         startup_command,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
-                        #[cfg(debug_assertions)]
                         tracing::info!(
                             "edit_host: reading form — proxy_kind={:?}, form.proxy_id={:?}, proxy_url={:?}",
                             f.proxy_kind,
@@ -403,7 +411,6 @@ impl CrabportApp {
                             .and_then(|f| f.group_id),
                         startup_command: startup_command.clone(),
                     };
-                    #[cfg(debug_assertions)]
                     tracing::info!(
                         "edit_host: on_connect — editing_proxy_id={:?}, resolved_entry.proxy_id={:?}",
                         editing_proxy_id,

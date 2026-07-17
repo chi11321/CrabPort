@@ -1375,12 +1375,10 @@ fn trigger_upload(
             Ok(Ok(Some(paths))) => Some(paths),
             Ok(Ok(None)) => None,
             Ok(Err(_e)) => {
-                #[cfg(debug_assertions)]
                 tracing::warn!("SFTP upload: file picker error: {_e}");
                 None
             }
             Err(_e) => {
-                #[cfg(debug_assertions)]
                 tracing::warn!("SFTP upload: picker channel closed: {_e}");
                 None
             }

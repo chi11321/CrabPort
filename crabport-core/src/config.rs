@@ -618,8 +618,17 @@ impl From<toml::ser::Error> for ConfigError {
 
 /// Process-wide configuration handle. Initialized on first access from the
 /// on-disk `config.toml` (or defaults if the file does not exist yet).
-pub static CONFIG: LazyLock<Arc<RwLock<CrabPortConfig>>> =
-    LazyLock::new(|| Arc::new(RwLock::new(load().unwrap_or_default())));
+pub static CONFIG: LazyLock<Arc<RwLock<CrabPortConfig>>> = LazyLock::new(|| {
+    match load() {
+        Ok(cfg) => Arc::new(RwLock::new(cfg)),
+        Err(e) => {
+            // Don't panic — the app can still run on defaults. Log so the
+            // user has a chance to notice a corrupted config.toml.
+            tracing::warn!("config: failed to load config.toml ({e}) — using defaults");
+            Arc::new(RwLock::new(CrabPortConfig::default()))
+        }
+    }
+});
 
 // ---------------------------------------------------------------------------
 // Path helpers

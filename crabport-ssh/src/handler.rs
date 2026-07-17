@@ -75,7 +75,6 @@ impl client::Handler for SshHandler {
         if let Some(store) = &self.known_hosts {
             match store.lookup(&self.host, self.port, &algo, &fingerprint) {
                 Ok(LookupResult::Matched) => {
-                    #[cfg(debug_assertions)]
                     tracing::debug!(
                         "SSH: known_hosts match for {}:{} ({} {})",
                         self.host,
@@ -179,7 +178,6 @@ impl client::Handler for SshHandler {
         {
             Some(t) => t,
             None => {
-                #[cfg(debug_assertions)]
                 tracing::warn!(
                     "SSH: reverse forward hit with no registered target for {}:{} \
                      (originator {}:{}) — dropping channel",
@@ -193,7 +191,6 @@ impl client::Handler for SshHandler {
             }
         };
 
-        #[cfg(debug_assertions)]
         tracing::debug!(
             "SSH: reverse forward {}:{} -> {}:{} (originator {}:{})",
             connected_address,
@@ -214,7 +211,6 @@ impl client::Handler for SshHandler {
             let tcp = match TcpStream::connect((target_host.as_str(), target_port)).await {
                 Ok(s) => s,
                 Err(e) => {
-                    #[cfg(debug_assertions)]
                     tracing::warn!(
                         "SSH: reverse forward bridge — connect to {}:{} failed ({e})",
                         target_host,
@@ -262,7 +258,6 @@ pub(crate) async fn bridge(channel: russh::Channel<Msg>, tcp: TcpStream) {
     tokio::join!(
         async {
             if let Err(e) = tokio::io::copy(&mut ch_rx, &mut tcp_tx).await {
-                #[cfg(debug_assertions)]
                 tracing::debug!("SSH: bridge channel->tcp copy ended with error: {e}");
             }
             // Signal EOF on the tcp write side so the peer sees a clean close.
@@ -270,7 +265,6 @@ pub(crate) async fn bridge(channel: russh::Channel<Msg>, tcp: TcpStream) {
         },
         async {
             if let Err(e) = tokio::io::copy(&mut tcp_rx, &mut ch_tx).await {
-                #[cfg(debug_assertions)]
                 tracing::debug!("SSH: bridge tcp->channel copy ended with error: {e}");
             }
             // Signal EOF on the channel write side.
