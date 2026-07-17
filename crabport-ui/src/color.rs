@@ -129,84 +129,126 @@ impl Theme {
     /// bad value in `config.toml` can't brick the UI.
     pub fn from_config(cfg: &ThemeConfig) -> Self {
         let fallback = ThemeConfig::modern_dark();
+        // `$cfg` is an expression yielding `&String`; `$fb` is the matching
+        // modern-dark field. Unparseable `cfg` value → fall back to `fb`,
+        // which itself must parse (panicking here surfaces a build-time bug
+        // in the modern-dark preset rather than silently rendering black).
         macro_rules! p {
-            ($field:ident) => {
-                parse_hex(&cfg.$field).unwrap_or_else(|| {
-                    parse_hex(&fallback.$field).expect("modern-dark preset must parse")
-                })
+            ($cfg:expr, $fb:expr) => {
+                parse_hex($cfg)
+                    .unwrap_or_else(|| parse_hex($fb).expect("modern-dark preset must parse"))
             };
         }
         Self {
-            bg_base: p!(bg_base),
-            bg_sidebar: p!(bg_sidebar),
-            bg_tab_bar: p!(bg_tab_bar),
-            border: p!(border),
-            surface_hover: p!(surface_hover),
-            surface_active: p!(surface_active),
-            text_primary: p!(text_primary),
-            text_muted: p!(text_muted),
-            tab_btn_bg: p!(tab_btn_bg),
-            tab_btn_bg_hover: p!(tab_btn_bg_hover),
-            tab_btn_bg_selected: p!(tab_btn_bg_selected),
-            tab_btn_bg_pressed: p!(tab_btn_bg_pressed),
-            tab_btn_bg_disabled: p!(tab_btn_bg_disabled),
-            tab_btn_border: p!(tab_btn_border),
-            tab_btn_text_disabled: p!(tab_btn_text_disabled),
-            btn_bg: p!(btn_bg),
-            btn_bg_hover: p!(btn_bg_hover),
-            btn_bg_selected: p!(btn_bg_selected),
-            btn_bg_pressed: p!(btn_bg_pressed),
-            btn_bg_disabled: p!(btn_bg_disabled),
-            btn_border: p!(btn_border),
-            btn_text_disabled: p!(btn_text_disabled),
-            btn_primary_bg: p!(btn_primary_bg),
-            btn_primary_bg_hover: p!(btn_primary_bg_hover),
-            btn_primary_bg_selected: p!(btn_primary_bg_selected),
-            btn_primary_bg_disabled: p!(btn_primary_bg_disabled),
-            btn_primary_border: p!(btn_primary_border),
-            btn_primary_text_disabled: p!(btn_primary_text_disabled),
-            btn_ghost_bg: p!(btn_ghost_bg),
-            btn_ghost_bg_hover: p!(btn_ghost_bg_hover),
-            btn_ghost_bg_selected: p!(btn_ghost_bg_selected),
-            btn_ghost_bg_disabled: p!(btn_ghost_bg_disabled),
-            btn_ghost_border: p!(btn_ghost_border),
-            btn_ghost_text_disabled: p!(btn_ghost_text_disabled),
-            input_bg: p!(input_bg),
-            input_bg_focused: p!(input_bg_focused),
-            input_bg_disabled: p!(input_bg_disabled),
-            input_text_disabled: p!(input_text_disabled),
-            input_border: p!(input_border),
-            input_border_hover: p!(input_border_hover),
-            input_border_focused: p!(input_border_focused),
-            input_border_error: p!(input_border_error),
-            input_placeholder: p!(input_placeholder),
-            input_selection: p!(input_selection),
-            command_overlay: p!(command_overlay),
-            command_bg: p!(command_bg),
-            command_border: p!(command_border),
-            command_item_hover: p!(command_item_hover),
-            command_item_active: p!(command_item_active),
-            command_group_label: p!(command_group_label),
-            term_fg: p!(term_fg),
-            term_bg: p!(term_bg),
-            term_cursor: p!(term_cursor),
-            term_black: p!(term_black),
-            term_red: p!(term_red),
-            term_green: p!(term_green),
-            term_yellow: p!(term_yellow),
-            term_blue: p!(term_blue),
-            term_magenta: p!(term_magenta),
-            term_cyan: p!(term_cyan),
-            term_white: p!(term_white),
-            term_bright_black: p!(term_bright_black),
-            term_bright_red: p!(term_bright_red),
-            term_bright_green: p!(term_bright_green),
-            term_bright_yellow: p!(term_bright_yellow),
-            term_bright_blue: p!(term_bright_blue),
-            term_bright_magenta: p!(term_bright_magenta),
-            term_bright_cyan: p!(term_bright_cyan),
-            term_bright_white: p!(term_bright_white),
-            selection_bg: p!(selection_bg),
+            bg_base: p!(&cfg.base.bg_base, &fallback.base.bg_base),
+            bg_sidebar: p!(&cfg.base.bg_sidebar, &fallback.base.bg_sidebar),
+            bg_tab_bar: p!(&cfg.base.bg_tab_bar, &fallback.base.bg_tab_bar),
+            border: p!(&cfg.border.border, &fallback.border.border),
+            surface_hover: p!(&cfg.surface.surface_hover, &fallback.surface.surface_hover),
+            surface_active: p!(
+                &cfg.surface.surface_active,
+                &fallback.surface.surface_active
+            ),
+            text_primary: p!(&cfg.text.text_primary, &fallback.text.text_primary),
+            text_muted: p!(&cfg.text.text_muted, &fallback.text.text_muted),
+            tab_btn_bg: p!(&cfg.tab_button.bg, &fallback.tab_button.bg),
+            tab_btn_bg_hover: p!(&cfg.tab_button.bg_hover, &fallback.tab_button.bg_hover),
+            tab_btn_bg_selected: p!(
+                &cfg.tab_button.bg_selected,
+                &fallback.tab_button.bg_selected
+            ),
+            tab_btn_bg_pressed: p!(&cfg.tab_button.bg_pressed, &fallback.tab_button.bg_pressed),
+            tab_btn_bg_disabled: p!(
+                &cfg.tab_button.bg_disabled,
+                &fallback.tab_button.bg_disabled
+            ),
+            tab_btn_border: p!(&cfg.tab_button.border, &fallback.tab_button.border),
+            tab_btn_text_disabled: p!(
+                &cfg.tab_button.text_disabled,
+                &fallback.tab_button.text_disabled
+            ),
+            btn_bg: p!(&cfg.button.bg, &fallback.button.bg),
+            btn_bg_hover: p!(&cfg.button.bg_hover, &fallback.button.bg_hover),
+            btn_bg_selected: p!(&cfg.button.bg_selected, &fallback.button.bg_selected),
+            btn_bg_pressed: p!(&cfg.button.bg_pressed, &fallback.button.bg_pressed),
+            btn_bg_disabled: p!(&cfg.button.bg_disabled, &fallback.button.bg_disabled),
+            btn_border: p!(&cfg.button.border, &fallback.button.border),
+            btn_text_disabled: p!(&cfg.button.text_disabled, &fallback.button.text_disabled),
+            btn_primary_bg: p!(&cfg.button_primary.bg, &fallback.button_primary.bg),
+            btn_primary_bg_hover: p!(
+                &cfg.button_primary.bg_hover,
+                &fallback.button_primary.bg_hover
+            ),
+            btn_primary_bg_selected: p!(
+                &cfg.button_primary.bg_selected,
+                &fallback.button_primary.bg_selected
+            ),
+            btn_primary_bg_disabled: p!(
+                &cfg.button_primary.bg_disabled,
+                &fallback.button_primary.bg_disabled
+            ),
+            btn_primary_border: p!(&cfg.button_primary.border, &fallback.button_primary.border),
+            btn_primary_text_disabled: p!(
+                &cfg.button_primary.text_disabled,
+                &fallback.button_primary.text_disabled
+            ),
+            btn_ghost_bg: p!(&cfg.button_ghost.bg, &fallback.button_ghost.bg),
+            btn_ghost_bg_hover: p!(&cfg.button_ghost.bg_hover, &fallback.button_ghost.bg_hover),
+            btn_ghost_bg_selected: p!(
+                &cfg.button_ghost.bg_selected,
+                &fallback.button_ghost.bg_selected
+            ),
+            btn_ghost_bg_disabled: p!(
+                &cfg.button_ghost.bg_disabled,
+                &fallback.button_ghost.bg_disabled
+            ),
+            btn_ghost_border: p!(&cfg.button_ghost.border, &fallback.button_ghost.border),
+            btn_ghost_text_disabled: p!(
+                &cfg.button_ghost.text_disabled,
+                &fallback.button_ghost.text_disabled
+            ),
+            input_bg: p!(&cfg.input.bg, &fallback.input.bg),
+            input_bg_focused: p!(&cfg.input.bg_focused, &fallback.input.bg_focused),
+            input_bg_disabled: p!(&cfg.input.bg_disabled, &fallback.input.bg_disabled),
+            input_text_disabled: p!(&cfg.input.text_disabled, &fallback.input.text_disabled),
+            input_border: p!(&cfg.input.border, &fallback.input.border),
+            input_border_hover: p!(&cfg.input.border_hover, &fallback.input.border_hover),
+            input_border_focused: p!(&cfg.input.border_focused, &fallback.input.border_focused),
+            input_border_error: p!(&cfg.input.border_error, &fallback.input.border_error),
+            input_placeholder: p!(&cfg.input.placeholder, &fallback.input.placeholder),
+            input_selection: p!(&cfg.input.selection, &fallback.input.selection),
+            command_overlay: p!(&cfg.command.overlay, &fallback.command.overlay),
+            command_bg: p!(&cfg.command.bg, &fallback.command.bg),
+            command_border: p!(&cfg.command.border, &fallback.command.border),
+            command_item_hover: p!(&cfg.command.item_hover, &fallback.command.item_hover),
+            command_item_active: p!(&cfg.command.item_active, &fallback.command.item_active),
+            command_group_label: p!(&cfg.command.group_label, &fallback.command.group_label),
+            term_fg: p!(&cfg.terminal.fg, &fallback.terminal.fg),
+            term_bg: p!(&cfg.terminal.bg, &fallback.terminal.bg),
+            term_cursor: p!(&cfg.terminal.cursor, &fallback.terminal.cursor),
+            term_black: p!(&cfg.terminal.black, &fallback.terminal.black),
+            term_red: p!(&cfg.terminal.red, &fallback.terminal.red),
+            term_green: p!(&cfg.terminal.green, &fallback.terminal.green),
+            term_yellow: p!(&cfg.terminal.yellow, &fallback.terminal.yellow),
+            term_blue: p!(&cfg.terminal.blue, &fallback.terminal.blue),
+            term_magenta: p!(&cfg.terminal.magenta, &fallback.terminal.magenta),
+            term_cyan: p!(&cfg.terminal.cyan, &fallback.terminal.cyan),
+            term_white: p!(&cfg.terminal.white, &fallback.terminal.white),
+            term_bright_black: p!(&cfg.terminal.bright_black, &fallback.terminal.bright_black),
+            term_bright_red: p!(&cfg.terminal.bright_red, &fallback.terminal.bright_red),
+            term_bright_green: p!(&cfg.terminal.bright_green, &fallback.terminal.bright_green),
+            term_bright_yellow: p!(
+                &cfg.terminal.bright_yellow,
+                &fallback.terminal.bright_yellow
+            ),
+            term_bright_blue: p!(&cfg.terminal.bright_blue, &fallback.terminal.bright_blue),
+            term_bright_magenta: p!(
+                &cfg.terminal.bright_magenta,
+                &fallback.terminal.bright_magenta
+            ),
+            term_bright_cyan: p!(&cfg.terminal.bright_cyan, &fallback.terminal.bright_cyan),
+            term_bright_white: p!(&cfg.terminal.bright_white, &fallback.terminal.bright_white),
+            selection_bg: p!(&cfg.selection.bg, &fallback.selection.bg),
         }
     }
 }
@@ -357,9 +399,32 @@ pub fn refresh_theme() {
 /// Apply a preset by id and persist it. Convenience wrapper for the Settings
 /// window: writes the preset to config, refreshes the cache, and returns the
 /// new theme so the caller can drive a global repaint.
+///
+/// Kept for backwards-compat with callers that only know the built-in
+/// preset ids; new code should prefer [`apply_theme`] which resolves any
+/// id (built-in OR custom) via the theme catalog.
 pub fn apply_preset(id: &str) -> Theme {
     let _ = config::update(|cfg| {
         cfg.appearance.theme = ThemeConfig::preset(id);
+    });
+    refresh_theme();
+    theme()
+}
+
+/// Apply a theme by id (built-in OR custom) and persist it. Resolves `id`
+/// via the [`crate::theme`] catalog — which merges the embedded built-in
+/// themes with user-supplied `.toml` files from `{data_dir}/crabport/themes/`
+/// — writes the resolved [`ThemeConfig`] to `config.toml`, refreshes the
+/// cached parsed [`Theme`], and returns the new parsed theme so the caller
+/// can drive a global repaint.
+///
+/// Unknown ids fall back to `modern-dark` (see [`crate::theme::get`]), so a
+/// stale `config.toml` referencing a deleted custom theme can never break
+/// the UI.
+pub fn apply_theme(id: &str) -> Theme {
+    let cfg = crate::theme::get(id);
+    let _ = config::update(|c| {
+        c.appearance.theme = cfg;
     });
     refresh_theme();
     theme()

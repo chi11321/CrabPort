@@ -268,13 +268,16 @@ impl SettingsWindow {
             0
         };
 
-        // Map the persisted theme preset name to a dropdown index. Unknown
-        // names (e.g. a hand-edited config.toml) fall back to the default.
-        let presets = crabport_core::config::ThemeConfig::PRESETS;
+        // Theme dropdown is built from the merged catalog (built-in +
+        // user-supplied `.toml` files under {data_dir}/crabport/themes/).
+        // See `crate::theme`. The catalog is refreshed on startup and whenever
+        // the user adds/removes a theme file — but we only snapshot it once
+        // per render here (and clone the id list into the on_change closure).
+        let themes = crate::theme::list();
         let current_name = config::snapshot().appearance.theme.name;
-        let theme_idx = presets
+        let theme_idx = themes
             .iter()
-            .position(|p| *p == current_name.as_str())
+            .position(|t| t.id == current_name.as_str())
             .unwrap_or(0);
 
         // Lazily build the font family list on first render.
@@ -311,10 +314,11 @@ impl SettingsWindow {
         let theme_dropdown = {
             let h_for_toggle = handle.clone();
             let h_for_change = handle.clone();
-            Dropdown::new("settings-theme")
-                .item(t!("window.settings.appearance.theme_modern_dark"))
-                .item(t!("window.settings.appearance.theme_mocha"))
-                .item(t!("window.settings.appearance.theme_tokyo_night"))
+            let mut dropdown = Dropdown::new("settings-theme");
+            for t in &themes {
+                dropdown = dropdown.item_with_value(t.dropdown_label(), t.id.clone());
+            }
+            dropdown
                 .selected(theme_idx)
                 .is_open(self.theme_dropdown_open)
                 .on_toggle(move |_w, cx| {
@@ -324,10 +328,14 @@ impl SettingsWindow {
                     });
                 })
                 .on_change(move |idx, _w, cx| {
-                    let id = presets.get(idx).copied().unwrap_or("modern-dark");
-                    let _ = config::update(|cfg| {
-                        cfg.appearance.theme = crabport_core::config::ThemeConfig::preset(id);
-                    });
+                    // `idx` is the position in the catalog snapshot captured
+                    // above; resolve it back to an id via the same list, then
+                    // apply via the catalog (handles built-in + custom).
+                    let id = themes
+                        .get(idx)
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| "modern-dark".to_string());
+                    crate::color::apply_theme(&id);
                     crate::refresh_theme_with(cx);
                     h_for_change.update(cx, |view, cx| {
                         view.theme_dropdown_open = false;

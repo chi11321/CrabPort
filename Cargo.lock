@@ -1486,6 +1486,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "ureq",
  "windows 0.61.3",
