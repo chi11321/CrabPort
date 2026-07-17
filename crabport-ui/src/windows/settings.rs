@@ -107,10 +107,16 @@ impl SettingsWindow {
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(720.0), px(820.0)), cx)),
-            #[cfg(target_os = "macos")]
+            // See `app::open_main_window` for the per-platform titlebar
+            // rationale. `appears_transparent: true` is required on Windows
+            // (not just macOS) to actually strip the system title bar;
+            // the GPUI default leaves it visible. The `title` is kept on
+            // every platform so the taskbar / window switcher / Expose all
+            // show "Settings" instead of a blank name.
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.settings.title").to_string().into()),
                 appears_transparent: true,
+                #[cfg(target_os = "macos")]
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
@@ -268,13 +274,16 @@ impl SettingsWindow {
             0
         };
 
-        // Map the persisted theme preset name to a dropdown index. Unknown
-        // names (e.g. a hand-edited config.toml) fall back to the default.
-        let presets = crabport_core::config::ThemeConfig::PRESETS;
+        // Theme dropdown is built from the merged catalog (built-in +
+        // user-supplied `.toml` files under {data_dir}/crabport/themes/).
+        // See `crate::theme`. The catalog is refreshed on startup and whenever
+        // the user adds/removes a theme file — but we only snapshot it once
+        // per render here (and clone the id list into the on_change closure).
+        let themes = crate::theme::list();
         let current_name = config::snapshot().appearance.theme.name;
-        let theme_idx = presets
+        let theme_idx = themes
             .iter()
-            .position(|p| *p == current_name.as_str())
+            .position(|t| t.id == current_name.as_str())
             .unwrap_or(0);
 
         // Lazily build the font family list on first render.
@@ -311,10 +320,11 @@ impl SettingsWindow {
         let theme_dropdown = {
             let h_for_toggle = handle.clone();
             let h_for_change = handle.clone();
-            Dropdown::new("settings-theme")
-                .item(t!("window.settings.appearance.theme_modern_dark"))
-                .item(t!("window.settings.appearance.theme_mocha"))
-                .item(t!("window.settings.appearance.theme_tokyo_night"))
+            let mut dropdown = Dropdown::new("settings-theme");
+            for t in &themes {
+                dropdown = dropdown.item_with_value(t.dropdown_label(), t.id.clone());
+            }
+            dropdown
                 .selected(theme_idx)
                 .is_open(self.theme_dropdown_open)
                 .on_toggle(move |_w, cx| {
@@ -324,10 +334,14 @@ impl SettingsWindow {
                     });
                 })
                 .on_change(move |idx, _w, cx| {
-                    let id = presets.get(idx).copied().unwrap_or("modern-dark");
-                    let _ = config::update(|cfg| {
-                        cfg.appearance.theme = crabport_core::config::ThemeConfig::preset(id);
-                    });
+                    // `idx` is the position in the catalog snapshot captured
+                    // above; resolve it back to an id via the same list, then
+                    // apply via the catalog (handles built-in + custom).
+                    let id = themes
+                        .get(idx)
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| "modern-dark".to_string());
+                    crate::color::apply_theme(&id);
                     crate::refresh_theme_with(cx);
                     h_for_change.update(cx, |view, cx| {
                         view.theme_dropdown_open = false;
@@ -671,6 +685,17 @@ impl Render for SettingsWindow {
             SettingsTab::General => self.render_general_pane(cx).into_any_element(),
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
             SettingsTab::Keybinds => self.render_keybinds_pane(cx).into_any_element(),
+        };
+
+        // The content pane is overlapped at the top by the `h_11` (44px)
+        // client-side window controls strip on Windows/Linux. Push content
+        // down by that height so the first section header isn't hidden under
+        // the buttons. macOS uses the native title bar and renders no
+        // overlap, so no padding is added there.
+        let content = if HAS_CLIENT_CONTROLS {
+            div().pt_6().h_full().child(content).into_any_element()
+        } else {
+            content
         };
 
         render_sidebar_window(

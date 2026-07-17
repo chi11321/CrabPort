@@ -929,12 +929,19 @@ fn tunnel_row(
                     .divider_after();
 
                     let mut items = vec![toggle_item, favorite_item];
-                    items.push(ContextMenuItem::new(t!("tunnels.edit").to_string(), {
-                        let on_edit = on_edit.clone();
-                        move |w, cx| {
-                            on_edit(w, cx);
-                        }
-                    }));
+                    items.push(
+                        ContextMenuItem::new(t!("tunnels.edit").to_string(), {
+                            let on_edit = on_edit.clone();
+                            move |w, cx| {
+                                on_edit(w, cx);
+                            }
+                        })
+                        // Disable Edit while the tunnel is running — editing the
+                        // bind/target of a live forward would silently
+                        // diverge from the active session, so require Stop
+                        // first.
+                        .disabled(tunnel_running),
+                    );
                     items.push(
                         ContextMenuItem::new(t!("tunnels.delete").to_string(), {
                             let on_remove = on_remove.clone();
@@ -968,7 +975,11 @@ fn tunnel_row(
                                 });
                             }
                         })
-                        .danger(true),
+                        .danger(true)
+                        // Disable Delete while the tunnel is running —
+                        // deleting a live forward would leave the underlying
+                        // SSH session/channel dangling. Require Stop first.
+                        .disabled(tunnel_running),
                     );
 
                     c.show(

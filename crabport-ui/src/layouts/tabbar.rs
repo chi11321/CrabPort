@@ -55,10 +55,37 @@ pub fn render_tab_bar(
         .border_b_1()
         .border_color(rgb(border()))
         .relative()
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, _cx| {
+            // Cross-platform: on Linux this fires `_NET_WM_MOVERESIZE` /
+            // `xdg_toplevel._move`; on macOS/Windows it's a no-op (those
+            // platforms handle drag natively — see the doc comment in
+            // `window_controls::start_window_move`).
+            crate::components::window_controls::start_window_move(window);
+        })
         .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
             if event.click_count == 2 {
-                window.titlebar_double_click();
+                // Cross-platform: macOS delegates to `titlebar_double_click`
+                // (respects `AppleActionOnDoubleClick`), Windows/Linux use
+                // our explicit maximize/restore toggle. See the doc comment
+                // in `window_controls::toggle_maximize`.
+                crate::components::window_controls::toggle_maximize(window);
             }
+        })
+        // Register the whole tab bar as a window-drag region on
+        // Windows/Linux so the user can drag the window by grabbing any
+        // empty area of the bar (left gutter, gaps between tabs, gap
+        // before the `+` button, gap before the window controls) —
+        // mirroring how a native title bar behaves. Buttons (tabs,
+        // `+`, window controls) call [`InteractiveElement::occlude_mouse`]
+        // so their hitboxes block this drag-region hitbox beneath them,
+        // keeping their clicks working under Windows' `WM_NCHITTEST`.
+        //
+        // macOS is excluded because `window_control_area` is a no-op
+        // there (GPUI's `on_hit_test_window_control` is empty on
+        // macOS) — macOS already provides drag via the transparent
+        // system title bar + `traffic_light_position`.
+        .when(cfg!(not(target_os = "macos")), |el| {
+            el.window_control_area(WindowControlArea::Drag)
         })
         // --- Scrollable tabs layer -----------------------------------------
         // Occupies the full tab-bar width but is inset on the right by
@@ -133,6 +160,11 @@ pub fn render_tab_bar(
                                     .border_0()
                                     .px_3()
                                     .text_sm()
+                                    // Block the tab-bar drag region beneath
+                                    // the tab so clicking the tab activates it
+                                    // instead of starting a window drag on
+                                    // Windows/Linux.
+                                    .occlude_mouse()
                                     .on_click(move |_e, _w, cx| {
                                         h2.update(cx, |app, _| {
                                             app.activate_tab(tab_id);
@@ -181,6 +213,10 @@ pub fn render_tab_bar(
                         .border_0()
                         .px_0()
                         .text_sm()
+                        // Block the tab-bar drag region beneath the `+`
+                        // button so clicking it opens the command palette
+                        // instead of starting a window drag on Windows/Linux.
+                        .occlude_mouse()
                         .on_click(move |_e, w, cx| {
                             h.update(cx, |app, cx| {
                                 let cmd = app.app_ctx.command_palette.clone();
@@ -192,7 +228,7 @@ pub fn render_tab_bar(
                         }),
                 )
                 .when(HAS_CLIENT_CONTROLS, |el| {
-                    el.child(WindowControls::new("main"))
+                    el.child(WindowControls::new("main").with_aux_buttons(true))
                 }),
         )
 }

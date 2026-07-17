@@ -93,8 +93,23 @@ impl KeybindConfig {
     }
 }
 
+/// Default UI locale used when `config.toml` doesn't pin one yet
+/// (fresh install, or the field was removed). Resolves to the current OS
+/// locale when it's a Chinese variant, otherwise falls back to `en` —
+/// the two locales CrabPort ships translations for.
+///
+/// This only runs for *missing* `locale` fields thanks to the
+/// `#[serde(default = "default_locale")]` attribute, so an explicit user
+/// choice in Settings (which is persisted immediately) always wins, and
+/// existing `config.toml` files that already pin `locale = "en"` are left
+/// untouched.
 fn default_locale() -> String {
-    "en".to_string()
+    let sys = sys_locale::get_locale().unwrap_or_default();
+    if sys.to_lowercase().starts_with("zh") {
+        "zh-CN".to_string()
+    } else {
+        "en".to_string()
+    }
 }
 
 impl Default for AppearanceConfig {
@@ -180,111 +195,117 @@ pub fn default_terminal_font_family() -> &'static str {
 
 /// Color theme stored under `[appearance.theme]` in `config.toml`.
 ///
-/// Every field is a hex string (`"#rrggbb"`, `"rrggbb"`, or `"#rrggbbaa"`
-/// for colors that need an alpha channel) so the file stays diff-friendly
-/// and editable by hand. The UI parses them into `u32` via
-/// `crabport_ui::color::Theme::from_config`.
+/// The theme is split into nested sub-tables mirroring the UI's logical
+/// color groups (`[theme.base]`, `[theme.surface]`, `[theme.text]`,
+/// `[theme.button]`, `[theme.button_primary]`, `[theme.button_ghost]`,
+/// `[theme.tab_button]`, `[theme.input]`, `[theme.command]`,
+/// `[theme.terminal]`, `[theme.selection]`) — same two-level structure the
+/// i18n files use. This keeps a hand-edited `config.toml` scannable and lets
+/// a user override just one group (e.g. `[theme.terminal]`) while the rest
+/// fall back to the modern-dark defaults.
+///
+/// Every leaf color is a hex string (`"#rrggbb"`, `"rrggbb"`, or
+/// `"#rrggbbaa"` for colors that need an alpha channel) so the file stays
+/// diff-friendly. The UI parses them into `u32` via
+/// `crabport_ui::color::Theme::from_config`, which falls back to the
+/// modern-dark value for any empty / malformed string — so a `#[serde(default)]`
+/// that yields an empty `String` is always safe (no per-field default fns
+/// needed).
 ///
 /// `Default` is the built-in "modern-dark" palette — a refined, slightly
 /// cool neutral dark with an indigo accent. Other presets are available via
 /// [`ThemeConfig::mocha`] / [`ThemeConfig::tokyo_night`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ThemeConfig {
-    /// Preset name label (informational; does not affect rendering).
+    /// Preset name label — also the theme id used by the catalog and the
+    /// Settings dropdown. Informational for rendering, but round-trips
+    /// through `config.toml` so the selected theme survives restarts.
     #[serde(default = "ThemeConfig::default_name")]
     pub name: String,
 
-    // -- Base --------------------------------------------------------------
-    pub bg_base: String,
-    pub bg_sidebar: String,
-    pub bg_tab_bar: String,
+    /// Base window backgrounds (root, sidebar, tab bar).
+    #[serde(default)]
+    pub base: ThemeBase,
+    /// Single shared border color used across most dividers.
+    #[serde(default)]
+    pub border: ThemeBorder,
+    /// Surface fills for hover / active states.
+    #[serde(default)]
+    pub surface: ThemeSurface,
+    /// Primary / muted text colors.
+    #[serde(default)]
+    pub text: ThemeText,
+    /// Default (non-primary, non-ghost) button colors.
+    #[serde(default)]
+    pub button: ThemeButton,
+    /// Primary (accent) button colors — the prominent CTA style.
+    #[serde(default)]
+    pub button_primary: ThemeButton,
+    /// Ghost (transparent / icon-only) button colors.
+    #[serde(default)]
+    pub button_ghost: ThemeButton,
+    /// Tab button colors (the sidebar/tab-bar pill buttons).
+    #[serde(default)]
+    pub tab_button: ThemeButton,
+    /// Input field colors (text inputs, dropdowns, textareas).
+    #[serde(default)]
+    pub input: ThemeInput,
+    /// Command palette overlay + items.
+    #[serde(default)]
+    pub command: ThemeCommand,
+    /// Terminal ANSI 16-color palette + fg/bg/cursor.
+    #[serde(default)]
+    pub terminal: ThemeTerminal,
+    /// Text selection background.
+    #[serde(default)]
+    pub selection: ThemeSelection,
+}
 
-    // -- Border ------------------------------------------------------------
-    pub border: String,
+/// Define a theme sub-group struct.
+///
+/// Generates a `#[derive(Clone, Debug, Serialize, Deserialize, Default)]`
+/// struct with one `pub` `String` field per listed name, each annotated
+/// `#[serde(default)]` (empty string). An empty leaf is harmless because
+/// `Theme::from_config` falls back to the modern-dark value for any string
+/// that fails to parse as hex — so we don't need 50 per-field `default =
+/// "..."` functions, just one `Default` derive per group.
+macro_rules! theme_group {
+    ($name:ident; $($field:ident),+ $(,)?) => {
+        #[derive(Clone, Debug, Serialize, Deserialize, Default)]
+        pub struct $name {
+            $(
+                #[serde(default)]
+                pub $field: String,
+            )+
+        }
+    };
+}
 
-    // -- Surface -----------------------------------------------------------
-    pub surface_hover: String,
-    pub surface_active: String,
+theme_group!(ThemeBase; bg_base, bg_sidebar, bg_tab_bar);
+theme_group!(ThemeBorder; border);
+theme_group!(ThemeSurface; surface_hover, surface_active);
+theme_group!(ThemeText; text_primary, text_muted);
+theme_group!(ThemeButton; bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled);
+theme_group!(ThemeInput; bg, bg_focused, bg_disabled, text_disabled, border, border_hover, border_focused, border_error, placeholder, selection);
+theme_group!(ThemeCommand; overlay, bg, border, item_hover, item_active, group_label);
+theme_group!(ThemeTerminal; fg, bg, cursor, black, red, green, yellow, blue, magenta, cyan, white, bright_black, bright_red, bright_green, bright_yellow, bright_blue, bright_magenta, bright_cyan, bright_white);
+theme_group!(ThemeSelection; bg);
 
-    // -- Text --------------------------------------------------------------
-    pub text_primary: String,
-    pub text_muted: String,
-
-    // -- Tab button (subtle, blends with sidebar/tabbar) ------------------
-    pub tab_btn_bg: String,
-    pub tab_btn_bg_hover: String,
-    pub tab_btn_bg_selected: String,
-    pub tab_btn_bg_pressed: String,
-    pub tab_btn_bg_disabled: String,
-    pub tab_btn_border: String,
-    pub tab_btn_text_disabled: String,
-
-    // -- Button (prominent) -----------------------------------------------
-    pub btn_bg: String,
-    pub btn_bg_hover: String,
-    pub btn_bg_selected: String,
-    pub btn_bg_pressed: String,
-    pub btn_bg_disabled: String,
-    pub btn_border: String,
-    pub btn_text_disabled: String,
-
-    // -- Button — primary (accent) ----------------------------------------
-    pub btn_primary_bg: String,
-    pub btn_primary_bg_hover: String,
-    pub btn_primary_bg_selected: String,
-    pub btn_primary_bg_disabled: String,
-    pub btn_primary_border: String,
-    pub btn_primary_text_disabled: String,
-
-    // -- Button — ghost (transparent, icon-only friendly) -----------------
-    pub btn_ghost_bg: String,
-    pub btn_ghost_bg_hover: String,
-    pub btn_ghost_bg_selected: String,
-    pub btn_ghost_bg_disabled: String,
-    pub btn_ghost_border: String,
-    pub btn_ghost_text_disabled: String,
-
-    // -- Input -------------------------------------------------------------
-    pub input_bg: String,
-    pub input_bg_focused: String,
-    pub input_bg_disabled: String,
-    pub input_text_disabled: String,
-    pub input_border: String,
-    pub input_border_hover: String,
-    pub input_border_focused: String,
-    pub input_border_error: String,
-    pub input_placeholder: String,
-    pub input_selection: String,
-
-    // -- Command palette ---------------------------------------------------
-    pub command_overlay: String,
-    pub command_bg: String,
-    pub command_border: String,
-    pub command_item_hover: String,
-    pub command_item_active: String,
-    pub command_group_label: String,
-
-    // -- Terminal ANSI palette --------------------------------------------
-    pub term_fg: String,
-    pub term_bg: String,
-    pub term_cursor: String,
-    pub term_black: String,
-    pub term_red: String,
-    pub term_green: String,
-    pub term_yellow: String,
-    pub term_blue: String,
-    pub term_magenta: String,
-    pub term_cyan: String,
-    pub term_white: String,
-    pub term_bright_black: String,
-    pub term_bright_red: String,
-    pub term_bright_green: String,
-    pub term_bright_yellow: String,
-    pub term_bright_blue: String,
-    pub term_bright_magenta: String,
-    pub term_bright_cyan: String,
-    pub term_bright_white: String,
-    pub selection_bg: String,
+/// Construct a theme sub-group from `field: "#hex"` pairs. Unlisted fields
+/// default to the empty string (via `..Default::default()`), which
+/// `Theme::from_config` substitutes with the modern-dark value — so a preset
+/// can omit fields it doesn't care about and inherit the default. Every
+/// preset below lists all fields anyway, so this is just a shorthand to drop
+/// the repeated `"#xxx".into()` boilerplate.
+macro_rules! tc {
+    ($group:ident; $($field:ident: $hex:literal),+ $(,)?) => {
+        $group {
+            $(
+                $field: $hex.into(),
+            )+
+            ..Default::default()
+        }
+    };
 }
 
 impl ThemeConfig {
@@ -320,87 +341,41 @@ impl ThemeConfig {
     pub fn modern_dark() -> Self {
         Self {
             name: "modern-dark".into(),
-            // Base
-            bg_base: "#14161c".into(),
-            bg_sidebar: "#0f1116".into(),
-            bg_tab_bar: "#0f1116".into(),
-            // Border
-            border: "#23262f".into(),
-            // Surface
-            surface_hover: "#1c1f27".into(),
-            surface_active: "#262a34".into(),
-            // Text
-            text_primary: "#e6e9ef".into(),
-            text_muted: "#8b90a0".into(),
-            // Tab button
-            tab_btn_bg: "#0f1116".into(),
-            tab_btn_bg_hover: "#1c1f27".into(),
-            tab_btn_bg_selected: "#262a34".into(),
-            tab_btn_bg_pressed: "#2e333f".into(),
-            tab_btn_bg_disabled: "#0a0c10".into(),
-            tab_btn_border: "#23262f".into(),
-            tab_btn_text_disabled: "#2e333f".into(),
-            // Button
-            btn_bg: "#262a34".into(),
-            btn_bg_hover: "#2e333f".into(),
-            btn_bg_selected: "#363b48".into(),
-            btn_bg_pressed: "#3f4452".into(),
-            btn_bg_disabled: "#14161c".into(),
-            btn_border: "#2e333f".into(),
-            btn_text_disabled: "#6b7080".into(),
-            // Button — primary (indigo)
-            btn_primary_bg: "#6366f1".into(),
-            btn_primary_bg_hover: "#4f46e5".into(),
-            btn_primary_bg_selected: "#4338ca".into(),
-            btn_primary_bg_disabled: "#312e81".into(),
-            btn_primary_border: "#6366f1".into(),
-            btn_primary_text_disabled: "#a5b4fc".into(),
-            // Button — ghost
-            btn_ghost_bg: "#00000000".into(),
-            btn_ghost_bg_hover: "#2e333fff".into(),
-            btn_ghost_bg_selected: "#262a34ff".into(),
-            btn_ghost_bg_disabled: "#00000000".into(),
-            btn_ghost_border: "#00000000".into(),
-            btn_ghost_text_disabled: "#6b7080ff".into(),
-            // Input
-            input_bg: "#0f1116".into(),
-            input_bg_focused: "#14161c".into(),
-            input_bg_disabled: "#0a0c10".into(),
-            input_text_disabled: "#2e333f".into(),
-            input_border: "#23262f".into(),
-            input_border_hover: "#2e333f".into(),
-            input_border_focused: "#818cf8".into(),
-            input_border_error: "#f87171".into(),
-            input_placeholder: "#6b7080".into(),
-            input_selection: "#818cf833".into(),
-            // Command
-            command_overlay: "#00000050".into(),
-            command_bg: "#14161c".into(),
-            command_border: "#23262f".into(),
-            command_item_hover: "#1c1f27".into(),
-            command_item_active: "#262a34".into(),
-            command_group_label: "#6b7080".into(),
-            // Terminal ANSI
-            term_fg: "#e6e9ef".into(),
-            term_bg: "#14161c".into(),
-            term_cursor: "#c8cce4".into(),
-            term_black: "#2e333f".into(),
-            term_red: "#f87171".into(),
-            term_green: "#4ade80".into(),
-            term_yellow: "#facc15".into(),
-            term_blue: "#818cf8".into(),
-            term_magenta: "#e879f9".into(),
-            term_cyan: "#22d3ee".into(),
-            term_white: "#c1c5d0".into(),
-            term_bright_black: "#6b7080".into(),
-            term_bright_red: "#f87171".into(),
-            term_bright_green: "#4ade80".into(),
-            term_bright_yellow: "#facc15".into(),
-            term_bright_blue: "#818cf8".into(),
-            term_bright_magenta: "#e879f9".into(),
-            term_bright_cyan: "#22d3ee".into(),
-            term_bright_white: "#e6e9ef".into(),
-            selection_bg: "#6b7080".into(),
+            base: tc!(ThemeBase;
+                bg_base: "#14161c", bg_sidebar: "#0f1116", bg_tab_bar: "#0f1116"),
+            border: tc!(ThemeBorder; border: "#23262f"),
+            surface: tc!(ThemeSurface; surface_hover: "#1c1f27", surface_active: "#262a34"),
+            text: tc!(ThemeText; text_primary: "#e6e9ef", text_muted: "#8b90a0"),
+            button: tc!(ThemeButton;
+                bg: "#262a34", bg_hover: "#2e333f", bg_selected: "#363b48",
+                bg_pressed: "#3f4452", bg_disabled: "#14161c",
+                border: "#2e333f", text_disabled: "#6b7080"),
+            button_primary: tc!(ThemeButton;
+                bg: "#6366f1", bg_hover: "#4f46e5", bg_selected: "#4338ca",
+                bg_disabled: "#312e81", border: "#6366f1", text_disabled: "#a5b4fc"),
+            button_ghost: tc!(ThemeButton;
+                bg: "#00000000", bg_hover: "#2e333fff", bg_selected: "#262a34ff",
+                bg_disabled: "#00000000", border: "#00000000", text_disabled: "#6b7080ff"),
+            tab_button: tc!(ThemeButton;
+                bg: "#0f1116", bg_hover: "#1c1f27", bg_selected: "#262a34",
+                bg_pressed: "#2e333f", bg_disabled: "#0a0c10",
+                border: "#23262f", text_disabled: "#2e333f"),
+            input: tc!(ThemeInput;
+                bg: "#0f1116", bg_focused: "#14161c", bg_disabled: "#0a0c10",
+                text_disabled: "#2e333f", border: "#23262f", border_hover: "#2e333f",
+                border_focused: "#818cf8", border_error: "#f87171",
+                placeholder: "#6b7080", selection: "#818cf833"),
+            command: tc!(ThemeCommand;
+                overlay: "#00000050", bg: "#14161c", border: "#23262f",
+                item_hover: "#1c1f27", item_active: "#262a34", group_label: "#6b7080"),
+            terminal: tc!(ThemeTerminal;
+                fg: "#e6e9ef", bg: "#14161c", cursor: "#c8cce4",
+                black: "#2e333f", red: "#f87171", green: "#4ade80", yellow: "#facc15",
+                blue: "#818cf8", magenta: "#e879f9", cyan: "#22d3ee", white: "#c1c5d0",
+                bright_black: "#6b7080", bright_red: "#f87171", bright_green: "#4ade80",
+                bright_yellow: "#facc15", bright_blue: "#818cf8", bright_magenta: "#e879f9",
+                bright_cyan: "#22d3ee", bright_white: "#e6e9ef"),
+            selection: tc!(ThemeSelection; bg: "#6b7080"),
         }
     }
 
@@ -408,76 +383,41 @@ impl ThemeConfig {
     pub fn mocha() -> Self {
         Self {
             name: "mocha".into(),
-            bg_base: "#1e1e2e".into(),
-            bg_sidebar: "#181825".into(),
-            bg_tab_bar: "#181825".into(),
-            border: "#313244".into(),
-            surface_hover: "#24273a".into(),
-            surface_active: "#313244".into(),
-            text_primary: "#cdd6f4".into(),
-            text_muted: "#585b70".into(),
-            tab_btn_bg: "#181825".into(),
-            tab_btn_bg_hover: "#24273a".into(),
-            tab_btn_bg_selected: "#313244".into(),
-            tab_btn_bg_pressed: "#45475a".into(),
-            tab_btn_bg_disabled: "#11111b".into(),
-            tab_btn_border: "#313244".into(),
-            tab_btn_text_disabled: "#45475a".into(),
-            btn_bg: "#313244".into(),
-            btn_bg_hover: "#45475a".into(),
-            btn_bg_selected: "#585b70".into(),
-            btn_bg_pressed: "#6c7086".into(),
-            btn_bg_disabled: "#1e1e2e".into(),
-            btn_border: "#45475a".into(),
-            btn_text_disabled: "#585b70".into(),
-            btn_primary_bg: "#3b82f6".into(),
-            btn_primary_bg_hover: "#2563eb".into(),
-            btn_primary_bg_selected: "#1d4ed8".into(),
-            btn_primary_bg_disabled: "#1e3a5f".into(),
-            btn_primary_border: "#3b82f6".into(),
-            btn_primary_text_disabled: "#93c5fd".into(),
-            btn_ghost_bg: "#00000000".into(),
-            btn_ghost_bg_hover: "#45475aff".into(),
-            btn_ghost_bg_selected: "#313244ff".into(),
-            btn_ghost_bg_disabled: "#00000000".into(),
-            btn_ghost_border: "#00000000".into(),
-            btn_ghost_text_disabled: "#585b70ff".into(),
-            input_bg: "#181825".into(),
-            input_bg_focused: "#1e1e2e".into(),
-            input_bg_disabled: "#11111b".into(),
-            input_text_disabled: "#45475a".into(),
-            input_border: "#313244".into(),
-            input_border_hover: "#45475a".into(),
-            input_border_focused: "#89b4fa".into(),
-            input_border_error: "#ef4444".into(),
-            input_placeholder: "#585b70".into(),
-            input_selection: "#89b4fa33".into(),
-            command_overlay: "#00000050".into(),
-            command_bg: "#1e1e2e".into(),
-            command_border: "#313244".into(),
-            command_item_hover: "#24273a".into(),
-            command_item_active: "#313244".into(),
-            command_group_label: "#585b70".into(),
-            term_fg: "#cdd6f4".into(),
-            term_bg: "#1e1e2e".into(),
-            term_cursor: "#f5e0dc".into(),
-            term_black: "#45475a".into(),
-            term_red: "#f38ba8".into(),
-            term_green: "#a6e3a1".into(),
-            term_yellow: "#f9e2af".into(),
-            term_blue: "#89b4fa".into(),
-            term_magenta: "#f5c2e7".into(),
-            term_cyan: "#94e2d5".into(),
-            term_white: "#bac2de".into(),
-            term_bright_black: "#585b70".into(),
-            term_bright_red: "#f38ba8".into(),
-            term_bright_green: "#a6e3a1".into(),
-            term_bright_yellow: "#f9e2af".into(),
-            term_bright_blue: "#89b4fa".into(),
-            term_bright_magenta: "#f5c2e7".into(),
-            term_bright_cyan: "#94e2d5".into(),
-            term_bright_white: "#a6adc8".into(),
-            selection_bg: "#585b70".into(),
+            base: tc!(ThemeBase;
+                bg_base: "#1e1e2e", bg_sidebar: "#181825", bg_tab_bar: "#181825"),
+            border: tc!(ThemeBorder; border: "#313244"),
+            surface: tc!(ThemeSurface; surface_hover: "#24273a", surface_active: "#313244"),
+            text: tc!(ThemeText; text_primary: "#cdd6f4", text_muted: "#585b70"),
+            button: tc!(ThemeButton;
+                bg: "#313244", bg_hover: "#45475a", bg_selected: "#585b70",
+                bg_pressed: "#6c7086", bg_disabled: "#1e1e2e",
+                border: "#45475a", text_disabled: "#585b70"),
+            button_primary: tc!(ThemeButton;
+                bg: "#3b82f6", bg_hover: "#2563eb", bg_selected: "#1d4ed8",
+                bg_disabled: "#1e3a5f", border: "#3b82f6", text_disabled: "#93c5fd"),
+            button_ghost: tc!(ThemeButton;
+                bg: "#00000000", bg_hover: "#45475aff", bg_selected: "#313244ff",
+                bg_disabled: "#00000000", border: "#00000000", text_disabled: "#585b70ff"),
+            tab_button: tc!(ThemeButton;
+                bg: "#181825", bg_hover: "#24273a", bg_selected: "#313244",
+                bg_pressed: "#45475a", bg_disabled: "#11111b",
+                border: "#313244", text_disabled: "#45475a"),
+            input: tc!(ThemeInput;
+                bg: "#181825", bg_focused: "#1e1e2e", bg_disabled: "#11111b",
+                text_disabled: "#45475a", border: "#313244", border_hover: "#45475a",
+                border_focused: "#89b4fa", border_error: "#ef4444",
+                placeholder: "#585b70", selection: "#89b4fa33"),
+            command: tc!(ThemeCommand;
+                overlay: "#00000050", bg: "#1e1e2e", border: "#313244",
+                item_hover: "#24273a", item_active: "#313244", group_label: "#585b70"),
+            terminal: tc!(ThemeTerminal;
+                fg: "#cdd6f4", bg: "#1e1e2e", cursor: "#f5e0dc",
+                black: "#45475a", red: "#f38ba8", green: "#a6e3a1", yellow: "#f9e2af",
+                blue: "#89b4fa", magenta: "#f5c2e7", cyan: "#94e2d5", white: "#bac2de",
+                bright_black: "#585b70", bright_red: "#f38ba8", bright_green: "#a6e3a1",
+                bright_yellow: "#f9e2af", bright_blue: "#89b4fa", bright_magenta: "#f5c2e7",
+                bright_cyan: "#94e2d5", bright_white: "#a6adc8"),
+            selection: tc!(ThemeSelection; bg: "#585b70"),
         }
     }
 
@@ -485,76 +425,41 @@ impl ThemeConfig {
     pub fn tokyo_night() -> Self {
         Self {
             name: "tokyo-night".into(),
-            bg_base: "#1a1b26".into(),
-            bg_sidebar: "#16161e".into(),
-            bg_tab_bar: "#16161e".into(),
-            border: "#2a2b3d".into(),
-            surface_hover: "#1f2335".into(),
-            surface_active: "#292e42".into(),
-            text_primary: "#c0caf5".into(),
-            text_muted: "#565f89".into(),
-            tab_btn_bg: "#16161e".into(),
-            tab_btn_bg_hover: "#1f2335".into(),
-            tab_btn_bg_selected: "#292e42".into(),
-            tab_btn_bg_pressed: "#3b4261".into(),
-            tab_btn_bg_disabled: "#101014".into(),
-            tab_btn_border: "#2a2b3d".into(),
-            tab_btn_text_disabled: "#3b4261".into(),
-            btn_bg: "#292e42".into(),
-            btn_bg_hover: "#3b4261".into(),
-            btn_bg_selected: "#414868".into(),
-            btn_bg_pressed: "#4c5375".into(),
-            btn_bg_disabled: "#1a1b26".into(),
-            btn_border: "#3b4261".into(),
-            btn_text_disabled: "#565f89".into(),
-            btn_primary_bg: "#7aa2f7".into(),
-            btn_primary_bg_hover: "#89b4fa".into(),
-            btn_primary_bg_selected: "#6183bb".into(),
-            btn_primary_bg_disabled: "#2e3a5f".into(),
-            btn_primary_border: "#7aa2f7".into(),
-            btn_primary_text_disabled: "#b4c5e8".into(),
-            btn_ghost_bg: "#00000000".into(),
-            btn_ghost_bg_hover: "#3b4261ff".into(),
-            btn_ghost_bg_selected: "#292e42ff".into(),
-            btn_ghost_bg_disabled: "#00000000".into(),
-            btn_ghost_border: "#00000000".into(),
-            btn_ghost_text_disabled: "#565f89ff".into(),
-            input_bg: "#16161e".into(),
-            input_bg_focused: "#1a1b26".into(),
-            input_bg_disabled: "#101014".into(),
-            input_text_disabled: "#3b4261".into(),
-            input_border: "#2a2b3d".into(),
-            input_border_hover: "#3b4261".into(),
-            input_border_focused: "#7aa2f7".into(),
-            input_border_error: "#f7768e".into(),
-            input_placeholder: "#565f89".into(),
-            input_selection: "#7aa2f733".into(),
-            command_overlay: "#00000050".into(),
-            command_bg: "#1a1b26".into(),
-            command_border: "#2a2b3d".into(),
-            command_item_hover: "#1f2335".into(),
-            command_item_active: "#292e42".into(),
-            command_group_label: "#565f89".into(),
-            term_fg: "#c0caf5".into(),
-            term_bg: "#1a1b26".into(),
-            term_cursor: "#c0caf5".into(),
-            term_black: "#414868".into(),
-            term_red: "#f7768e".into(),
-            term_green: "#9ece6a".into(),
-            term_yellow: "#e0af68".into(),
-            term_blue: "#7aa2f7".into(),
-            term_magenta: "#bb9af7".into(),
-            term_cyan: "#7dcfff".into(),
-            term_white: "#a9b1d6".into(),
-            term_bright_black: "#565f89".into(),
-            term_bright_red: "#f7768e".into(),
-            term_bright_green: "#9ece6a".into(),
-            term_bright_yellow: "#e0af68".into(),
-            term_bright_blue: "#7aa2f7".into(),
-            term_bright_magenta: "#bb9af7".into(),
-            term_bright_cyan: "#7dcfff".into(),
-            term_bright_white: "#c0caf5".into(),
-            selection_bg: "#33467c".into(),
+            base: tc!(ThemeBase;
+                bg_base: "#1a1b26", bg_sidebar: "#16161e", bg_tab_bar: "#16161e"),
+            border: tc!(ThemeBorder; border: "#2a2b3d"),
+            surface: tc!(ThemeSurface; surface_hover: "#1f2335", surface_active: "#292e42"),
+            text: tc!(ThemeText; text_primary: "#c0caf5", text_muted: "#565f89"),
+            button: tc!(ThemeButton;
+                bg: "#292e42", bg_hover: "#3b4261", bg_selected: "#414868",
+                bg_pressed: "#4c5375", bg_disabled: "#1a1b26",
+                border: "#3b4261", text_disabled: "#565f89"),
+            button_primary: tc!(ThemeButton;
+                bg: "#7aa2f7", bg_hover: "#89b4fa", bg_selected: "#6183bb",
+                bg_disabled: "#2e3a5f", border: "#7aa2f7", text_disabled: "#b4c5e8"),
+            button_ghost: tc!(ThemeButton;
+                bg: "#00000000", bg_hover: "#3b4261ff", bg_selected: "#292e42ff",
+                bg_disabled: "#00000000", border: "#00000000", text_disabled: "#565f89ff"),
+            tab_button: tc!(ThemeButton;
+                bg: "#16161e", bg_hover: "#1f2335", bg_selected: "#292e42",
+                bg_pressed: "#3b4261", bg_disabled: "#101014",
+                border: "#2a2b3d", text_disabled: "#3b4261"),
+            input: tc!(ThemeInput;
+                bg: "#16161e", bg_focused: "#1a1b26", bg_disabled: "#101014",
+                text_disabled: "#3b4261", border: "#2a2b3d", border_hover: "#3b4261",
+                border_focused: "#7aa2f7", border_error: "#f7768e",
+                placeholder: "#565f89", selection: "#7aa2f733"),
+            command: tc!(ThemeCommand;
+                overlay: "#00000050", bg: "#1a1b26", border: "#2a2b3d",
+                item_hover: "#1f2335", item_active: "#292e42", group_label: "#565f89"),
+            terminal: tc!(ThemeTerminal;
+                fg: "#c0caf5", bg: "#1a1b26", cursor: "#c0caf5",
+                black: "#414868", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+                blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+                bright_black: "#565f89", bright_red: "#f7768e", bright_green: "#9ece6a",
+                bright_yellow: "#e0af68", bright_blue: "#7aa2f7", bright_magenta: "#bb9af7",
+                bright_cyan: "#7dcfff", bright_white: "#c0caf5"),
+            selection: tc!(ThemeSelection; bg: "#33467c"),
         }
     }
 }
@@ -691,4 +596,53 @@ pub fn update<R>(f: impl FnOnce(&mut CrabPortConfig) -> R) -> Result<R, ConfigEr
 /// Convenience: take a read lock and clone the current config snapshot.
 pub fn snapshot() -> CrabPortConfig {
     CONFIG.read().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A nested `[theme.terminal]` table parses into the matching sub-struct,
+    /// and missing sub-tables fall back to empty strings (which `from_config`
+    /// later substitutes with the modern-dark value).
+    #[test]
+    fn nested_theme_partial_parses() {
+        let toml = r##"
+name = "my-theme"
+
+[terminal]
+fg = "#abcdef"
+bg = "#111111"
+"##;
+        let cfg: ThemeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.name, "my-theme");
+        assert_eq!(cfg.terminal.fg, "#abcdef");
+        assert_eq!(cfg.terminal.bg, "#111111");
+        // Missing group → empty default (from_config falls back to modern-dark).
+        assert_eq!(cfg.base.bg_base, "");
+        assert_eq!(cfg.button.bg, "");
+        assert_eq!(cfg.selection.bg, "");
+    }
+
+    /// Every built-in preset round-trips through TOML serialize → parse
+    /// without dropping a field. Catches typos in the `tc!` macro calls and
+    /// serde attribute regressions.
+    #[test]
+    fn presets_roundtrip() {
+        for preset in [
+            ThemeConfig::modern_dark(),
+            ThemeConfig::mocha(),
+            ThemeConfig::tokyo_night(),
+        ] {
+            let text = toml::to_string_pretty(&preset).unwrap();
+            let back: ThemeConfig = toml::from_str(&text).unwrap();
+            assert_eq!(preset.name, back.name);
+            assert_eq!(preset.base.bg_base, back.base.bg_base);
+            assert_eq!(preset.terminal.bright_white, back.terminal.bright_white);
+            assert_eq!(preset.selection.bg, back.selection.bg);
+            assert_eq!(preset.button_primary.bg, back.button_primary.bg);
+            assert_eq!(preset.tab_button.border, back.tab_button.border);
+            assert_eq!(preset.input.selection, back.input.selection);
+        }
+    }
 }

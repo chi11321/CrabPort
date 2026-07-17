@@ -29,6 +29,11 @@ ureq = { version = "3", features = ["json"] }
 semver = "1"
 serde = { version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
+# Used by `src/theme.rs` to parse user-supplied `.toml` theme files from the
+# data dir. `crabport-core` already depends on `toml` for `config.toml`, but
+# each crate must declare its own direct deps — re-exporting would muddy the
+# public surface.
+toml = "0.8"
 
 # Windows-only: needed by `components/window_controls.rs` to read the native
 # HWND out of a GPUI `Window` and call `ShowWindowAsync` for proper

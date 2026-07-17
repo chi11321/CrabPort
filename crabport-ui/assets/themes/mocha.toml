@@ -1,0 +1,99 @@
+# Catppuccin Mocha — the legacy palette, kept for continuity.
+# Structure mirrors `crabport_core::config::ThemeConfig`; see modern-dark.toml
+# for the group layout.
+
+name = "mocha"
+
+[base]
+bg_base = "#1e1e2e"
+bg_sidebar = "#181825"
+bg_tab_bar = "#181825"
+
+[border]
+border = "#313244"
+
+[surface]
+surface_hover = "#24273a"
+surface_active = "#313244"
+
+[text]
+text_primary = "#cdd6f4"
+text_muted = "#585b70"
+
+[button]
+bg = "#313244"
+bg_hover = "#45475a"
+bg_selected = "#585b70"
+bg_pressed = "#6c7086"
+bg_disabled = "#1e1e2e"
+border = "#45475a"
+text_disabled = "#585b70"
+
+[button_primary]
+bg = "#3b82f6"
+bg_hover = "#2563eb"
+bg_selected = "#1d4ed8"
+bg_disabled = "#1e3a5f"
+border = "#3b82f6"
+text_disabled = "#93c5fd"
+
+[button_ghost]
+bg = "#00000000"
+bg_hover = "#45475aff"
+bg_selected = "#313244ff"
+bg_disabled = "#00000000"
+border = "#00000000"
+text_disabled = "#585b70ff"
+
+[tab_button]
+bg = "#181825"
+bg_hover = "#24273a"
+bg_selected = "#313244"
+bg_pressed = "#45475a"
+bg_disabled = "#11111b"
+border = "#313244"
+text_disabled = "#45475a"
+
+[input]
+bg = "#181825"
+bg_focused = "#1e1e2e"
+bg_disabled = "#11111b"
+text_disabled = "#45475a"
+border = "#313244"
+border_hover = "#45475a"
+border_focused = "#89b4fa"
+border_error = "#ef4444"
+placeholder = "#585b70"
+selection = "#89b4fa33"
+
+[command]
+overlay = "#00000050"
+bg = "#1e1e2e"
+border = "#313244"
+item_hover = "#24273a"
+item_active = "#313244"
+group_label = "#585b70"
+
+[terminal]
+fg = "#cdd6f4"
+bg = "#1e1e2e"
+cursor = "#f5e0dc"
+black = "#45475a"
+red = "#f38ba8"
+green = "#a6e3a1"
+yellow = "#f9e2af"
+blue = "#89b4fa"
+magenta = "#f5c2e7"
+cyan = "#94e2d5"
+white = "#bac2de"
+bright_black = "#585b70"
+bright_red = "#f38ba8"
+bright_green = "#a6e3a1"
+bright_yellow = "#f9e2af"
+bright_blue = "#89b4fa"
+bright_magenta = "#f5c2e7"
+bright_cyan = "#94e2d5"
+bright_white = "#a6adc8"
+
+[selection]
+bg = "#585b70"

@@ -328,12 +328,25 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
     let divider_after = item.divider_after;
     let on_click = item.on_click.clone();
 
+    // Resolve the label color for the *current* state. NOTE: this value is
+    // also driven through `transition_when_else` below (not just set
+    // statically via `.text_color(...)`). `with_transition(row_id)` caches
+    // the element's style state on first render and replays `state.cur` on
+    // every subsequent render, overwriting any statically-set color — so a
+    // menu item that was disabled the first time it rendered (e.g. Edit on
+    // a running tunnel) would stay grey even after the menu is re-shown for
+    // a stopped tunnel, because the cache holds the old `text_muted`
+    // value. Driving it through `transition_when_else` makes the library
+    // aware of both branches and re-evaluates them on each render.
+    let primary_color = text_primary();
+    let muted_color = text_muted();
+    let danger_color = term_red();
     let label_color = if disabled {
-        text_muted()
+        muted_color
     } else if danger {
-        term_red()
+        danger_color
     } else {
-        text_primary()
+        primary_color
     };
 
     let row_id = ElementId::Name(format!("ctx-item-{}", idx).into());
@@ -347,7 +360,6 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         .py_0p5()
         .rounded(px(3.0))
         .text_xs()
-        .text_color(rgb(label_color))
         .bg(rgba(0x00000000))
         .when(!disabled, |el| {
             el.when_some(on_click, |el, cb| {
@@ -378,6 +390,21 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
                     el.bg(rgba(0x00000000))
                 }
             },
+        )
+        // Drive text_color through the transition system so the cached
+        // style state updates when `disabled` / `danger` change between
+        // successive menu shows for different rows (see note above).
+        // `transition_when_else` with identical durations on both branches
+        // means no visible animation — the color just snaps to the right
+        // value each render. We use three branches by nesting: the outer
+        // picks disabled vs not-disabled, and the not-disabled branch is
+        // further split into danger vs primary.
+        .transition_when_else(
+            disabled,
+            Duration::from_millis(0),
+            EaseInOutCubic,
+            move |state| state.text_color(rgb(muted_color)),
+            move |state| state.text_color(rgb(label_color)),
         );
 
     if divider_after {

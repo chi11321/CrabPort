@@ -86,10 +86,16 @@ impl AboutWindow {
         // tab has room for a scrollable text block + dependency list.
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
-            #[cfg(target_os = "macos")]
+            // See `app::open_main_window` for the per-platform titlebar
+            // rationale. `appears_transparent: true` is required on Windows
+            // (not just macOS) to actually strip the system title bar;
+            // the GPUI default leaves it visible. The `title` is kept on
+            // every platform so the taskbar / window switcher / Expose all
+            // show "About CrabPort" instead of a blank name.
             titlebar: Some(TitlebarOptions {
                 title: Some(t!("window.about.title").to_string().into()),
                 appears_transparent: true,
+                #[cfg(target_os = "macos")]
                 traffic_light_position: Some(point(px(12.0), px(14.0))),
                 ..Default::default()
             }),
@@ -260,6 +266,17 @@ impl Render for AboutWindow {
         let content: AnyElement = match self.tab {
             AboutTab::Version => self.render_version_pane().into_any_element(),
             AboutTab::License => self.render_license_pane(cx).into_any_element(),
+        };
+
+        // The content pane is overlapped at the top by the `h_11` (44px)
+        // client-side window controls strip on Windows/Linux. Push content
+        // down by that height so the first row of text/controls isn't
+        // hidden under the buttons. macOS uses the native title bar and
+        // renders no overlap, so no padding is added there.
+        let content = if HAS_CLIENT_CONTROLS {
+            div().pt_6().h_full().child(content).into_any_element()
+        } else {
+            content
         };
 
         render_sidebar_window(

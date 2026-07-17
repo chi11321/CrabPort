@@ -1,0 +1,99 @@
+# Tokyo Night — a popular cool-toned blue/indigo dark palette.
+# Structure mirrors `crabport_core::config::ThemeConfig`; see modern-dark.toml
+# for the group layout.
+
+name = "tokyo-night"
+
+[base]
+bg_base = "#1a1b26"
+bg_sidebar = "#16161e"
+bg_tab_bar = "#16161e"
+
+[border]
+border = "#2a2b3d"
+
+[surface]
+surface_hover = "#1f2335"
+surface_active = "#292e42"
+
+[text]
+text_primary = "#c0caf5"
+text_muted = "#565f89"
+
+[button]
+bg = "#292e42"
+bg_hover = "#3b4261"
+bg_selected = "#414868"
+bg_pressed = "#4c5375"
+bg_disabled = "#1a1b26"
+border = "#3b4261"
+text_disabled = "#565f89"
+
+[button_primary]
+bg = "#7aa2f7"
+bg_hover = "#89b4fa"
+bg_selected = "#6183bb"
+bg_disabled = "#2e3a5f"
+border = "#7aa2f7"
+text_disabled = "#b4c5e8"
+
+[button_ghost]
+bg = "#00000000"
+bg_hover = "#3b4261ff"
+bg_selected = "#292e42ff"
+bg_disabled = "#00000000"
+border = "#00000000"
+text_disabled = "#565f89ff"
+
+[tab_button]
+bg = "#16161e"
+bg_hover = "#1f2335"
+bg_selected = "#292e42"
+bg_pressed = "#3b4261"
+bg_disabled = "#101014"
+border = "#2a2b3d"
+text_disabled = "#3b4261"
+
+[input]
+bg = "#16161e"
+bg_focused = "#1a1b26"
+bg_disabled = "#101014"
+text_disabled = "#3b4261"
+border = "#2a2b3d"
+border_hover = "#3b4261"
+border_focused = "#7aa2f7"
+border_error = "#f7768e"
+placeholder = "#565f89"
+selection = "#7aa2f733"
+
+[command]
+overlay = "#00000050"
+bg = "#1a1b26"
+border = "#2a2b3d"
+item_hover = "#1f2335"
+item_active = "#292e42"
+group_label = "#565f89"
+
+[terminal]
+fg = "#c0caf5"
+bg = "#1a1b26"
+cursor = "#c0caf5"
+black = "#414868"
+red = "#f7768e"
+green = "#9ece6a"
+yellow = "#e0af68"
+blue = "#7aa2f7"
+magenta = "#bb9af7"
+cyan = "#7dcfff"
+white = "#a9b1d6"
+bright_black = "#565f89"
+bright_red = "#f7768e"
+bright_green = "#9ece6a"
+bright_yellow = "#e0af68"
+bright_blue = "#7aa2f7"
+bright_magenta = "#bb9af7"
+bright_cyan = "#7dcfff"
+bright_white = "#c0caf5"
+
+[selection]
+bg = "#33467c"

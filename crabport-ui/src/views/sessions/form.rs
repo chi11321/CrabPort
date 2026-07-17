@@ -635,285 +635,315 @@ fn render_dialog(
         )
         // Scrollable area: connection-type tabs. The `flex_1` + `min_h_0`
         // lets this region shrink when the dialog hits `max_h`, and
-        // `overflow_y_scrollbar` activates the scrollbar. The `.id()` is
-        // required by the Scrollable wrapper.
+        // `overflow_y_scrollbar` activates the scrollbar.
+        //
+        // IMPORTANT: the horizontal/bottom padding (px_6 / pb_4) lives on an
+        // INNER wrapper, NOT on this scroll element. The `Scrollable` wrapper
+        // (gpui-component) strips style off its direct element and reapplies
+        // it to the outer viewport div — if padding were set here, the
+        // scrollbar layer (which is absolutely positioned to fill the outer
+        // viewport) would span the padding region too, making its draggable
+        // track taller than the actual scroll area. That mismatch causes the
+        // thumb to overshoot: dragging to the bottom leaves a gap while wheel
+        // scrolling reaches the real bottom. Keeping padding on the inner
+        // child keeps the scrollbar track == scroll-area exactly.
         .child(
             div()
                 .id(ElementId::Name("conn-form-scroll".into()))
-                .px_6()
-                .pb_4()
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scrollbar()
                 .child(
-                    Tabs::new("conn-type-tabs")
-                        .active(active_type_index)
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.ssh").to_string(),
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    // Username (shared across auth types)
-                                    // Host + Port row
-                                    .child(render_host_port_row(
-                                        host_input.clone(),
-                                        port_input.clone(),
-                                        host_focused,
-                                        port_focused,
-                                        errors.host.clone(),
-                                    ))
-                                    // Username (shared across auth types)
-                                    .child(
-                                        div().child(
-                                            StyledInput::new("username", user_input.clone())
-                                                .label(t!("connection_form.username").to_string())
-                                                .focused(user_focused)
-                                                .when_some(errors.user.clone(), |el, e| {
-                                                    el.error(e)
-                                                }),
-                                        ),
-                                    )
-                                    .child(
-                                        Tabs::new("conn-auth-tabs")
-                                            .active(auth_active_index)
-                                            .pane(
-                                                TabPane::new(
-                                                    t!("connection_form.auth_password").to_string(),
-                                                    div().flex().flex_col().gap_4().child(
-                                                        StyledPasswordInput::new(
-                                                            "password",
-                                                            pass_input.clone(),
-                                                        )
-                                                        .label(
-                                                            t!("connection_form.password")
-                                                                .to_string(),
-                                                        )
-                                                        .focused(pass_focused)
-                                                        .when_some(errors.pass.clone(), |el, e| {
-                                                            el.error(e)
-                                                        }),
-                                                    ),
-                                                )
-                                                .height(px({
-                                                    if errors.pass.is_some() { 80.0 } else { 57.0 }
-                                                })),
-                                            )
-                                            .pane(
-                                                TabPane::new(
-                                                    t!("connection_form.auth_certificate")
-                                                        .to_string(),
-                                                    WithCertificateForm {
-                                                        passphrase_input,
-                                                        private_key_input,
-                                                        private_key_path_input,
-                                                        passphrase_focused,
-                                                        private_key_focused,
-                                                        private_key_path_focused,
-                                                        private_key_error: errors
-                                                            .private_key
-                                                            .clone(),
-                                                        app: app.clone(),
-                                                    },
-                                                )
-                                                .height(px({
-                                                    let has_err = errors.private_key.is_some();
-                                                    let pass_h = if has_err { 80.0 } else { 57.0 };
-                                                    let path_h = if has_err { 80.0 } else { 57.0 };
-                                                    let pk_h = if has_err { 148.0 } else { 125.0 };
-                                                    pass_h + 16.0 + path_h + 16.0 + pk_h
-                                                })),
-                                            )
-                                            .on_change({
-                                                let app = app.clone();
-                                                move |index, _w, cx| {
-                                                    app.update(cx, |app, cx| {
-                                                        if let Some(ref mut form) =
-                                                            app.connection_form
-                                                        {
-                                                            form.auth_kind = match index {
-                                                                0 => AuthKind::Password,
-                                                                _ => AuthKind::Certificate,
-                                                            };
-                                                            cx.notify();
+                    div().px_6().pb_4().child(
+                        Tabs::new("conn-type-tabs")
+                            .active(active_type_index)
+                            .pane(
+                                TabPane::new(
+                                    t!("new_connection.ssh").to_string(),
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_4()
+                                        // Username (shared across auth types)
+                                        // Host + Port row
+                                        .child(render_host_port_row(
+                                            host_input.clone(),
+                                            port_input.clone(),
+                                            host_focused,
+                                            port_focused,
+                                            errors.host.clone(),
+                                        ))
+                                        // Username (shared across auth types)
+                                        .child(
+                                            div().child(
+                                                StyledInput::new("username", user_input.clone())
+                                                    .label(
+                                                        t!("connection_form.username").to_string(),
+                                                    )
+                                                    .focused(user_focused)
+                                                    .when_some(errors.user.clone(), |el, e| {
+                                                        el.error(e)
+                                                    }),
+                                            ),
+                                        )
+                                        .child(
+                                            Tabs::new("conn-auth-tabs")
+                                                .active(auth_active_index)
+                                                .pane(
+                                                    TabPane::new(
+                                                        t!("connection_form.auth_password")
+                                                            .to_string(),
+                                                        div().flex().flex_col().gap_4().child(
+                                                            StyledPasswordInput::new(
+                                                                "password",
+                                                                pass_input.clone(),
+                                                            )
+                                                            .label(
+                                                                t!("connection_form.password")
+                                                                    .to_string(),
+                                                            )
+                                                            .focused(pass_focused)
+                                                            .when_some(
+                                                                errors.pass.clone(),
+                                                                |el, e| el.error(e),
+                                                            ),
+                                                        ),
+                                                    )
+                                                    .height(px({
+                                                        if errors.pass.is_some() {
+                                                            80.0
+                                                        } else {
+                                                            57.0
                                                         }
-                                                    });
-                                                }
-                                            }),
-                                    )
-                                    // Proxy tabs (None / System / Custom). Only
-                                    // Custom has content (a proxy URL input).
-                                    .child(WithProxyForm {
-                                        proxy_url_input: proxy_url_input.clone(),
-                                        proxy_url_focused,
-                                        proxy_kind,
-                                        proxy_url_error: errors.proxy_url.clone(),
-                                        app: app.clone(),
-                                    })
-                                    // Startup command — sent to the remote shell
-                                    // once the SSH session is ready.
-                                    .child(
-                                        StyledInput::new(
-                                            "ssh-startup-command",
-                                            startup_command_input.clone(),
+                                                    })),
+                                                )
+                                                .pane(
+                                                    TabPane::new(
+                                                        t!("connection_form.auth_certificate")
+                                                            .to_string(),
+                                                        WithCertificateForm {
+                                                            passphrase_input,
+                                                            private_key_input,
+                                                            private_key_path_input,
+                                                            passphrase_focused,
+                                                            private_key_focused,
+                                                            private_key_path_focused,
+                                                            private_key_error: errors
+                                                                .private_key
+                                                                .clone(),
+                                                            app: app.clone(),
+                                                        },
+                                                    )
+                                                    .height(px({
+                                                        let has_err = errors.private_key.is_some();
+                                                        let pass_h =
+                                                            if has_err { 80.0 } else { 57.0 };
+                                                        let path_h =
+                                                            if has_err { 80.0 } else { 57.0 };
+                                                        let pk_h =
+                                                            if has_err { 148.0 } else { 125.0 };
+                                                        pass_h + 16.0 + path_h + 16.0 + pk_h
+                                                    })),
+                                                )
+                                                .on_change({
+                                                    let app = app.clone();
+                                                    move |index, _w, cx| {
+                                                        app.update(cx, |app, cx| {
+                                                            if let Some(ref mut form) =
+                                                                app.connection_form
+                                                            {
+                                                                form.auth_kind = match index {
+                                                                    0 => AuthKind::Password,
+                                                                    _ => AuthKind::Certificate,
+                                                                };
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                }),
                                         )
-                                        .label(t!("connection_form.startup_command").to_string())
-                                        .multi_line(true)
-                                        .rows(3)
-                                        .focused(startup_command_focused),
-                                    ),
+                                        // Proxy tabs (None / System / Custom). Only
+                                        // Custom has content (a proxy URL input).
+                                        .child(WithProxyForm {
+                                            proxy_url_input: proxy_url_input.clone(),
+                                            proxy_url_focused,
+                                            proxy_kind,
+                                            proxy_url_error: errors.proxy_url.clone(),
+                                            app: app.clone(),
+                                        })
+                                        // Startup command — sent to the remote shell
+                                        // once the SSH session is ready.
+                                        .child(
+                                            StyledInput::new(
+                                                "ssh-startup-command",
+                                                startup_command_input.clone(),
+                                            )
+                                            .label(
+                                                t!("connection_form.startup_command").to_string(),
+                                            )
+                                            .multi_line(true)
+                                            .rows(3)
+                                            .focused(startup_command_focused),
+                                        ),
+                                )
+                                .height(px({
+                                    let field_h = |err: bool| if err { 80.0 } else { 57.0 };
+                                    let auth_pane = match auth_kind {
+                                        AuthKind::Password => field_h(errors.pass.is_some()),
+                                        AuthKind::Certificate => {
+                                            let has_err = errors.private_key.is_some();
+                                            let pass_h = field_h(has_err);
+                                            let path_h = field_h(has_err);
+                                            let pk_h = if has_err { 148.0 } else { 125.0 };
+                                            pass_h + 16.0 + path_h + 16.0 + pk_h
+                                        }
+                                    };
+                                    let auth_h = field_h(errors.host.is_some())
+                                        + 16.0
+                                        + field_h(errors.user.is_some())
+                                        + 16.0
+                                        + 35.0
+                                        + 8.0
+                                        + auth_pane;
+                                    let proxy_pane = if proxy_kind == ProxyKind::Custom {
+                                        field_h(errors.proxy_url.is_some())
+                                    } else {
+                                        0.0
+                                    };
+                                    let proxy_h = 16.0 + 21.0 + 4.0 + 35.0 + 8.0 + proxy_pane;
+                                    let startup_h = 16.0 + 85.0;
+                                    auth_h + proxy_h + startup_h
+                                })),
                             )
-                            .height(px({
-                                let field_h = |err: bool| if err { 80.0 } else { 57.0 };
-                                let auth_pane = match auth_kind {
-                                    AuthKind::Password => field_h(errors.pass.is_some()),
-                                    AuthKind::Certificate => {
-                                        let has_err = errors.private_key.is_some();
-                                        let pass_h = field_h(has_err);
-                                        let path_h = field_h(has_err);
-                                        let pk_h = if has_err { 148.0 } else { 125.0 };
-                                        pass_h + 16.0 + path_h + 16.0 + pk_h
-                                    }
-                                };
-                                let auth_h = field_h(errors.host.is_some())
-                                    + 16.0
-                                    + field_h(errors.user.is_some())
-                                    + 16.0
-                                    + 35.0
-                                    + 8.0
-                                    + auth_pane;
-                                let proxy_pane = if proxy_kind == ProxyKind::Custom {
-                                    field_h(errors.proxy_url.is_some())
-                                } else {
-                                    0.0
-                                };
-                                let proxy_h = 16.0 + 21.0 + 4.0 + 35.0 + 8.0 + proxy_pane;
-                                let startup_h = 16.0 + 85.0;
-                                auth_h + proxy_h + startup_h
-                            })),
-                        )
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.telnet").to_string(),
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    // Host + Port row
-                                    .child(render_host_port_row(
-                                        host_input.clone(),
-                                        port_input.clone(),
-                                        host_focused,
-                                        port_focused,
-                                        errors.host.clone(),
-                                    ))
-                                    // Username
-                                    .child(
-                                        div().child(
-                                            StyledInput::new("telnet-username", user_input.clone())
+                            .pane(
+                                TabPane::new(
+                                    t!("new_connection.telnet").to_string(),
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_4()
+                                        // Host + Port row
+                                        .child(render_host_port_row(
+                                            host_input.clone(),
+                                            port_input.clone(),
+                                            host_focused,
+                                            port_focused,
+                                            errors.host.clone(),
+                                        ))
+                                        // Username
+                                        .child(
+                                            div().child(
+                                                StyledInput::new(
+                                                    "telnet-username",
+                                                    user_input.clone(),
+                                                )
                                                 .label(t!("connection_form.username").to_string())
                                                 .focused(user_focused)
                                                 .when_some(errors.user.clone(), |el, e| {
                                                     el.error(e)
                                                 }),
-                                        ),
-                                    )
-                                    // Password
-                                    .child(
-                                        div().child(
-                                            StyledPasswordInput::new(
-                                                "telnet-password",
-                                                pass_input.clone(),
-                                            )
-                                            .label(t!("connection_form.password").to_string())
-                                            .focused(pass_focused)
-                                            .when_some(errors.pass.clone(), |el, e| el.error(e)),
-                                        ),
-                                    )
-                                    // Proxy tabs
-                                    .child(WithProxyForm {
-                                        proxy_url_input: proxy_url_input.clone(),
-                                        proxy_url_focused,
-                                        proxy_kind,
-                                        proxy_url_error: errors.proxy_url.clone(),
-                                        app: app.clone(),
-                                    })
-                                    // Startup command — sent after the telnet
-                                    // connection is established.
-                                    .child(
-                                        StyledInput::new(
-                                            "telnet-startup-command",
-                                            startup_command_input.clone(),
+                                            ),
                                         )
-                                        .label(t!("connection_form.startup_command").to_string())
-                                        .multi_line(true)
-                                        .rows(3)
-                                        .focused(startup_command_focused),
-                                    ),
+                                        // Password
+                                        .child(
+                                            div().child(
+                                                StyledPasswordInput::new(
+                                                    "telnet-password",
+                                                    pass_input.clone(),
+                                                )
+                                                .label(t!("connection_form.password").to_string())
+                                                .focused(pass_focused)
+                                                .when_some(errors.pass.clone(), |el, e| {
+                                                    el.error(e)
+                                                }),
+                                            ),
+                                        )
+                                        // Proxy tabs
+                                        .child(WithProxyForm {
+                                            proxy_url_input: proxy_url_input.clone(),
+                                            proxy_url_focused,
+                                            proxy_kind,
+                                            proxy_url_error: errors.proxy_url.clone(),
+                                            app: app.clone(),
+                                        })
+                                        // Startup command — sent after the telnet
+                                        // connection is established.
+                                        .child(
+                                            StyledInput::new(
+                                                "telnet-startup-command",
+                                                startup_command_input.clone(),
+                                            )
+                                            .label(
+                                                t!("connection_form.startup_command").to_string(),
+                                            )
+                                            .multi_line(true)
+                                            .rows(3)
+                                            .focused(startup_command_focused),
+                                        ),
+                                )
+                                .height(px({
+                                    let field_h = |err: bool| if err { 80.0 } else { 57.0 };
+                                    let proxy_pane = if proxy_kind == ProxyKind::Custom {
+                                        field_h(errors.proxy_url.is_some())
+                                    } else {
+                                        0.0
+                                    };
+                                    field_h(errors.host.is_some())
+                                        + 16.0
+                                        + field_h(errors.user.is_some())
+                                        + 16.0
+                                        + field_h(errors.pass.is_some())
+                                        + 16.0
+                                        + 21.0
+                                        + 4.0
+                                        + 35.0
+                                        + 8.0
+                                        + proxy_pane
+                                        + 16.0
+                                        + 85.0
+                                })),
                             )
-                            .height(px({
-                                let field_h = |err: bool| if err { 80.0 } else { 57.0 };
-                                let proxy_pane = if proxy_kind == ProxyKind::Custom {
-                                    field_h(errors.proxy_url.is_some())
-                                } else {
-                                    0.0
-                                };
-                                field_h(errors.host.is_some())
-                                    + 16.0
-                                    + field_h(errors.user.is_some())
-                                    + 16.0
-                                    + field_h(errors.pass.is_some())
-                                    + 16.0
-                                    + 21.0
-                                    + 4.0
-                                    + 35.0
-                                    + 8.0
-                                    + proxy_pane
-                                    + 16.0
-                                    + 85.0
-                            })),
-                        )
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.serial").to_string(),
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_sm()
-                                    .text_color(rgb(text_muted()))
-                                    .child(t!("connection_form.coming_soon").to_string()),
+                            .pane(
+                                TabPane::new(
+                                    t!("new_connection.serial").to_string(),
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_sm()
+                                        .text_color(rgb(text_muted()))
+                                        .child(t!("connection_form.coming_soon").to_string()),
+                                )
+                                .height(px(80.0)),
                             )
-                            .height(px(80.0)),
-                        )
-                        .on_change({
-                            let app = app.clone();
-                            move |index, w, cx| {
-                                app.update(cx, |app, cx| {
-                                    if let Some(ref mut form) = app.connection_form {
-                                        form.kind = match index {
-                                            0 => ConnectionKind::SSH,
-                                            1 => ConnectionKind::Telnet,
-                                            _ => ConnectionKind::Serial,
-                                        };
-                                        let cur = form.port_text(cx);
-                                        let new_port = match form.kind {
-                                            ConnectionKind::SSH => "22",
-                                            ConnectionKind::Telnet => "23",
-                                            ConnectionKind::Serial => "22",
-                                        };
-                                        if cur == "22" || cur == "23" || cur.is_empty() {
-                                            form.port_input.update(cx, |state, cx| {
-                                                state.set_value(new_port, w, cx);
-                                            });
+                            .on_change({
+                                let app = app.clone();
+                                move |index, w, cx| {
+                                    app.update(cx, |app, cx| {
+                                        if let Some(ref mut form) = app.connection_form {
+                                            form.kind = match index {
+                                                0 => ConnectionKind::SSH,
+                                                1 => ConnectionKind::Telnet,
+                                                _ => ConnectionKind::Serial,
+                                            };
+                                            let cur = form.port_text(cx);
+                                            let new_port = match form.kind {
+                                                ConnectionKind::SSH => "22",
+                                                ConnectionKind::Telnet => "23",
+                                                ConnectionKind::Serial => "22",
+                                            };
+                                            if cur == "22" || cur == "23" || cur.is_empty() {
+                                                form.port_input.update(cx, |state, cx| {
+                                                    state.set_value(new_port, w, cx);
+                                                });
+                                            }
+                                            cx.notify();
                                         }
-                                        cx.notify();
-                                    }
-                                });
-                            }
-                        }),
-                ), // close scrollable div's .child
+                                    });
+                                }
+                            }),
+                    ), // close inner padding div's .child(Tabs)
+                ), // close scrollable div's .child (inner padding div)
         ) // close scrollable div
         // Buttons (fixed at bottom — do not scroll)
         .child(

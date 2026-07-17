@@ -1,0 +1,106 @@
+# Modern Dark — the default palette.
+# A refined, slightly cool neutral dark with an indigo accent and well-tuned
+# neutrals. Higher contrast and less purple cast than the legacy Mocha palette.
+#
+# Structure mirrors `crabport_core::config::ThemeConfig`:
+#   [base] [border] [surface] [text]
+#   [button] [button_primary] [button_ghost] [tab_button]
+#   [input] [command] [terminal] [selection]
+# Missing tables / fields fall back to the modern-dark defaults, so a custom
+# theme can override just one group (e.g. [terminal]) and inherit the rest.
+
+name = "modern-dark"
+
+[base]
+bg_base = "#14161c"
+bg_sidebar = "#0f1116"
+bg_tab_bar = "#0f1116"
+
+[border]
+border = "#23262f"
+
+[surface]
+surface_hover = "#1c1f27"
+surface_active = "#262a34"
+
+[text]
+text_primary = "#e6e9ef"
+text_muted = "#8b90a0"
+
+[button]
+bg = "#262a34"
+bg_hover = "#2e333f"
+bg_selected = "#363b48"
+bg_pressed = "#3f4452"
+bg_disabled = "#14161c"
+border = "#2e333f"
+text_disabled = "#6b7080"
+
+[button_primary]
+bg = "#6366f1"
+bg_hover = "#4f46e5"
+bg_selected = "#4338ca"
+bg_disabled = "#312e81"
+border = "#6366f1"
+text_disabled = "#a5b4fc"
+
+[button_ghost]
+bg = "#00000000"
+bg_hover = "#2e333fff"
+bg_selected = "#262a34ff"
+bg_disabled = "#00000000"
+border = "#00000000"
+text_disabled = "#6b7080ff"
+
+[tab_button]
+bg = "#0f1116"
+bg_hover = "#1c1f27"
+bg_selected = "#262a34"
+bg_pressed = "#2e333f"
+bg_disabled = "#0a0c10"
+border = "#23262f"
+text_disabled = "#2e333f"
+
+[input]
+bg = "#0f1116"
+bg_focused = "#14161c"
+bg_disabled = "#0a0c10"
+text_disabled = "#2e333f"
+border = "#23262f"
+border_hover = "#2e333f"
+border_focused = "#818cf8"
+border_error = "#f87171"
+placeholder = "#6b7080"
+selection = "#818cf833"
+
+[command]
+overlay = "#00000050"
+bg = "#14161c"
+border = "#23262f"
+item_hover = "#1c1f27"
+item_active = "#262a34"
+group_label = "#6b7080"
+
+[terminal]
+fg = "#e6e9ef"
+bg = "#14161c"
+cursor = "#c8cce4"
+black = "#2e333f"
+red = "#f87171"
+green = "#4ade80"
+yellow = "#facc15"
+blue = "#818cf8"
+magenta = "#e879f9"
+cyan = "#22d3ee"
+white = "#c1c5d0"
+bright_black = "#6b7080"
+bright_red = "#f87171"
+bright_green = "#4ade80"
+bright_yellow = "#facc15"
+bright_blue = "#818cf8"
+bright_magenta = "#e879f9"
+bright_cyan = "#22d3ee"
+bright_white = "#e6e9ef"
+
+[selection]
+bg = "#6b7080"
