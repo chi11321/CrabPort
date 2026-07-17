@@ -46,40 +46,57 @@ pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElemen
                 .relative()
                 .when(cfg!(target_os = "macos"), |el| el.bg(opaque_base_bg()))
                 .child(content)
-                // Top drag strip (Windows/Linux only), scoped to the
-                // content pane so the sidebar stays fully interactive.
-                // Painted behind the window-control buttons that each
-                // window overlays on top of it; those buttons
-                // `occlude_mouse` so their clicks win over this drag region
-                // under Windows' `WM_NCHITTEST`.
+                // Top drag strip, scoped to the content pane so the sidebar
+                // stays fully interactive. Painted behind the window-control
+                // buttons that each window overlays on top of it; those
+                // buttons `occlude_mouse` so their clicks win over this drag
+                // region under Windows' `WM_NCHITTEST`.
                 //
-                // `on_mouse_down`/`on_mouse_up` are only used on Linux
-                // (via `start_window_move` / `toggle_maximize`) — Windows
-                // handles drag + double-click-maximize natively once
-                // `WM_NCHITTEST` returns `HTCAPTION`. macOS isn't reached
-                // at all (see the `cfg` below).
-                .when(cfg!(not(target_os = "macos")), |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h_11()
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                move |_: &MouseDownEvent, window, _cx| {
-                                    crate::components::window_controls::start_window_move(window);
-                                },
-                            )
-                            .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
+                // `on_mouse_down`/`on_mouse_up` are only used on Linux (via
+                // `start_window_move` / `toggle_maximize`) — Windows handles
+                // drag + double-click-maximize natively once `WM_NCHITTEST`
+                // returns `HTCAPTION`. macOS uses its native transparent
+                // title bar, but the strip is still rendered there (without
+                // `window_control_area`) so the debug logging fires and we
+                // can verify the hit-test path cross-platform.
+                //
+                // TODO: gate back to `cfg!(not(target_os = "macos"))` once
+                // the Windows drag issue is resolved.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h_11()
+                        .when(cfg!(not(target_os = "macos")), |el| {
+                            el.window_control_area(WindowControlArea::Drag)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |event: &MouseDownEvent, window, _cx| {
+                                tracing::info!(
+                                    "sidebar-window drag strip on_mouse_down: click_count={} position={:?}",
+                                    event.click_count,
+                                    event.position
+                                );
+                                crate::components::window_controls::start_window_move(window);
+                            },
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            move |event: &MouseUpEvent, window, _| {
+                                tracing::info!(
+                                    "sidebar-window drag strip on_mouse_up: click_count={} position={:?}",
+                                    event.click_count,
+                                    event.position
+                                );
                                 if event.click_count == 2 {
                                     crate::components::window_controls::toggle_maximize(window);
                                 }
-                            }),
-                    )
-                }),
+                            },
+                        ),
+                ),
         )
 }
 

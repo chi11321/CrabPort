@@ -55,19 +55,24 @@ pub fn render_tab_bar(
         .border_b_1()
         .border_color(rgb(border()))
         .relative()
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, _cx| {
-            // Cross-platform: on Linux this fires `_NET_WM_MOVERESIZE` /
-            // `xdg_toplevel._move`; on macOS/Windows it's a no-op (those
-            // platforms handle drag natively — see the doc comment in
-            // `window_controls::start_window_move`).
-            crate::components::window_controls::start_window_move(window);
-        })
-        .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window, _cx| {
+                tracing::info!(
+                    "tabbar on_mouse_down: click_count={} position={:?}",
+                    event.click_count,
+                    event.position
+                );
+                crate::components::window_controls::start_window_move(window);
+            },
+        )
+        .on_mouse_up(MouseButton::Left, move |event: &MouseUpEvent, window, _| {
+            tracing::info!(
+                "tabbar on_mouse_up: click_count={} position={:?}",
+                event.click_count,
+                event.position
+            );
             if event.click_count == 2 {
-                // Cross-platform: macOS delegates to `titlebar_double_click`
-                // (respects `AppleActionOnDoubleClick`), Windows/Linux use
-                // our explicit maximize/restore toggle. See the doc comment
-                // in `window_controls::toggle_maximize`.
                 crate::components::window_controls::toggle_maximize(window);
             }
         })
