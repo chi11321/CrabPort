@@ -55,10 +55,85 @@ pub struct AppearanceConfig {
     /// sane range. Stored under `[appearance]` so it survives restarts.
     #[serde(default = "default_panel_width")]
     pub panel_width: f32,
+
+    /// Which view to open at app launch. Stored under `[appearance.startup]`
+    /// so it survives restarts alongside other general UI prefs.
+    #[serde(default)]
+    pub startup: StartupConfig,
 }
 
 fn default_panel_width() -> f32 {
     220.0
+}
+
+// ---------------------------------------------------------------------------
+// Startup config
+// ---------------------------------------------------------------------------
+
+/// User-configurable launch behavior. Stored under `[appearance.startup]`
+/// in `config.toml`.
+///
+/// `Home`, `Sftp`, and `LocalTerminal` resolve to the corresponding built-in
+/// tab kinds; `Session(id)` opens the saved host with that id. A stale
+/// `Session` id (host deleted from the store) falls back to `Home` at launch.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct StartupConfig {
+    /// Where to land when the app starts. `Home` by default so a fresh
+    /// install behaves predictably.
+    #[serde(default)]
+    pub page: StartupPage,
+}
+
+/// The launch target. Serialized as a single-tagged string
+/// (`"home"`, `"sftp"`, `"local_terminal"`, `"session:<id>"`)
+/// so hand-editing `config.toml` stays readable.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPage {
+    /// Land on the Home (sessions) tab.
+    #[default]
+    Home,
+    /// Land on the SFTP tab (id=1).
+    Sftp,
+    /// Open a new local terminal tab.
+    LocalTerminal,
+    /// Reconnect to a saved session by host id. If the host no longer
+    /// exists at launch time, the app falls back to `Home`.
+    Session(i64),
+}
+
+impl StartupPage {
+    /// Stable string id used as the dropdown item value. Round-trips via
+    /// [`StartupPage::from_id`].
+    pub fn to_id(&self) -> String {
+        match self {
+            StartupPage::Home => "home".to_string(),
+            StartupPage::Sftp => "sftp".to_string(),
+            StartupPage::LocalTerminal => "local_terminal".to_string(),
+            StartupPage::Session(id) => format!("session:{id}"),
+        }
+    }
+
+    /// Parse a string id back into a [`StartupPage`]. Unknown / malformed
+    /// values fall back to `Home` so a corrupted `config.toml` can never
+    /// brick launch.
+    pub fn from_id(s: &str) -> Self {
+        if s == "home" {
+            return StartupPage::Home;
+        }
+        if s == "sftp" {
+            return StartupPage::Sftp;
+        }
+        if s == "local_terminal" {
+            return StartupPage::LocalTerminal;
+        }
+        if let Some(rest) = s.strip_prefix("session:") {
+            if let Ok(id) = rest.parse::<i64>() {
+                return StartupPage::Session(id);
+            }
+        }
+        StartupPage::Home
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +194,7 @@ impl Default for AppearanceConfig {
             theme: ThemeConfig::default(),
             terminal: TerminalConfig::default(),
             panel_width: default_panel_width(),
+            startup: StartupConfig::default(),
         }
     }
 }
@@ -644,5 +720,39 @@ bg = "#111111"
             assert_eq!(preset.tab_button.border, back.tab_button.border);
             assert_eq!(preset.input.selection, back.input.selection);
         }
+    }
+
+    /// `StartupPage` round-trips through its string id form, including the
+    /// `session:<id>` variant. Unknown ids fall back to `Home` so a stale
+    /// `config.toml` can't brick launch.
+    #[test]
+    fn startup_page_id_roundtrip() {
+        for page in [
+            StartupPage::Home,
+            StartupPage::Sftp,
+            StartupPage::LocalTerminal,
+            StartupPage::Session(42),
+            StartupPage::Session(-1),
+        ] {
+            let id = page.to_id();
+            assert_eq!(StartupPage::from_id(&id), page);
+        }
+        // Unknown / malformed ids fall back to Home.
+        assert_eq!(StartupPage::from_id(""), StartupPage::Home);
+        assert_eq!(StartupPage::from_id("bogus"), StartupPage::Home);
+        assert_eq!(
+            StartupPage::from_id("session:not-a-number"),
+            StartupPage::Home
+        );
+    }
+
+    /// `StartupPage` serializes into a single tagged string in `config.toml`,
+    /// keeping the file readable and round-tripping through `to_id`/`from_id`.
+    #[test]
+    fn startup_page_serializes_as_string() {
+        let toml = toml::to_string(&StartupPage::Session(7)).unwrap();
+        assert!(toml.contains("\"session:7\""));
+        let back: StartupPage = toml::from_str(&toml).unwrap();
+        assert_eq!(back, StartupPage::Session(7));
     }
 }

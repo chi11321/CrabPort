@@ -32,6 +32,7 @@ use crate::views::sessions::ConnectionHost;
 use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
+use crabport_core::{config, config::StartupPage};
 
 // ---- CrabPortTab trait ----
 
@@ -384,6 +385,64 @@ impl CrabportApp {
         // exists, a non-auto-dismissing toast with a "详情" button (opens
         // the release page) appears. Failures are silent.
         crate::version_check::check_for_updates(self.app_ctx.notifications.clone(), cx);
+
+        // Apply the persisted startup page. Must run after `wired` is true
+        // (so callbacks the startup actions rely on — e.g. terminal pane
+        // focus tracking — are installed) and after `hosts` is populated
+        // (so `Session(id)` can validate the id against the live store).
+        self.apply_startup_page(cx);
+    }
+
+    /// Resolve [`AppearanceConfig::startup`] into the launch view. Called
+    /// once from `wire`. Falls back to `Home` (the default tab) when the
+    /// configured page is `Home`, when a `Session(id)` no longer exists in
+    /// the store, or when any error occurs — so a corrupted or stale
+    /// `config.toml` can never brick the app at launch.
+    ///
+    /// This is the authoritative launch-time resolver: the Settings UI's
+    /// dropdown separately normalizes a stale id for display, but the
+    /// actual navigation happens here.
+    fn apply_startup_page(&mut self, cx: &mut Context<Self>) {
+        let page = config::snapshot().appearance.startup.page.clone();
+        match page {
+            StartupPage::Home => {
+                // Home is the default tab (id=0) — no action needed.
+                tracing::debug!("apply_startup_page: Home");
+            }
+            StartupPage::Sftp => {
+                tracing::debug!("apply_startup_page: Sftp");
+                self.activate_tab(1);
+            }
+            StartupPage::LocalTerminal => {
+                tracing::debug!("apply_startup_page: LocalTerminal");
+                self.add_tab(cx);
+            }
+            StartupPage::Session(host_id) => {
+                let exists = self.hosts.iter().any(|h| h.id == host_id)
+                    || AppState::store(cx)
+                        .lock()
+                        .find_host(host_id)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if exists {
+                    tracing::debug!("apply_startup_page: Session({host_id}) — connecting");
+                    self.connect_to_host(host_id, cx);
+                } else {
+                    // Host was deleted since the user last picked it —
+                    // fall back to Home (the default tab) and clear the
+                    // stale id from config so the next launch doesn't
+                    // try the same dead host again.
+                    tracing::info!(
+                        "apply_startup_page: Session({host_id}) not found — falling back to Home"
+                    );
+                    let _ = config::update(|cfg| {
+                        cfg.appearance.startup.page = StartupPage::Home;
+                    });
+                }
+            }
+        }
+        cx.notify();
     }
 
     // -- Helpers --
