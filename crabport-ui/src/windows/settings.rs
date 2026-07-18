@@ -27,6 +27,7 @@ use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
+use crate::motion::RADIUS_MD;
 
 // ---------------------------------------------------------------------------
 // Tab enum
@@ -630,7 +631,7 @@ impl SettingsWindow {
                         .min_w(px(72.0))
                         .h(px(28.0))
                         .px_3()
-                        .rounded_md()
+                        .rounded(RADIUS_MD)
                         .cursor_pointer()
                         .border_1()
                         .border_color(rgb(if is_recording {

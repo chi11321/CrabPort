@@ -2,12 +2,13 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 
 use crate::app::{CrabportApp, Tab, TabKind};
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
+use crate::motion::{DURATION_BASE, EASE_LINEAR};
 
 pub fn render_tab_bar(
     handle: &Entity<CrabportApp>,
@@ -124,8 +125,8 @@ pub fn render_tab_bar(
                 .with_transition("tabbar-scroll")
                 .transition_when_else(
                     is_home,
-                    std::time::Duration::from_millis(150),
-                    Linear,
+                    DURATION_BASE,
+                    EASE_LINEAR,
                     move |el| el.left(pad_narrow),
                     move |el| el.left(pad_wide),
                 )
@@ -144,8 +145,8 @@ pub fn render_tab_bar(
                         .with_transition(wrapper_id)
                         .transition_when_else(
                             is_active,
-                            std::time::Duration::from_millis(150),
-                            Linear,
+                            DURATION_BASE,
+                            EASE_LINEAR,
                             |el| el.w_48(),
                             |el| el.w_24(),
                         )

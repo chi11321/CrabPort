@@ -21,13 +21,15 @@
 //! backdrop dismisses it with the same easing.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
+use crate::motion::{
+    DURATION_BASE, DURATION_FAST, DURATION_INSTANT, EASE_STANDARD, RADIUS_MD, RADIUS_SM,
+};
 
 // ---------------------------------------------------------------------------
 // ContextMenuItem
@@ -118,7 +120,7 @@ impl ContextMenuState {
 
 /// How long the dismiss animation runs before the state is dropped. Matches
 /// the `transition_when_else` duration used in `render_menu`.
-const CONTEXT_MENU_DISMISS_MS: u64 = 120;
+const CONTEXT_MENU_DISMISS_MS: u64 = 150;
 
 pub struct ContextMenuController {
     /// `None` when no menu is showing or dismissing.
@@ -256,8 +258,8 @@ fn render_context_menu(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            Duration::from_millis(120),
-            EaseInOutCubic,
+            DURATION_BASE,
+            EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
         )
@@ -272,7 +274,7 @@ fn render_context_menu(
                 .bg(rgb(bg_base()))
                 .border_1()
                 .border_color(rgb(border()))
-                .rounded_md()
+                .rounded(RADIUS_MD)
                 .shadow_lg()
                 .flex()
                 .flex_col()
@@ -287,8 +289,8 @@ fn render_context_menu(
                 .with_transition(menu_id)
                 .transition_when_else(
                     open,
-                    Duration::from_millis(120),
-                    EaseInOutCubic,
+                    DURATION_BASE,
+                    EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),
                 )
@@ -358,7 +360,7 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         .gap_1p5()
         .px_2()
         .py_0p5()
-        .rounded(px(3.0))
+        .rounded(RADIUS_SM)
         .text_xs()
         .bg(rgba(0x00000000))
         .when(!disabled, |el| {
@@ -380,17 +382,13 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         })
         .child(div().flex_1().min_w_0().child(label.to_string()))
         .with_transition(row_id)
-        .transition_on_hover(
-            Duration::from_millis(100),
-            EaseInOutCubic,
-            move |hovered, el| {
-                if *hovered {
-                    el.bg(rgb(surface_hover()))
-                } else {
-                    el.bg(rgba(0x00000000))
-                }
-            },
-        )
+        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+            if *hovered {
+                el.bg(rgb(surface_hover()))
+            } else {
+                el.bg(rgba(0x00000000))
+            }
+        })
         // Drive text_color through the transition system so the cached
         // style state updates when `disabled` / `danger` change between
         // successive menu shows for different rows (see note above).
@@ -401,8 +399,8 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         // further split into danger vs primary.
         .transition_when_else(
             disabled,
-            Duration::from_millis(0),
-            EaseInOutCubic,
+            DURATION_INSTANT,
+            EASE_STANDARD,
             move |state| state.text_color(rgb(muted_color)),
             move |state| state.text_color(rgb(label_color)),
         );

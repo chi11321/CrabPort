@@ -23,14 +23,13 @@
 //! caller does not need to invert the bool themselves.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
-use gpui_animation::transition::general::EaseInOutQuad;
 
 use crate::color::*;
+use crate::motion::{DURATION_MODERATE, EASE_STANDARD};
 
 /// Dimensions for the switch track and knob. Tuned to match the height of
 /// the `StyledInput` shell (`px(32.0)`) so a switch aligns with a labelled
@@ -132,8 +131,8 @@ impl RenderOnce for Switch {
             .with_transition(knob_id)
             .transition_when_else(
                 checked && !disabled,
-                Duration::from_millis(180),
-                EaseInOutQuad,
+                DURATION_MODERATE,
+                EASE_STANDARD,
                 move |s| s.left(on_left).bg(rgb(knob_on)),
                 move |s| s.left(off_left).bg(rgb(knob_off)),
             );
@@ -156,8 +155,8 @@ impl RenderOnce for Switch {
             .with_transition(track_id)
             .transition_when_else(
                 checked && !disabled,
-                Duration::from_millis(180),
-                EaseInOutQuad,
+                DURATION_MODERATE,
+                EASE_STANDARD,
                 move |s| s.bg(rgb(track_bg_on)),
                 move |s| s.bg(rgb(track_bg_off)),
             )

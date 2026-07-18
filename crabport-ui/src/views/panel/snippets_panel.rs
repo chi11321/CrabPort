@@ -23,17 +23,17 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::scroll::ScrollbarShow;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
-use std::time::Duration;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
+use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
 
 /// A single saved snippet, mirroring the Store row.
 #[derive(Clone, Debug)]
@@ -238,17 +238,13 @@ impl Render for SnippetsPanel {
                                     cb(cmd_for_run.clone(), cx);
                                 }
                             })
-                            .transition_on_hover(
-                                Duration::from_millis(100),
-                                Linear,
-                                |hovered, el| {
-                                    if *hovered {
-                                        el.bg(rgb(surface_hover()))
-                                    } else {
-                                        el.bg(rgba(0x00000000))
-                                    }
-                                },
-                            )
+                            .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                                if *hovered {
+                                    el.bg(rgb(surface_hover()))
+                                } else {
+                                    el.bg(rgba(0x00000000))
+                                }
+                            })
                             .child(
                                 svg()
                                     .path("icons/file-terminal.svg")
@@ -293,17 +289,13 @@ impl Render for SnippetsPanel {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
                             })
-                            .transition_on_hover(
-                                Duration::from_millis(100),
-                                Linear,
-                                |hovered, el| {
-                                    if *hovered {
-                                        el.bg(rgb(surface_hover()))
-                                    } else {
-                                        el.bg(rgba(0x00000000))
-                                    }
-                                },
-                            )
+                            .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                                if *hovered {
+                                    el.bg(rgb(surface_hover()))
+                                } else {
+                                    el.bg(rgba(0x00000000))
+                                }
+                            })
                             .child(
                                 svg()
                                     .path("icons/clipboard-copy.svg")
@@ -343,8 +335,8 @@ impl Render for SnippetsPanel {
                             })
                             .transition_when_else(
                                 is_hovered,
-                                std::time::Duration::from_millis(120),
-                                Linear,
+                                DURATION_FAST,
+                                EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
@@ -389,8 +381,8 @@ impl Render for SnippetsPanel {
                                     ))
                                     .transition_when_else(
                                         is_hovered,
-                                        std::time::Duration::from_millis(120),
-                                        Linear,
+                                        DURATION_FAST,
+                                        EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),
                                     )
@@ -453,7 +445,7 @@ impl Render for SnippetsPanel {
                             .border_1()
                             .border_color(rgb(border()))
                             .bg(rgb(bg_tab_bar()))
-                            .rounded_md()
+                            .rounded(RADIUS_MD)
                             .overflow_hidden()
                             .child(list)
                             .child(

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
@@ -38,6 +38,7 @@ use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::input::StyledInput;
+use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
 use crate::views::tunnels::TunnelView;
 
 /// Color accents for the kind badge (mirrors the Tunnels page). Read live
@@ -484,8 +485,8 @@ impl Render for TunnelsPanel {
                             })
                             .transition_when_else(
                                 is_highlighted,
-                                std::time::Duration::from_millis(120),
-                                Linear,
+                                DURATION_FAST,
+                                EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
@@ -555,8 +556,8 @@ impl Render for TunnelsPanel {
                                     .with_transition(star_id)
                                     .transition_when_else(
                                         star_visible,
-                                        std::time::Duration::from_millis(120),
-                                        Linear,
+                                        DURATION_FAST,
+                                        EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),
                                     )
@@ -630,7 +631,7 @@ impl Render for TunnelsPanel {
                         .border_1()
                         .border_color(rgb(border()))
                         .bg(rgb(bg_tab_bar()))
-                        .rounded_md()
+                        .rounded(RADIUS_MD)
                         .overflow_hidden()
                         .child(list)
                         .child(

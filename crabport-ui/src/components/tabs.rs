@@ -1,8 +1,7 @@
 use crate::components::segmented_control::{Segment, SegmentedControl};
+use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
-use gpui_animation::transition::general::EaseInOutQuad;
-use std::time::Duration;
 
 // Tabs::new("my-tabs")
 //     .active(self.active_tab)
@@ -211,8 +210,8 @@ impl RenderOnce for Tabs {
                 .with_transition(panel_id)
                 .transition_when_else(
                     is_active,
-                    Duration::from_millis(280),
-                    EaseInOutQuad,
+                    DURATION_SLOWER,
+                    EASE_STANDARD,
                     |state| state.opacity(1.),
                     |state| state.opacity(0.),
                 )
@@ -245,8 +244,8 @@ impl RenderOnce for Tabs {
             let target = DefiniteLength::Fraction(-(i as f32));
             track = track.transition_when_else(
                 active == i,
-                Duration::from_millis(320),
-                EaseInOutQuad,
+                DURATION_SLOWER,
+                EASE_STANDARD,
                 move |state| state.left(target),
                 |state| state,
             );
@@ -274,8 +273,8 @@ impl RenderOnce for Tabs {
             for (i, h) in sizing_heights.into_iter().enumerate() {
                 sizing = sizing.transition_when_else(
                     active == i,
-                    Duration::from_millis(320),
-                    EaseInOutQuad,
+                    DURATION_SLOWER,
+                    EASE_STANDARD,
                     move |state| state.h(h).max_h(h),
                     |state| state,
                 );
@@ -290,8 +289,8 @@ impl RenderOnce for Tabs {
             for (i, h) in pane_heights.into_iter().enumerate() {
                 area = area.transition_when_else(
                     active == i,
-                    Duration::from_millis(320),
-                    EaseInOutQuad,
+                    DURATION_SLOWER,
+                    EASE_STANDARD,
                     move |state| state.max_h(h),
                     |state| state,
                 );

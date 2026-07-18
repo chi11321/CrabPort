@@ -35,9 +35,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseOutQuad};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
+use crate::motion::{EASE_OUT, RADIUS_MD, RADIUS_XS};
 
 // ---------------------------------------------------------------------------
 // NotificationLevel
@@ -505,7 +506,7 @@ fn render_notification_card(
         .bg(rgb(bg_base()))
         .border_1()
         .border_color(rgb(border()))
-        .rounded_md()
+        .rounded(RADIUS_MD)
         .shadow_lg()
         .flex()
         .flex_row()
@@ -519,7 +520,7 @@ fn render_notification_card(
         .transition_when_else(
             open,
             Duration::from_millis(NOTIFICATION_DISMISS_MS),
-            EaseOutQuad,
+            EASE_OUT,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-8.0)),
         );
@@ -612,7 +613,7 @@ fn render_notification_card(
             .justify_center()
             .h_5()
             .w_5()
-            .rounded_sm()
+            .rounded(RADIUS_XS)
             .text_color(rgb(text_muted()))
             .child(
                 svg()

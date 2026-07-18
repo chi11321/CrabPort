@@ -15,14 +15,14 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
+use crate::motion::{DURATION_FAST, DURATION_MODERATE, EASE_LINEAR, RADIUS_MD, RADIUS_SM};
 
 /// Render a collapsible group header.
 ///
@@ -82,7 +82,7 @@ pub fn group_header(
         .px_3()
         .py_1()
         .mt_2()
-        .rounded_md()
+        .rounded(RADIUS_MD)
         // Pre-set the rest background so the transition registry has a
         // concrete `Some(bg)` to interpolate *from* on hover-in. Without
         // this the initial `to.bg` is `None` and the hover-in animation
@@ -105,7 +105,7 @@ pub fn group_header(
             })
         })
         .with_transition(header_id)
-        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+        .transition_on_hover(DURATION_FAST, EASE_LINEAR, move |hovered, el| {
             if *hovered {
                 el.bg(rgb(surface_hover()))
             } else {
@@ -122,7 +122,7 @@ pub fn group_header(
                     .text_color(rgb(text_muted()))
                     .with_animation(
                         chevron_anim_id,
-                        Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                        Animation::new(DURATION_MODERATE).with_easing(ease_in_out),
                         move |this, delta| {
                             // Collapsed: 0 -> -90° (points right).
                             // Open: -90° -> 0° (points down).
@@ -204,6 +204,7 @@ pub fn group_header(
                     .flex()
                     .items_center()
                     .justify_center()
+                    .rounded(RADIUS_SM)
                     .child(
                         svg()
                             .path("icons/star.svg")
@@ -217,8 +218,8 @@ pub fn group_header(
                     .with_transition(star_id)
                     .transition_when_else(
                         favorite,
-                        Duration::from_millis(120),
-                        Linear,
+                        DURATION_FAST,
+                        EASE_LINEAR,
                         |el| el.opacity(1.0),
                         |el| el.opacity(0.0),
                     )

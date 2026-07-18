@@ -1,9 +1,8 @@
 use crate::color::*;
+use crate::motion::{DURATION_BASE, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_SM, RADIUS_XS};
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
-use gpui_animation::transition::general::EaseInOutQuad;
 use std::rc::Rc;
-use std::time::Duration;
 
 pub struct Segment {
     pub label: AnyElement,
@@ -126,8 +125,8 @@ impl RenderOnce for SegmentedControl {
             let target = DefiniteLength::Fraction(i as f32 * seg_width);
             spacer = spacer.transition_when_else(
                 active == i,
-                Duration::from_millis(250),
-                EaseInOutQuad,
+                DURATION_SLOW,
+                EASE_STANDARD,
                 move |state| state.w(target),
                 |state| state,
             );
@@ -142,7 +141,7 @@ impl RenderOnce for SegmentedControl {
             .flex_none()
             .w(DefiniteLength::Fraction(seg_width))
             .h_full()
-            .rounded_sm()
+            .rounded(RADIUS_SM)
             .bg(rgb(bg_base()));
 
         // The track is absolute and fills the inner container via inset_0.
@@ -192,7 +191,7 @@ impl RenderOnce for SegmentedControl {
                     .gap_1p5()
                     .px_3()
                     .py_1()
-                    .rounded_sm()
+                    .rounded(RADIUS_XS)
                     .text_sm()
                     .text_color(rgb(if is_active {
                         active_color
@@ -201,21 +200,17 @@ impl RenderOnce for SegmentedControl {
                     }))
                     .bg(rgba(0x24273a00))
                     .with_transition(tab_id)
-                    .transition_on_hover(
-                        Duration::from_millis(150),
-                        EaseInOutQuad,
-                        move |hovered, state| {
-                            if *hovered {
-                                state.bg(rgba(0x24273a80))
-                            } else {
-                                state.bg(rgba(0x24273a00))
-                            }
-                        },
-                    )
+                    .transition_on_hover(DURATION_BASE, EASE_STANDARD, move |hovered, state| {
+                        if *hovered {
+                            state.bg(rgba(0x24273a80))
+                        } else {
+                            state.bg(rgba(0x24273a00))
+                        }
+                    })
                     .transition_when_else(
                         is_active,
-                        Duration::from_millis(150),
-                        EaseInOutQuad,
+                        DURATION_BASE,
+                        EASE_STANDARD,
                         move |state| state.text_color(rgb(active_color)),
                         move |state| state.text_color(rgb(inactive_color)),
                     );
@@ -267,7 +262,7 @@ impl RenderOnce for SegmentedControl {
         let mut root = div()
             .id(self.id)
             .bg(rgb(surface_active()))
-            .rounded_md()
+            .rounded(RADIUS_MD)
             .p_0p5()
             .child(inner);
 

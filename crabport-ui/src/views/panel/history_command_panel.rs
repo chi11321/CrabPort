@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::label::Label;
 use gpui_component::scroll::Scrollbar;
@@ -37,6 +37,7 @@ use rust_i18n::t;
 use crate::color::*;
 use crate::components::input::StyledInput;
 use crate::components::notification::{Notification, NotificationLevel};
+use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
 
 /// A single previously-run terminal command entry.
 ///
@@ -239,8 +240,8 @@ impl Render for HistoryCommandPanel {
                                 }
                             })
                             .transition_on_hover(
-                                std::time::Duration::from_millis(100),
-                                Linear,
+                                DURATION_FAST,
+                                EASE_STANDARD,
                                 move |hovered, el| {
                                     if *hovered {
                                         el.bg(rgb(surface_hover()))
@@ -314,8 +315,8 @@ impl Render for HistoryCommandPanel {
                                 }
                             })
                             .transition_on_hover(
-                                std::time::Duration::from_millis(100),
-                                Linear,
+                                DURATION_FAST,
+                                EASE_STANDARD,
                                 move |hovered, el| {
                                     if *hovered {
                                         el.bg(rgb(surface_hover()))
@@ -374,8 +375,8 @@ impl Render for HistoryCommandPanel {
                             })
                             .transition_when_else(
                                 is_hovered,
-                                std::time::Duration::from_millis(120),
-                                Linear,
+                                DURATION_FAST,
+                                EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                             )
@@ -419,8 +420,8 @@ impl Render for HistoryCommandPanel {
                                     ))
                                     .transition_when_else(
                                         is_hovered,
-                                        std::time::Duration::from_millis(120),
-                                        Linear,
+                                        DURATION_FAST,
+                                        EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),
                                     )
@@ -496,8 +497,8 @@ impl Render for HistoryCommandPanel {
                                         }
                                     })
                                     .transition_on_hover(
-                                        std::time::Duration::from_millis(100),
-                                        Linear,
+                                        DURATION_FAST,
+                                        EASE_STANDARD,
                                         |hovered, el| {
                                             if *hovered {
                                                 el.bg(rgb(surface_hover()))
@@ -545,7 +546,7 @@ impl Render for HistoryCommandPanel {
                             .border_1()
                             .border_color(rgb(border()))
                             .bg(rgb(bg_tab_bar()))
-                            .rounded_md()
+                            .rounded(RADIUS_MD)
                             .overflow_hidden()
                             .child(list)
                             .child(
