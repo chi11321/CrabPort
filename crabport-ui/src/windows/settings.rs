@@ -711,6 +711,7 @@ impl Render for SettingsWindow {
             ),
             content,
         )
+        .id("settings-root")
         .track_focus(&self.focus_handle)
         // Intercept key presses while recording a keybind.
         .when(self.recording_action.is_some(), |el| {

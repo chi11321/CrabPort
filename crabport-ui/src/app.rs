@@ -492,6 +492,7 @@ impl Render for CrabportApp {
         // wanted. Only the sidebar paints a translucent tint so vibrancy shows
         // there alone.
         div()
+            .id("app-root")
             .size_full()
             .when(cfg!(not(target_os = "macos")), |el| el.bg(rgb(bg_base())))
             .flex()

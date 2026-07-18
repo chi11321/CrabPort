@@ -61,6 +61,7 @@ pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElemen
                 .when(cfg!(not(target_os = "macos")), |el| {
                     el.child(
                         div()
+                            .id("window-drag-strip")
                             .absolute()
                             .top_0()
                             .left_0()
