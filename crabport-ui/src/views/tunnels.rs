@@ -213,7 +213,17 @@ impl Render for TunnelsView {
         let hovered_tunnel_id = self.hovered_tunnel_id;
         let form_state = self.form_state.clone();
         let app = self.app.clone();
-        let form_hosts = self.hosts.clone();
+        // Tunnels only run over SSH (the underlying driver is an SSH
+        // client — see `crabport-ssh`). Filter the host list so the
+        // tunnel form's host dropdown only offers SSH hosts, instead of
+        // also surfacing Telnet / Serial entries that can't actually back
+        // a tunnel.
+        let form_hosts = self
+            .hosts
+            .iter()
+            .filter(|h| h.kind == crate::views::sessions::ConnectionKind::SSH)
+            .cloned()
+            .collect::<Vec<_>>();
 
         // Load tunnel groups from the store (ordered by sort_order, id).
         let groups = AppState::store(_cx)
