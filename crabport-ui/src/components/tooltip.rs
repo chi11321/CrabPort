@@ -21,16 +21,16 @@
 //! The tooltip fades in/out with a 120ms opacity transition. A 400ms show
 //! delay keeps it from flickering on quick mouse-overs.
 
-use std::time::Duration;
-
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
+use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_SM};
 
-/// How long the fade-out animation runs before the state is dropped.
-const TOOLTIP_DISMISS_MS: u64 = 120;
+/// How long the fade-out animation runs before the state is dropped. Should
+/// match the `transition_when_else` duration used in `render_tooltip`.
+const TOOLTIP_DISMISS_MS: u64 = 150;
 /// Delay before showing (ms). Keeps the tooltip from flickering on quick
 /// mouse-overs.
 const TOOLTIP_SHOW_DELAY_MS: u64 = 400;
@@ -137,7 +137,7 @@ fn render_tooltip(state: TooltipState) -> impl IntoElement {
         .bg(rgb(bg_base()))
         .border_1()
         .border_color(rgb(border()))
-        .rounded(px(4.0))
+        .rounded(RADIUS_SM)
         .shadow_sm()
         .px_2()
         .py_1()
@@ -150,8 +150,8 @@ fn render_tooltip(state: TooltipState) -> impl IntoElement {
         .with_transition(tooltip_id)
         .transition_when_else(
             open,
-            Duration::from_millis(120),
-            EaseInOutCubic,
+            DURATION_BASE,
+            EASE_STANDARD,
             |el| el.opacity(1.0),
             |el| el.opacity(0.0),
         )

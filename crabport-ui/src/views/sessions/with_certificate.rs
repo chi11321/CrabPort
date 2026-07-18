@@ -6,6 +6,7 @@ use rust_i18n::t;
 use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::input::{StyledInput, StyledPasswordInput};
+use crate::motion::RADIUS_SM;
 
 #[derive(IntoElement)]
 pub struct WithCertificateForm {
@@ -76,7 +77,7 @@ impl RenderOnce for WithCertificateForm {
                                 .items_center()
                                 .h(px(22.0))
                                 .px_2()
-                                .rounded_sm()
+                                .rounded(RADIUS_SM)
                                 .text_xs()
                                 .text_color(rgb(text_primary()))
                                 .bg(rgb(surface_hover()))

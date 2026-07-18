@@ -1,6 +1,5 @@
 use gpui::{prelude::FluentBuilder, *};
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
-use std::time::Duration;
+use gpui_animation::animation::TransitionExt;
 
 use crabport_terminal::terminal::{
     MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus, SftpTransferBytes, SftpTransferKind,
@@ -9,6 +8,7 @@ use crabport_terminal::terminal::{
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
 use crate::views::terminal::SftpProgress;
 
 const TOOLBAR_HEIGHT: f32 = 36.0;
@@ -68,8 +68,8 @@ pub fn render_terminal_toolbar(
         .with_transition("terminal-toolbar-height")
         .transition_when_else(
             show_toolbar,
-            Duration::from_millis(500),
-            EaseInOutCubic,
+            DURATION_SLOWER,
+            EASE_STANDARD,
             |el| el.h(px(TOOLBAR_HEIGHT)),
             |el| el.h_0(),
         )
@@ -161,12 +161,9 @@ fn render_memory(memory: Option<MemoryStats>) -> Option<impl IntoElement> {
                             .rounded(px(3.0))
                             .bg(rgb(color_accent()))
                             .with_transition("memory-bar-fill")
-                            .transition_when(
-                                true,
-                                Duration::from_millis(300),
-                                EaseInOutCubic,
-                                move |el| el.w(px(filled_w)),
-                            ),
+                            .transition_when(true, DURATION_SLOWER, EASE_STANDARD, move |el| {
+                                el.w(px(filled_w))
+                            }),
                     ),
             )
             .child(div().text_xs().child(format_memory(mem.used, mem.total))),
@@ -345,12 +342,9 @@ fn render_progress_bar(
                     .rounded(px(3.0))
                     .bg(rgb(color))
                     .with_transition(fill_id)
-                    .transition_when(
-                        true,
-                        Duration::from_millis(300),
-                        EaseInOutCubic,
-                        move |el| el.w(px(filled_w)),
-                    ),
+                    .transition_when(true, DURATION_SLOWER, EASE_STANDARD, move |el| {
+                        el.w(px(filled_w))
+                    }),
             ),
     )
 }

@@ -24,14 +24,10 @@ pub use state::{TunnelRegistry, TunnelView};
 
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{
-    animation::TransitionExt,
-    transition::general::{EaseInOutQuad, Linear},
-};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 
@@ -42,6 +38,7 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::group_header::group_header;
+use crate::motion::{DURATION_FAST, DURATION_MODERATE, EASE_STANDARD, RADIUS_MD, RADIUS_SM};
 use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 use crate::views::sessions::ConnectionHost;
 
@@ -485,8 +482,8 @@ impl Render for TunnelsView {
                                         .with_transition(body_id)
                                         .transition_when_else(
                                             !favorites_collapsed,
-                                            Duration::from_millis(200),
-                                            EaseInOutQuad,
+                                            DURATION_MODERATE,
+                                            EASE_STANDARD,
                                             move |el| {
                                                 el.h(px(fav_count as f32 * 86.0 - 4.0)).opacity(1.0)
                                             },
@@ -679,8 +676,8 @@ impl Render for TunnelsView {
                                         .with_transition(body_id)
                                         .transition_when_else(
                                             !collapsed,
-                                            Duration::from_millis(200),
-                                            EaseInOutQuad,
+                                            DURATION_MODERATE,
+                                            EASE_STANDARD,
                                             move |el| {
                                                 el.h(px(member_count as f32 * 86.0 - 4.0))
                                                     .opacity(1.0)
@@ -869,7 +866,7 @@ fn tunnel_row(
         .gap_3()
         .px_3()
         .py_2()
-        .rounded_md()
+        .rounded(RADIUS_MD)
         .bg(rgb(bg_base()))
         // Right-click context menu: Favorite, Move-to-Group, Start/Stop,
         // Edit, Delete.
@@ -1033,8 +1030,8 @@ fn tunnel_row(
         })
         .transition_when_else(
             is_highlighted,
-            Duration::from_millis(120),
-            Linear,
+            DURATION_FAST,
+            EASE_STANDARD,
             |el| el.bg(rgb(surface_active())),
             |el| el.bg(rgb(bg_base())),
         )
@@ -1054,7 +1051,7 @@ fn tunnel_row(
                         .items_center()
                         .justify_center()
                         .size_5()
-                        .rounded_md()
+                        .rounded(RADIUS_SM)
                         .bg(rgba((kind_color << 8) | 0x22))
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -1136,8 +1133,8 @@ fn tunnel_row(
                         .with_transition(star_id)
                         .transition_when_else(
                             star_visible,
-                            Duration::from_millis(120),
-                            Linear,
+                            DURATION_FAST,
+                            EASE_STANDARD,
                             |el| el.opacity(1.0),
                             |el| el.opacity(0.0),
                         )

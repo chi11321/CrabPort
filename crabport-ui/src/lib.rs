@@ -6,6 +6,7 @@ pub mod components;
 pub mod keybinds;
 pub mod layouts;
 pub mod menus;
+pub mod motion;
 pub mod theme;
 pub mod version_check;
 pub mod views;

@@ -19,13 +19,12 @@
 //!         .hint(t!("sftp.drop_upload_hint").to_string()))
 //! ```
 
-use std::time::Duration;
-
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
+use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_MD};
 
 /// A translucent overlay shown over a drop target while external files
 /// are being dragged over it. Fades in/out with a 150ms ease.
@@ -94,13 +93,13 @@ impl RenderOnce for DropZoneOverlay {
             .when(active, |el| {
                 el.border_2()
                     .border_color(rgb(btn_primary_bg()))
-                    .rounded(px(6.0))
+                    .rounded(RADIUS_MD)
             })
             .with_transition(self.id)
             .transition_when_else(
                 active,
-                Duration::from_millis(150),
-                EaseInOutCubic,
+                DURATION_BASE,
+                EASE_STANDARD,
                 |el| el.opacity(1.0).bg(rgba((btn_primary_bg() << 8) | 0x20)),
                 |el| el.opacity(0.0).bg(rgba(0x00000000)),
             )

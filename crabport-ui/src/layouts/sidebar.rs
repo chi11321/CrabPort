@@ -1,9 +1,10 @@
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::app::SidebarItem;
 use crate::color::*;
 use crate::components::button::Button;
+use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
 
 pub fn render_sidebar(
     selected: SidebarItem,
@@ -19,8 +20,8 @@ pub fn render_sidebar(
         .with_transition("sidebar-container")
         .transition_when_else(
             show,
-            std::time::Duration::from_millis(300),
-            EaseInOutCubic,
+            DURATION_SLOWER,
+            EASE_STANDARD,
             |el| el.w(px(180.0)),
             |el| el.w_0(),
         )

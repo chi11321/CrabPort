@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_animation::animation::TransitionExt;
 use rust_i18n::t;
 
 use crate::app::AppCtx;
@@ -12,6 +13,7 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
 use crate::layouts::toolbar::render_terminal_toolbar;
+use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_SM};
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
@@ -1115,7 +1117,6 @@ fn render_split_button(
     tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    use gpui_animation::{animation::TransitionExt, transition::general::Linear};
     let btn_id = ElementId::Name(format!("{}-btn", id).into());
     let hover_bg = rgba((surface_hover() << 8) | 0xFF);
     let rest_bg = rgba((surface_hover() << 8) | 0x00);
@@ -1126,7 +1127,7 @@ fn render_split_button(
         .items_center()
         .justify_center()
         .size(px(24.0))
-        .rounded(px(4.0))
+        .rounded(RADIUS_SM)
         // Pre-set the rest (transparent) bg so the transition registry has
         // a concrete `Some(bg)` to interpolate *from* on hover-in.
         .bg(rest_bg)
@@ -1149,17 +1150,13 @@ fn render_split_button(
             on_click(w, cx);
             cx.stop_propagation();
         })
-        .transition_on_hover(
-            std::time::Duration::from_millis(120),
-            Linear,
-            move |hovered, el| {
-                if *hovered {
-                    el.bg(hover_bg)
-                } else {
-                    el.bg(rgba((surface_hover() << 8) | 0x00))
-                }
-            },
-        )
+        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg)
+            } else {
+                el.bg(rgba((surface_hover() << 8) | 0x00))
+            }
+        })
         .child(
             svg()
                 .path(icon)

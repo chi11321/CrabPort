@@ -4,14 +4,14 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::motion::{DURATION_FAST, EASE_STANDARD};
 
 use super::view::{SftpTabView, join_remote_path};
 use crate::components::host_selector::PanelSide;
@@ -70,7 +70,7 @@ pub(super) fn render_action_button(
                 })
             })
         })
-        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
             } else {

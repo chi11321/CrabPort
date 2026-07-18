@@ -1,10 +1,9 @@
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
@@ -16,6 +15,7 @@ use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
+use crate::motion::{DURATION_FAST, EASE_STANDARD};
 
 /// Drag payload for an SFTP row being dragged within the app.
 /// Dropped onto a terminal area to trigger a download.
@@ -1062,8 +1062,8 @@ impl Render for SftpPanel {
                                             // Hover / context-menu highlight.
                                             .transition_when_else(
                                                 is_highlighted,
-                                                std::time::Duration::from_millis(120),
-                                                Linear,
+                                                DURATION_FAST,
+                                                EASE_STANDARD,
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                                             )
@@ -1087,8 +1087,8 @@ impl Render for SftpPanel {
                                                     .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
                                                     .transition_when_else(
                                                         is_selected,
-                                                        std::time::Duration::from_millis(120),
-                                                        Linear,
+                                                        DURATION_FAST,
+                                                        EASE_STANDARD,
                                                         |el| el.opacity(1.0),
                                                         |el| el.opacity(0.0),
                                                     ),
@@ -1329,7 +1329,7 @@ fn render_sftp_action_button(
             })
         })
         .with_transition(id)
-        .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
             } else {

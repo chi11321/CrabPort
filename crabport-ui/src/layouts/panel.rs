@@ -1,9 +1,10 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
 use crate::components::tabs::{TabPane, Tabs};
+use crate::motion::{DURATION_INSTANT, DURATION_SLOWER, EASE_STANDARD};
 use crate::views::panel::PanelKind;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
@@ -144,9 +145,9 @@ pub fn render_panel(
     // During a drag the duration is zero so width updates are instant;
     // otherwise the 500ms duration drives the smooth show/hide.
     let duration = if dragging {
-        std::time::Duration::ZERO
+        DURATION_INSTANT
     } else {
-        std::time::Duration::from_millis(500)
+        DURATION_SLOWER
     };
     div()
         .id("panel-sidebar")
@@ -158,7 +159,7 @@ pub fn render_panel(
         .transition_when_else(
             visible,
             duration,
-            EaseInOutCubic,
+            EASE_STANDARD,
             move |el| el.w(px(width)),
             |el| el.w_0(),
         )
