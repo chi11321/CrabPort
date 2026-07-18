@@ -137,6 +137,59 @@ fn which_executable(program: &str) -> Option<()> {
 }
 
 // ===========================================================================
+// Locale handling — ensure the child PTY shell uses UTF-8
+// ===========================================================================
+//
+// On macOS (and some Linux DE setups) a GUI-launched app does *not* inherit
+// the login shell's `LANG` / `LC_*` environment variables. Without a UTF-8
+// locale the spawned shell defaults to ASCII / C, and any CJK output is
+// rendered as `?????` or mojibake in the terminal. alacritty's
+// `tty::setup_env()` only sets `TERM` / `COLORTERM`, so we fill in the
+// locale ourselves when the user hasn't already.
+//
+// Rules:
+//   1. Never override an explicit user choice. If `LANG`, `LC_CTYPE`, or
+//      `LC_ALL` is already set in *our* process environment, leave it — the
+//      child inherits it via `exec`.
+//   2. Otherwise derive a UTF-8 locale from the system locale reported by
+//      `sys_locale` (e.g. `zh-CN` → `zh_CN.UTF-8` on Unix, `en-US` →
+//      `en_US.UTF-8`). Fallback to `C.UTF-8` when the system reports nothing
+//      — glibc on Linux and recent macOS support it, and it's strictly
+//      better than the ASCII-only `C` locale for a terminal.
+#[cfg(unix)]
+fn ensure_utf8_locale() {
+    use std::env;
+
+    // If the user already has any of these set, respect their choice.
+    if env::var_os("LANG").is_some()
+        || env::var_os("LC_CTYPE").is_some()
+        || env::var_os("LC_ALL").is_some()
+    {
+        return;
+    }
+
+    // Map a BCP-47-ish locale ("zh-CN", "en_US", …) to a Unix locale tag
+    // with an explicit `.UTF-8` codeset. `sys_locale::get_locale` returns
+    // values like "zh_CN" / "en-US" depending on the platform, so normalize
+    // the separator and append the codeset.
+    let normalized = sys_locale::get_locale().map(|l| {
+        let tag = l.replace('-', "_");
+        format!("{tag}.UTF-8")
+    });
+
+    let locale = normalized.unwrap_or_else(|| "C.UTF-8".to_string());
+
+    // SAFETY: single-threaded startup path; no concurrent access to the
+    // environment. `set_var` writes to `environ`, which is then inherited
+    // by the `fork`/`exec` chain inside `tty::new`.
+    unsafe {
+        env::set_var("LANG", &locale);
+        env::set_var("LC_CTYPE", &locale);
+    }
+    tracing::debug!("locale not set; forced LANG/LC_CTYPE = {locale}");
+}
+
+// ===========================================================================
 // Command enum — shared between platforms
 // ===========================================================================
 
@@ -183,6 +236,12 @@ pub struct PtyBackend {
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
         tty::setup_env();
+        // alacritty only sets TERM / COLORTERM. On macOS a GUI-launched
+        // app does not inherit the login shell's LANG / LC_*, so a forked
+        // shell would default to ASCII and render CJK as `?????` or
+        // mojibake. Patch in a UTF-8 locale when the user hasn't set one
+        // themselves. See `ensure_utf8_locale` for the rationale.
+        ensure_utf8_locale();
 
         let window_size = WindowSize {
             num_lines: rows,

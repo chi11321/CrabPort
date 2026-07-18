@@ -13,3 +13,4 @@ smol = "2.0.2"
 async-channel = "2.5.0"
 async-broadcast = "0.7.2"
 sysinfo = { version = "0.35", default-features = false, features = ["system", "network"] }
+sys-locale = "0.3"
