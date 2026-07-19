@@ -249,11 +249,33 @@ pub struct MemoryStats {
     pub used: u64,
 }
 
+/// CPU utilization snapshot. `usage_pct` is the aggregate across all
+/// logical cores (0.0–100.0).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpuStats {
+    /// Aggregate CPU usage percentage across all cores, 0.0–100.0.
+    pub usage_pct: f32,
+}
+
+/// Disk utilization snapshot. `used` / `total` are bytes on the *primary*
+/// disk (the one the OS boots from on the local machine, or `/` on the
+/// remote). We intentionally do not surface every mount: a typical user
+/// only cares about "how full is my main drive", and enumerating every
+/// mount on a server with many volumes would make the chip unreadable
+/// and slow to query.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DiskStats {
+    pub total: u64,
+    pub used: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteMetrics {
     pub latency_ms: Option<u32>,
     pub memory: Option<MemoryStats>,
     pub network: Option<NetworkStats>,
+    pub cpu: Option<CpuStats>,
+    pub disk: Option<DiskStats>,
 }
 
 pub trait CrabPortMonitor: Send + Sync {

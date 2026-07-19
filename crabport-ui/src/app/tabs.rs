@@ -818,6 +818,162 @@ impl CrabportApp {
         cx.notify();
     }
 
+    /// Show the terminal pane's right-click context menu (Copy / Paste /
+    /// Clear selection / Split / Clear screen) at `pos`. The menu is scoped
+    /// to `pane_id`'s view so Copy/Paste operate on the right terminal
+    /// even in a split layout.
+    ///
+    /// The menu uses the global `ContextMenuController` (owned by
+    /// `AppCtx`) and is non-sticky — clicking an item both invokes the
+    /// action and dismisses the menu, matching the conventional context
+    /// menu UX.
+    pub fn show_terminal_context_menu(
+        &mut self,
+        pane_id: u64,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
+        use crate::views::terminal::split::SplitDir;
+        // `pane_id` here is actually `TerminalView::count`, which is the
+        // `id` passed to `TerminalView::new`. For the primary pane of a
+        // terminal tab, `add_tab` / `add_ssh_tab` / `add_telnet_tab` pass
+        // the *tab_id*; for split panes, `split_active_pane` passes the
+        // real pane_id. So we look up the view in both maps: first
+        // `pane_views` (split panes), then `terminal_views` (primary pane
+        // of a non-split terminal tab, keyed by tab_id).
+        let view = self
+            .pane_views
+            .get(&pane_id)
+            .cloned()
+            .or_else(|| self.terminal_views.get(&pane_id).cloned());
+        let Some(view) = view else {
+            return;
+        };
+        let has_sel = view.read_with(cx, |v, _| v.has_selection());
+        // Read the view's `on_split_request` callback so we can invoke it
+        // from the Split menu items. Cloning the `Option<Rc<...>>` is
+        // cheap.
+        let split_cb = view.read_with(cx, |v, _| v.on_split_request_cb());
+        // Find the real pane_id (the key in `pane_views`) for this view,
+        // so we can tell `split_active_pane` to split THIS pane, not
+        // whatever `last_focused_pane` happens to point at. The primary
+        // pane of a terminal tab is also in `pane_views` (via
+        // `init_split_for_tab`), so a single entity-equality scan covers
+        // both primary and split panes.
+        let real_pane_id = self
+            .pane_views
+            .iter()
+            .find(|(_, v)| **v == view)
+            .map(|(p, _)| *p);
+        if let Some(pid) = real_pane_id {
+            self.last_focused_pane = Some(pid);
+        }
+        let cm = self.app_ctx.context_menu.clone();
+
+        let view_for_copy = view.clone();
+        let view_for_paste = view.clone();
+        let view_for_clear = view.clone();
+        let view_for_clear_screen = view.clone();
+        let view_for_reset = view.clone();
+        let split_cb_for_right = split_cb.clone();
+        let split_cb_for_down = split_cb.clone();
+
+        let mut items: Vec<ContextMenuItem> = Vec::with_capacity(8);
+
+        // Copy — disabled when there's no selection so the user gets
+        // visual feedback that the action isn't available.
+        items.push(
+            ContextMenuItem::new(t!("menu.copy").to_string(), move |_w, cx| {
+                let _ = view_for_copy.update(cx, |v, cx| v.trigger_copy(cx));
+            })
+            .disabled(!has_sel),
+        );
+
+        // Paste — always available; the platform clipboard is the source.
+        items.push(ContextMenuItem::new(
+            t!("menu.paste").to_string(),
+            move |_w, cx| {
+                let _ = view_for_paste.update(cx, |v, cx| v.trigger_paste(cx));
+            },
+        ));
+
+        // Clear selection — only meaningful when there is one.
+        if has_sel {
+            items.push(ContextMenuItem::new(
+                t!("menu.clear_selection").to_string(),
+                move |_w, cx| {
+                    let _ = view_for_clear.update(cx, |v, cx| {
+                        v.clear_selection();
+                        cx.notify();
+                    });
+                },
+            ));
+        }
+
+        // Divider before the split + clear group so clipboard actions
+        // stay visually grouped apart from pane-management actions.
+        items.push(
+            ContextMenuItem::new("", move |_w, _cx| {})
+                .disabled(true)
+                .divider_after(),
+        );
+
+        // Split Right / Split Down — invoke the view's `on_split_request`
+        // callback, which the app wires to `split_active_pane`. This
+        // matches the keyboard-shortcut path.
+        items.push(ContextMenuItem::new(
+            t!("terminal.split_right").to_string(),
+            move |_w, cx| {
+                if let Some(cb) = &split_cb_for_right {
+                    cb(SplitDir::Vertical, cx);
+                }
+            },
+        ));
+        items.push(ContextMenuItem::new(
+            t!("terminal.split_down").to_string(),
+            move |_w, cx| {
+                if let Some(cb) = &split_cb_for_down {
+                    cb(SplitDir::Horizontal, cx);
+                }
+            },
+        ));
+
+        // Clear Screen — erases the visible terminal display but keeps
+        // scrollback. Equivalent to the `clear` shell command.
+        items.push(ContextMenuItem::new(
+            t!("menu.clear_screen").to_string(),
+            move |_w, cx| {
+                let _ = view_for_clear_screen.update(cx, |v, cx| {
+                    v.clear_screen();
+                    cx.notify();
+                });
+            },
+        ));
+
+        // Reset Terminal — full RIS reset, clears scrollback too.
+        items.push(ContextMenuItem::new(
+            t!("menu.reset_terminal").to_string(),
+            move |_w, cx| {
+                let _ = view_for_reset.update(cx, |v, cx| {
+                    v.reset_terminal();
+                    cx.notify();
+                });
+            },
+        ));
+
+        cm.update(cx, |c, cx| {
+            c.show(
+                ContextMenuState {
+                    position: pos,
+                    items,
+                    ..ContextMenuState::default()
+                },
+                cx,
+            );
+        });
+    }
+
     /// Wire a freshly-created pane's `on_focused` callback so that when it
     /// receives keyboard focus the app marks it as the active pane of its
     /// tab. Used by `add_tab` / `add_ssh_tab` / `add_telnet_tab` /
@@ -829,10 +985,30 @@ impl CrabportApp {
     ) {
         let app_handle = cx.entity().downgrade();
         let app_handle2 = cx.entity().downgrade();
+        let app_handle3 = cx.entity().downgrade();
+        // Capture the view entity so the `on_focused` callback can resolve
+        // the real pane_id (the key in `pane_views`) by entity equality.
+        // The `pane_id` passed to the callback is `TerminalView::count`,
+        // which for the primary pane of a non-split terminal tab is the
+        // *tab_id*, not the real pane_id — so `sync_active_pane_from_focus`
+        // can't find it in `split_trees` and would no-op, leaving
+        // `last_focused_pane` stale. Resolving via entity equality fixes
+        // the "split targets the wrong pane" bug.
+        let view_for_focus_cb = view.clone();
         view.update(cx, |v, _cx| {
             v.set_on_focused(move |pane_id, cx| {
                 let _ = app_handle.update(cx, |app, cx| {
-                    app.sync_active_pane_from_focus(pane_id, cx);
+                    // Try to resolve the real pane_id by entity equality.
+                    // Falls back to the passed-in `pane_id` if the view
+                    // isn't in `pane_views` (shouldn't happen, but is a
+                    // safe default).
+                    let real_pane_id = app
+                        .pane_views
+                        .iter()
+                        .find(|(_, v)| **v == view_for_focus_cb)
+                        .map(|(p, _)| *p)
+                        .unwrap_or(pane_id);
+                    app.sync_active_pane_from_focus(real_pane_id, cx);
                 });
             });
             v.set_on_split_request(move |dir, cx| {
@@ -845,6 +1021,13 @@ impl CrabportApp {
                     let _ = h.update(cx, |app, cx| {
                         app.split_active_pane(dir, cx);
                     });
+                });
+            });
+            // Right-click inside the terminal pane surfaces a
+            // Copy/Paste/Select-All context menu.
+            v.set_on_context_menu(move |pane_id, pos, cx| {
+                let _ = app_handle3.update(cx, |app, cx| {
+                    app.show_terminal_context_menu(pane_id, pos, cx);
                 });
             });
         });

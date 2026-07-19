@@ -4,7 +4,9 @@ use parking_lot::RwLock;
 use russh::{ChannelMsg, client};
 use tokio::sync::Mutex as TokioMutex;
 
-use crabport_terminal::terminal::{MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus};
+use crabport_terminal::terminal::{
+    CpuStats, DiskStats, MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
+};
 
 use crate::backend::MonitorState;
 use crate::handler::SshHandler;
@@ -27,6 +29,8 @@ pub(crate) async fn monitor_loop(
         let h = handle.lock().await;
         let latency_ms = measure_latency(&h).await;
         let memory = collect_memory(&h).await;
+        let cpu = collect_cpu(&h).await;
+        let disk = collect_disk(&h).await;
         let network = collect_network(&h).await;
 
         if let Some(net) = network {
@@ -38,6 +42,8 @@ pub(crate) async fn monitor_loop(
         m.metrics = RemoteMetrics {
             latency_ms,
             memory,
+            cpu,
+            disk,
             network: None, // No rate on first tick
         };
     }
@@ -61,6 +67,12 @@ pub(crate) async fn monitor_loop(
         // ---- Memory: parse /proc/meminfo ----
         let memory = collect_memory(&h).await;
 
+        // ---- CPU: parse /proc/loadavg (portable across Linux/macOS) ----
+        let cpu = collect_cpu(&h).await;
+
+        // ---- Disk: stat the root filesystem via `df` ----
+        let disk = collect_disk(&h).await;
+
         // ---- Network: parse /proc/net/dev ----
         let raw_network = collect_network(&h).await;
         let network = raw_network.map(|net| {
@@ -80,6 +92,8 @@ pub(crate) async fn monitor_loop(
             m.metrics = RemoteMetrics {
                 latency_ms,
                 memory,
+                cpu,
+                disk,
                 network,
             };
         }
@@ -136,6 +150,80 @@ async fn collect_memory(handle: &client::Handle<SshHandler>) -> Option<MemorySta
     Some(MemoryStats {
         total,
         used: total.saturating_sub(available),
+    })
+}
+
+/// Collect remote CPU stats. We use `/proc/loadavg` because it's the most
+/// portable single source across Linux distros and macOS-likes, and it
+/// doesn't require a follow-up sample (unlike `/proc/stat`, which needs
+/// two reads ~1s apart to compute a usage percentage).
+///
+/// `usage_pct` is derived as `load_avg * 100 / num_cpus`, clamped to
+/// 100.0. This isn't a true instantaneous CPU usage, but it's a
+/// reasonable proxy for "how busy is this box" and matches what
+/// `htop`/`top` show in their headers. We compute the CPU count from
+/// `nproc` (Linux) — failing that, we fall back to assuming the load is
+/// per-core (load_avg_1m * 100).
+///
+/// We no longer surface the raw 1-minute load average as a separate
+/// field — the toolbar only shows the percentage, so carrying the extra
+/// number through `RemoteMetrics` was dead weight.
+async fn collect_cpu(handle: &client::Handle<SshHandler>) -> Option<CpuStats> {
+    let output = exec_and_read(handle, "cat /proc/loadavg").await?;
+    let first = output.split_whitespace().next()?;
+    let load = first.parse::<f32>().ok()?;
+
+    // Try to get CPU count. `nproc` is universally available on Linux;
+    // `sysctl -n hw.ncpu` on macOS/BSD. We try both sequentially.
+    let ncpus: f32 = exec_and_read(handle, "nproc 2>/dev/null || sysctl -n hw.ncpu")
+        .await
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|n| if n > 0.0 { n } else { 1.0 })
+        .unwrap_or(1.0);
+
+    let usage_pct = ((load / ncpus) * 100.0).clamp(0.0, 100.0);
+    Some(CpuStats { usage_pct })
+}
+
+/// Collect remote disk stats by parsing `df` output for the root
+/// filesystem (`/`). We use `df -k -P` to get POSIX-compatible output:
+/// `-k` forces 1KB blocks, `-P` keeps the line-format stable (no splitting
+/// long device paths across two lines). We pick the row whose mount point
+/// is exactly `/` because that's the most universal "primary disk" on a
+/// remote server. If the root isn't present (unusual but possible on
+/// BSD/macOS), we fall back to the row with the largest total size.
+async fn collect_disk(handle: &client::Handle<SshHandler>) -> Option<DiskStats> {
+    // `df -kP` headers:
+    // Filesystem 1024-blocks Used Available Capacity Mounted on
+    let output = exec_and_read(handle, "df -kP 2>/dev/null || df -kP /").await?;
+    // Parse every row into (mount_point, total_bytes, used_bytes).
+    let mut rows: Vec<(&str, u64, u64)> = Vec::new();
+    for line in output.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
+            // Not a complete df row — skip. This also covers the rare
+            // case where `df` wraps a long device path onto two lines.
+            continue;
+        }
+        let mount = parts[parts.len() - 1];
+        let total_kb = parts[parts.len() - 5].parse::<u64>().ok();
+        let used_kb = parts[parts.len() - 4].parse::<u64>().ok();
+        if let (Some(total), Some(used)) = (total_kb, used_kb) {
+            rows.push((mount, total * 1024, used * 1024));
+        }
+    }
+    // Prefer the row whose mount point is `/`; else the largest total.
+    let pick = rows
+        .iter()
+        .find(|r| r.0 == "/")
+        .copied()
+        .or_else(|| rows.iter().max_by_key(|r| r.1).copied())?;
+    if pick.1 == 0 {
+        return None;
+    }
+    Some(DiskStats {
+        total: pick.1,
+        used: pick.2,
     })
 }
 

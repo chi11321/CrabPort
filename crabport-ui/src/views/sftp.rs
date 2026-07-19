@@ -10,7 +10,9 @@
 mod drag;
 mod helpers;
 mod panel;
+pub mod toolbar;
 pub mod view;
 
 pub use drag::{LocalFileDragValue, SftpDragValue};
+pub use toolbar::render_sftp_history_toggle;
 pub use view::{PanelHost, SftpTabView};
