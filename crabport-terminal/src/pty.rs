@@ -44,7 +44,9 @@ use std::{
 // Shared across platforms — struct fields and the CrabPortMonitor impl use these.
 use std::{
     sync::Arc,
+    sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    time::SystemTime,
 };
 
 #[cfg(windows)]
@@ -65,8 +67,8 @@ use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
 use crate::terminal::{
-    BackendEvent, CrabPortMonitor, CrabPortTerminal, MemoryStats, NetworkStats, RemoteMetrics,
-    RemoteStatus,
+    BackendEvent, CpuStats, CrabPortMonitor, CrabPortTerminal, DiskStats, MemoryStats,
+    NetworkStats, RemoteMetrics, RemoteStatus,
 };
 
 // ===========================================================================
@@ -137,6 +139,149 @@ fn which_executable(program: &str) -> Option<()> {
 }
 
 // ===========================================================================
+// Global local-metrics cache — shared across all PtyBackend instances
+// ===========================================================================
+//
+// Every local PTY pane (whether a separate tab or a split pane) collects
+// the *same* host metrics — CPU, memory, disk, network are all properties
+// of the machine, not of the individual shell process. Without this cache
+// each `PtyBackend::metrics()` call would run its own `sysinfo::System::
+// refresh_*` + `Disks::refresh` + `Networks::refresh`, which is wasteful
+// (N panes → N sysinfo refreshes per second) and can cause visible
+// jitter in the toolbar when the refreshes race each other.
+//
+// The cache is a process-global singleton: the first `PtyBackend` to call
+// `metrics()` initializes it, and every subsequent `PtyBackend` reads from
+// the same snapshot. The snapshot is refreshed at most once per second —
+// the same cadence the old per-backend code used — so the toolbar still
+// updates live, just without the duplicate work.
+//
+// SSH backends are unaffected: they run their own `monitor_loop` over SSH
+// exec, and split panes on an SSH tab already share the parent's monitor
+// state (see `SshBackend::new_channel_backend`).
+struct LocalMetricsCache {
+    /// Cached snapshot. Replaced atomically (via the lock) every refresh tick.
+    snapshot: RwLock<RemoteMetrics>,
+    /// Monotonic millis of the last refresh. Accessed via a mutex alongside
+    /// the refresh itself so only one thread refreshes at a time.
+    last_refresh_ms: AtomicU64,
+    /// Guard so only one thread performs the refresh; other threads just
+    /// read the existing snapshot. Implemented as a Mutex<bool> flag —
+    /// `try_lock` succeeds when no refresh is in progress.
+    refreshing: Mutex<bool>,
+    // sysinfo state is kept inside the cache so it retains its internal
+    // counters between refreshes (sysinfo computes CPU usage as a diff,
+    // so the first refresh after a fresh `System::new()` always returns 0).
+    sys: RwLock<sysinfo::System>,
+    networks: RwLock<sysinfo::Networks>,
+    disks: RwLock<sysinfo::Disks>,
+    /// Previous cumulative network bytes (for computing per-second rate).
+    prev_net_sent: AtomicU64,
+    prev_net_recv: AtomicU64,
+}
+
+impl LocalMetricsCache {
+    fn new() -> Self {
+        Self {
+            snapshot: RwLock::new(RemoteMetrics::default()),
+            last_refresh_ms: AtomicU64::new(0),
+            refreshing: Mutex::new(false),
+            sys: RwLock::new(sysinfo::System::new()),
+            networks: RwLock::new(sysinfo::Networks::new_with_refreshed_list()),
+            disks: RwLock::new(sysinfo::Disks::new_with_refreshed_list()),
+            prev_net_sent: AtomicU64::new(0),
+            prev_net_recv: AtomicU64::new(0),
+        }
+    }
+
+    /// Return the current metrics snapshot, refreshing it first if it's
+    /// older than 1 second. Only one thread performs the refresh; others
+    /// fall through to read the existing snapshot. This keeps the toolbar
+    /// responsive even when N panes all call `metrics()` in the same frame.
+    fn metrics(&self) -> RemoteMetrics {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self.last_refresh_ms.load(AtomicOrdering::Relaxed);
+        if now.saturating_sub(last) >= 1000 {
+            // Try to claim the refresh slot. If another thread is already
+            // refreshing, skip — we'll just read the slightly-stale snapshot.
+            if let Some(mut guard) = self.refreshing.try_lock() {
+                if !*guard {
+                    *guard = true;
+                    drop(guard);
+                    self.refresh(now);
+                    *self.refreshing.lock() = false;
+                }
+            }
+        }
+        self.snapshot.read().clone()
+    }
+
+    fn refresh(&self, now: u64) {
+        {
+            let mut sys = self.sys.write();
+            sys.refresh_memory();
+            sys.refresh_cpu_usage();
+        }
+        {
+            let mut networks = self.networks.write();
+            networks.refresh(true);
+        }
+        {
+            let mut disks = self.disks.write();
+            disks.refresh(true);
+        }
+
+        let sys = self.sys.read();
+        let memory = MemoryStats {
+            total: sys.total_memory(),
+            used: sys.used_memory(),
+        };
+        let cpu = CpuStats {
+            usage_pct: sys.global_cpu_usage(),
+        };
+        drop(sys);
+
+        let networks = self.networks.read();
+        let mut bytes_sent: u64 = 0;
+        let mut bytes_recv: u64 = 0;
+        for (_name, network) in networks.iter() {
+            bytes_sent += network.transmitted();
+            bytes_recv += network.received();
+        }
+        let prev_sent = self.prev_net_sent.swap(bytes_sent, AtomicOrdering::Relaxed);
+        let prev_recv = self.prev_net_recv.swap(bytes_recv, AtomicOrdering::Relaxed);
+        let network = NetworkStats {
+            bytes_sent: bytes_sent.saturating_sub(prev_sent),
+            bytes_recv: bytes_recv.saturating_sub(prev_recv),
+        };
+
+        let disk = {
+            let disks_guard = self.disks.read();
+            pick_primary_disk(disks_guard.list())
+        };
+
+        let mut cached = self.snapshot.write();
+        *cached = RemoteMetrics {
+            latency_ms: None,
+            memory: Some(memory),
+            network: Some(network),
+            cpu: Some(cpu),
+            disk,
+        };
+        self.last_refresh_ms.store(now, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Process-global local-metrics cache. Initialized on first use.
+fn local_metrics_cache() -> &'static LocalMetricsCache {
+    static CACHE: OnceLock<LocalMetricsCache> = OnceLock::new();
+    CACHE.get_or_init(LocalMetricsCache::new)
+}
+
+// ===========================================================================
 // Command enum — shared between platforms
 // ===========================================================================
 
@@ -144,6 +289,75 @@ enum Command {
     Write(Vec<u8>),
     Resize(u16, u16),
     Close,
+}
+
+// ===========================================================================
+// Disk selection helper — pick the primary disk to surface in metrics
+// ===========================================================================
+
+/// Pick the disk whose usage we surface in [`RemoteMetrics::disk`]. The
+/// rule is intentionally simple — users typically only care about their
+/// "main" disk, and enumerating every mount would make the toolbar chip
+/// unreadable. Selection order:
+///
+/// 1. On Unix, the mount whose `mount_point` is the prefix of the user's
+///    home directory. This is the disk that actually matters for "is my
+///    home directory full". On Windows, we instead match the system drive
+///    (the root of `%SystemRoot%`, usually `C:\`).
+/// 2. Otherwise the disk with the largest `total_space` — a reasonable
+///    proxy for "primary disk" on hosts where (1) didn't match.
+/// 3. Returns `None` when `disks` is empty (e.g. on a chroot / container
+///    where sysinfo can't enumerate mounts).
+fn pick_primary_disk(disks: &[sysinfo::Disk]) -> Option<DiskStats> {
+    if disks.is_empty() {
+        return None;
+    }
+
+    // (1) Match by home / system drive.
+    let pick = disks.iter().find(|d| {
+        let mp = d.mount_point();
+        #[cfg(unix)]
+        {
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = std::path::Path::new(&home);
+                return mp == home || home.starts_with(mp);
+            }
+            false
+        }
+        #[cfg(windows)]
+        {
+            // On Windows the system drive is the root of %SystemRoot%
+            // (e.g. `C:\\`). sysinfo returns mount points as `\\\\?\\C:\\`
+            // or `C:\\`, so we compare the first non-prefix character.
+            if let Ok(sysroot) = std::env::var("SystemRoot") {
+                let sysroot = std::path::Path::new(&sysroot);
+                if let Some(sysroot_root) = sysroot.ancestors().nth(1) {
+                    return mp == sysroot_root;
+                }
+            }
+            false
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    });
+
+    // (2) Fallback to the largest disk.
+    let pick = pick.or_else(|| {
+        disks
+            .iter()
+            .max_by_key(|d| d.total_space())
+            .filter(|d| d.total_space() > 0)
+    });
+
+    let d = pick?;
+    let total = d.total_space();
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(d.available_space());
+    Some(DiskStats { total, used })
 }
 
 // ===========================================================================
@@ -164,15 +378,6 @@ pub struct PtyBackend {
     /// there are no active subscribers. Without holding one receiver the
     /// channel reports `Closed` to new subscribers immediately.
     _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
-    sys: RwLock<sysinfo::System>,
-    networks: RwLock<sysinfo::Networks>,
-    /// Monotonic millis of the last sysinfo refresh.
-    last_refresh_ms: AtomicU64,
-    /// Cached metrics snapshot.
-    cached_metrics: RwLock<RemoteMetrics>,
-    /// Previous cumulative network bytes (for computing per-second rate).
-    prev_net_sent: AtomicU64,
-    prev_net_recv: AtomicU64,
 }
 
 // ===========================================================================
@@ -305,12 +510,6 @@ impl PtyBackend {
             command_tx,
             event_tx,
             _event_rx,
-            sys: RwLock::new(sysinfo::System::new()),
-            networks: RwLock::new(sysinfo::Networks::new_with_refreshed_list()),
-            last_refresh_ms: AtomicU64::new(0),
-            cached_metrics: RwLock::new(RemoteMetrics::default()),
-            prev_net_sent: AtomicU64::new(0),
-            prev_net_recv: AtomicU64::new(0),
         })
     }
 }
@@ -481,12 +680,6 @@ impl PtyBackend {
             command_tx,
             event_tx,
             _event_rx,
-            sys: RwLock::new(sysinfo::System::new()),
-            networks: RwLock::new(sysinfo::Networks::new_with_refreshed_list()),
-            last_refresh_ms: AtomicU64::new(0),
-            cached_metrics: RwLock::new(RemoteMetrics::default()),
-            prev_net_sent: AtomicU64::new(0),
-            prev_net_recv: AtomicU64::new(0),
         })
     }
 }
@@ -549,65 +742,13 @@ impl CrabPortMonitor for PtyBackend {
     }
 
     fn metrics(&self) -> RemoteMetrics {
-        // Refresh at most once per second; first call always refreshes
-        // because last_refresh_ms starts at 0.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let last = self.last_refresh_ms.load(AtomicOrdering::Relaxed);
-        if now.saturating_sub(last) >= 1000 {
-            // Only one writer wins the race
-            if self
-                .last_refresh_ms
-                .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
-                .is_ok()
-            {
-                {
-                    let mut sys = self.sys.write();
-                    sys.refresh_memory();
-                }
-                {
-                    let mut networks = self.networks.write();
-                    networks.refresh(true);
-                }
-
-                let sys = self.sys.read();
-                let memory = MemoryStats {
-                    total: sys.total_memory(),
-                    used: sys.used_memory(),
-                };
-                drop(sys);
-
-                let networks = self.networks.read();
-                let mut bytes_sent: u64 = 0;
-                let mut bytes_recv: u64 = 0;
-                for (_name, network) in networks.iter() {
-                    bytes_sent += network.transmitted();
-                    bytes_recv += network.received();
-                }
-
-                // Compute per-second rate from cumulative delta
-                let prev_sent = self.prev_net_sent.swap(bytes_sent, AtomicOrdering::Relaxed);
-                let prev_recv = self.prev_net_recv.swap(bytes_recv, AtomicOrdering::Relaxed);
-                let rate_sent = bytes_sent.saturating_sub(prev_sent);
-                let rate_recv = bytes_recv.saturating_sub(prev_recv);
-
-                let network = NetworkStats {
-                    bytes_sent: rate_sent,
-                    bytes_recv: rate_recv,
-                };
-
-                let mut cached = self.cached_metrics.write();
-                *cached = RemoteMetrics {
-                    latency_ms: None,
-                    memory: Some(memory),
-                    network: Some(network),
-                };
-            }
-        }
-
-        self.cached_metrics.read().clone()
+        // All local PTY panes share a single process-global metrics cache
+        // — CPU / memory / disk / network are properties of the host, not
+        // of the individual shell, so there's no point in each pane
+        // running its own sysinfo refresh. The cache refreshes at most
+        // once per second (same cadence as before) and is thread-safe.
+        // See `LocalMetricsCache` for the rationale.
+        local_metrics_cache().metrics()
     }
 }
 
@@ -702,6 +843,7 @@ impl CrabPortMonitor for FailedPtyBackend {
 
 /// Maximum number of history entries to surface in the UI panel. Mirrors
 /// the SSH-side cap so local + remote behave the same.
+#[cfg(not(windows))]
 const MAX_LOCAL_HISTORY: usize = 1000;
 
 /// Read the local user's shell history file and return its commands,

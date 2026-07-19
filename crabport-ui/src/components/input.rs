@@ -43,12 +43,12 @@
 //! ```
 
 use gpui::{prelude::FluentBuilder, *};
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Sizable, Size};
-use std::time::Duration;
 
 use crate::color::*;
+use crate::motion::{DURATION_FAST, EASE_LINEAR, RADIUS_MD};
 
 // ---------------------------------------------------------------------------
 // Shared label + shell + error column builder
@@ -314,12 +314,12 @@ impl RenderOnce for StyledInput {
             )
             .w_full()
             .overflow_y_scroll()
-            .rounded_md()
+            .rounded(RADIUS_MD)
             .bg(rgb(base_bg))
             .border_1()
             .border_color(rgb(base_border))
             .with_transition(shell_id)
-            .transition_on_hover(Duration::from_millis(120), Linear, move |hovered, el| {
+            .transition_on_hover(DURATION_FAST, EASE_LINEAR, move |hovered, el| {
                 if has_error || focused {
                     el // don't override error / focus border on hover
                 } else if *hovered {

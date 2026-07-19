@@ -43,6 +43,7 @@ use crate::views::terminal::selection::*;
 
 pub mod connection_overlay;
 pub mod split;
+pub mod toolbar;
 
 mod color;
 mod fonts;
@@ -149,6 +150,13 @@ pub struct TerminalView {
     /// Invoked when the user triggers a split via keyboard shortcut.
     /// Receives the split direction. The app calls `split_active_pane`.
     on_split_request: Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>>,
+    /// Invoked when the user right-clicks inside the terminal pane.
+    /// Receives the click position (window-relative pixels) and the pane
+    /// id, so the app can show a context menu with Copy/Paste/etc. actions
+    /// scoped to this pane. The app owns the `ContextMenuController` and
+    /// decides which items to show — the terminal view itself doesn't know
+    /// about the menu system.
+    on_context_menu: Option<Rc<dyn Fn(u64, gpui::Point<gpui::Pixels>, &mut App)>>,
     /// Latest SFTP transfer progress pushed by the backend, or `None` when
     /// no transfer is in flight. Updated by the backend-event subscriber;
     /// read by the toolbar via [`Self::sftp_progress`].
@@ -625,6 +633,7 @@ impl TerminalView {
             on_backend_closed: None,
             on_focused: None,
             on_split_request: None,
+            on_context_menu: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
@@ -716,6 +725,84 @@ impl TerminalView {
         self.session.write_raw(data);
     }
 
+    /// Copy the current selection (or the whole visible grid if no
+    /// selection) to the clipboard. Equivalent to the `TerminalAction::Copy`
+    /// keyboard shortcut — sets the `pending_copy` flag, which the next
+    /// render tick consumes. Used by the terminal right-click context menu.
+    pub fn trigger_copy(&mut self, cx: &mut Context<Self>) {
+        self.pending_copy = true;
+        cx.notify();
+    }
+
+    /// Paste the current clipboard contents into the terminal. Equivalent
+    /// to the `TerminalAction::Paste` keyboard shortcut — sets the
+    /// `pending_paste` flag, which the next render tick consumes. Used by
+    /// the terminal right-click context menu.
+    pub fn trigger_paste(&mut self, cx: &mut Context<Self>) {
+        self.pending_paste = true;
+        cx.notify();
+    }
+
+    /// Whether the terminal currently has a non-empty text selection.
+    /// Used by the right-click context menu to decide whether to enable
+    /// the "Copy" item.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .lock()
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Clear the current text selection. Used by the right-click context
+    /// menu's "Clear Selection" item.
+    pub fn clear_selection(&mut self) {
+        *self.selection.lock() = None;
+    }
+
+    /// Clear the terminal screen by asking the shell to run `clear`.
+    //
+    // We send the `clear` command through the PTY (via `write_raw`, which
+    // doesn't record it into the command history) rather than feeding
+    // ANSI escape sequences directly into the term grid via `feed_escape`.
+    // The reason: `feed_escape(b"\x1b[2J\x1b[H")` erases the visible grid
+    // but the shell has no idea the screen was cleared, so it won't
+    // redraw its prompt — the `[user@host] ...` prompt vanishes and the
+    // user is left with a blank screen until they press Enter.
+    //
+    // By running `clear` as a shell command, the shell's own `clear`
+    // implementation sends the right escape sequences AND redraws the
+    // prompt via its precmd/preprompt hook, so the result matches what
+    // the user expects from typing `clear` at the prompt.
+    //
+    // `write_raw` is used instead of `write` so the `clear` invocation
+    // isn't captured into the command history (it's a UI action, not a
+    // user command).
+    pub fn clear_screen(&mut self) {
+        self.session.write_raw(b"clear\n");
+        self.session.scroll_to_bottom();
+    }
+
+    /// Reset the terminal by running `reset` in the shell. This performs
+    // a full terminal reset (re-initializes the terminal state, clears
+    // scrollback, redraws the prompt) — heavier than `clear_screen`.
+    //
+    // Like [`clear_screen`], we send `reset\n` through the PTY via
+    // `write_raw` rather than feeding `ESC c` (RIS) directly into the
+    // term grid. `ESC c` resets the terminal emulator's state but the
+    // shell doesn't know it happened, so the prompt wouldn't redraw.
+    // Running `reset` as a command lets the shell + `reset` binary
+    // coordinate the full reset sequence and prompt redraw.
+    //
+    // Note: `reset` may not exist on all systems (e.g. minimal
+    // embedded shells). On systems without it, the shell will print
+    // "command not found" — a tolerable failure mode. If this becomes
+    // a real issue we can fall back to `stty sane` + `clear`.
+    pub fn reset_terminal(&mut self) {
+        self.session.write_raw(b"reset\n");
+        self.session.scroll_to_bottom();
+    }
+
     /// Delete a remote file or directory. The backend stats the path to
     /// decide between `remove_file` and recursive `remove_dir`.
     pub fn sftp_delete(&self, remote_path: &str) {
@@ -793,6 +880,28 @@ impl TerminalView {
         f: impl Fn(crate::views::terminal::split::SplitDir, &mut App) + 'static,
     ) {
         self.on_split_request = Some(Rc::new(f));
+    }
+
+    /// Clone of the current `on_split_request` callback, if any. Exposed so
+    /// the right-click context menu can invoke the same split path as the
+    /// keyboard shortcut without the app having to re-resolve the target
+    /// pane.
+    pub fn on_split_request_cb(
+        &self,
+    ) -> Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>> {
+        self.on_split_request.clone()
+    }
+
+    /// Set the callback invoked when the user right-clicks inside this
+    /// terminal pane. The app uses it to show a context menu with
+    /// Copy/Paste/Select-All actions scoped to this pane. The callback
+    /// receives this pane's id and the click position (window-relative
+    /// pixels).
+    pub fn set_on_context_menu(
+        &mut self,
+        f: impl Fn(u64, gpui::Point<gpui::Pixels>, &mut App) + 'static,
+    ) {
+        self.on_context_menu = Some(Rc::new(f));
     }
 
     /// Attach a `CrabPortTunnel` view of this tab's backend, so the Tunnels
@@ -1321,6 +1430,11 @@ impl Render for TerminalView {
         // Read by the paint callback to render a solid cursor when focused
         // vs. a hollow outline when not focused (no blinking).
         let is_focused_paint = self.is_focused.clone();
+        // Cloned into the right-click handler so a right-click inside the
+        // terminal pane surfaces a Copy/Paste context menu via the app's
+        // global `ContextMenuController`.
+        let on_context_menu = self.on_context_menu.clone();
+        let pane_id_for_ctx = self.count;
 
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
@@ -1942,6 +2056,20 @@ impl Render for TerminalView {
                                 }
                             }
                             needs_repaint.store(true, Ordering::Release);
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        let on_context_menu = on_context_menu.clone();
+                        move |event, _window, cx| {
+                            // Right-click inside the terminal pane: surface a
+                            // Copy/Paste/Select-All context menu via the
+                            // app-injected callback. The app owns the
+                            // `ContextMenuController` and decides which items
+                            // to show; the terminal view just reports the
+                            // click position + pane id.
+                            if let Some(cb) = &on_context_menu {
+                                cb(pane_id_for_ctx, event.position, cx);
+                            }
                         }
                     }),
             )

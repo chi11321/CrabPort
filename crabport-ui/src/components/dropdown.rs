@@ -1,11 +1,14 @@
 use crate::color::*;
+use crate::motion::{
+    DURATION_FAST, DURATION_MODERATE, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_XS,
+};
 use gpui::{prelude::FluentBuilder, *};
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutQuad};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::scroll::ScrollableElement;
 use rust_i18n::t;
 use std::cell::Cell;
 use std::f32::consts::PI;
-use std::{rc::Rc, time::Duration};
+use std::rc::Rc;
 
 /// Rotation (in radians) of the trigger chevron when the menu is open.
 /// PI = 180°, so the down-chevron points up when open.
@@ -219,7 +222,7 @@ impl RenderOnce for Dropdown {
             .text_color(rgb(text_muted()))
             .with_animation(
                 chevron_anim_id,
-                Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                Animation::new(DURATION_MODERATE).with_easing(ease_in_out),
                 move |this, delta| {
                     let angle = if is_open {
                         delta * CHEVRON_OPEN_ROTATION
@@ -239,7 +242,7 @@ impl RenderOnce for Dropdown {
             .w_full()
             .h_9()
             .px_3()
-            .rounded_md()
+            .rounded(RADIUS_MD)
             .bg(rgb(if disabled {
                 input_bg_disabled()
             } else {
@@ -388,25 +391,21 @@ impl RenderOnce for Dropdown {
                     .h(ITEM_HEIGHT)
                     .px_3()
                     .w_full()
-                    .rounded_sm()
+                    .rounded(RADIUS_XS)
                     .text_sm()
                     .bg(rgba(0x00000000))
                     .with_transition(item_id)
-                    .transition_on_hover(
-                        Duration::from_millis(120),
-                        EaseInOutQuad,
-                        move |hovered, el| {
-                            if *hovered {
-                                el.bg(rgb(surface_active()))
-                            } else {
-                                el.bg(rgba(0x00000000))
-                            }
-                        },
-                    )
+                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+                        if *hovered {
+                            el.bg(rgb(surface_active()))
+                        } else {
+                            el.bg(rgba(0x00000000))
+                        }
+                    })
                     .transition_when_else(
                         is_selected,
-                        Duration::from_millis(120),
-                        EaseInOutQuad,
+                        DURATION_FAST,
+                        EASE_STANDARD,
                         move |state| state.text_color(rgb(selected_color)),
                         move |state| state.text_color(rgb(unselected_color)),
                     )
@@ -461,22 +460,18 @@ impl RenderOnce for Dropdown {
                     .h(ITEM_HEIGHT)
                     .px_3()
                     .w_full()
-                    .rounded_sm()
+                    .rounded(RADIUS_XS)
                     .text_sm()
                     .text_color(rgb(term_blue()))
                     .bg(rgba(0x00000000))
                     .with_transition(ElementId::Name(format!("{id_str}-create").into()))
-                    .transition_on_hover(
-                        Duration::from_millis(120),
-                        EaseInOutQuad,
-                        move |hovered, el| {
-                            if *hovered {
-                                el.bg(rgb(surface_active()))
-                            } else {
-                                el.bg(rgba(0x00000000))
-                            }
-                        },
-                    )
+                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+                        if *hovered {
+                            el.bg(rgb(surface_active()))
+                        } else {
+                            el.bg(rgba(0x00000000))
+                        }
+                    })
                     .child(t!("groups.create", name = query_str.as_str()).to_string())
                     .on_click(move |_e, w, cx| {
                         on_create(query_str.clone(), w, cx);
@@ -514,7 +509,7 @@ impl RenderOnce for Dropdown {
             .mt_1()
             .w_full()
             .overflow_hidden()
-            .rounded_md()
+            .rounded(RADIUS_MD)
             .border_1()
             .border_color(rgb(border()))
             .bg(rgb(bg_base()))
@@ -538,8 +533,8 @@ impl RenderOnce for Dropdown {
             .with_transition(menu_id)
             .transition_when_else(
                 is_open,
-                Duration::from_millis(250),
-                EaseInOutQuad,
+                DURATION_SLOW,
+                EASE_STANDARD,
                 move |state| state.h(menu_h).opacity(1.),
                 move |state| state.h(px(0.)).opacity(0.),
             )

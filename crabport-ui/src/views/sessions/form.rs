@@ -1,10 +1,9 @@
 use gpui::{prelude::FluentBuilder, *};
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 use std::rc::Rc;
-use std::time::Duration;
 
 use super::with_certificate::WithCertificateForm;
 use super::with_proxy::{ProxyKind, WithProxyForm};
@@ -15,6 +14,7 @@ use crate::components::dropdown::Dropdown;
 use crate::components::input::{StyledInput, StyledPasswordInput};
 use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
+use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG};
 use crabport_core::credential::PrivateKeyKind;
 
 // ---------------------------------------------------------------------------
@@ -579,7 +579,7 @@ fn render_dialog(
         .bg(rgb(bg_base()))
         .border_1()
         .border_color(rgb(border()))
-        .rounded_lg()
+        .rounded(RADIUS_LG)
         .shadow_lg()
         .flex()
         .flex_col()
@@ -595,8 +595,8 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             active,
-            Duration::from_millis(150),
-            Linear,
+            DURATION_BASE,
+            EASE_STANDARD,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),
         )

@@ -10,11 +10,10 @@
 //! which dispatches to the matching store CRUD method based on `kind`.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
@@ -25,6 +24,7 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::input::StyledInput;
 use crate::components::overlay::render_overlay;
+use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG};
 
 // ---------------------------------------------------------------------------
 // Output passed to the save callback
@@ -222,7 +222,7 @@ fn render_dialog(
         .bg(rgb(bg_base()))
         .border_1()
         .border_color(rgb(border()))
-        .rounded_lg()
+        .rounded(RADIUS_LG)
         .shadow_lg()
         .flex()
         .flex_col()
@@ -238,8 +238,8 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             open,
-            Duration::from_millis(150),
-            Linear,
+            DURATION_BASE,
+            EASE_STANDARD,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),
         )

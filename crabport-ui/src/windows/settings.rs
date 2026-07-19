@@ -14,8 +14,10 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
 use rust_i18n::t;
 
-use crabport_core::config;
+use crabport_core::config::{self, StartupPage};
+use crabport_core::credential::HostEntry;
 
+use crate::app_state::AppState;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
@@ -25,6 +27,7 @@ use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
+use crate::motion::RADIUS_MD;
 
 // ---------------------------------------------------------------------------
 // Tab enum
@@ -76,6 +79,7 @@ pub struct SettingsWindow {
     locale_dropdown_open: bool,
     theme_dropdown_open: bool,
     font_family_dropdown_open: bool,
+    startup_dropdown_open: bool,
     /// Search input backing the terminal font-family dropdown. Lets the
     /// user type to filter the (potentially long) list of installed fonts.
     font_search_input: Entity<InputState>,
@@ -186,6 +190,7 @@ impl SettingsWindow {
             locale_dropdown_open: false,
             theme_dropdown_open: false,
             font_family_dropdown_open: false,
+            startup_dropdown_open: false,
             font_search_input,
             font_size_input,
             font_size_focused: false,
@@ -206,12 +211,100 @@ impl SettingsWindow {
             .unwrap_or_else(|_| "(unknown)".to_string());
         let handle = cx.entity().clone();
 
+        // ---- Startup page dropdown ----
+        // Build from the saved-host list so the user can pin any session as
+        // the launch target. Hosts come straight from the store (not the
+        // in-memory `CrabportApp::hosts` list, which lives in the main
+        // window and isn't reachable from here).
+        let hosts: Vec<HostEntry> = AppState::store(cx).lock().hosts().unwrap_or_default();
+        let current_page = config::snapshot().appearance.startup.page.clone();
+
+        // Stable item list: Home / SFTP / Local Terminal, then every saved
+        // host as `Session(<id>)`. Values use `StartupPage::to_id` so
+        // `on_change` can resolve the selected index back to a page.
+        let mut startup_items: Vec<(String, String)> = vec![
+            (
+                t!("window.settings.general.startup_page_home").to_string(),
+                StartupPage::Home.to_id(),
+            ),
+            (
+                t!("window.settings.general.startup_page_sftp").to_string(),
+                StartupPage::Sftp.to_id(),
+            ),
+            (
+                t!("window.settings.general.startup_page_local_terminal").to_string(),
+                StartupPage::LocalTerminal.to_id(),
+            ),
+        ];
+        for h in &hosts {
+            startup_items.push((
+                format!(
+                    "{}{} ({})",
+                    t!("window.settings.general.startup_page_session_prefix"),
+                    h.name,
+                    h.host
+                ),
+                StartupPage::Session(h.id).to_id(),
+            ));
+        }
+        let startup_idx = startup_items
+            .iter()
+            .position(|(_, v)| *v == current_page.to_id())
+            // Stale host id (host was deleted since the user last picked
+            // it) → fall back to Home so the dropdown always shows a valid
+            // entry. The launch-time fallback in `CrabportApp::wire` also
+            // guards this, but normalizing here keeps the displayed value
+            // honest.
+            .or_else(|| startup_items.iter().position(|(_, v)| v == "home"))
+            .unwrap_or(0);
+
+        let startup_dropdown = {
+            let h_for_toggle = handle.clone();
+            let h_for_change = handle.clone();
+            let items_for_change = startup_items.clone();
+            let mut dd = Dropdown::new("settings-startup-page")
+                .is_open(self.startup_dropdown_open)
+                .selected(startup_idx);
+            for (label, value) in &startup_items {
+                dd = dd.item_with_value(label.clone(), value.clone());
+            }
+            dd.on_toggle(move |_w, cx| {
+                h_for_toggle.update(cx, |view, cx| {
+                    view.startup_dropdown_open = !view.startup_dropdown_open;
+                    cx.notify();
+                });
+            })
+            .on_change(move |idx, _w, cx| {
+                let page = items_for_change
+                    .get(idx)
+                    .map(|(_, v)| StartupPage::from_id(v))
+                    .unwrap_or(StartupPage::Home);
+                let _ = config::update(|cfg| {
+                    cfg.appearance.startup.page = page;
+                });
+                h_for_change.update(cx, |view, cx| {
+                    view.startup_dropdown_open = false;
+                    cx.notify();
+                });
+            })
+        };
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .p_6()
             .gap_6()
+            // --- Startup page section ---
+            .child(
+                Section::new()
+                    .header(t!("window.settings.general.section_startup"))
+                    .desc(t!("window.settings.general.startup_page_desc"))
+                    .field(
+                        t!("window.settings.general.startup_page_label").to_string(),
+                        div().w(px(280.0)).child(startup_dropdown),
+                    ),
+            )
             // --- Data directory section ---
             .child(
                 Section::new()
@@ -538,7 +631,7 @@ impl SettingsWindow {
                         .min_w(px(72.0))
                         .h(px(28.0))
                         .px_3()
-                        .rounded_md()
+                        .rounded(RADIUS_MD)
                         .cursor_pointer()
                         .border_1()
                         .border_color(rgb(if is_recording {
@@ -711,6 +804,7 @@ impl Render for SettingsWindow {
             ),
             content,
         )
+        .id("settings-root")
         .track_focus(&self.focus_handle)
         // Intercept key presses while recording a keybind.
         .when(self.recording_action.is_some(), |el| {

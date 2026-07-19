@@ -21,13 +21,13 @@
 //! backdrop dismisses it with the same easing.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
+use crate::motion::{DURATION_BASE, DURATION_INSTANT, EASE_STANDARD, RADIUS_MD, RADIUS_SM};
 
 // ---------------------------------------------------------------------------
 // ContextMenuItem
@@ -101,6 +101,15 @@ pub struct ContextMenuState {
     pub header: Option<SharedString>,
     /// Whether the menu is currently shown. Drives the in/out transition.
     pub open: bool,
+    /// When `true`, clicking an item does NOT auto-dismiss the menu — the
+    /// menu stays open so the user can toggle multiple items in a row
+    /// (used by the toolbar's slot-visibility menu). The menu is closed
+    /// by clicking outside it (backdrop) or pressing Escape, same as the
+    /// non-sticky variant.
+    ///
+    /// Default `false` — the conventional behavior where a click both
+    /// invokes the item's handler and dismisses the menu.
+    pub sticky: bool,
 }
 
 impl ContextMenuState {
@@ -118,7 +127,7 @@ impl ContextMenuState {
 
 /// How long the dismiss animation runs before the state is dropped. Matches
 /// the `transition_when_else` duration used in `render_menu`.
-const CONTEXT_MENU_DISMISS_MS: u64 = 120;
+const CONTEXT_MENU_DISMISS_MS: u64 = 150;
 
 pub struct ContextMenuController {
     /// `None` when no menu is showing or dismissing.
@@ -142,21 +151,30 @@ impl ContextMenuController {
     /// is replaced (its item callbacks are dropped without being invoked).
     pub fn show(&mut self, mut state: ContextMenuState, cx: &mut Context<Self>) {
         let entity = cx.entity().downgrade();
+        let sticky = state.sticky;
 
         // Wrap each item's click handler so that after invoking it we
         // dismiss the menu (which plays the out animation + clears state).
-        for item in &mut state.items {
-            if item.disabled {
-                continue;
-            }
-            let user_cb = item.on_click.take();
-            let entity = entity.clone();
-            item.on_click = Some(Rc::new(move |w, cx| {
-                if let Some(cb) = user_cb.as_ref() {
-                    cb(w, cx);
+        //
+        // Exception: `sticky` menus keep the menu open after an item click
+        // so the user can toggle multiple items in a row — the toolbar's
+        // slot-visibility menu uses this. Sticky menus still dismiss on
+        // backdrop click (handled in `render_context_menu` via the overlay
+        // backdrop's `on_click`).
+        if !sticky {
+            for item in &mut state.items {
+                if item.disabled {
+                    continue;
                 }
-                let _ = entity.update(cx, |this, cx| this.begin_dismiss(cx));
-            }));
+                let user_cb = item.on_click.take();
+                let entity = entity.clone();
+                item.on_click = Some(Rc::new(move |w, cx| {
+                    if let Some(cb) = user_cb.as_ref() {
+                        cb(w, cx);
+                    }
+                    let _ = entity.update(cx, |this, cx| this.begin_dismiss(cx));
+                }));
+            }
         }
 
         // Bump generation so any in-flight dismiss task becomes stale and
@@ -203,10 +221,46 @@ impl ContextMenuController {
     pub fn is_active(&self) -> bool {
         self.state.is_some()
     }
+
+    /// Replace the current menu's items in-place, without replaying the
+    /// open/close animation. Used by **sticky** menus (e.g. the toolbar's
+    /// slot-visibility menu) to update checkmarks after a click without
+    /// the flicker of a full re-show.
+    ///
+    /// No-op if no menu is currently showing. Also re-wraps the new items'
+    /// click handlers with the dismiss-after-click behavior — unless the
+    /// current state is `sticky`, in which case the items are kept as-is
+    /// (sticky menus stay open after a click).
+    pub fn replace_items(&mut self, mut new_items: Vec<ContextMenuItem>, cx: &mut Context<Self>) {
+        let Some(s) = self.state.as_mut() else {
+            return;
+        };
+        let sticky = s.sticky;
+        let entity = cx.entity().downgrade();
+        // Apply the same click-handler wrapping as `show` does — sticky
+        // menus skip the dismiss-after-click wrapper.
+        if !sticky {
+            for item in &mut new_items {
+                if item.disabled {
+                    continue;
+                }
+                let user_cb = item.on_click.take();
+                let entity = entity.clone();
+                item.on_click = Some(Rc::new(move |w, cx| {
+                    if let Some(cb) = user_cb.as_ref() {
+                        cb(w, cx);
+                    }
+                    let _ = entity.update(cx, |this, cx| this.begin_dismiss(cx));
+                }));
+            }
+        }
+        s.items = new_items;
+        cx.notify();
+    }
 }
 
 impl Render for ContextMenuController {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(state) = self.state.clone() else {
             return div().into_any_element();
         };
@@ -218,7 +272,46 @@ impl Render for ContextMenuController {
         let on_backdrop_click = Rc::new(move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
             let _ = weak.update(cx, |this, cx| this.begin_dismiss(cx));
         });
-        render_context_menu(state, Some(on_backdrop_click)).into_any_element()
+        // Clamp the menu position so the card stays inside the window:
+        // if the click point is too close to the bottom/right edge we
+        // flip the menu to open above/to-the-left of the cursor. We
+        // don't know the menu's exact rendered size here (it depends on
+        // item count + label length), so we estimate using a fixed width
+        // (200px, matching `.w(px(200.0))` in `render_context_menu`) and
+        // a per-item height of ~24px plus header/padding. The estimate
+        // only needs to be good enough to keep the card on screen —
+        // overflow is clipped anyway, so off-by-a-few-pixels is fine.
+        let viewport = window.viewport_size();
+        let win_w = f32::from(viewport.width);
+        let win_h = f32::from(viewport.height);
+        const MENU_WIDTH: f32 = 200.0;
+        const MENU_ITEM_H: f32 = 24.0;
+        const MENU_HEADER_H: f32 = 26.0;
+        const MENU_PADDING: f32 = 8.0; // p_1 top + bottom
+        let estimated_h = MENU_PADDING
+            + if state.header.is_some() {
+                MENU_HEADER_H + 4.0
+            } else {
+                0.0
+            }
+            + state.items.len() as f32 * MENU_ITEM_H;
+        let pos = state.position;
+        let mut x = f32::from(pos.x);
+        let mut y = f32::from(pos.y);
+        // Flip left: if the card would overflow the right edge, place it
+        // to the left of the cursor so its right edge aligns with the
+        // click point (instead of clamping to the window edge, which
+        // would detach the menu from the cursor).
+        if x + MENU_WIDTH > win_w {
+            x = (f32::from(pos.x) - MENU_WIDTH).max(0.0);
+        }
+        // Flip up: if the card would overflow the bottom edge, place it
+        // above the cursor so its bottom edge aligns with the click point.
+        if y + estimated_h > win_h {
+            y = (f32::from(pos.y) - estimated_h).max(0.0);
+        }
+        let clamped_pos = point(px(x), px(y));
+        render_context_menu(state, clamped_pos, Some(on_backdrop_click)).into_any_element()
     }
 }
 
@@ -228,10 +321,10 @@ impl Render for ContextMenuController {
 
 fn render_context_menu(
     state: ContextMenuState,
+    position: Point<Pixels>,
     on_backdrop_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 ) -> impl IntoElement {
     let open = state.open;
-    let position = state.position;
     let header = state.header.clone();
     let items = state.items.clone();
 
@@ -256,8 +349,8 @@ fn render_context_menu(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            Duration::from_millis(120),
-            EaseInOutCubic,
+            DURATION_BASE,
+            EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
         )
@@ -272,7 +365,7 @@ fn render_context_menu(
                 .bg(rgb(bg_base()))
                 .border_1()
                 .border_color(rgb(border()))
-                .rounded_md()
+                .rounded(RADIUS_MD)
                 .shadow_lg()
                 .flex()
                 .flex_col()
@@ -287,8 +380,8 @@ fn render_context_menu(
                 .with_transition(menu_id)
                 .transition_when_else(
                     open,
-                    Duration::from_millis(120),
-                    EaseInOutCubic,
+                    DURATION_BASE,
+                    EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),
                 )
@@ -348,6 +441,8 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
     } else {
         primary_color
     };
+    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let rest_bg = rgba((surface_hover() << 8) | 0x00);
 
     let row_id = ElementId::Name(format!("ctx-item-{}", idx).into());
     let row = div()
@@ -358,9 +453,9 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         .gap_1p5()
         .px_2()
         .py_0p5()
-        .rounded(px(3.0))
+        .rounded(RADIUS_SM)
         .text_xs()
-        .bg(rgba(0x00000000))
+        .bg(rest_bg)
         .when(!disabled, |el| {
             el.when_some(on_click, |el, cb| {
                 el.on_click(move |_e, w, cx| {
@@ -380,29 +475,27 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         })
         .child(div().flex_1().min_w_0().child(label.to_string()))
         .with_transition(row_id)
-        .transition_on_hover(
-            Duration::from_millis(100),
-            EaseInOutCubic,
-            move |hovered, el| {
-                if *hovered {
-                    el.bg(rgb(surface_hover()))
-                } else {
-                    el.bg(rgba(0x00000000))
-                }
-            },
-        )
+        // Hover background fade — uses `transition_on_hover` so the bg
+        // eases in/out on mouse enter/leave. `DURATION_BASE` (150ms) is
+        // deliberately slightly slower than the old `DURATION_FAST`
+        // (100ms) so the hover feels perceptible rather than snapping.
+        .transition_on_hover(DURATION_BASE, EASE_STANDARD, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg)
+            } else {
+                el.bg(rest_bg)
+            }
+        })
         // Drive text_color through the transition system so the cached
         // style state updates when `disabled` / `danger` change between
         // successive menu shows for different rows (see note above).
         // `transition_when_else` with identical durations on both branches
         // means no visible animation — the color just snaps to the right
-        // value each render. We use three branches by nesting: the outer
-        // picks disabled vs not-disabled, and the not-disabled branch is
-        // further split into danger vs primary.
+        // value each render.
         .transition_when_else(
             disabled,
-            Duration::from_millis(0),
-            EaseInOutCubic,
+            DURATION_INSTANT,
+            EASE_STANDARD,
             move |state| state.text_color(rgb(muted_color)),
             move |state| state.text_color(rgb(label_color)),
         );

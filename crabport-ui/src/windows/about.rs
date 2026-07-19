@@ -25,6 +25,7 @@ use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
+use crate::motion::RADIUS_MD;
 
 // The project is licensed under Apache 2.0. We show the license name as
 // plain text rather than embedding the full LICENSE text (200+ lines) —
@@ -236,7 +237,7 @@ impl AboutWindow {
                     .border_1()
                     .border_color(rgb(border()))
                     .bg(rgb(bg_tab_bar()))
-                    .rounded_md()
+                    .rounded(RADIUS_MD)
                     .overflow_hidden()
                     .child(deps_list)
                     .child(

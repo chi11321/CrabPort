@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_animation::animation::TransitionExt;
 use rust_i18n::t;
 
 use crate::app::AppCtx;
@@ -11,12 +12,13 @@ use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::layouts::toolbar::render_terminal_toolbar;
+use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_SM};
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
+use crate::views::terminal::toolbar::{TerminalToolbarInput, render_terminal_toolbar};
 use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus};
 
 /// Clone the active terminal's `Entity` so a callback can forward calls to
@@ -417,6 +419,7 @@ pub fn render_content(
                     context_menu.clone(),
                     alert_controller.clone(),
                     ctx.tooltip.clone(),
+                    ctx.transfer_history.clone(),
                     hosts.to_vec(),
                     handle.clone(),
                     window,
@@ -597,6 +600,7 @@ pub fn render_content(
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),
+            ctx.tooltip.clone(),
             window,
             cx,
         );
@@ -980,10 +984,40 @@ pub fn render_content(
                 }),
         )
         .child(render_terminal_toolbar(
-            is_terminal,
-            status,
-            metrics,
-            sftp_progress,
+            TerminalToolbarInput::new(is_terminal, status, metrics, sftp_progress),
+            // The caller already passes `app_ctx` (which owns the context
+            // menu controller) into `render_content`, so we grab it
+            // directly here. Going through `handle.read_with(cx, ...)` would
+            // panic — `CrabportApp` is already borrowed mutably by its own
+            // `render` method, and GPUI forbids nested reads of the same
+            // entity ("cannot read while it is already being updated").
+            Some(ctx.context_menu.clone()),
+            // SFTP tab: inject the "transfer history" toggle button as a
+            // trailing element so it appears in the toolbar without the
+            // terminal toolbar knowing about SFTP. Terminal tabs pass an
+            // empty vec (no trailing buttons).
+            if is_sftp_tab {
+                let transfer_history = ctx.transfer_history.clone();
+                let on = transfer_history.read_with(cx, |c, _| c.is_open());
+                vec![
+                    crate::views::sftp::render_sftp_history_toggle(transfer_history, on)
+                        .into_any_element(),
+                ]
+            } else {
+                Vec::new()
+            },
+            {
+                let handle = handle.clone();
+                move |id, cx| {
+                    // Toggle the slot's visibility flag in config and persist.
+                    // The toolbar reads the flag on the next render, so the
+                    // ctxmenu checkmark updates immediately.
+                    let _ = crabport_core::config::update(|cfg| {
+                        cfg.appearance.terminal.toolbar.toggle(id);
+                    });
+                    let _ = handle.update(cx, |_, cx| cx.notify());
+                }
+            },
         ))
 }
 
@@ -1115,7 +1149,6 @@ fn render_split_button(
     tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    use gpui_animation::{animation::TransitionExt, transition::general::Linear};
     let btn_id = ElementId::Name(format!("{}-btn", id).into());
     let hover_bg = rgba((surface_hover() << 8) | 0xFF);
     let rest_bg = rgba((surface_hover() << 8) | 0x00);
@@ -1126,7 +1159,7 @@ fn render_split_button(
         .items_center()
         .justify_center()
         .size(px(24.0))
-        .rounded(px(4.0))
+        .rounded(RADIUS_SM)
         // Pre-set the rest (transparent) bg so the transition registry has
         // a concrete `Some(bg)` to interpolate *from* on hover-in.
         .bg(rest_bg)
@@ -1149,17 +1182,13 @@ fn render_split_button(
             on_click(w, cx);
             cx.stop_propagation();
         })
-        .transition_on_hover(
-            std::time::Duration::from_millis(120),
-            Linear,
-            move |hovered, el| {
-                if *hovered {
-                    el.bg(hover_bg)
-                } else {
-                    el.bg(rgba((surface_hover() << 8) | 0x00))
-                }
-            },
-        )
+        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg)
+            } else {
+                el.bg(rgba((surface_hover() << 8) | 0x00))
+            }
+        })
         .child(
             svg()
                 .path(icon)

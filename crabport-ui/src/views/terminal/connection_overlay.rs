@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
+use gpui_animation::animation::TransitionExt;
 use parking_lot::Mutex;
 use rust_i18n::t;
 use tokio::sync::oneshot;
@@ -14,6 +14,7 @@ use crabport_terminal::terminal::RemoteStatus;
 
 use crate::color::{term_bg, term_fg, term_green, term_red, term_yellow};
 use crate::components::button::Button;
+use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
 
 /// A single log entry shown on the connection overlay.
 #[derive(Debug, Clone)]
@@ -293,12 +294,9 @@ pub(crate) fn render_connection_overlay(
         .bg(rgb(term_bg()))
         .opacity(1.0)
         .with_transition(("connection-overlay-opacity", count))
-        .transition_when(
-            is_fading_out,
-            std::time::Duration::from_millis(500),
-            EaseInOutCubic,
-            |el| el.opacity(0.0),
-        )
+        .transition_when(is_fading_out, DURATION_SLOWER, EASE_STANDARD, |el| {
+            el.opacity(0.0)
+        })
         .child(
             div()
                 .flex()
@@ -355,8 +353,8 @@ pub(crate) fn render_connection_overlay(
                                     .with_transition(row_id)
                                     .transition_when_else(
                                         true,
-                                        std::time::Duration::from_millis(320),
-                                        EaseInOutCubic,
+                                        DURATION_SLOWER,
+                                        EASE_STANDARD,
                                         |el| el.opacity(1.0).mt_0(),
                                         |el| el.opacity(0.0).mt(px(-4.0)),
                                     )

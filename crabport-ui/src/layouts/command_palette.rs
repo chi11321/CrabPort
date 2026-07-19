@@ -1,13 +1,13 @@
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::animation::AnimatedWrapper;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::color::*;
+use crate::motion::{DURATION_BASE, DURATION_FAST, EASE_LINEAR, RADIUS_LG, RADIUS_SM};
 use crate::views::sessions::ConnectionHost;
 
 // ---------------------------------------------------------------------------
@@ -225,8 +225,8 @@ fn render_overlay(
         .with_transition(overlay_id)
         .transition_when_else(
             is_open,
-            Duration::from_millis(150),
-            Linear,
+            DURATION_BASE,
+            EASE_LINEAR,
             |el| el.bg(rgba(command_overlay())),
             |el| el.bg(rgba(0x00000000)),
         )
@@ -249,7 +249,7 @@ fn render_dialog(
         .bg(rgb(command_bg()))
         .border_1()
         .border_color(rgb(command_border()))
-        .rounded_lg()
+        .rounded(RADIUS_LG)
         .shadow_lg()
         .flex()
         .flex_col()
@@ -264,8 +264,8 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             is_open,
-            Duration::from_millis(150),
-            Linear,
+            DURATION_BASE,
+            EASE_LINEAR,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),
         )
@@ -386,7 +386,7 @@ fn command_item(
         .gap_3()
         .px_2()
         .py_2()
-        .rounded_sm()
+        .rounded(RADIUS_SM)
         .bg(rgb(command_bg()))
         .when(enabled, |el| {
             el.on_click(move |_e, w, cx| {
@@ -395,7 +395,7 @@ fn command_item(
             })
         })
         .with_transition(id.clone())
-        .transition_on_hover(Duration::from_millis(120), Linear, |hovered, el| {
+        .transition_on_hover(DURATION_FAST, EASE_LINEAR, |hovered, el| {
             if *hovered {
                 el.bg(rgb(command_item_hover()))
             } else {

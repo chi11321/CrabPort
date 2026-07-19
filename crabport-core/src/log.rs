@@ -4,9 +4,10 @@
 //!   to `{data_dir}/crabport/latest.log`.
 //! - Release build: logs to `{data_dir}/crabport/latest.log` only.
 //!
-//! The file is opened in append mode, so consecutive app runs accumulate in
-//! the same `latest.log` until the user clears it. Truncate-on-start could be
-//! added later if the file grows too large.
+//! The file is opened in truncate mode on every startup, so each run
+//! starts with a fresh `latest.log` containing only that session's logs.
+//! Previous content is overwritten; if you need to keep history, copy the
+//! file before relaunching.
 //!
 //! `init()` is called unconditionally from `main` (no `debug_assertions`
 //! gate) — release builds produce logs too, which is essential for
@@ -41,9 +42,10 @@ fn log_path() -> Option<PathBuf> {
     Some(base.join("crabport").join("latest.log"))
 }
 
-/// Open (or create) `latest.log` for append, creating the parent directory
-/// if needed. Returns `None` if the file can't be opened (logged to stderr
-/// as a last resort).
+/// Open (or create) `latest.log`, truncating any previous content so each
+/// app run starts with a fresh log. The parent directory is created if
+/// needed. Returns `None` if the file can't be opened (logged to stderr as
+/// a last resort).
 fn open_log_file() -> Option<Arc<Mutex<File>>> {
     let path = log_path()?;
     if let Some(parent) = path.parent() {
@@ -53,7 +55,8 @@ fn open_log_file() -> Option<Arc<Mutex<File>>> {
     }
     OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&path)
         .map(|f| Arc::new(Mutex::new(f)))
         .map_err(|e| {

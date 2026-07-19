@@ -1,25 +1,60 @@
-use gpui::{prelude::FluentBuilder, *};
-use gpui_animation::{animation::TransitionExt, transition::general::EaseInOutCubic};
-use std::time::Duration;
+//! Bottom toolbar framework.
+//!
+//! This module is intentionally *generic*: it knows how to lay out a
+//! horizontal strip of slots with a gear button on the right that opens a
+//! context menu for toggling each slot's visibility. It does NOT know what
+//! the slots actually render — that's the caller's responsibility (see
+//! `crabport-ui/src/views/terminal/toolbar.rs` for the terminal-tab
+//! concrete toolbar, and the SFTP tab uses the same framework to render
+//! transfer progress + a "history" toggle).
+//!
+//! ## Framework / caller contract
+//!
+//! - The caller passes a `Vec<ToolbarSlot>` describing every *possible*
+//!   slot: its stable id, the label shown in the ctxmenu, its current
+//!   visibility, and a closure that builds its element tree.
+//! - The caller also passes an `on_toggle` closure that's invoked when
+//!   the user picks a slot in the ctxmenu. The caller is responsible for
+//!   persisting the new visibility (e.g. to `config.toml`); the framework
+//!   just dispatches the toggle and re-renders on the next frame.
+//! - The toolbar's overall open/closed state is derived: it's shown iff
+//!   at least one slot is both *visible* and *non-empty* (i.e. the slot's
+//!   render closure returned `Some`). This matches the old behavior where
+//!   the terminal toolbar stayed hidden until metrics loaded.
+//!
+//! ## Layout
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────────┐
+//! │ ● 12ms │ ▮ 2.1G/16G │ CPU 5% │ 💾 80% │ ↑1.2K ↓4K │ [⚙]    │
+//! └────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! The gear icon opens a context menu whose items are the slot labels,
+//! each prefixed with a checkmark when the slot is currently visible.
 
-use crabport_terminal::terminal::{
-    MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus, SftpTransferBytes, SftpTransferKind,
-    SftpTransferStage,
-};
+use std::rc::Rc;
+
+use gpui::{prelude::FluentBuilder, *};
+use gpui_animation::animation::TransitionExt;
+
 use rust_i18n::t;
 
 use crate::color::*;
-use crate::views::terminal::SftpProgress;
+use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
+use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
 
-const TOOLBAR_HEIGHT: f32 = 36.0;
-const BAR_WIDTH: f32 = 80.0;
-const BAR_HEIGHT: f32 = 6.0;
+pub const TOOLBAR_HEIGHT: f32 = 36.0;
+pub const BAR_WIDTH: f32 = 80.0;
+pub const BAR_HEIGHT: f32 = 6.0;
 
 // ---------------------------------------------------------------------------
-// Status colors
+// Status colors (used by the terminal concrete toolbar below)
 // ---------------------------------------------------------------------------
 
-fn status_color(status: RemoteStatus) -> u32 {
+#[allow(dead_code)]
+pub(crate) fn status_color(status: crabport_terminal::terminal::RemoteStatus) -> u32 {
+    use crabport_terminal::terminal::RemoteStatus;
     match status {
         RemoteStatus::Local => term_bright_black(),
         RemoteStatus::Connected => term_green(),
@@ -30,35 +65,142 @@ fn status_color(status: RemoteStatus) -> u32 {
 
 /// Accent color for progress bar fills — read live so theme changes are
 /// picked up without a recompile.
-fn color_accent() -> u32 {
+#[allow(dead_code)]
+pub(crate) fn color_accent() -> u32 {
     term_blue()
 }
 
 // ---------------------------------------------------------------------------
-// Terminal toolbar (connection / memory / network / sftp progress)
+// ToolbarSlot — one unit of toolbar content
 // ---------------------------------------------------------------------------
 
-pub fn render_terminal_toolbar(
-    // Whether to show the connection / memory / network chips. Only terminal
-    // tabs have a monitor; SFTP tabs pass `false` and rely solely on the
-    // SFTP progress chip.
-    show_metrics: bool,
-    status: RemoteStatus,
-    metrics: RemoteMetrics,
-    sftp_progress: Option<SftpProgress>,
-) -> impl IntoElement {
-    // Only render the toolbar contents when metrics have actually been loaded.
-    // Matches the SFTP panel pattern: no data → no element tree.
-    //
-    // We also keep the toolbar open while an SFTP transfer is in flight so
-    // the progress log stays visible even if metrics haven't loaded yet
-    // (e.g. on a freshly connected host before the first monitor tick),
-    // or when the active tab is the SFTP tab (which has no monitor but
-    // still drives transfers via its dual panels).
-    let has_metrics = show_metrics
-        && (metrics.latency_ms.is_some() || metrics.memory.is_some() || metrics.network.is_some());
-    let has_progress = sftp_progress.is_some();
-    let show_toolbar = has_metrics || has_progress;
+/// A single slot in the toolbar.
+///
+/// `id` must be stable across renders — it's used as the ctxmenu item
+/// discriminator and is passed to `on_toggle`. Use a `&'static str` literal
+/// (e.g. `"latency"`, `"cpu"`, `"sftp_history"`).
+///
+/// `visible` is the *caller-controlled* visibility (driven by config).
+/// The framework additionally hides the slot when `render` returns
+/// `None`, so a slot that has no data (e.g. CPU stats before the first
+/// monitor tick) doesn't take up space even when its config flag is on.
+///
+/// `render` is called every frame the toolbar is painted. Returning
+/// `None` means "no content this frame" — the framework will skip this
+/// slot without leaving a gap.
+#[derive(Clone)]
+pub struct ToolbarSlot {
+    pub id: &'static str,
+    pub label: SharedString,
+    pub visible: bool,
+    pub render: Rc<dyn Fn() -> Option<AnyElement>>,
+}
+
+impl ToolbarSlot {
+    pub fn new(
+        id: &'static str,
+        label: impl Into<SharedString>,
+        visible: bool,
+        render: impl Fn() -> Option<AnyElement> + 'static,
+    ) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            visible,
+            render: Rc::new(render),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolbarProps — everything the framework needs to render
+// ---------------------------------------------------------------------------
+
+/// Props passed to [`render_toolbar`].
+///
+/// The caller builds a fresh `ToolbarProps` every render. The framework
+/// doesn't hold state between frames — visibility lives in the caller's
+/// config, and the ctxmenu's open/dismiss state is handled by the global
+/// [`ContextMenuController`].
+pub struct ToolbarProps {
+    /// Slots in left-to-right display order. Hidden slots (`visible ==
+    /// false` or `render == None`) are dropped from the layout.
+    pub slots: Vec<ToolbarSlot>,
+    /// Invoked when the user clicks a slot's entry in the ctxmenu. The
+    /// closure receives the slot's `id` so the caller can flip the
+    /// matching config flag. The caller is responsible for persisting
+    /// the change.
+    pub on_toggle: Rc<dyn Fn(&str, &mut App) + 'static>,
+    /// Entity of the global context-menu controller. Used to show the
+    /// slot-toggle menu when the user clicks the gear icon. If `None`,
+    /// the gear button is hidden (no toggling).
+    pub context_menu: Option<Entity<ContextMenuController>>,
+    /// Extra right-aligned children rendered *before* the gear icon.
+    /// Used by callers that want toolbar-internal actions that aren't
+    /// toggleable (e.g. an "SFTP history" toggle button that flips
+    /// a panel rather than a slot).
+    pub trailing: Vec<AnyElement>,
+}
+
+impl ToolbarProps {
+    pub fn new(on_toggle: impl Fn(&str, &mut App) + 'static) -> Self {
+        Self {
+            slots: Vec::new(),
+            on_toggle: Rc::new(on_toggle),
+            context_menu: None,
+            trailing: Vec::new(),
+        }
+    }
+
+    pub fn slot(mut self, slot: ToolbarSlot) -> Self {
+        self.slots.push(slot);
+        self
+    }
+
+    pub fn context_menu(mut self, cm: Entity<ContextMenuController>) -> Self {
+        self.context_menu = Some(cm);
+        self
+    }
+
+    pub fn trailing(mut self, el: impl IntoElement) -> Self {
+        self.trailing.push(el.into_any_element());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// render_toolbar — the framework entry point
+// ---------------------------------------------------------------------------
+
+/// Render the toolbar framework.
+///
+/// The toolbar's overall height animates between `TOOLBAR_HEIGHT` and `0`
+/// based on whether any slot produced visible content. The transition
+/// mirrors the original terminal toolbar's feel (320ms EaseInOutCubic).
+pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
+    // Compute the visible-element list up front so we can decide whether
+    // the toolbar should be open at all. We materialize the elements
+    // (rather than deferring to a lazy iterator) because gpui's `.children()`
+    // takes a concrete `IntoIterator` and we need a stable count for the
+    // show/hide decision anyway.
+    let mut visible: Vec<AnyElement> = Vec::new();
+    for slot in &props.slots {
+        if !slot.visible {
+            continue;
+        }
+        if let Some(el) = (slot.render)() {
+            visible.push(el);
+        }
+    }
+    let has_trailing = !props.trailing.is_empty();
+    let show_toolbar = !visible.is_empty() || has_trailing;
+
+    let on_toggle = props.on_toggle.clone();
+    let context_menu = props.context_menu.clone();
+    // Snapshot the slot list for the ctxmenu builder (which runs on click,
+    // not at render time).
+    let slots_snapshot = props.slots.clone();
+    let trailing = props.trailing;
 
     div()
         .id("terminal-toolbar")
@@ -68,8 +210,8 @@ pub fn render_terminal_toolbar(
         .with_transition("terminal-toolbar-height")
         .transition_when_else(
             show_toolbar,
-            Duration::from_millis(500),
-            EaseInOutCubic,
+            DURATION_SLOWER,
+            EASE_STANDARD,
             |el| el.h(px(TOOLBAR_HEIGHT)),
             |el| el.h_0(),
         )
@@ -87,280 +229,144 @@ pub fn render_terminal_toolbar(
                     .px_3()
                     .gap_4()
                     .text_color(rgb(text_muted()))
-                    .child(render_connection(status, metrics.latency_ms))
-                    .children(render_memory(metrics.memory))
-                    .children(render_network(metrics.network))
-                    // Flexible spacer pushes the SFTP progress log to the
+                    .children(visible)
+                    // Flexible spacer pushes the trailing cluster to the
                     // far right edge of the toolbar.
                     .child(div().flex_1())
-                    .children(render_sftp_progress_chip(sftp_progress)),
+                    .children(trailing)
+                    // Right-click anywhere on the toolbar opens the
+                    // slot-visibility context menu. This replaces the
+                    // earlier gear button — same menu, but discoverable
+                    // via the conventional right-click gesture and without
+                    // taking up toolbar real estate.
+                    .when_some(context_menu, |el, cm| {
+                        el.on_mouse_down(MouseButton::Right, move |event, _w, cx| {
+                            show_slot_menu(&cm, &slots_snapshot, event.position, &on_toggle, cx);
+                        })
+                    }),
             )
         })
 }
 
 // ---------------------------------------------------------------------------
-// Connection status + latency
+// Right-click ctxmenu — show the slot-visibility menu
 // ---------------------------------------------------------------------------
 
-fn render_connection(status: RemoteStatus, latency_ms: Option<u32>) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1p5()
-        .min_w(px(50.0))
-        .child(
-            div()
-                .size(px(8.0))
-                .rounded_full()
-                .bg(rgb(status_color(status))),
-        )
-        .child(div().text_xs().child(match latency_ms {
-            Some(ms) => format!("{}ms", ms),
-            None => "—".into(),
-        }))
+/// Show the slot-visibility context menu at `pos` (window-relative pixels).
+///
+/// Each slot becomes one menu item, prefixed with `✓` when the slot is
+/// currently visible. Clicking an item flips that slot via `on_toggle`,
+/// which the caller turns into a config write, AND re-shows the menu with
+/// the updated checkmarks — this is a **sticky** menu (see
+/// `ContextMenuState::sticky`), so the user can toggle multiple slots in
+/// a row without re-right-clicking. The menu closes on backdrop click.
+///
+/// This is invoked from the toolbar's right-click handler. It mirrors the
+/// SFTP panel's `cm.update(cx, |c, cx| c.show(...))` pattern, plus the
+/// sticky re-show loop.
+pub(crate) fn show_slot_menu(
+    cm: &Entity<ContextMenuController>,
+    slots: &[ToolbarSlot],
+    pos: Point<Pixels>,
+    on_toggle: &Rc<dyn Fn(&str, &mut App) + 'static>,
+    cx: &mut App,
+) {
+    let items = build_slot_items(slots, on_toggle, cm, pos);
+    cm.update(cx, |c, cx| {
+        c.show(
+            ContextMenuState {
+                position: pos,
+                header: Some(t!("toolbar.gear_header").to_string().into()),
+                items,
+                sticky: true,
+                ..ContextMenuState::default()
+            },
+            cx,
+        );
+    });
 }
 
-// ---------------------------------------------------------------------------
-// Memory: progress bar + "xxxM / xxxG"
-// ---------------------------------------------------------------------------
-
-fn render_memory(memory: Option<MemoryStats>) -> Option<impl IntoElement> {
-    let mem = memory?;
-    if mem.total == 0 {
-        return None;
+/// Build the menu items for the slot-visibility menu.
+///
+/// Each item's click handler:
+///   1. Invokes `on_toggle(id, cx)` to flip the config flag.
+///   2. Flips the matching slot's `visible` field in the captured snapshot.
+///   3. Replaces the current menu's items in-place (without re-playing the
+///      open animation) so the checkmarks update instantly. We do NOT call
+///      `ContextMenuController::show` here — that would reset the
+///      gpui-animation transition state and replay the pop-in animation,
+///      causing the flicker the user reported. Instead we poke the items
+///      directly via `update_state_items`, which keeps the menu open with
+///      the new items and no animation replay.
+fn build_slot_items(
+    slots: &[ToolbarSlot],
+    on_toggle: &Rc<dyn Fn(&str, &mut App) + 'static>,
+    cm: &Entity<ContextMenuController>,
+    pos: Point<Pixels>,
+) -> Vec<ContextMenuItem> {
+    let mut items: Vec<ContextMenuItem> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let id = slot.id;
+        let label = slot.label.clone();
+        let checked = slot.visible;
+        let display_label = if checked {
+            format!("✓  {label}")
+        } else {
+            format!("     {label}")
+        };
+        let on_toggle = on_toggle.clone();
+        let cm = cm.clone();
+        let slots_snapshot: Vec<ToolbarSlot> = slots.to_vec();
+        items.push(ContextMenuItem::new(display_label, move |_w, cx| {
+            // 1. Flip the config flag.
+            on_toggle(id, cx);
+            // 2. Flip the matching slot's `visible` in the snapshot, so the
+            //    re-shown menu's checkmark matches the new reality.
+            let mut updated = slots_snapshot.clone();
+            if let Some(s) = updated.iter_mut().find(|s| s.id == id) {
+                s.visible = !s.visible;
+            }
+            // 3. Build the new items and poke them into the controller's
+            //    current state without replaying the open animation.
+            let new_items = build_slot_items(&updated, &on_toggle, &cm, pos);
+            cm.update(cx, |c, cx| {
+                c.replace_items(new_items, cx);
+            });
+        }));
     }
-
-    let ratio = (mem.used as f64 / mem.total as f64).clamp(0.0, 1.0);
-    let filled_w = BAR_WIDTH * ratio as f32;
-
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .min_w(px(180.0))
-            .child(
-                svg()
-                    .path("icons/terminal-toolbar/memory-stick.svg")
-                    .size(px(14.0))
-                    .text_color(rgb(text_muted())),
-            )
-            // Progress bar
-            .child(
-                div()
-                    .w(px(BAR_WIDTH))
-                    .h(px(BAR_HEIGHT))
-                    .rounded(px(3.0))
-                    .bg(rgb(border()))
-                    .child(
-                        div()
-                            .id("memory-bar-fill")
-                            .h_full()
-                            .rounded(px(3.0))
-                            .bg(rgb(color_accent()))
-                            .with_transition("memory-bar-fill")
-                            .transition_when(
-                                true,
-                                Duration::from_millis(300),
-                                EaseInOutCubic,
-                                move |el| el.w(px(filled_w)),
-                            ),
-                    ),
-            )
-            .child(div().text_xs().child(format_memory(mem.used, mem.total))),
-    )
+    items
 }
 
 // ---------------------------------------------------------------------------
-// Network: ↑/↓ icons + rate
+// (removed) render_gear_button
 // ---------------------------------------------------------------------------
+//
+// The earlier implementation used a gear-shaped button in the toolbar
+// that opened the slot-visibility ctxmenu on left-click. It never fired
+// reliably — `with_transition` wraps the element in an `AnimatedWrapper`
+// that doesn't expose `Div`'s mouse-listener API, and even after reordering
+// the calls so `on_mouse_down` was registered on the raw `Stateful<Div>`,
+// clicks still didn't reach the handler (likely because an ancestor
+// `Div` in the terminal view's mouse overlay was intercepting them).
+// The right-click-on-toolbar gesture is more conventional and avoids
+// the whole hit-target problem.
 
-fn render_network(network: Option<NetworkStats>) -> Option<impl IntoElement> {
-    let net = network?;
-    // We show cumulative totals — the caller can switch to rate if desired.
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .min_w(px(180.0))
-            // Upload
-            .child(
-                svg()
-                    .path("icons/terminal-toolbar/arrow-up-to-line.svg")
-                    .size(px(12.0))
-                    .text_color(rgb(text_muted())),
-            )
-            .child(div().text_xs().child(format_rate(net.bytes_sent)))
-            // Download
-            .child(
-                svg()
-                    .path("icons/terminal-toolbar/arrow-down-to-line.svg")
-                    .size(px(12.0))
-                    .text_color(rgb(text_muted())),
-            )
-            .child(div().text_xs().child(format_rate(net.bytes_recv))),
-    )
+/*
+fn render_gear_button(
+    cm: Entity<ContextMenuController>,
+    slots: Vec<ToolbarSlot>,
+    on_toggle: Rc<dyn Fn(&str, &mut App) + 'static>,
+) -> impl IntoElement {
+    ...
 }
+*/
 
 // ---------------------------------------------------------------------------
-// SFTP transfer progress rendering
-// ---------------------------------------------------------------------------
-
-/// Common display data computed from an [`SftpProgress`] snapshot.
-///
-/// Both the inline chip (terminal toolbar) and the standalone bar (SFTP
-/// tab) derive their visual state from this struct, avoiding duplicated
-/// match arms for `kind` / `stage` / `icon`.
-struct SftpProgressDisplay {
-    kind_label: String,
-    stage_label: String,
-    stage_color: u32,
-    icon_path: &'static str,
-    detail: String,
-}
-
-impl SftpProgressDisplay {
-    fn new(p: &SftpProgress) -> Self {
-        let kind_label = match p.kind {
-            SftpTransferKind::Download => t!("sftp.progress.download").to_string(),
-            SftpTransferKind::Upload => t!("sftp.progress.upload").to_string(),
-            SftpTransferKind::Rename => t!("sftp.rename").to_string(),
-            SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
-            SftpTransferKind::Delete => t!("sftp.delete").to_string(),
-        };
-        let (stage_label, stage_color) = match p.stage {
-            SftpTransferStage::Compress => {
-                (t!("sftp.progress.compress").to_string(), term_yellow())
-            }
-            SftpTransferStage::Transfer => {
-                (t!("sftp.progress.transfer").to_string(), color_accent())
-            }
-            SftpTransferStage::Decompress => {
-                (t!("sftp.progress.decompress").to_string(), term_yellow())
-            }
-            SftpTransferStage::CleanUp => (t!("sftp.progress.cleanup").to_string(), text_muted()),
-        };
-        let icon_path = match p.kind {
-            SftpTransferKind::Download => "icons/terminal-toolbar/arrow-down-to-line.svg",
-            SftpTransferKind::Upload => "icons/terminal-toolbar/arrow-up-to-line.svg",
-            SftpTransferKind::Rename => "icons/terminal-toolbar/edit.svg",
-            SftpTransferKind::Edit => "icons/terminal-toolbar/arrow-up-to-line.svg",
-            SftpTransferKind::Delete => "icons/terminal-toolbar/arrow-up-to-line.svg",
-        };
-        let detail = truncate_path_middle(&p.message, 40);
-        Self {
-            kind_label,
-            stage_label,
-            stage_color,
-            icon_path,
-            detail,
-        }
-    }
-}
-
-/// Render the right-aligned SFTP progress chip for the terminal toolbar.
-///
-/// Returns `None` when there's no in-flight transfer, so the caller's
-/// `.children(...)` renders nothing.
-fn render_sftp_progress_chip(progress: Option<SftpProgress>) -> Option<impl IntoElement> {
-    let p = progress?;
-    let d = SftpProgressDisplay::new(&p);
-    let bar = render_progress_bar(p.bytes, d.stage_color, "sftp-progress-bar-fill");
-
-    Some(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .min_w_0()
-            .child(
-                svg()
-                    .path(d.icon_path)
-                    .size(px(12.0))
-                    .flex_shrink_0()
-                    .text_color(rgb(d.stage_color)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(d.stage_color))
-                    .child(d.stage_label),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_muted()))
-                    .min_w_0()
-                    .truncate()
-                    .child(format!("{}: {}", d.kind_label, d.detail)),
-            )
-            .when_some(bar, |el, bar| {
-                el.child(bar).when_some(p.bytes, |el, b| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(text_muted()))
-                            .flex_shrink_0()
-                            .child(format_byte_ratio(b.done, b.total)),
-                    )
-                })
-            }),
-    )
-}
-
-/// Render a thin determinate progress bar when byte counts are available.
-/// Returns `None` for indeterminate stages (no `bytes` field).
-///
-/// Uses `gpui-animation`'s `transition_when` with a stable element id so the
-/// fill width eases between updates — same pattern as the memory-usage bar.
-/// Without this, each progress event would snap the fill to its new width.
-fn render_progress_bar(
-    bytes: Option<SftpTransferBytes>,
-    color: u32,
-    fill_id: &'static str,
-) -> Option<impl IntoElement> {
-    let b = bytes?;
-    let ratio = if b.total == 0 {
-        0.0
-    } else {
-        (b.done as f64 / b.total as f64).clamp(0.0, 1.0)
-    };
-    let filled_w = BAR_WIDTH * ratio as f32;
-    Some(
-        div()
-            .w(px(BAR_WIDTH))
-            .h(px(BAR_HEIGHT))
-            .rounded(px(3.0))
-            .bg(rgb(border()))
-            .flex_shrink_0()
-            .child(
-                div()
-                    .id(fill_id)
-                    .h_full()
-                    .rounded(px(3.0))
-                    .bg(rgb(color))
-                    .with_transition(fill_id)
-                    .transition_when(
-                        true,
-                        Duration::from_millis(300),
-                        EaseInOutCubic,
-                        move |el| el.w(px(filled_w)),
-                    ),
-            ),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Formatting helpers
+// Shared formatting helpers — re-exported for concrete toolbar impls
 // ---------------------------------------------------------------------------
 
 /// Format used/total as e.g. "2.1G / 16.0G" or "512.0M / 8.0G"
-fn format_memory(used: u64, total: u64) -> String {
+pub fn format_memory(used: u64, total: u64) -> String {
     let (used_val, used_unit) = human_bytes(used);
     let (total_val, total_unit) = human_bytes(total);
     format!(
@@ -369,7 +375,7 @@ fn format_memory(used: u64, total: u64) -> String {
     )
 }
 
-fn human_bytes(bytes: u64) -> (f64, &'static str) {
+pub fn human_bytes(bytes: u64) -> (f64, &'static str) {
     let b = bytes as f64;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -385,13 +391,13 @@ fn human_bytes(bytes: u64) -> (f64, &'static str) {
     }
 }
 
-fn format_rate(bytes_per_sec: u64) -> String {
+pub fn format_rate(bytes_per_sec: u64) -> String {
     let (val, unit) = human_bytes(bytes_per_sec);
     format!("{:.1}{}/s", val, unit)
 }
 
 /// Format a `done / total` byte ratio for display, e.g. "2.1M / 8.0M".
-fn format_byte_ratio(done: u64, total: u64) -> String {
+pub fn format_byte_ratio(done: u64, total: u64) -> String {
     if total == 0 {
         let (d, du) = human_bytes(done);
         format!("{:.1}{}", d, du)
@@ -403,22 +409,14 @@ fn format_byte_ratio(done: u64, total: u64) -> String {
 }
 
 /// Truncate a filesystem path in the *middle*, keeping the head (top-level
-/// directory) and tail (filename) visible with `…` between them. This is
-/// more useful than a head-only or tail-only truncation because the user
-/// can tell both *which* top-level project a file belongs to and *what* the
-/// file is.
+/// directory) and tail (filename) visible with `…` between them.
 ///
-/// Examples (max=30):
-///   "/home/user/file.txt"              -> "/home/user/file.txt"
-///   "/home/user/projects/x/deep/f.txt"  -> "/home/.../deep/f.txt"
-///   "very_long_filename_no_slashes.txt" -> "very_long_filen...ses.txt"
-fn truncate_path_middle(path: &str, max: usize) -> String {
+/// Lifted verbatim from the previous terminal-toolbar module so the SFTP
+/// progress chip keeps its existing behavior.
+pub fn truncate_path_middle(path: &str, max: usize) -> String {
     if path.len() <= max {
         return path.to_string();
     }
-    // Split into components on `/`. We keep the first segment (head) and the
-    // last segment (tail), and collapse everything in between into a single
-    // `…`. If even that doesn't fit, we hard-truncate the tail.
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let is_absolute = path.starts_with('/');
     let prefix = if is_absolute { "/" } else { "" };
@@ -426,12 +424,10 @@ fn truncate_path_middle(path: &str, max: usize) -> String {
     if parts.len() >= 3 {
         let head = parts[0];
         let tail = parts.last().unwrap();
-        // "/head/…/tail"
         let candidate = format!("{prefix}{head}/…/{tail}");
         if candidate.len() <= max {
             return candidate;
         }
-        // Tail alone is too long — hard-truncate it from the middle too.
         let budget = max.saturating_sub(prefix.len() + head.len() + 4); // "/…/…"
         if budget > 4 {
             let half = budget / 2;
@@ -442,47 +438,18 @@ fn truncate_path_middle(path: &str, max: usize) -> String {
                 return format!("{prefix}{head}/…/{keep_head}…{keep_tail}");
             }
         }
-        // Fallback: just show head + … + truncated tail.
         let tail_budget = max.saturating_sub(prefix.len() + head.len() + 3); // "/…"
         let cut = tail_budget.saturating_sub(1).max(1);
         return format!("{prefix}{head}/…/{}…", &tail[..cut.min(tail.len())]);
     }
 
-    // No slashes (or very few): hard-truncate the middle of the single
-    // segment.
     let cut = max.saturating_sub(1);
     let half = cut / 2;
-    let s = path.as_bytes();
-    // Be careful not to split a multi-byte char — fall back to char indices.
     let chars: Vec<char> = path.chars().collect();
     if chars.len() > cut {
         let head: String = chars[..half].iter().collect();
         let tail: String = chars[chars.len() - half..].iter().collect();
         return format!("{head}…{tail}");
     }
-    let _ = s;
     path.chars().take(cut).collect::<String>() + "…"
-}
-
-/// Truncate a filesystem path for display, keeping the basename and
-/// prefixing with `…` when the full path exceeds `max` chars. Absolute
-/// paths and relative paths are both handled — we split on `/`.
-///
-/// Deprecated in favour of [`truncate_path_middle`], which preserves both
-/// the head and tail of a long path. Kept for any future callers that want
-/// the simpler tail-only form.
-#[allow(dead_code)]
-fn truncate_path(path: &str, max: usize) -> String {
-    if path.len() <= max {
-        return path.to_string();
-    }
-    // Find the last `/` and keep everything after it.
-    let base = path.rsplit('/').next().unwrap_or(path);
-    if base.len() >= max {
-        // Even the basename is too long — hard-truncate it.
-        let cut = max.saturating_sub(1);
-        format!("{}…", &base[..cut])
-    } else {
-        format!("…/{}", base)
-    }
 }

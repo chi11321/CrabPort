@@ -7,11 +7,10 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::{animation::TransitionExt, transition::general::Linear};
+use gpui_animation::animation::TransitionExt;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::v_virtual_list;
 use rust_i18n::t;
@@ -23,6 +22,7 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::host_selector::PanelSide;
 use crate::components::input::StyledInput;
+use crate::motion::{DURATION_FAST, EASE_STANDARD};
 
 use super::drag::LocalFileDragValue;
 use super::drag::SftpDragValue;
@@ -844,8 +844,8 @@ impl SftpTabView {
                                             })
                                             .transition_when_else(
                                                 is_highlighted,
-                                                Duration::from_millis(120),
-                                                Linear,
+                                                DURATION_FAST,
+                                                EASE_STANDARD,
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                                             )
@@ -864,8 +864,8 @@ impl SftpTabView {
                                                     .with_transition(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
                                                     .transition_when_else(
                                                         is_selected,
-                                                        Duration::from_millis(120),
-                                                        Linear,
+                                                        DURATION_FAST,
+                                                        EASE_STANDARD,
                                                         |el| el.opacity(1.0),
                                                         |el| el.opacity(0.0),
                                                     ),
@@ -1761,8 +1761,8 @@ impl SftpTabView {
                                             })
                                             .transition_when_else(
                                                 is_highlighted,
-                                                Duration::from_millis(120),
-                                                Linear,
+                                                DURATION_FAST,
+                                                EASE_STANDARD,
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
                                             )
@@ -1781,8 +1781,8 @@ impl SftpTabView {
                                                     .with_transition(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
                                                     .transition_when_else(
                                                         is_selected,
-                                                        Duration::from_millis(120),
-                                                        Linear,
+                                                        DURATION_FAST,
+                                                        EASE_STANDARD,
                                                         |el| el.opacity(1.0),
                                                         |el| el.opacity(0.0),
                                                     ),

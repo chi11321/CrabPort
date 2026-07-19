@@ -32,6 +32,7 @@ use crate::views::sessions::ConnectionHost;
 use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
+use crabport_core::{config, config::StartupPage};
 
 // ---- CrabPortTab trait ----
 
@@ -225,6 +226,7 @@ impl CrabportApp {
         let tooltip = cx.new(|_cx| crate::components::tooltip::TooltipController::new());
         let notifications =
             cx.new(|_cx| NotificationController::new(NotificationPosition::BottomRight));
+        let transfer_history = cx.new(|_cx| crate::views::sftp::TransferHistoryController::new());
         let tunnels = Arc::new(crate::views::tunnels::TunnelRegistry::new());
 
         // Read persisted data through the shared global store. The global
@@ -269,6 +271,7 @@ impl CrabportApp {
             context_menu,
             tooltip,
             notifications,
+            transfer_history,
             tunnels,
             command_palette,
             sftp_panel,
@@ -384,6 +387,64 @@ impl CrabportApp {
         // exists, a non-auto-dismissing toast with a "详情" button (opens
         // the release page) appears. Failures are silent.
         crate::version_check::check_for_updates(self.app_ctx.notifications.clone(), cx);
+
+        // Apply the persisted startup page. Must run after `wired` is true
+        // (so callbacks the startup actions rely on — e.g. terminal pane
+        // focus tracking — are installed) and after `hosts` is populated
+        // (so `Session(id)` can validate the id against the live store).
+        self.apply_startup_page(cx);
+    }
+
+    /// Resolve [`AppearanceConfig::startup`] into the launch view. Called
+    /// once from `wire`. Falls back to `Home` (the default tab) when the
+    /// configured page is `Home`, when a `Session(id)` no longer exists in
+    /// the store, or when any error occurs — so a corrupted or stale
+    /// `config.toml` can never brick the app at launch.
+    ///
+    /// This is the authoritative launch-time resolver: the Settings UI's
+    /// dropdown separately normalizes a stale id for display, but the
+    /// actual navigation happens here.
+    fn apply_startup_page(&mut self, cx: &mut Context<Self>) {
+        let page = config::snapshot().appearance.startup.page.clone();
+        match page {
+            StartupPage::Home => {
+                // Home is the default tab (id=0) — no action needed.
+                tracing::debug!("apply_startup_page: Home");
+            }
+            StartupPage::Sftp => {
+                tracing::debug!("apply_startup_page: Sftp");
+                self.activate_tab(1);
+            }
+            StartupPage::LocalTerminal => {
+                tracing::debug!("apply_startup_page: LocalTerminal");
+                self.add_tab(cx);
+            }
+            StartupPage::Session(host_id) => {
+                let exists = self.hosts.iter().any(|h| h.id == host_id)
+                    || AppState::store(cx)
+                        .lock()
+                        .find_host(host_id)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if exists {
+                    tracing::debug!("apply_startup_page: Session({host_id}) — connecting");
+                    self.connect_to_host(host_id, cx);
+                } else {
+                    // Host was deleted since the user last picked it —
+                    // fall back to Home (the default tab) and clear the
+                    // stale id from config so the next launch doesn't
+                    // try the same dead host again.
+                    tracing::info!(
+                        "apply_startup_page: Session({host_id}) not found — falling back to Home"
+                    );
+                    let _ = config::update(|cfg| {
+                        cfg.appearance.startup.page = StartupPage::Home;
+                    });
+                }
+            }
+        }
+        cx.notify();
     }
 
     // -- Helpers --
@@ -492,6 +553,7 @@ impl Render for CrabportApp {
         // wanted. Only the sidebar paints a translucent tint so vibrancy shows
         // there alone.
         div()
+            .id("app-root")
             .size_full()
             .when(cfg!(not(target_os = "macos")), |el| el.bg(rgb(bg_base())))
             .flex()
@@ -512,6 +574,8 @@ impl Render for CrabportApp {
             .child(self.app_ctx.tooltip.clone())
             // -- Global toast notifications --
             .child(self.app_ctx.notifications.clone())
+            // -- Global SFTP transfer-history popover --
+            .child(self.app_ctx.transfer_history.clone())
             // -- Group form overlay (new / rename group, shared across kinds) --
             .when_some(group_form_state, |el, state| {
                 el.child(crate::views::groups::GroupFormView::new(
@@ -587,15 +651,93 @@ pub fn open_main_window(cx: &mut App) {
             let app = cx.new(|cx| CrabportApp::new(_window, cx));
             app.update(cx, |app, cx| app.wire(cx));
 
-            // Quit the application when this main window is closed.
-            // `cx.on_release` fires for this specific window, not all windows.
-            cx.on_release(|_, cx| {
-                cx.quit();
-            })
-            .detach();
+            // Window-close behavior differs by platform:
+            //
+            // - **macOS**: closing the main window should hide the app to the
+            //   Dock (background) — keeping the process AND every in-memory
+            //   view (terminal sessions, SFTP connections, tunnel registry,
+            //   command palette, etc.) fully alive. The window object itself
+            //   stays alive, just hidden; clicking the Dock icon later
+            //   unhides the same window with all state intact (not a fresh
+            //   `CrabportApp`).
+            //
+            //   We do this by intercepting `windowShouldClose:` — returning
+            //   `false` cancels the close, then we `cx.hide()` to hide the
+            //   entire app (NSApp hide). The Dock-reopen path is wired in
+            //   `main.rs` via `Application::on_reopen` — when the user
+            //   clicks the Dock icon and no windows are visible, we call
+            //   `cx.activate(true)` to bring the same (hidden) window back.
+            //
+            // - **Windows / Linux**: closing the last window should quit
+            //   the app, matching native conventions. The macOS reopen flow
+            //   has no equivalent on these platforms, so leaving the process
+            //   alive would just strand an invisible app.
+            //
+            // `cx.on_release` fires when the window is actually released —
+            // on macOS we never release the window (we cancel the close),
+            //   so this hook only runs on non-macOS. The quit on non-mac is
+            //   per-window: as soon as the main window closes, the app
+            //   exits even if an auxiliary window (Settings/About) is still
+            //   open — which is the desired behavior since the main window
+            //   is the application root.
+            #[cfg(target_os = "macos")]
+            {
+                // Intercept the close: return `false` so macOS doesn't
+                // release the window, then hide the app. The `on_window_should_close`
+                // callback gives us `&mut Window` + `&mut App`, so we can call
+                // the platform-level hide directly.
+                _window.on_window_should_close(cx, |_window, cx| {
+                    cx.hide();
+                    false
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                cx.on_release(|_, cx| {
+                    cx.quit();
+                })
+                .detach();
+            }
 
             gpui_component::Root::new(app, _window, cx)
         })
     })
     .expect("Failed to open main window");
+}
+
+/// Restore the main window from the hidden (Docked) state on macOS.
+///
+/// Called from `main.rs`'s `Application::on_reopen` callback (macOS Dock click
+/// when there are no visible windows). On macOS, clicking the Dock icon fires
+/// `applicationShouldHandleReopen:hasVisibleWindows:` — GPUI surfaces this as
+/// `on_reopen`. We unhide the app via `cx.activate(true)`, which brings the
+/// previously-hidden main window (the same window object that was hidden in
+/// `on_window_should_close`) back to the foreground.
+///
+/// Idempotent: if a window is already visible, this is a no-op — the
+/// `activate` call still focuses the app but doesn't create a duplicate window.
+///
+/// On non-macOS this function is effectively dead (the `on_reopen` callback
+/// only fires on macOS), but is harmless to call.
+pub fn reopen_main_window_if_closed(cx: &mut App) {
+    // If the main window was hidden via `cx.hide()` in
+    // `on_window_should_close`, it still exists in `cx.windows()` — GPUI
+    // doesn't release hidden windows. So we unhide the app, which brings
+    // the same window back without creating a new `CrabportApp`.
+    //
+    // The fallback (`cx.windows().is_empty()`) handles the edge case where
+    // the window was actually released (e.g. a crash-recovery path or a
+    // future refactor that releases the hidden window). In that case we
+    // open a fresh main window — same as a normal launch.
+    if !cx.windows().is_empty() {
+        // Bring the existing window to the front. `activate(true)` unhides
+        // the app and raises its windows; `activate_window()` on the
+        // active handle also focuses the specific window.
+        cx.activate(true);
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, |_, window, _cx| window.activate_window());
+        }
+        return;
+    }
+    open_main_window(cx);
 }
