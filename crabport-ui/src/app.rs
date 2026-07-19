@@ -651,15 +651,93 @@ pub fn open_main_window(cx: &mut App) {
             let app = cx.new(|cx| CrabportApp::new(_window, cx));
             app.update(cx, |app, cx| app.wire(cx));
 
-            // Quit the application when this main window is closed.
-            // `cx.on_release` fires for this specific window, not all windows.
-            cx.on_release(|_, cx| {
-                cx.quit();
-            })
-            .detach();
+            // Window-close behavior differs by platform:
+            //
+            // - **macOS**: closing the main window should hide the app to the
+            //   Dock (background) — keeping the process AND every in-memory
+            //   view (terminal sessions, SFTP connections, tunnel registry,
+            //   command palette, etc.) fully alive. The window object itself
+            //   stays alive, just hidden; clicking the Dock icon later
+            //   unhides the same window with all state intact (not a fresh
+            //   `CrabportApp`).
+            //
+            //   We do this by intercepting `windowShouldClose:` — returning
+            //   `false` cancels the close, then we `cx.hide()` to hide the
+            //   entire app (NSApp hide). The Dock-reopen path is wired in
+            //   `main.rs` via `Application::on_reopen` — when the user
+            //   clicks the Dock icon and no windows are visible, we call
+            //   `cx.activate(true)` to bring the same (hidden) window back.
+            //
+            // - **Windows / Linux**: closing the last window should quit
+            //   the app, matching native conventions. The macOS reopen flow
+            //   has no equivalent on these platforms, so leaving the process
+            //   alive would just strand an invisible app.
+            //
+            // `cx.on_release` fires when the window is actually released —
+            // on macOS we never release the window (we cancel the close),
+            //   so this hook only runs on non-macOS. The quit on non-mac is
+            //   per-window: as soon as the main window closes, the app
+            //   exits even if an auxiliary window (Settings/About) is still
+            //   open — which is the desired behavior since the main window
+            //   is the application root.
+            #[cfg(target_os = "macos")]
+            {
+                // Intercept the close: return `false` so macOS doesn't
+                // release the window, then hide the app. The `on_window_should_close`
+                // callback gives us `&mut Window` + `&mut App`, so we can call
+                // the platform-level hide directly.
+                _window.on_window_should_close(cx, |_window, cx| {
+                    cx.hide();
+                    false
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                cx.on_release(|_, cx| {
+                    cx.quit();
+                })
+                .detach();
+            }
 
             gpui_component::Root::new(app, _window, cx)
         })
     })
     .expect("Failed to open main window");
+}
+
+/// Restore the main window from the hidden (Docked) state on macOS.
+///
+/// Called from `main.rs`'s `Application::on_reopen` callback (macOS Dock click
+/// when there are no visible windows). On macOS, clicking the Dock icon fires
+/// `applicationShouldHandleReopen:hasVisibleWindows:` — GPUI surfaces this as
+/// `on_reopen`. We unhide the app via `cx.activate(true)`, which brings the
+/// previously-hidden main window (the same window object that was hidden in
+/// `on_window_should_close`) back to the foreground.
+///
+/// Idempotent: if a window is already visible, this is a no-op — the
+/// `activate` call still focuses the app but doesn't create a duplicate window.
+///
+/// On non-macOS this function is effectively dead (the `on_reopen` callback
+/// only fires on macOS), but is harmless to call.
+pub fn reopen_main_window_if_closed(cx: &mut App) {
+    // If the main window was hidden via `cx.hide()` in
+    // `on_window_should_close`, it still exists in `cx.windows()` — GPUI
+    // doesn't release hidden windows. So we unhide the app, which brings
+    // the same window back without creating a new `CrabportApp`.
+    //
+    // The fallback (`cx.windows().is_empty()`) handles the edge case where
+    // the window was actually released (e.g. a crash-recovery path or a
+    // future refactor that releases the hidden window). In that case we
+    // open a fresh main window — same as a normal launch.
+    if !cx.windows().is_empty() {
+        // Bring the existing window to the front. `activate(true)` unhides
+        // the app and raises its windows; `activate_window()` on the
+        // active handle also focuses the specific window.
+        cx.activate(true);
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, |_, window, _cx| window.activate_window());
+        }
+        return;
+    }
+    open_main_window(cx);
 }
