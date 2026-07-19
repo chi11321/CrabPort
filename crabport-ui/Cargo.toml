@@ -34,6 +34,11 @@ serde_json = "1"
 # each crate must declare its own direct deps — re-exporting would muddy the
 # public surface.
 toml = "0.8"
+# Used by the SFTP transfer-history panel to format completion timestamps
+# in the user's local timezone. `crabport-core` also depends on chrono for
+# log timestamps; `crabport-ui` declares its own dep so it doesn't reach
+# through `crabport-core`'s public surface.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Windows-only: needed by `components/window_controls.rs` to read the native
 # HWND out of a GPUI `Window` and call `ShowWindowAsync` for proper

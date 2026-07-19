@@ -760,23 +760,46 @@ impl TerminalView {
         *self.selection.lock() = None;
     }
 
-    /// Clear the terminal screen (but keep scrollback). Writes the ANSI
-    /// "Erase in Display" + "Cursor Position" sequence to the PTY, which
-    // moves the prompt to the top of the viewport — equivalent to the
-    // `clear` shell command without losing history. Used by the
-    // right-click context menu's "Clear Screen" item.
+    /// Clear the terminal screen by asking the shell to run `clear`.
+    //
+    // We send the `clear` command through the PTY (via `write_raw`, which
+    // doesn't record it into the command history) rather than feeding
+    // ANSI escape sequences directly into the term grid via `feed_escape`.
+    // The reason: `feed_escape(b"\x1b[2J\x1b[H")` erases the visible grid
+    // but the shell has no idea the screen was cleared, so it won't
+    // redraw its prompt — the `[user@host] ...` prompt vanishes and the
+    // user is left with a blank screen until they press Enter.
+    //
+    // By running `clear` as a shell command, the shell's own `clear`
+    // implementation sends the right escape sequences AND redraws the
+    // prompt via its precmd/preprompt hook, so the result matches what
+    // the user expects from typing `clear` at the prompt.
+    //
+    // `write_raw` is used instead of `write` so the `clear` invocation
+    // isn't captured into the command history (it's a UI action, not a
+    // user command).
     pub fn clear_screen(&mut self) {
-        // ESC[2J = erase entire display, ESC[H = cursor to home.
-        self.session.write(b"\x1b[2J\x1b[H");
+        self.session.write_raw(b"clear\n");
         self.session.scroll_to_bottom();
     }
 
-    /// Reset the terminal to its initial state (full RIS reset). Clears
-    // scrollback too, unlike `clear_screen`. Used by the right-click
-    // context menu's "Reset Terminal" item.
+    /// Reset the terminal by running `reset` in the shell. This performs
+    // a full terminal reset (re-initializes the terminal state, clears
+    // scrollback, redraws the prompt) — heavier than `clear_screen`.
+    //
+    // Like [`clear_screen`], we send `reset\n` through the PTY via
+    // `write_raw` rather than feeding `ESC c` (RIS) directly into the
+    // term grid. `ESC c` resets the terminal emulator's state but the
+    // shell doesn't know it happened, so the prompt wouldn't redraw.
+    // Running `reset` as a command lets the shell + `reset` binary
+    // coordinate the full reset sequence and prompt redraw.
+    //
+    // Note: `reset` may not exist on all systems (e.g. minimal
+    // embedded shells). On systems without it, the shell will print
+    // "command not found" — a tolerable failure mode. If this becomes
+    // a real issue we can fall back to `stty sane` + `clear`.
     pub fn reset_terminal(&mut self) {
-        // ESC c = RIS (Reset to Initial State).
-        self.session.write(b"\x1bc");
+        self.session.write_raw(b"reset\n");
         self.session.scroll_to_bottom();
     }
 

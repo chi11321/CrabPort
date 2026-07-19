@@ -419,6 +419,7 @@ pub fn render_content(
                     context_menu.clone(),
                     alert_controller.clone(),
                     ctx.tooltip.clone(),
+                    ctx.transfer_history.clone(),
                     hosts.to_vec(),
                     handle.clone(),
                     window,
@@ -995,19 +996,11 @@ pub fn render_content(
             // terminal toolbar knowing about SFTP. Terminal tabs pass an
             // empty vec (no trailing buttons).
             if is_sftp_tab {
-                let handle_for_toggle = handle.clone();
+                let transfer_history = ctx.transfer_history.clone();
+                let on = transfer_history.read_with(cx, |c, _| c.is_open());
                 vec![
-                    crate::views::sftp::render_sftp_history_toggle(move |cx| {
-                        // Flip the persisted flag and notify the app so the
-                        // SFTP view repaints with (or without) the history
-                        // panel and the button reflects the new state.
-                        let _ = crabport_core::config::update(|cfg| {
-                            cfg.appearance.terminal.toolbar.sftp_history =
-                                !cfg.appearance.terminal.toolbar.sftp_history;
-                        });
-                        let _ = handle_for_toggle.update(cx, |_, cx| cx.notify());
-                    })
-                    .into_any_element(),
+                    crate::views::sftp::render_sftp_history_toggle(transfer_history, on)
+                        .into_any_element(),
                 ]
             } else {
                 Vec::new()

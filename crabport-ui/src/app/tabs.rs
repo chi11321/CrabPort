@@ -580,17 +580,27 @@ impl CrabportApp {
         let Some(tree) = self.split_trees.get(&tab_id).cloned() else {
             return;
         };
-        // The pane being split is the last one to have had keyboard focus
-        // (`last_focused_pane`), tracked via each pane's `on_focused`
-        // callback and via `focus_pane` on click. This is **not** cleared
-        // when focus moves to a non-terminal element (e.g. the split toolbar
-        // button), so splitting always targets the pane the user was last
-        // typing in — e.g. split-down splits the focused left pane, not the
-        // right one. Falls back to the tree's `active_pane` if we have no
-        // record (e.g. focus was never on a pane this session).
-        let active_pane = self
-            .last_focused_pane
-            .filter(|&p| tree.root.find_pane(p))
+        // The pane being split is the **keyboard-focused** pane. We find
+        // it by scanning the active tab's panes for the one whose
+        // `TerminalView::is_focused()` returns true — this is tracked
+        // synchronously via the `on_focus`/`on_blur` listeners (no
+        // `cx.defer`), so it reflects the *current* focus even when the
+        // `on_focused` callback (which updates `last_focused_pane`) is
+        // still pending. This fixes the "split targets the wrong pane"
+        // race where the user clicks pane B and immediately triggers
+        // split — the deferred `on_focused` hadn't run yet, so
+        // `last_focused_pane` still pointed at the previous pane.
+        //
+        // Fallbacks: `last_focused_pane` (covers the case where focus
+        // moved to a non-terminal element like the split toolbar button,
+        // so no pane reports `is_focused`), then the tree's `active_pane`.
+        let focused_pane = self
+            .pane_views
+            .iter()
+            .find(|(p, v)| tree.root.find_pane(**p) && v.read_with(cx, |view, _| view.is_focused()))
+            .map(|(p, _)| *p);
+        let active_pane = focused_pane
+            .or_else(|| self.last_focused_pane.filter(|&p| tree.root.find_pane(p)))
             .unwrap_or(tree.active_pane);
         let new_pane_id = self.alloc_pane_id();
 
@@ -891,6 +901,12 @@ impl CrabportApp {
         );
 
         // Paste — always available; the platform clipboard is the source.
+        // This item (or the conditional Clear selection below it) carries the
+        // divider that separates clipboard actions from pane-management
+        // actions. We attach the divider to the *last* clipboard item rather
+        // than inserting a dummy empty item, because a dummy item would
+        // render as a visible disabled row (the "blank item" bug).
+        let mut last_clipboard_idx = items.len();
         items.push(ContextMenuItem::new(
             t!("menu.paste").to_string(),
             move |_w, cx| {
@@ -900,6 +916,7 @@ impl CrabportApp {
 
         // Clear selection — only meaningful when there is one.
         if has_sel {
+            last_clipboard_idx = items.len();
             items.push(ContextMenuItem::new(
                 t!("menu.clear_selection").to_string(),
                 move |_w, cx| {
@@ -911,13 +928,11 @@ impl CrabportApp {
             ));
         }
 
-        // Divider before the split + clear group so clipboard actions
-        // stay visually grouped apart from pane-management actions.
-        items.push(
-            ContextMenuItem::new("", move |_w, _cx| {})
-                .disabled(true)
-                .divider_after(),
-        );
+        // Attach the divider to the last clipboard item so the next group
+        // (split + clear) is visually separated.
+        if let Some(item) = items.get_mut(last_clipboard_idx) {
+            item.divider_after = true;
+        }
 
         // Split Right / Split Down — invoke the view's `on_split_request`
         // callback, which the app wires to `split_active_pane`. This
@@ -995,6 +1010,17 @@ impl CrabportApp {
         // `last_focused_pane` stale. Resolving via entity equality fixes
         // the "split targets the wrong pane" bug.
         let view_for_focus_cb = view.clone();
+        // Capture the view entity for the right-click context menu callback
+        // too. The `pane_id` passed to `on_context_menu` is also
+        // `TerminalView::count`, which for the primary pane is the tab_id,
+        // not the real pane_id. `show_terminal_context_menu` would then
+        // fall back to `terminal_views[tab_id]` — which tracks the
+        // *active* pane's view, not necessarily the one the user
+        // right-clicked. Resolving the real pane_id here by entity
+        // equality ensures the ctxmenu (and its Copy/Paste/Clear actions)
+        // operate on the exact pane the user clicked, not whatever pane
+        // last grabbed keyboard focus.
+        let view_for_ctx_cb = view.clone();
         view.update(cx, |v, _cx| {
             v.set_on_focused(move |pane_id, cx| {
                 let _ = app_handle.update(cx, |app, cx| {
@@ -1024,10 +1050,24 @@ impl CrabportApp {
                 });
             });
             // Right-click inside the terminal pane surfaces a
-            // Copy/Paste/Select-All context menu.
-            v.set_on_context_menu(move |pane_id, pos, cx| {
+            // Copy/Paste/Select-All context menu. Resolve the real pane_id
+            // (the key in `pane_views`) by entity equality so the menu
+            // actions target THIS pane, not whatever pane
+            // `terminal_views[tab_id]` happens to point at (which is the
+            // active pane, possibly a different split).
+            v.set_on_context_menu(move |_pane_id, pos, cx| {
                 let _ = app_handle3.update(cx, |app, cx| {
-                    app.show_terminal_context_menu(pane_id, pos, cx);
+                    // Find the real pane_id by entity equality. Falls back
+                    // to the passed-in `_pane_id` if the view isn't in
+                    // `pane_views` (shouldn't happen, but is a safe
+                    // default).
+                    let real_pane_id = app
+                        .pane_views
+                        .iter()
+                        .find(|(_, v)| **v == view_for_ctx_cb)
+                        .map(|(p, _)| *p)
+                        .unwrap_or(_pane_id);
+                    app.show_terminal_context_menu(real_pane_id, pos, cx);
                 });
             });
         });

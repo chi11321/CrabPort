@@ -209,6 +209,10 @@ notif_upload_failed_title = "Upload failed"
 notif_upload_failed_msg = "%{message}"
 drop_upload_hint = "Drop files to upload"
 drag_download_hint = "Drag to terminal to download"
+history_title = "Transfer history"
+history_empty = "No transfers yet"
+history_status_success = "Success"
+history_status_failed = "Failed"
 
 [sftp.progress]
 download = "Download"
