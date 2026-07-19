@@ -843,6 +843,7 @@ impl CrabPortMonitor for FailedPtyBackend {
 
 /// Maximum number of history entries to surface in the UI panel. Mirrors
 /// the SSH-side cap so local + remote behave the same.
+#[cfg(not(windows))]
 const MAX_LOCAL_HISTORY: usize = 1000;
 
 /// Read the local user's shell history file and return its commands,
