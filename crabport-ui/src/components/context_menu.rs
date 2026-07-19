@@ -298,13 +298,17 @@ impl Render for ContextMenuController {
         let pos = state.position;
         let mut x = f32::from(pos.x);
         let mut y = f32::from(pos.y);
-        // Flip left if the card would overflow the right edge.
+        // Flip left: if the card would overflow the right edge, place it
+        // to the left of the cursor so its right edge aligns with the
+        // click point (instead of clamping to the window edge, which
+        // would detach the menu from the cursor).
         if x + MENU_WIDTH > win_w {
-            x = (win_w - MENU_WIDTH).max(0.0);
+            x = (f32::from(pos.x) - MENU_WIDTH).max(0.0);
         }
-        // Flip up if the card would overflow the bottom edge.
+        // Flip up: if the card would overflow the bottom edge, place it
+        // above the cursor so its bottom edge aligns with the click point.
         if y + estimated_h > win_h {
-            y = (y - estimated_h).max(0.0);
+            y = (f32::from(pos.y) - estimated_h).max(0.0);
         }
         let clamped_pos = point(px(x), px(y));
         render_context_menu(state, clamped_pos, Some(on_backdrop_click)).into_any_element()

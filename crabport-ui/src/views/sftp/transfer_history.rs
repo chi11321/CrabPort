@@ -166,11 +166,14 @@ fn render_transfer_history(
     const POPOVER_H: f32 = 240.0;
     let mut x = f32::from(anchor.x);
     let mut y = f32::from(anchor.y) + 28.0; // below the button
+    // Flip left: if the popover would overflow the right edge, place it
+    // to the left of the anchor so its right edge aligns with the button.
     if x + POPOVER_W > f32::from(viewport.width) {
-        x = (f32::from(viewport.width) - POPOVER_W).max(0.0);
+        x = (f32::from(anchor.x) - POPOVER_W).max(0.0);
     }
+    // Flip up: if the popover would overflow the bottom edge, place it
+    // above the anchor so its bottom edge aligns with the button.
     if y + POPOVER_H > f32::from(viewport.height) {
-        // Flip above the button instead.
         y = (f32::from(anchor.y) - POPOVER_H - 4.0).max(0.0);
     }
 
