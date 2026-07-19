@@ -518,6 +518,17 @@ impl CrabportApp {
             panel.forget_tab(id);
             cx.notify();
         });
+        // Tear down any borrowed tunnels that were started from this tab —
+        // they reuse the tab's SSH session, so closing the tab must stop
+        // them (otherwise they'd be left pointing at a dead session).
+        // Owned tunnels (started from the Tunnels page) are left alone.
+        let tunnels = self.app_ctx.tunnels.clone();
+        let app_entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            tunnels.teardown_for_tab(id).await;
+            let _ = app_entity.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
         self.tabs.retain(|t| t.id != id);
         if self.active_tab_id == id {
             self.active_tab_id = 0;
