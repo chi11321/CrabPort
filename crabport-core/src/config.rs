@@ -220,6 +220,16 @@ pub struct TerminalConfig {
     /// Font size in CSS pixels. Clamped into `[8.0, 32.0]` at use sites.
     #[serde(default = "default_terminal_font_size")]
     pub font_size: f32,
+
+    /// Per-slot visibility for the bottom toolbar, stored under
+    /// `[appearance.terminal.toolbar]`. Each field defaults to `true` so a
+    /// fresh install shows every available chip; the user toggles them
+    /// via the gear context menu in the toolbar itself. Fields that don't
+    /// exist in the struct (e.g. ones added in a later version) just get
+    /// the `#[serde(default)]` value, so config round-trips cleanly across
+    /// versions.
+    #[serde(default)]
+    pub toolbar: ToolbarVisibilityConfig,
 }
 
 fn default_terminal_font_size() -> f32 {
@@ -231,6 +241,7 @@ impl Default for TerminalConfig {
         Self {
             font_family: String::new(),
             font_size: default_terminal_font_size(),
+            toolbar: ToolbarVisibilityConfig::default(),
         }
     }
 }
@@ -250,6 +261,100 @@ impl TerminalConfig {
     /// hand-edited `config.toml` values from bricking the terminal.
     pub fn effective_font_size(&self) -> f32 {
         self.font_size.clamp(8.0, 32.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolbarVisibilityConfig
+// ---------------------------------------------------------------------------
+
+/// Per-slot visibility for the bottom toolbar. Stored under
+/// `[appearance.terminal.toolbar]` in `config.toml`. Each boolean toggles
+/// one toolbar chip on (true) or off (false). The gear context menu in the
+/// toolbar flips these live; the change is persisted immediately.
+///
+/// Every field defaults to `true` so a fresh install shows the full toolbar.
+/// Fields not in this struct (added in later versions) silently fall back to
+/// `true` thanks to `#[serde(default)]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolbarVisibilityConfig {
+    #[serde(default = "default_true")]
+    pub latency: bool,
+    #[serde(default = "default_true")]
+    pub cpu: bool,
+    #[serde(default = "default_true")]
+    pub disk: bool,
+    #[serde(default = "default_true")]
+    pub memory: bool,
+    #[serde(default = "default_true")]
+    pub network: bool,
+    /// SFTP transfer progress chip (right-aligned in the terminal toolbar).
+    #[serde(default = "default_true")]
+    pub sftp_progress: bool,
+    /// "SFTP transfer history" toggle button in the SFTP tab toolbar.
+    /// Defaults to `false` because the panel is opt-in — surfacing it by
+    /// default would draw the user's attention to a feature they may not
+    /// know about yet.
+    #[serde(default = "default_false")]
+    pub sftp_history: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
+}
+
+impl Default for ToolbarVisibilityConfig {
+    fn default() -> Self {
+        Self {
+            latency: true,
+            cpu: true,
+            disk: true,
+            memory: true,
+            network: true,
+            sftp_progress: true,
+            sftp_history: false,
+        }
+    }
+}
+
+impl ToolbarVisibilityConfig {
+    /// Toggle the visibility for the slot identified by `id`. The `id`
+    /// strings are the same `&'static str` discriminators used by
+    /// [`crate::layouts::toolbar::ToolbarSlot::id`]. An unknown id is a
+    /// no-op so the gear menu doesn't panic if a stale slot id is passed
+    /// from an older build.
+    pub fn toggle(&mut self, id: &str) {
+        match id {
+            "latency" => self.latency = !self.latency,
+            "cpu" => self.cpu = !self.cpu,
+            "disk" => self.disk = !self.disk,
+            "memory" => self.memory = !self.memory,
+            "network" => self.network = !self.network,
+            "sftp_progress" => self.sftp_progress = !self.sftp_progress,
+            "sftp_history" => self.sftp_history = !self.sftp_history,
+            _ => {}
+        }
+    }
+
+    /// Read the visibility for the slot identified by `id`. Unknown ids
+    /// default to `true` so a slot that the config doesn't yet know about
+    /// still shows up (matching the `#[serde(default)]` semantics on the
+    /// struct fields).
+    pub fn get(&self, id: &str) -> bool {
+        match id {
+            "latency" => self.latency,
+            "cpu" => self.cpu,
+            "disk" => self.disk,
+            "memory" => self.memory,
+            "network" => self.network,
+            "sftp_progress" => self.sftp_progress,
+            "sftp_history" => self.sftp_history,
+            _ => true,
+        }
     }
 }
 

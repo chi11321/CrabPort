@@ -167,6 +167,7 @@ pub struct SftpTabView {
     pub(super) context_menu: Option<Entity<ContextMenuController>>,
     pub(super) alert_controller: Option<Entity<AlertController>>,
     pub(super) tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
+    pub(super) transfer_history: Option<Entity<crate::views::sftp::TransferHistoryController>>,
 
     // --- Host selector overlay ---
     pub(super) host_selector: Option<Entity<HostSelectorOverlay>>,
@@ -183,6 +184,7 @@ impl SftpTabView {
             context_menu: None,
             alert_controller: None,
             tooltip: None,
+            transfer_history: None,
             host_selector: None,
             host_selector_open_for: None,
             hosts: Vec::new(),
@@ -318,6 +320,7 @@ impl SftpTabView {
         context_menu: Entity<ContextMenuController>,
         alert_controller: Entity<AlertController>,
         tooltip: Entity<crate::components::tooltip::TooltipController>,
+        transfer_history: Entity<crate::views::sftp::TransferHistoryController>,
         hosts: Vec<ConnectionHost>,
         app: Entity<CrabportApp>,
         window: &mut Window,
@@ -369,6 +372,7 @@ impl SftpTabView {
         }
         self.hosts = hosts;
         self.app = Some(app);
+        self.transfer_history = Some(transfer_history);
         // Keep the overlay's host list in sync.
         if let Some(ref overlay) = self.host_selector {
             overlay.update(cx, |o, cx| {
@@ -908,8 +912,27 @@ impl SftpTabView {
         });
 
         let app_handle = self.app.clone().map(|e| e.downgrade());
+        let transfer_history_ctrl = self.transfer_history.clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
+                // Append to the global transfer-history controller so
+                // the popover can display it. Done before the early-return
+                // arms below (Rename/Edit on success skip the toast but
+                // should still be logged in history).
+                let record = crate::views::sftp::TransferRecord {
+                    kind,
+                    success,
+                    message: message.clone(),
+                    finished_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                };
+                if let Some(ref ctrl) = transfer_history_ctrl {
+                    let _ = ctrl.update(cx, |c, cx| {
+                        c.push(record, cx);
+                    });
+                }
                 let Some(ref ah) = app_handle else { return };
                 let _ = ah.update(cx, |app, cx| {
                     let (title, message_notif, level, duration) = match (kind, success) {

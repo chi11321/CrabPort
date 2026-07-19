@@ -12,13 +12,13 @@ use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::layouts::toolbar::render_terminal_toolbar;
 use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_SM};
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
+use crate::views::terminal::toolbar::{TerminalToolbarInput, render_terminal_toolbar};
 use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus};
 
 /// Clone the active terminal's `Entity` so a callback can forward calls to
@@ -419,6 +419,7 @@ pub fn render_content(
                     context_menu.clone(),
                     alert_controller.clone(),
                     ctx.tooltip.clone(),
+                    ctx.transfer_history.clone(),
                     hosts.to_vec(),
                     handle.clone(),
                     window,
@@ -982,10 +983,40 @@ pub fn render_content(
                 }),
         )
         .child(render_terminal_toolbar(
-            is_terminal,
-            status,
-            metrics,
-            sftp_progress,
+            TerminalToolbarInput::new(is_terminal, status, metrics, sftp_progress),
+            // The caller already passes `app_ctx` (which owns the context
+            // menu controller) into `render_content`, so we grab it
+            // directly here. Going through `handle.read_with(cx, ...)` would
+            // panic — `CrabportApp` is already borrowed mutably by its own
+            // `render` method, and GPUI forbids nested reads of the same
+            // entity ("cannot read while it is already being updated").
+            Some(ctx.context_menu.clone()),
+            // SFTP tab: inject the "transfer history" toggle button as a
+            // trailing element so it appears in the toolbar without the
+            // terminal toolbar knowing about SFTP. Terminal tabs pass an
+            // empty vec (no trailing buttons).
+            if is_sftp_tab {
+                let transfer_history = ctx.transfer_history.clone();
+                let on = transfer_history.read_with(cx, |c, _| c.is_open());
+                vec![
+                    crate::views::sftp::render_sftp_history_toggle(transfer_history, on)
+                        .into_any_element(),
+                ]
+            } else {
+                Vec::new()
+            },
+            {
+                let handle = handle.clone();
+                move |id, cx| {
+                    // Toggle the slot's visibility flag in config and persist.
+                    // The toolbar reads the flag on the next render, so the
+                    // ctxmenu checkmark updates immediately.
+                    let _ = crabport_core::config::update(|cfg| {
+                        cfg.appearance.terminal.toolbar.toggle(id);
+                    });
+                    let _ = handle.update(cx, |_, cx| cx.notify());
+                }
+            },
         ))
 }
 
