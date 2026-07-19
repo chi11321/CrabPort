@@ -84,6 +84,9 @@ pub struct SftpPanel {
     context_menu: Option<Entity<crate::components::context_menu::ContextMenuController>>,
     /// Global alert dialog host, used for the delete-confirmation prompt.
     alert_controller: Option<Entity<AlertController>>,
+    /// Global tooltip host, used for the upload/download/refresh button
+    /// hover tooltips.
+    tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
     /// The entry name that triggered the currently-open context menu, if
     /// any. While set, that row stays highlighted in the hover color even
     /// though the mouse has moved to the overlay.
@@ -140,6 +143,7 @@ impl SftpPanel {
             active_tab_id: None,
             context_menu: None,
             alert_controller: None,
+            tooltip: None,
             context_menu_entry: None,
             hovered_entry: None,
             selected: FxHashSet::default(),
@@ -170,6 +174,7 @@ impl SftpPanel {
         active_tab_id: u64,
         context_menu: Entity<crate::components::context_menu::ContextMenuController>,
         alert_controller: Entity<AlertController>,
+        tooltip: Entity<crate::components::tooltip::TooltipController>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -227,6 +232,7 @@ impl SftpPanel {
             self.active_tab_id = Some(active_tab_id);
             self.context_menu = Some(context_menu);
             self.alert_controller = Some(alert_controller);
+            self.tooltip = Some(tooltip);
             self.on_download = on_download;
             self.on_upload = on_upload;
             self.on_delete = on_delete;
@@ -297,6 +303,7 @@ impl SftpPanel {
         self.active_tab_id = Some(active_tab_id);
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
+        self.tooltip = Some(tooltip);
         if tab_changed || entries_changed {
             self.selected.clear();
             self.renaming_entry = None;
@@ -464,6 +471,7 @@ impl Render for SftpPanel {
         let cwd = self.cwd.clone();
         let on_navigate = self.on_navigate.clone();
         let on_download = self.on_download.clone();
+        let tooltip_ctrl = self.tooltip.clone();
         let on_upload = self.on_upload.clone();
         let on_upload_for_drop = on_upload.clone();
         let cwd_for_drop = cwd.clone();
@@ -512,6 +520,7 @@ impl Render for SftpPanel {
                         "icons/upload.svg",
                         t!("sftp.upload").to_string(),
                         on_upload.is_some(),
+                        tooltip_ctrl.clone(),
                         {
                             let entity = entity.clone();
                             let on_upload = on_upload.clone();
@@ -531,6 +540,7 @@ impl Render for SftpPanel {
                         "icons/download.svg",
                         t!("sftp.download").to_string(),
                         on_download.is_some(),
+                        tooltip_ctrl.clone(),
                         {
                             let entity = entity.clone();
                             let on_download = on_download.clone();
@@ -550,6 +560,7 @@ impl Render for SftpPanel {
                         "icons/refresh-cw.svg",
                         t!("sftp.refresh").to_string(),
                         on_navigate.is_some(),
+                        tooltip_ctrl.clone(),
                         {
                             let on_navigate = on_navigate.clone();
                             let cwd = cwd.clone();
@@ -1305,6 +1316,7 @@ fn render_sftp_action_button(
     icon: &'static str,
     tooltip: String,
     enabled: bool,
+    tooltip_ctrl: Option<Entity<crate::components::tooltip::TooltipController>>,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let color = if enabled { text_muted() } else { 0x45475a };
@@ -1312,8 +1324,10 @@ fn render_sftp_action_button(
     let to_color = |c: u32| rgba(if c <= 0xFFFFFF { (c << 8) | 0xFF } else { c });
     let rest_bg = to_color(0x00000000);
     let hover_bg_rgba = to_color(hover_bg);
+    let btn_id = ElementId::Name(id.into());
+    let tooltip_text_clone = tooltip.clone();
     div()
-        .id(id)
+        .id(btn_id.clone())
         .flex()
         .items_center()
         .justify_center()
@@ -1321,14 +1335,32 @@ fn render_sftp_action_button(
         .rounded(px(4.0))
         .bg(rest_bg)
         .when(!enabled, |el| el.cursor_not_allowed())
-        .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(w, cx))
         .when(enabled, |el| {
             el.on_click(move |_e, w, cx| {
                 on_click(w, cx);
                 cx.stop_propagation();
             })
         })
-        .with_transition(id)
+        .with_transition(btn_id)
+        // on_hover must come AFTER with_transition (on the AnimatedWrapper)
+        // and BEFORE transition_on_hover — otherwise transition_on_hover
+        // registers a second hover handler and GPUI panics. Mirrors
+        // `render_action_button` in sftp/helpers.rs.
+        .when_some(tooltip_ctrl, |el, ctrl| {
+            el.when(enabled, |el| {
+                el.on_hover(move |hovered, w, cx| {
+                    if *hovered {
+                        ctrl.update(cx, |t, cx| {
+                            t.show(tooltip_text_clone.clone(), w.mouse_position(), cx);
+                        });
+                    } else {
+                        ctrl.update(cx, |t, cx| {
+                            t.hide(cx);
+                        });
+                    }
+                })
+            })
+        })
         .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)

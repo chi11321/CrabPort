@@ -600,6 +600,7 @@ pub fn render_content(
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),
+            ctx.tooltip.clone(),
             window,
             cx,
         );
