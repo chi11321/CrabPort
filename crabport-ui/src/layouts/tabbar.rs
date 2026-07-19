@@ -85,8 +85,21 @@ pub fn render_tab_bar(
         // there (GPUI's `on_hit_test_window_control` is empty on
         // macOS) — macOS already provides drag via the transparent
         // system title bar + `traffic_light_position`.
+        //
+        // `occlude_mouse` is what makes the drag region *itself* a
+        // `BlockMouse` hitbox. This stops GPUI's `hit_test` from also
+        // collecting ancestor hitboxes (notably the `app-root` div with
+        // `.track_focus(...)`). Without it, that ancestor's hitbox would
+        // be in `mouse_hit_test.ids`, its `track_focus` mouse-down handler
+        // would call `window.prevent_default()`, and gpui's
+        // `WM_NCLBUTTONDOWN` handler would see `default_prevented = true`,
+        // return `Some(0)`, and cancel the native `HTCAPTION` drag (and
+        // the double-click maximize). Drag-region buttons painted above
+        // this bar still call `occlude_mouse` themselves, so they win the
+        // hit-test via the reverse iteration and their clicks fire as
+        // before.
         .when(cfg!(not(target_os = "macos")), |el| {
-            el.window_control_area(WindowControlArea::Drag)
+            el.window_control_area(WindowControlArea::Drag).occlude()
         })
         // --- Scrollable tabs layer -----------------------------------------
         // Occupies the full tab-bar width but is inset on the right by

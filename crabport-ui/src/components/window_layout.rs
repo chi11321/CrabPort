@@ -68,6 +68,27 @@ pub fn render_sidebar_window(sidebar: impl IntoElement, content: impl IntoElemen
                             .right_0()
                             .h_11()
                             .window_control_area(WindowControlArea::Drag)
+                            // `occlude_mouse` makes this hitbox
+                            // `HitboxBehavior::BlockMouse`, so GPUI's
+                            // `hit_test` stops collecting hitboxes *after*
+                            // it (i.e. ancestors like the window root).
+                            // Without this, a parent `track_focus`
+                            // handler (Settings / main window roots both
+                            // use `.track_focus(...)`) would see its own
+                            // hitbox as hovered and call
+                            // `window.prevent_default()` on the mouse-down —
+                            // which gpui's `WM_NCLBUTTONDOWN` handler
+                            // treats as "handled" and returns `Some(0)`,
+                            // cancelling the native `HTCAPTION` drag and
+                            // the double-click maximize.
+                            //
+                            // Drag-region buttons (minimize / maximize /
+                            // close) and the `+` / tab buttons are painted
+                            // *above* this strip and already call
+                            // `occlude_mouse` themselves, so they still win
+                            // the hit-test (reverse iteration) and their
+                            // clicks fire as before.
+                            .occlude()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 move |_: &MouseDownEvent, window, _cx| {
