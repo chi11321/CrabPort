@@ -125,7 +125,13 @@ impl TerminalMetrics {
     /// Compute metrics for the current config (family + size). Falls back to
     /// the legacy hardcoded values if the font can't be measured.
     ///
-    /// `line_height` = `font_size * 1.5` (matches the original 13 → 20 ratio).
+    /// `line_height` = `font_size * 1.3` — matches Zed terminal's "Standard"
+    /// line height. A tighter ratio than the legacy 1.5× shrinks the
+    /// `padding_top = (line_height - ascent - descent) / 2` strip that GPUI's
+    /// `paint_line` leaves between rows, so box-drawing characters (▀▄█)
+    /// stitch together more tightly in TUI banners. At 1.3×, Menlo 13px gives
+    /// `padding_top ≈ 0.88px` (vs. 2.43px at 1.5×), reducing the visible
+    /// row seam from ~5px to under 2px.
     /// `cell_width` is the advance width of the ASCII glyph `'M'` in the
     /// configured font at the configured size — measured via the text system
     /// so changing either the family or the size updates the grid cleanly.
@@ -135,7 +141,7 @@ impl TerminalMetrics {
         let family = font_family();
         let size = config::snapshot().appearance.terminal.effective_font_size();
         let font_size = px(size);
-        let line_height = px((size * 1.5).round());
+        let line_height = px((size * 1.3).round());
 
         let cell_width = measure_cell_width(cx, &family, font_size).unwrap_or_else(|| {
             // Fallback: a roughly 0.6× ratio matches Menlo/Consolas. Keeps
