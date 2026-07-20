@@ -371,7 +371,7 @@ pub fn render_content(
                                 .occlude()
                                 .child(render_split_button(
                                     "term-split-right",
-                                    "icons/panel-right.svg",
+                                    "icons/columns-2.svg",
                                     t!("terminal.split_right").to_string(),
                                     ctx.tooltip.clone(),
                                     {
@@ -388,7 +388,7 @@ pub fn render_content(
                                 ))
                                 .child(render_split_button(
                                     "term-split-down",
-                                    "icons/panel-bottom.svg",
+                                    "icons/rows-2.svg",
                                     t!("terminal.split_down").to_string(),
                                     ctx.tooltip.clone(),
                                     {
