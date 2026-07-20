@@ -535,6 +535,26 @@ impl SettingsWindow {
                     .field(
                         t!("window.settings.appearance.terminal_font_size").to_string(),
                         div().w(px(180.0)).child(font_size_stepper),
+                    )
+                    .field(
+                        t!("window.settings.appearance.terminal_expand_panel").to_string(),
+                        div().w(px(180.0)).child(
+                            crate::components::switch::Switch::new("settings-term-expand-panel")
+                                .checked(term_cfg.expand_panel_on_connect)
+                                .on_change({
+                                    let h = handle.clone();
+                                    move |checked, _w, cx| {
+                                        let _ = config::update(|cfg| {
+                                            cfg.appearance.terminal.expand_panel_on_connect =
+                                                *checked;
+                                        });
+                                        // Repaint every window so open terminal
+                                        // tabs pick up the new default on
+                                        // their next render.
+                                        let _ = h.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
+                        ),
                     ),
             )
     }

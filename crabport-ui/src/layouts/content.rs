@@ -52,6 +52,12 @@ pub fn render_content(
     // the `CrabportApp` borrow) and passed in to avoid a nested
     // `handle.read_with` during render.
     panel_active_tab: PanelKind,
+    // Whether the user has toggled the right-hand panel open for this tab.
+    // The toolbar's panel toggle button flips this; `render_panel`'s
+    // `with_transition` drives the slide animation. The caller (which owns
+    // the `CrabportApp` borrow) pre-reads it to avoid a nested
+    // `handle.read_with` during render.
+    panel_open: bool,
     // Pre-read by the caller (which owns the `CrabportApp` borrow) to avoid
     // a nested `handle.read_with` during render — same reason as
     // `panel_active_tab`.
@@ -307,6 +313,7 @@ pub fn render_content(
                     terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
+                let handle_panel = handle.clone();
                 // Clone the download callback + terminal entity so the
                 // on_drop handler can trigger a download when the user
                 // drags an SFTP file row onto the terminal area.
@@ -392,6 +399,20 @@ pub fn render_content(
                                                     crate::views::terminal::split::SplitDir::Horizontal,
                                                     cx,
                                                 );
+                                            });
+                                        }
+                                    },
+                                ))
+                                .child(render_split_button(
+                                    "term-toggle-panel",
+                                    "icons/panel-right.svg",
+                                    t!("terminal.toggle_panel").to_string(),
+                                    ctx.tooltip.clone(),
+                                    {
+                                        let handle = handle_panel.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.toggle_right_panel(active_tab_id, cx);
                                             });
                                         }
                                     },
@@ -482,7 +503,13 @@ pub fn render_content(
     // considered ready immediately; remote (SSH / Telnet) backends cycle
     // through `Connecting` -> `Connected` (or `Disconnected`), and the
     // panel stays collapsed until they actually reach `Connected`.
-    let panel_show = is_terminal && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
+    //
+    // The user can still toggle the panel closed via the toolbar button even
+    // when the session is ready — `panel_open` (defaulting to true) is
+    // AND-ed with the readiness check so the panel never appears mid-connect.
+    let panel_show = is_terminal
+        && panel_open
+        && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.

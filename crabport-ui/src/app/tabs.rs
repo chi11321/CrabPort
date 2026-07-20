@@ -514,6 +514,7 @@ impl CrabportApp {
         // Drop this tab's per-tab panel state so the HashMaps don't leak
         // entries for closed tabs.
         self.panel_active_tab.remove(&id);
+        self.panel_open.remove(&id);
         self.app_ctx.tunnels_panel.update(cx, |panel, cx| {
             panel.forget_tab(id);
             cx.notify();
@@ -1151,6 +1152,30 @@ impl CrabportApp {
                 cmd.open(_window, cx);
             }
         });
+        cx.notify();
+    }
+
+    /// Toggle the right-hand panel's visibility for the active terminal tab.
+    /// The actual show/hide animation is driven by `gpui-animation`'s
+    /// `with_transition` in `render_panel` — this just flips a per-tab bool
+    /// and notifies, so the panel slides in/out smoothly rather than
+    /// vanishing instantly.
+    ///
+    /// `None` means the user hasn't toggled this tab yet, so we fall back
+    /// to the configured default (`appearance.terminal.expand_panel_on_connect`).
+    /// Once toggled, the per-tab value wins so the user's explicit choice
+    /// sticks for that tab regardless of the global setting.
+    pub fn toggle_right_panel(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let default_open = crabport_core::config::snapshot()
+            .appearance
+            .terminal
+            .expand_panel_on_connect;
+        let current = self
+            .panel_open
+            .get(&tab_id)
+            .copied()
+            .unwrap_or(default_open);
+        self.panel_open.insert(tab_id, !current);
         cx.notify();
     }
 }

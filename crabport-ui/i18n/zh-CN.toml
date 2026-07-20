@@ -159,6 +159,7 @@ host_key_accept = "信任并连接"
 host_key_cancel = "取消"
 split_right = "向右分屏"
 split_down = "向下分屏"
+toggle_panel = "开启/关闭右侧面板"
 close_pane = "关闭窗格"
 
 [toolbar]
@@ -355,6 +356,7 @@ section_terminal = "终端"
 terminal_desc = "选择所有终端标签页使用的等宽字体和字号。"
 terminal_font_family = "字体"
 terminal_font_size = "字号"
+terminal_expand_panel = "连接时展开面板"
 
 [window.settings.keybinds]
 section_shortcuts = "快捷键"

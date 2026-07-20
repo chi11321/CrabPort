@@ -75,6 +75,56 @@ use crate::terminal::{
 // Platform-agnostic shell selection
 // ===========================================================================
 
+/// Ensure the PTY child shell runs in a UTF-8 capable locale.
+///
+/// See [`PtyBackend::new`] for why this is needed: GUI-launched processes
+/// on macOS don't inherit a usable `LANG` — the process starts with
+/// `LANG=""` and macOS's quirky `LC_CTYPE="UTF-8"` (which is not a valid
+/// POSIX locale name). The shell itself is lenient about this so input
+/// parsing works, but any child program that calls `setlocale(LC_ALL, "")`
+/// (`ls`, `echo`, …) rejects the bogus `LC_CTYPE`, silently falls back to
+/// the `C` locale, and emits `????` for any non-ASCII byte.
+///
+/// Fix: if `LANG` is missing or `C`/`POSIX`, force it to `en_US.UTF-8`
+/// (shipped by default on every macOS install, and a UTF-8 codeset is all
+/// that's needed to correctly round-trip CJK / emoji bytes — the language
+/// part of the locale doesn't restrict which characters can be displayed).
+/// Also set `LC_CTYPE` to a real locale name so it stops being the bogus
+/// `"UTF-8"` value. We don't try to derive a locale matching the user's
+/// UI language because macOS doesn't ship script-tagged locales (e.g.
+/// `zh_Hans_CN.UTF-8` doesn't exist — only `zh_CN.UTF-8`), so naive
+/// conversion from BCP 47 produces names `setlocale` rejects.
+///
+/// If the user has explicitly set `LANG` to something real (e.g.
+/// `zh_CN.UTF-8`), we respect it.
+fn ensure_utf8_locale() {
+    // A locale is "good" if it's non-empty and not the `C` / `POSIX`
+    // default (which is ASCII-only). We don't otherwise validate the name —
+    // if the user set `LANG=zh_CN.UTF-8` we trust them.
+    let lang_ok = std::env::var("LANG")
+        .ok()
+        .filter(|s| !s.is_empty() && s != "C" && s != "POSIX")
+        .is_some();
+
+    if lang_ok {
+        return;
+    }
+
+    // Default to `en_US.UTF-8` — always installed on macOS, and a UTF-8
+    // codeset is sufficient for correct CJK / emoji handling regardless of
+    // the language part.
+    // SAFETY: setting env vars is process-global but our PTY is the only
+    // child we spawn, and we do so immediately after this in
+    // [`PtyBackend::new`]. No other thread is reading env vars concurrently
+    // at this point.
+    unsafe {
+        std::env::set_var("LANG", "en_US.UTF-8");
+        // Overwrite the bogus `"UTF-8"` value macOS injects — a real locale
+        // name is required for `setlocale` in child programs.
+        std::env::set_var("LC_CTYPE", "en_US.UTF-8");
+    }
+}
+
 /// Pick the default local shell for this platform, mirroring alacritty's
 /// own `tty::windows::cmdline` default (which is `powershell`) plus a
 /// fallback cascade through modern PowerShell Core to the legacy
@@ -388,6 +438,20 @@ pub struct PtyBackend {
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
         tty::setup_env();
+        // alacritty's `setup_env` only sets `TERM` / `COLORTERM`. A shell
+        // spawned from a GUI app (e.g. launched from Finder / Spotlight on
+        // macOS) starts with `LANG=""` and macOS's bogus `LC_CTYPE="UTF-8"`
+        // (not a valid POSIX locale name). The shell itself is lenient so
+        // input parsing works, but any child program that calls
+        // `setlocale(LC_ALL, "")` (`ls`, `echo`, …) rejects the locale and
+        // falls back to `C`, emitting `????` for non-ASCII bytes.
+        //
+        // Force a real UTF-8 locale (`en_US.UTF-8`, shipped by default on
+        // every macOS install) when the user hasn't set one. A UTF-8 codeset
+        // is all that's needed to round-trip CJK / emoji — the language part
+        // doesn't restrict which characters display. We respect any `LANG`
+        // the user explicitly set.
+        ensure_utf8_locale();
 
         let window_size = WindowSize {
             num_lines: rows,
@@ -482,6 +546,35 @@ impl PtyBackend {
                         }
 
                         Command::Close => {
+                            // Actively terminate the child shell so its
+                            // descendants (vim, top, …) get SIGHUP via
+                            // the kernel's session-leader semantics.
+                            // Just closing our writer fd isn't enough —
+                            // the reader thread still holds a clone of the
+                            // master fd, so the PTY never reaches EOF and
+                            // the child never sees HUP. Sending SIGTERM
+                            // (or SIGHUP) to the child's pid makes the
+                            // shell exit, which in turn tears down its
+                            // process group.
+                            #[cfg(unix)]
+                            {
+                                let pid = pty.lock().child().id();
+                                if pid > 0 {
+                                    // SIGHUP is the canonical "terminal
+                                    // hung up" signal; shells propagate
+                                    // it to their jobs.
+                                    unsafe {
+                                        libc::kill(pid as libc::pid_t, libc::SIGHUP);
+                                    }
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                // ConPTY doesn't expose the child pid via
+                                // `child()`; the pseudoconsole is torn down
+                                // when the `Pty` drops, which sends the
+                                // equivalent of a console close event.
+                            }
                             let _ = event_tx.broadcast(BackendEvent::Closed).await;
                             break;
                         }

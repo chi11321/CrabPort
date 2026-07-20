@@ -221,6 +221,21 @@ pub struct TerminalConfig {
     #[serde(default = "default_terminal_font_size")]
     pub font_size: f32,
 
+    /// Whether the right-hand panel auto-expands when a terminal tab
+    /// finishes connecting. Defaults to `true` so a fresh install mirrors
+    /// the behavior of every prior release (panel slides in once the SSH /
+    /// Telnet session reaches `Connected`, or immediately for local PTY).
+    /// The user can turn it off in Settings if they prefer the terminal to
+    /// occupy the full width and only open the panel on demand via the
+    /// toolbar toggle button.
+    ///
+    /// This is a *default* — the per-tab toggle (`CrabportApp::panel_open`)
+    /// still wins once the user has clicked the button. The setting just
+    /// controls what `panel_open` defaults to for a tab that hasn't been
+    /// toggled yet.
+    #[serde(default = "default_expand_panel_on_connect")]
+    pub expand_panel_on_connect: bool,
+
     /// Per-slot visibility for the bottom toolbar, stored under
     /// `[appearance.terminal.toolbar]`. Each field defaults to `true` so a
     /// fresh install shows every available chip; the user toggles them
@@ -236,11 +251,19 @@ fn default_terminal_font_size() -> f32 {
     13.0
 }
 
+/// Default for `TerminalConfig::expand_panel_on_connect` — `true` so a
+/// fresh install mirrors the pre-setting behavior (panel slides in on
+/// connect).
+fn default_expand_panel_on_connect() -> bool {
+    true
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_family: String::new(),
             font_size: default_terminal_font_size(),
+            expand_panel_on_connect: default_expand_panel_on_connect(),
             toolbar: ToolbarVisibilityConfig::default(),
         }
     }

@@ -121,6 +121,13 @@ pub struct CrabportApp {
     /// shows all four; Telnet shows only History + Snippets). Lookups fall
     /// back to the default [`PanelKind`] for tabs that haven't been visited.
     pub panel_active_tab: HashMap<u64, crate::views::panel::PanelKind>,
+    /// Per-tab right-panel visibility toggle, keyed by tab id. `None` means
+    /// "use the default" (open) for tabs that haven't been toggled yet; this
+    /// keeps the HashMap small — most users never toggle it and we don't
+    /// need an entry per tab. Set by the panel toggle button in the
+    /// terminal split-toolbar; read in `render_content` to decide whether
+    /// the right-hand panel is shown.
+    pub panel_open: HashMap<u64, bool>,
     /// Live panel resize drag state. When `Some`, the panel width tracks the
     /// cursor. On mouse-up the final width is persisted to config and this
     /// is cleared.
@@ -300,6 +307,7 @@ impl CrabportApp {
             hosts,
             connection_form: None,
             panel_active_tab: HashMap::new(),
+            panel_open: HashMap::new(),
             panel_drag: None,
             tunnel_form: None,
             snippet_form: None,
@@ -497,6 +505,21 @@ impl Render for CrabportApp {
             |drag| drag.width,
         );
         let panel_dragging = self.panel_drag.is_some();
+        // Read the active tab's right-panel visibility toggle. `None` means
+        // "use the default" for tabs that haven't been toggled yet — the
+        // default comes from the Settings > Terminal > "expand panel on
+        // connect" option, so the user can opt out of the auto-expand
+        // behavior globally while still being able to override it per-tab
+        // via the toolbar toggle button.
+        let panel_open_default = crabport_core::config::snapshot()
+            .appearance
+            .terminal
+            .expand_panel_on_connect;
+        let panel_open = self
+            .panel_open
+            .get(&self.active_tab_id)
+            .copied()
+            .unwrap_or(panel_open_default);
 
         let content = crate::layouts::content::render_content(
             self.sidebar_item,
@@ -510,6 +533,7 @@ impl Render for CrabportApp {
             &self.hosts,
             self.connection_form.as_ref(),
             panel_active_tab,
+            panel_open,
             tunnel_list,
             tunnel_form_state,
             snippet_form_state,

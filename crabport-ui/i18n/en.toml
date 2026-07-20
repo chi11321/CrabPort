@@ -160,6 +160,7 @@ host_key_accept = "Trust & Connect"
 host_key_cancel = "Cancel"
 split_right = "Split Right"
 split_down = "Split Down"
+toggle_panel = "Toggle Right Panel"
 close_pane = "Close Pane"
 
 [toolbar]
@@ -356,6 +357,7 @@ section_terminal = "Terminal"
 terminal_desc = "Choose the monospace font and size used by every terminal tab."
 terminal_font_family = "Font family"
 terminal_font_size = "Font size"
+terminal_expand_panel = "Expand panel on connect"
 
 [window.settings.keybinds]
 section_shortcuts = "Shortcuts"
