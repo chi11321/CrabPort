@@ -14,7 +14,7 @@ use crabport_terminal::terminal::RemoteStatus;
 
 use crate::color::{term_bg, term_fg, term_green, term_red, term_yellow};
 use crate::components::button::Button;
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 
 /// A single log entry shown on the connection overlay.
 #[derive(Debug, Clone)]
@@ -116,6 +116,16 @@ impl ConnectionOverlayState {
         }
     }
 
+    /// Create an overlay seeded with a "Starting local shell…" log entry.
+    /// Used by `TerminalView::new` so the overlay shown while the local
+    /// `PendingPtyBackend` is constructing the real `PtyBackend` has a
+    /// visible status line instead of just an empty spinner.
+    pub fn new_local_starting() -> Self {
+        let mut s = Self::new();
+        s.log(ConnectionLogLevel::Info, "Starting local shell…");
+        s
+    }
+
     /// Push a log entry.
     pub fn log(&mut self, level: ConnectionLogLevel, message: impl Into<String>) {
         self.logs.push(ConnectionLogEntry {
@@ -158,7 +168,21 @@ impl ConnectionOverlayState {
                     format!("Disconnected from {}", host),
                 );
             }
-            RemoteStatus::Local => {}
+            // Local PTY finished starting up. Trigger the fade-out so the
+            // overlay (shown while `PendingPtyBackend` was constructing the
+            // real backend) disappears instead of lingering on top of a
+            // ready local shell. The log line is suppressed when `host`
+            // is empty (the common local-terminal case) so we don't push a
+            // useless "Connected to " row.
+            RemoteStatus::Local => {
+                if !host.is_empty() {
+                    self.log(
+                        ConnectionLogLevel::Success,
+                        format!("Connected to {}", host),
+                    );
+                }
+                self.fade_out_started = true;
+            }
         }
         self.status = new_status;
     }
@@ -294,7 +318,7 @@ pub(crate) fn render_connection_overlay(
         .bg(rgb(term_bg()))
         .opacity(1.0)
         .with_transition(("connection-overlay-opacity", count))
-        .transition_when(is_fading_out, DURATION_SLOWER, EASE_STANDARD, |el| {
+        .transition_when(is_fading_out, duration_slower(), EASE_STANDARD, |el| {
             el.opacity(0.0)
         })
         .child(
@@ -353,7 +377,7 @@ pub(crate) fn render_connection_overlay(
                                     .with_transition(row_id)
                                     .transition_when_else(
                                         true,
-                                        DURATION_SLOWER,
+                                        duration_slower(),
                                         EASE_STANDARD,
                                         |el| el.opacity(1.0).mt_0(),
                                         |el| el.opacity(0.0).mt(px(-4.0)),

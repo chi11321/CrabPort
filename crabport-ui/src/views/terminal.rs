@@ -17,7 +17,6 @@ use crabport_ssh::backend::HostKeyInfo;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_telnet::backend::TelnetBackend;
 use crabport_telnet::session::TelnetConnectionInfo;
-use crabport_terminal::pty::{FailedPtyBackend, PtyBackend};
 use crabport_terminal::terminal::{
     CrabPortMonitor, RemoteStatus, SftpTransferBytes, SftpTransferKind, SftpTransferStage,
     TerminalSession,
@@ -180,21 +179,42 @@ impl TerminalView {
     pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        // Local PTY creation can fail on platforms without a usable
-        // pseudoterminal (e.g. older Windows builds without ConPTY, or
-        // headless CI hosts without a controlling TTY). Rather than panic
-        // — which aborts the whole app under the `panic = abort` release
-        // profile — surface the error in the connection overlay so the
-        // user sees what went wrong and can still use remote sessions.
-        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
-            match PtyBackend::new(cols as u16, rows as u16) {
-                Ok(b) => Arc::new(b),
-                Err(e) => {
-                    tracing::error!("failed to create local PTY backend: {e}");
-                    Arc::new(FailedPtyBackend::new(e.to_string()))
-                }
-            };
-        Self::with_backend(backend, cols, rows, None, None, count, cx)
+        // Spawn the local PTY *asynchronously* via `PendingPtyBackend`.
+        //
+        // On Windows, `PtyBackend::new` synchronously calls
+        // `CreatePseudoConsole` + `CreateProcessW` (which spawns
+        // `pwsh.exe` / `powershell.exe`) + `RegisterWaitForSingleObject`,
+        // which can take 200–500 ms — especially the first PowerShell
+        // launch in a session. Doing this on the gpui foreground thread
+        // stalls the render loop and produces a visible "hang" when the
+        // user opens the first local terminal tab.
+        //
+        // `PendingPtyBackend` returns immediately and constructs the real
+        // `PtyBackend` on a background thread, broadcasting status via
+        // `BackendEvent` so the connection overlay can show a spinner and
+        // the side panel waits until the shell is actually ready. This
+        // mirrors how `add_ssh_tab` / `add_telnet_tab` already work —
+        // heavy I/O off the UI thread, status streamed in via events.
+        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
+            crabport_terminal::pty::PendingPtyBackend::new(cols as u16, rows as u16),
+        );
+        // Pre-seed the overlay with a "Starting local shell…" log line so
+        // the spinner shown during `PendingPtyBackend` construction isn't
+        // an empty box.
+        let overlay: SharedOverlayState =
+            Arc::new(Mutex::new(ConnectionOverlayState::new_local_starting()));
+        Self::with_backend_and_host_and_overlay(
+            backend,
+            cols,
+            rows,
+            String::new(),
+            None,
+            overlay,
+            None,
+            None,
+            count,
+            cx,
+        )
     }
 
     pub fn with_backend(
@@ -348,7 +368,6 @@ impl TerminalView {
         // literal) so it can be captured by the paint closure. Read to render
         // a solid cursor when focused vs. a hollow outline when not focused.
         let is_focused = Arc::new(AtomicBool::new(false));
-        let is_remote = !host.is_empty();
 
         // Backend error/close events.
         let mut event_rx = session.subscribe_backend();
@@ -564,7 +583,12 @@ impl TerminalView {
         })
         .detach();
 
-        if is_remote {
+        // Spawn the fade-out watcher for both remote and local terminals.
+        // For remote (SSH / Telnet) sessions it hides the overlay after the
+        // connection establishes. For local terminals it hides the overlay
+        // once `PendingPtyBackend` finishes constructing the real `PtyBackend`
+        // and `update_status(Local, ...)` flips `fade_out_started`.
+        {
             let overlay_fade = overlay.clone();
             let dirty_fade = needs_repaint.clone();
             let fade_entity = cx.entity().downgrade();
@@ -2098,7 +2122,11 @@ impl Render for TerminalView {
                         ),
                 )
             })
-            // Connection overlay (remote sessions only).
+            // Connection overlay — shown for remote sessions (SSH / Telnet)
+            // and during the local-PTY startup window, while
+            // `PendingPtyBackend` is constructing the real `PtyBackend` on a
+            // background thread. Once the local PTY is ready the overlay
+            // fades out via `update_status(RemoteStatus::Local, ...)`.
             //
             // Note: the host-key confirmation prompt is no longer rendered
             // here. It is surfaced via the global `AlertController` (held by
@@ -2106,7 +2134,7 @@ impl Render for TerminalView {
             // pending host key on the active terminal view. That way the
             // dialog overlays the whole window and is unaffected by the
             // terminal container's padding.
-            .when(is_remote, |el| {
+            .when(is_remote || overlay_visible, |el| {
                 let on_reconnect: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)> =
                     Rc::new(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.reconnect(cx);

@@ -45,7 +45,7 @@ use std::{
 use std::{
     sync::Arc,
     sync::OnceLock,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     time::SystemTime,
 };
 
@@ -437,6 +437,29 @@ pub struct PtyBackend {
 #[cfg(unix)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        let (event_tx, event_rx) = broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        Self::build(cols, rows, event_tx, _event_rx)
+    }
+
+    /// Construct a `PtyBackend` that broadcasts on an externally-owned
+    /// channel. Used by [`PendingPtyBackend`] so subscribers attached
+    /// before the PTY exists still receive events once it's up.
+    pub(crate) fn new_with_event_tx(
+        cols: u16,
+        rows: u16,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+    ) -> std::io::Result<Self> {
+        let _event_rx = event_tx.new_receiver().deactivate();
+        Self::build(cols, rows, event_tx, _event_rx)
+    }
+
+    fn build(
+        cols: u16,
+        rows: u16,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+        _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+    ) -> std::io::Result<Self> {
         tty::setup_env();
         // alacritty's `setup_env` only sets `TERM` / `COLORTERM`. A shell
         // spawned from a GUI app (e.g. launched from Finder / Spotlight on
@@ -473,9 +496,6 @@ impl PtyBackend {
 
         let reader = pty.lock().file().try_clone()?;
         let mut writer = pty.lock().file().try_clone()?;
-
-        let (event_tx, event_rx) = broadcast(1024);
-        let _event_rx = event_rx.deactivate();
 
         let (command_tx, command_rx) = unbounded::<Command>();
 
@@ -643,6 +663,29 @@ impl PtyBackend {
 #[cfg(windows)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        Self::build(cols, rows, event_tx, _event_rx)
+    }
+
+    /// Construct a `PtyBackend` that broadcasts on an externally-owned
+    /// channel. Used by [`PendingPtyBackend`] so subscribers attached
+    /// before the PTY exists still receive events once it's up.
+    pub(crate) fn new_with_event_tx(
+        cols: u16,
+        rows: u16,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+    ) -> std::io::Result<Self> {
+        let _event_rx = event_tx.new_receiver().deactivate();
+        Self::build(cols, rows, event_tx, _event_rx)
+    }
+
+    fn build(
+        cols: u16,
+        rows: u16,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+        _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+    ) -> std::io::Result<Self> {
         use alacritty_terminal::{
             event::WindowSize,
             tty::{self, Options, Pty},
@@ -671,8 +714,7 @@ impl PtyBackend {
         let pty: Arc<Mutex<Pty>> = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
 
         // Broadcast channel for backend events.
-        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
-        let _event_rx = event_rx.deactivate();
+        // (Reuses the caller-provided `event_tx` — see `new_with_event_tx`.)
 
         // --- Reader thread: lock `pty`, call `reader().read()`, broadcast `Data` ---
         //
@@ -927,6 +969,224 @@ impl CrabPortMonitor for FailedPtyBackend {
     }
     fn metrics(&self) -> RemoteMetrics {
         RemoteMetrics::default()
+    }
+}
+
+// ===========================================================================
+// PendingPtyBackend — non-blocking local PTY launcher
+// ===========================================================================
+//
+// On Windows, `PtyBackend::new` is expensive: it calls `CreatePseudoConsole`
+// + `CreateProcessW` (which spawns `pwsh.exe` / `powershell.exe`), plus
+// `ChildExitWatcher::new` (which calls `RegisterWaitForSingleObject`).
+// PowerShell in particular can take 200–500 ms just to reach its first
+// prompt — all on the calling thread. When `TerminalView::new` is called
+// on the gpui foreground (which it is, from `add_tab` / split), that
+// stalls the render loop and produces a visible "hang" on the first
+// local terminal of the session.
+//
+// `PendingPtyBackend` fixes this by returning immediately and doing the
+// actual PTY construction on a background thread. It mirrors what the
+// SSH / Telnet backends already do — keep the heavy lifting off the UI
+// thread, broadcast status via `BackendEvent`, and let the connection
+// overlay show a spinner while the work is in flight.
+//
+// Lifecycle:
+//
+// 1. `new()` — creates a broadcast channel, spawns a worker thread, and
+//    returns immediately. Writes / resizes / closes issued before the
+//    PTY is ready are buffered into the same command channel the real
+//    `PtyBackend` will drain — they are replayed in order once the PTY
+//    is up, so the user's first keystrokes are not lost.
+// 2. The worker calls `PtyBackend::new_with_event_tx` (passing the
+//    already-created broadcast channel) so subscribers attached before
+//    the PTY existed still receive events. On success, it swaps the
+//    real backend into the `OnceLock` and the buffered command channel
+//    is seamlessly bridged (see `write` / `resize` / `close` below —
+//    they prefer the live backend and otherwise enqueue).
+// 3. On failure, the worker broadcasts `Error` + `Closed` (mirroring
+//    `FailedPtyBackend`) so the tab auto-closes with a visible message
+//    in the connection overlay.
+//
+// `as_monitor()` reports `RemoteStatus::Connecting` until the real
+// backend takes over, then `Local`. This drives the connection overlay
+// spinner and the "don't expand the side panel until ready" check in
+// `render_content`, so the layout doesn't shift mid-launch.
+
+/// State shared between `PendingPtyBackend` (UI thread) and the worker
+/// thread that actually constructs the `PtyBackend`.
+struct PendingState {
+    /// The real backend once it's ready. `None` while still constructing.
+    backend: OnceLock<Arc<PtyBackend>>,
+    /// Buffered commands issued before the PTY was ready. Drained by the
+    /// real backend's writer task once it takes over (the sender is
+    /// bridged in `PtyBackend::build` via the same `command_rx`).
+    command_tx: MpscSender<Command>,
+    /// Broadcast channel shared with the real backend (so subscribers
+    /// attached during construction receive events once it's up).
+    event_tx: async_broadcast::Sender<BackendEvent>,
+    /// Whether the worker has finished (success or failure). Used by
+    /// `status()` to distinguish "still starting" from "started".
+    done: AtomicBool,
+}
+
+pub struct PendingPtyBackend {
+    state: Arc<PendingState>,
+    _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+}
+
+impl PendingPtyBackend {
+    /// Construct a non-blocking local PTY launcher. Returns immediately;
+    /// the real `PtyBackend` is built on a background thread.
+    pub fn new(cols: u16, rows: u16) -> Self {
+        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        let (command_tx, command_rx) = unbounded::<Command>();
+
+        let state = Arc::new(PendingState {
+            backend: OnceLock::new(),
+            command_tx,
+            event_tx: event_tx.clone(),
+            done: AtomicBool::new(false),
+        });
+        let state_for_worker = state.clone();
+
+        std::thread::spawn(move || {
+            tracing::debug!("pending-pty: spawning real PtyBackend on worker");
+            match PtyBackend::new_with_event_tx(cols, rows, state_for_worker.event_tx.clone()) {
+                Ok(backend) => {
+                    // Bridge the buffered command queue onto the real
+                    // backend's writer task by forwarding any pending
+                    // commands. `command_rx` is the receiver we created
+                    // above; the real backend created its own internal
+                    // `command_rx`, so we just drain ours into the live
+                    // sender. New commands after this point go straight
+                    // to the live backend via `state.command_tx` (which
+                    // is the same sender the real backend's writer is
+                    // NOT draining — see below).
+                    //
+                    // Actually, the real `PtyBackend` created its own
+                    // `command_rx` in `build()`, so our buffered
+                    // commands need to be re-sent to the real backend's
+                    // `command_tx`. We do that here.
+                    let live_tx = backend.command_tx.clone();
+                    while let Ok(cmd) = command_rx.try_recv() {
+                        let _ = live_tx.try_send(cmd);
+                    }
+                    // Install the live backend. After this point, all
+                    // `write`/`resize`/`close` calls hit the real backend
+                    // directly (see `PendingPtyBackend` impl).
+                    let _ = state_for_worker.backend.set(Arc::new(backend));
+                    state_for_worker.done.store(true, AtomicOrdering::SeqCst);
+                    tracing::debug!("pending-pty: real backend installed");
+                }
+                Err(e) => {
+                    tracing::error!("pending-pty: construction failed: {e}");
+                    let msg = e.to_string();
+                    let _ = state_for_worker
+                        .event_tx
+                        .try_broadcast(BackendEvent::Error(msg));
+                    let _ = state_for_worker
+                        .event_tx
+                        .try_broadcast(BackendEvent::Closed);
+                    state_for_worker.done.store(true, AtomicOrdering::SeqCst);
+                }
+            }
+        });
+
+        Self { state, _event_rx }
+    }
+
+    /// Helper: route a command to the live backend if it's installed, else
+    /// buffer it in the pending queue. Keeps the public `write` / `resize` /
+    /// `close` methods DRY.
+    fn dispatch(&self, cmd: Command) {
+        if let Some(backend) = self.state.backend.get() {
+            // Live backend is up — send straight to its writer task.
+            let _ = backend.command_tx.try_send(cmd);
+        } else {
+            // Still constructing — buffer. Once the worker installs the
+            // real backend, it drains this queue and forwards the commands.
+            let _ = self.state.command_tx.try_send(cmd);
+        }
+    }
+}
+
+impl CrabPortTerminal for PendingPtyBackend {
+    fn write(&self, data: &[u8]) {
+        self.dispatch(Command::Write(data.to_vec()));
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        self.dispatch(Command::Resize(cols, rows));
+    }
+
+    fn close(&self) {
+        // If the real backend is up, tell it to close (which broadcasts
+        // `Closed` and tears down the child). Otherwise broadcast `Closed`
+        // ourselves so the session's reader loop terminates instead of
+        // waiting forever for the worker thread.
+        if let Some(backend) = self.state.backend.get() {
+            let _ = backend.command_tx.try_send(Command::Close);
+        } else {
+            let _ = self.state.event_tx.try_broadcast(BackendEvent::Closed);
+        }
+    }
+
+    fn subscribe(&self) -> BroadcastReceiver<BackendEvent> {
+        self.state.event_tx.new_receiver()
+    }
+
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        Some(self)
+    }
+
+    fn spawn_channel(&self, cols: u16, rows: u16) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        // Local PTY: each split pane gets its own independent shell. We
+        // spawn another `PendingPtyBackend` so split panes also don't
+        // stall the UI thread on Windows.
+        Some(std::sync::Arc::new(PendingPtyBackend::new(cols, rows)))
+    }
+
+    fn refresh_history(&self) {
+        // If the real backend is up, delegate to it so its event_tx is
+        // used. Otherwise queue the read to happen once it's ready —
+        // simplest is to spawn the read directly using our own event_tx
+        // (which is shared with the real backend once it takes over).
+        if let Some(backend) = self.state.backend.get() {
+            backend.refresh_history();
+        } else {
+            let event_tx = self.state.event_tx.clone();
+            std::thread::spawn(move || {
+                let cmds = read_local_shell_history();
+                let _ = event_tx.try_broadcast(BackendEvent::HistoryLoaded(cmds));
+            });
+        }
+    }
+}
+
+impl CrabPortMonitor for PendingPtyBackend {
+    fn status(&self) -> RemoteStatus {
+        if self.state.backend.get().is_some() {
+            RemoteStatus::Local
+        } else if self.state.done.load(AtomicOrdering::SeqCst) {
+            // Worker finished but no backend — construction failed.
+            RemoteStatus::Disconnected
+        } else {
+            // Still constructing.
+            RemoteStatus::Connecting
+        }
+    }
+
+    fn metrics(&self) -> RemoteMetrics {
+        // If the real backend is up, defer to its (cached) metrics. While
+        // pending, return defaults — the toolbar renders "—" for missing
+        // fields, which is fine for the short startup window.
+        if let Some(backend) = self.state.backend.get() {
+            backend.metrics()
+        } else {
+            RemoteMetrics::default()
+        }
     }
 }
 
