@@ -60,6 +60,14 @@ pub struct AppearanceConfig {
     /// so it survives restarts alongside other general UI prefs.
     #[serde(default)]
     pub startup: StartupConfig,
+
+    /// Global animation speed multiplier. Stored under `[appearance]` so it
+    /// survives restarts. Affects every `duration_*()` token in
+    /// `crabport-ui::motion` — higher tiers scale all transitions down by
+    /// the corresponding factor (e.g. `Fast` = 0.75× → a 150 ms dialog
+    /// fade completes in ~112 ms). `Standard` is the tuned baseline.
+    #[serde(default)]
+    pub animation_speed: AnimationSpeed,
 }
 
 fn default_panel_width() -> f32 {
@@ -137,6 +145,48 @@ impl StartupPage {
 }
 
 // ---------------------------------------------------------------------------
+// Animation speed
+// ---------------------------------------------------------------------------
+
+/// Global animation speed tier. Serialized as a single snake_case word
+/// (`slow` / `standard` / `fast` / `fastest`) so hand-editing `config.toml`
+/// stays readable.
+///
+/// The tier maps to a multiplier applied to every `duration_*()` token in
+/// `crabport-ui::motion` — higher tiers scale durations down by the listed
+/// factor. `Standard` is the tuned baseline (multiplier 1.0×) that the
+/// motion tokens were designed against.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationSpeed {
+    /// 1.25× the baseline duration. For users who find the default motion
+    /// too snappy and want transitions to ease in more noticeably.
+    Slow,
+    /// 1.0× — the tuned baseline. Every `duration_*()` token reads as its
+    /// nominal `DURATION_*` constant value.
+    #[default]
+    Standard,
+    /// 0.75× the baseline. Snappier without feeling instant; good for
+    /// power users who want to cut motion overhead.
+    Fast,
+    /// 0.5× the baseline. Transitions are perceptible but very quick —
+    /// the lower bound before motion starts feeling jumpy.
+    Fastest,
+}
+
+impl AnimationSpeed {
+    /// Multiplier applied to baseline durations. `Standard` returns 1.0.
+    pub fn multiplier(self) -> f32 {
+        match self {
+            AnimationSpeed::Slow => 1.25,
+            AnimationSpeed::Standard => 1.0,
+            AnimationSpeed::Fast => 0.75,
+            AnimationSpeed::Fastest => 0.5,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Keybind config
 // ---------------------------------------------------------------------------
 
@@ -195,6 +245,7 @@ impl Default for AppearanceConfig {
             terminal: TerminalConfig::default(),
             panel_width: default_panel_width(),
             startup: StartupConfig::default(),
+            animation_speed: AnimationSpeed::default(),
         }
     }
 }

@@ -38,7 +38,7 @@ use crate::app::CrabportApp;
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_fast};
 use crate::views::tunnels::TunnelView;
 
 /// Color accents for the kind badge (mirrors the Tunnels page). Read live
@@ -485,7 +485,7 @@ impl Render for TunnelsPanel {
                             })
                             .transition_when_else(
                                 is_highlighted,
-                                DURATION_FAST,
+                                duration_fast(),
                                 EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
@@ -556,7 +556,7 @@ impl Render for TunnelsPanel {
                                     .with_transition(star_id)
                                     .transition_when_else(
                                         star_visible,
-                                        DURATION_FAST,
+                                        duration_fast(),
                                         EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),

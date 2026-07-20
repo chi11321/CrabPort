@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, DURATION_MODERATE, EASE_LINEAR, RADIUS_MD, RADIUS_SM};
+use crate::motion::{EASE_LINEAR, RADIUS_MD, RADIUS_SM, duration_fast, duration_moderate};
 
 /// Render a collapsible group header.
 ///
@@ -105,7 +105,7 @@ pub fn group_header(
             })
         })
         .with_transition(header_id)
-        .transition_on_hover(DURATION_FAST, EASE_LINEAR, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_LINEAR, move |hovered, el| {
             if *hovered {
                 el.bg(rgb(surface_hover()))
             } else {
@@ -122,7 +122,7 @@ pub fn group_header(
                     .text_color(rgb(text_muted()))
                     .with_animation(
                         chevron_anim_id,
-                        Animation::new(DURATION_MODERATE).with_easing(ease_in_out),
+                        Animation::new(duration_moderate()).with_easing(ease_in_out),
                         move |this, delta| {
                             // Collapsed: 0 -> -90° (points right).
                             // Open: -90° -> 0° (points down).
@@ -218,7 +218,7 @@ pub fn group_header(
                     .with_transition(star_id)
                     .transition_when_else(
                         favorite,
-                        DURATION_FAST,
+                        duration_fast(),
                         EASE_LINEAR,
                         |el| el.opacity(1.0),
                         |el| el.opacity(0.0),

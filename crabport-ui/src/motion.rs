@@ -16,12 +16,12 @@
 //!
 //! ```ignore
 //! use gpui_animation::animation::TransitionExt;
-//! use crate::motion::{DURATION_BASE, EASE_STANDARD};
+//! use crate::motion::{duration_base, EASE_STANDARD};
 //!
 //! div()
 //!     .transition_when_else(
 //!         open,
-//!         DURATION_BASE,
+//!         duration_base(),
 //!         EASE_STANDARD,
 //!         |el| el.opacity(1.0),
 //!         |el| el.opacity(0.0),
@@ -30,25 +30,26 @@
 //!
 //! ## Token taxonomy
 //!
-//! Durations are tuned for an interactive desktop app (≈120 Hz UI thread):
+//! Durations are tuned for an interactive desktop app (≈120 Hz UI thread).
+//! Every `duration_*()` token reads the live speed multiplier from
+//! [`set_speed_multiplier`], so changing [`AnimationSpeed`] in config scales
+//! them uniformly:
 //!
-//! | Token                | ms  | Use for                                       |
-//! |----------------------|-----|-----------------------------------------------|
-//! | `DURATION_INSTANT`   | 0   | State changes that should appear immediate    |
-//! |                       |     | but still ride the transition cache (e.g.     |
-//! |                       |     | disabled text color).                         |
-//! | `DURATION_FAST`      | 100 | Micro-interactions: hover bg / opacity on     |
-//! |                       |     | list rows, menu items, small chips.           |
-//! | `DURATION_BASE`      | 150 | Default for most state transitions: dialog    |
-//! |                       |     | fade, overlay dim, input border, tooltip.     |
-//! | `DURATION_MODERATE`  | 200 | Open/close transitions with rotation or       |
-//! |                       |     | height changes: chevrons, collapsible rows.   |
-//! | `DURATION_SLOW`      | 250 | Larger state flips: dropdown menu open,       |
-//! |                       |     | segmented control indicator, button bg.       |
-//! | `DURATION_SLOWER`    | 320 | Tab indicator slide (multi-step layout        |
-//! |                       |     | animation).                                   |
-//! | `DURATION_VERY_SLOW` | 500 | Big layout mutations: sidebar/panel width,    |
-//! |                       |     | connection overlay fade-out.                  |
+//! | Token                | Baseline ms | Use for                                    |
+//! |----------------------|-------------|--------------------------------------------|
+//! | `duration_instant()` | 0           | State changes that should appear immediate |
+//! |                      |             | but still ride the transition cache (e.g.  |
+//! |                      |             | disabled text color).                      |
+//! | `duration_fast()`    | 100         | Micro-interactions: hover bg / opacity on  |
+//! |                      |             | list rows, menu items, small chips.        |
+//! | `duration_base()`    | 150         | Default for most state transitions: dialog |
+//! |                      |             | fade, overlay dim, input border, tooltip.  |
+//! | `duration_moderate()`| 200         | Open/close transitions with rotation or    |
+//! |                      |             | height changes: chevrons, collapsible rows.|
+//! | `duration_slow()`    | 250         | Larger state flips: dropdown menu open,    |
+//! |                      |             | segmented control indicator, button bg.    |
+//! | `duration_slower()`  | 320         | Tab indicator slide (multi-step layout     |
+//! |                      |             | animation).                                |
 //!
 //! Easings:
 //!
@@ -84,6 +85,7 @@
 //! div().rounded(RADIUS_MD)
 //! ```
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use gpui::Pixels;
@@ -92,29 +94,111 @@ use gpui_animation::transition::general::{EaseInOutCubic, EaseOutQuad, Linear};
 // ---------------------------------------------------------------------------
 // Durations
 // ---------------------------------------------------------------------------
+//
+// Every `DURATION_*` constant is the *baseline* ("Standard" speed tier)
+// value. `duration_*()` returns the live value scaled by the current
+// global multiplier (set from `AppearanceConfig::animation_speed` at app
+// init and on Settings changes). Call sites should call the function, not
+// read the constant — the constant only exists as the tuned reference and
+// as the unit-test oracle.
+//
+// The multiplier is stored as an integer `millis × 1000` (microseconds per
+// baseline millisecond) in an `AtomicU32` so motion tokens can be queried
+// from any thread without a lock. `1.0×` is stored as `1000` (i.e. every
+// baseline ms yields 1000 µs = 1 ms). `0.75×` stores `750`, `1.25×` stores
+// `1250`, etc. This sidesteps the lack of `AtomicF32` / `AtomicF64` in
+// `std` and keeps the hot path (a `Duration::from_micros` per call)
+// allocation-free.
 
-/// 0 ms — for state changes that should appear immediate but still ride
-/// the transition cache (e.g. flipping a `disabled` text color).
+/// Global animation speed multiplier, encoded as `millis × 1000` (µs per
+/// baseline ms). `1000` = 1.0×. Set once at app init from
+/// `AppearanceConfig::animation_speed` and updated whenever the user
+/// changes the Settings dropdown. Reads happen on every `duration_*()`
+/// call, so `Ordering::Relaxed` is enough — we only need eventual
+/// visibility, not cross-field synchronization.
+static SPEED_MICROS_PER_MS: AtomicU32 = AtomicU32::new(1000);
+
+/// Apply the live multiplier to a baseline `Duration`. Returns the scaled
+/// duration; called by every `duration_*()` below.
+///
+/// `Duration` doesn't expose `* f32` directly, so we scale the underlying
+/// nanosecond count. `as_nanos` is `u128`, which doesn't overflow for any
+/// plausible baseline × multiplier (a 500 ms baseline at 1.25× is 625 ms =
+/// 625_000_000 ns, far below `u128::MAX`).
+fn scale(base: Duration) -> Duration {
+    let per_ms = SPEED_MICROS_PER_MS.load(Ordering::Relaxed) as f32 / 1000.0;
+    let nanos = base.as_nanos() as f64;
+    Duration::from_nanos((nanos * per_ms as f64).round() as u64)
+}
+
+/// Set the global animation speed multiplier (1.0 = baseline). Called at
+/// app init from `config::snapshot().appearance.animation_speed.multiplier()`
+/// and again whenever the user changes the Settings dropdown. Passing a
+/// non-finite or non-positive value is a no-op so a corrupted config can't
+/// zero-out every animation.
+pub fn set_speed_multiplier(multiplier: f32) {
+    if !multiplier.is_finite() || multiplier <= 0.0 {
+        return;
+    }
+    // Store as µs-per-ms (1000 = 1.0×) so the `scale` fast path stays in
+    // integer arithmetic.
+    SPEED_MICROS_PER_MS.store((multiplier * 1000.0).round() as u32, Ordering::Relaxed);
+}
+
+/// Baseline 0 ms ("Standard" tier). For state changes that should appear
+/// immediate but still ride the transition cache (e.g. flipping a
+/// `disabled` text color). Scaling a zero duration stays zero, so this
+/// token is effectively unaffected by `animation_speed`.
 pub const DURATION_INSTANT: Duration = Duration::from_millis(0);
+/// Live version of [`DURATION_INSTANT`] — apply the current speed
+/// multiplier. Always returns zero (scaling a zero duration is a no-op),
+/// but kept for symmetry with the other `duration_*` tokens so call sites
+/// stay consistent.
+pub fn duration_instant() -> Duration {
+    scale(DURATION_INSTANT)
+}
 
-/// 100 ms — micro-interactions: hover bg / opacity on list rows, menu
-/// items, small chips.
+/// Baseline 100 ms ("Standard" tier) — micro-interactions: hover bg /
+/// opacity on list rows, menu items, small chips.
 pub const DURATION_FAST: Duration = Duration::from_millis(100);
+/// Live version of [`DURATION_FAST`] — apply the current speed multiplier.
+pub fn duration_fast() -> Duration {
+    scale(DURATION_FAST)
+}
 
-/// 150 ms — default for most state transitions: dialog fade, overlay dim,
-/// input border, tooltip.
+/// Baseline 150 ms ("Standard" tier) — default for most state transitions:
+/// dialog fade, overlay dim, input border, tooltip.
 pub const DURATION_BASE: Duration = Duration::from_millis(150);
+/// Live version of [`DURATION_BASE`] — apply the current speed multiplier.
+pub fn duration_base() -> Duration {
+    scale(DURATION_BASE)
+}
 
-/// 200 ms — open/close transitions with rotation or height changes:
-/// chevrons, collapsible row sections.
+/// Baseline 200 ms ("Standard" tier) — open/close transitions with
+/// rotation or height changes: chevrons, collapsible row sections.
 pub const DURATION_MODERATE: Duration = Duration::from_millis(200);
+/// Live version of [`DURATION_MODERATE`] — apply the current speed
+/// multiplier.
+pub fn duration_moderate() -> Duration {
+    scale(DURATION_MODERATE)
+}
 
-/// 250 ms — larger state flips: dropdown menu open, segmented control
-/// indicator slide, button background.
+/// Baseline 250 ms ("Standard" tier) — larger state flips: dropdown menu
+/// open, segmented control indicator slide, button background.
 pub const DURATION_SLOW: Duration = Duration::from_millis(250);
+/// Live version of [`DURATION_SLOW`] — apply the current speed multiplier.
+pub fn duration_slow() -> Duration {
+    scale(DURATION_SLOW)
+}
 
-/// 320 ms — tab indicator slide (multi-step layout animation).
+/// Baseline 320 ms ("Standard" tier) — tab indicator slide (multi-step
+/// layout animation).
 pub const DURATION_SLOWER: Duration = Duration::from_millis(320);
+/// Live version of [`DURATION_SLOWER`] — apply the current speed
+/// multiplier.
+pub fn duration_slower() -> Duration {
+    scale(DURATION_SLOWER)
+}
 
 // ---------------------------------------------------------------------------
 // Easings

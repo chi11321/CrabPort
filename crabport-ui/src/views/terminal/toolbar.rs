@@ -34,7 +34,7 @@ use crate::layouts::toolbar::{
     BAR_HEIGHT, BAR_WIDTH, ToolbarProps, ToolbarSlot, color_accent, format_byte_ratio,
     format_memory, format_rate, human_bytes, status_color, truncate_path_middle,
 };
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{duration_slower, EASE_STANDARD};
 use crate::views::terminal::SftpProgress;
 
 // ---------------------------------------------------------------------------
@@ -237,7 +237,7 @@ fn memory_slot(show_metrics: bool, memory: Option<MemoryStats>, visible: bool) -
                                     .with_transition("memory-bar-fill")
                                     .transition_when(
                                         true,
-                                        DURATION_SLOWER,
+                                        duration_slower(),
                                         EASE_STANDARD,
                                         move |el| el.w(px(filled_w)),
                                     ),
@@ -301,7 +301,7 @@ fn cpu_slot(show_metrics: bool, cpu: Option<CpuStats>, visible: bool) -> Toolbar
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("cpu-bar-fill")
-                                .transition_when(true, DURATION_SLOWER, EASE_STANDARD, move |el| {
+                                .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
                                     el.w(px(filled_w))
                                 }),
                         ),
@@ -369,7 +369,7 @@ fn disk_slot(show_metrics: bool, disk: Option<DiskStats>, visible: bool) -> Tool
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("disk-bar-fill")
-                                .transition_when(true, DURATION_SLOWER, EASE_STANDARD, move |el| {
+                                .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
                                     el.w(px(filled_w))
                                 }),
                         ),
@@ -557,7 +557,7 @@ fn render_progress_bar(
                     .rounded(px(3.0))
                     .bg(rgb(color))
                     .with_transition(fill_id)
-                    .transition_when(true, DURATION_SLOWER, EASE_STANDARD, move |el| {
+                    .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
                         el.w(px(filled_w))
                     }),
             ),

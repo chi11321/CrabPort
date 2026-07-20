@@ -17,7 +17,7 @@ use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{duration_base, EASE_STANDARD, RADIUS_MD};
 use crabport_terminal::terminal::SftpTransferKind;
 
 /// Maximum records kept in memory. Older entries are dropped (FIFO).
@@ -193,7 +193,7 @@ fn render_transfer_history(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
@@ -219,7 +219,7 @@ fn render_transfer_history(
                 .with_transition(popover_id)
                 .transition_when_else(
                     open,
-                    DURATION_BASE,
+                    duration_base(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),

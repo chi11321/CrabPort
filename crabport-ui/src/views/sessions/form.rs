@@ -14,7 +14,7 @@ use crate::components::dropdown::Dropdown;
 use crate::components::input::{StyledInput, StyledPasswordInput};
 use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG};
+use crate::motion::{duration_base, EASE_STANDARD, RADIUS_LG};
 use crabport_core::credential::PrivateKeyKind;
 
 // ---------------------------------------------------------------------------
@@ -595,7 +595,7 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             active,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),

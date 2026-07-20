@@ -4,7 +4,7 @@ use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{DURATION_INSTANT, DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_instant, duration_slower};
 use crate::views::panel::PanelKind;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
@@ -145,9 +145,9 @@ pub fn render_panel(
     // During a drag the duration is zero so width updates are instant;
     // otherwise the 500ms duration drives the smooth show/hide.
     let duration = if dragging {
-        DURATION_INSTANT
+        duration_instant()
     } else {
-        DURATION_SLOWER
+        duration_slower()
     };
     div()
         .id("panel-sidebar")

@@ -1,5 +1,5 @@
 use crate::color::*;
-use crate::motion::{DURATION_FAST, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_XS};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, RADIUS_XS, duration_fast, duration_slow};
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::animation::TransitionExt;
 use std::rc::Rc;
@@ -389,7 +389,7 @@ impl RenderOnce for Button {
                             .bg(rgb(surface_active())),
                     )
                     .with_transition(close_opacity_id)
-                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                    .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
                         if *hovered {
                             el.opacity(1.)
                         } else {
@@ -430,12 +430,12 @@ impl RenderOnce for Button {
                     })
                     .transition_when_else(
                         self.selected.unwrap_or_default(),
-                        DURATION_SLOW,
+                        duration_slow(),
                         EASE_STANDARD,
                         move |this| this.bg(to_color(bg_selected)),
                         move |this| this.bg(to_color(bg)),
                     )
-                    .transition_on_hover(DURATION_SLOW, EASE_STANDARD, move |hovered, this| {
+                    .transition_on_hover(duration_slow(), EASE_STANDARD, move |hovered, this| {
                         if *hovered {
                             this.bg(to_color(bg_hover))
                         } else {

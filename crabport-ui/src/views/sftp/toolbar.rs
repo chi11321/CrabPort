@@ -12,7 +12,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD, RADIUS_SM};
+use crate::motion::{duration_slower, EASE_STANDARD, RADIUS_SM};
 use crate::views::sftp::TransferHistoryController;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ pub fn render_sftp_history_toggle(
         // only reacts to the toggle state, not to mouse hover.
         .transition_when_else(
             on,
-            DURATION_SLOWER,
+            duration_slower(),
             EASE_STANDARD,
             move |el| el.bg(active_bg),
             move |el| el.bg(rest_bg),

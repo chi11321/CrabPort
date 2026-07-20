@@ -12,7 +12,7 @@ use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::layouts::panel::{PanelCaps, render_panel};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_fast};
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
@@ -1209,7 +1209,7 @@ fn render_split_button(
             on_click(w, cx);
             cx.stop_propagation();
         })
-        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg)
             } else {

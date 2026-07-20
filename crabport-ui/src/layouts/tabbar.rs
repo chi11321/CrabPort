@@ -8,7 +8,7 @@ use crate::app::{CrabportApp, Tab, TabKind};
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
-use crate::motion::{DURATION_BASE, EASE_LINEAR};
+use crate::motion::{EASE_LINEAR, duration_base};
 
 pub fn render_tab_bar(
     handle: &Entity<CrabportApp>,
@@ -138,7 +138,7 @@ pub fn render_tab_bar(
                 .with_transition("tabbar-scroll")
                 .transition_when_else(
                     is_home,
-                    DURATION_BASE,
+                    duration_base(),
                     EASE_LINEAR,
                     move |el| el.left(pad_narrow),
                     move |el| el.left(pad_wide),
@@ -158,7 +158,7 @@ pub fn render_tab_bar(
                         .with_transition(wrapper_id)
                         .transition_when_else(
                             is_active,
-                            DURATION_BASE,
+                            duration_base(),
                             EASE_LINEAR,
                             |el| el.w_48(),
                             |el| el.w_24(),

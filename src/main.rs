@@ -99,6 +99,14 @@ fn main() {
         let locale = crabport_core::config::snapshot().appearance.locale;
         crabport_ui::set_locale(&locale);
 
+        // Apply the persisted animation speed tier so transitions start at
+        // the user's chosen multiplier from the very first frame (no
+        // first-frame flash at 1.0× before Settings opens). The multiplier
+        // lives in `motion.rs` as an `AtomicU32`; Settings updates it live
+        // via the same call.
+        let speed = crabport_core::config::snapshot().appearance.animation_speed;
+        crabport_ui::motion::set_speed_multiplier(speed.multiplier());
+
         // Initialize process-wide shared state (store, window registry)
         // before opening any window. `CrabportApp::new` reads from this
         // global, so it must be ready first.

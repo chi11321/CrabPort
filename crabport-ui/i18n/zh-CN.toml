@@ -357,6 +357,13 @@ terminal_desc = "选择所有终端标签页使用的等宽字体和字号。"
 terminal_font_family = "字体"
 terminal_font_size = "字号"
 terminal_expand_panel = "连接时展开面板"
+section_animation = "动画"
+animation_speed_desc = "缩放界面过渡动画的时长。越快的档位越利落，「标准」是调校后的基准值。"
+animation_speed_label = "动画速度"
+animation_speed_slow = "较慢"
+animation_speed_standard = "标准"
+animation_speed_fast = "快速"
+animation_speed_fastest = "最快"
 
 [window.settings.keybinds]
 section_shortcuts = "快捷键"

@@ -1,6 +1,6 @@
 use crate::color::*;
 use crate::motion::{
-    DURATION_FAST, DURATION_MODERATE, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_XS,
+    EASE_STANDARD, RADIUS_MD, RADIUS_XS, duration_fast, duration_moderate, duration_slow,
 };
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::animation::TransitionExt;
@@ -222,7 +222,7 @@ impl RenderOnce for Dropdown {
             .text_color(rgb(text_muted()))
             .with_animation(
                 chevron_anim_id,
-                Animation::new(DURATION_MODERATE).with_easing(ease_in_out),
+                Animation::new(duration_moderate()).with_easing(ease_in_out),
                 move |this, delta| {
                     let angle = if is_open {
                         delta * CHEVRON_OPEN_ROTATION
@@ -395,7 +395,7 @@ impl RenderOnce for Dropdown {
                     .text_sm()
                     .bg(rgba(0x00000000))
                     .with_transition(item_id)
-                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+                    .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
                         if *hovered {
                             el.bg(rgb(surface_active()))
                         } else {
@@ -404,7 +404,7 @@ impl RenderOnce for Dropdown {
                     })
                     .transition_when_else(
                         is_selected,
-                        DURATION_FAST,
+                        duration_fast(),
                         EASE_STANDARD,
                         move |state| state.text_color(rgb(selected_color)),
                         move |state| state.text_color(rgb(unselected_color)),
@@ -465,7 +465,7 @@ impl RenderOnce for Dropdown {
                     .text_color(rgb(term_blue()))
                     .bg(rgba(0x00000000))
                     .with_transition(ElementId::Name(format!("{id_str}-create").into()))
-                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+                    .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
                         if *hovered {
                             el.bg(rgb(surface_active()))
                         } else {
@@ -533,7 +533,7 @@ impl RenderOnce for Dropdown {
             .with_transition(menu_id)
             .transition_when_else(
                 is_open,
-                DURATION_SLOW,
+                duration_slow(),
                 EASE_STANDARD,
                 move |state| state.h(menu_h).opacity(1.),
                 move |state| state.h(px(0.)).opacity(0.),

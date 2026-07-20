@@ -26,7 +26,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_base};
 
 /// How long the fade-out animation runs before the state is dropped. Should
 /// match the `transition_when_else` duration used in `render_tooltip`.
@@ -178,7 +178,7 @@ fn render_tooltip(state: TooltipState, viewport: Size<Pixels>) -> impl IntoEleme
         .with_transition(tooltip_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.opacity(1.0),
             |el| el.opacity(0.0),

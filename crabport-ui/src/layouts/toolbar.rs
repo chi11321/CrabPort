@@ -42,7 +42,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 
 pub const TOOLBAR_HEIGHT: f32 = 36.0;
 pub const BAR_WIDTH: f32 = 80.0;
@@ -210,7 +210,7 @@ pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
         .with_transition("terminal-toolbar-height")
         .transition_when_else(
             show_toolbar,
-            DURATION_SLOWER,
+            duration_slower(),
             EASE_STANDARD,
             |el| el.h(px(TOOLBAR_HEIGHT)),
             |el| el.h_0(),

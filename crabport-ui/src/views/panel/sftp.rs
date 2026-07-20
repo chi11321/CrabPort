@@ -15,7 +15,7 @@ use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_fast};
 
 /// Drag payload for an SFTP row being dragged within the app.
 /// Dropped onto a terminal area to trigger a download.
@@ -1073,7 +1073,7 @@ impl Render for SftpPanel {
                                             // Hover / context-menu highlight.
                                             .transition_when_else(
                                                 is_highlighted,
-                                                DURATION_FAST,
+                                                duration_fast(),
                                                 EASE_STANDARD,
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
@@ -1098,7 +1098,7 @@ impl Render for SftpPanel {
                                                     .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
                                                     .transition_when_else(
                                                         is_selected,
-                                                        DURATION_FAST,
+                                                        duration_fast(),
                                                         EASE_STANDARD,
                                                         |el| el.opacity(1.0),
                                                         |el| el.opacity(0.0),
@@ -1361,7 +1361,7 @@ fn render_sftp_action_button(
                 })
             })
         })
-        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
             } else {

@@ -28,7 +28,7 @@ use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::input::StyledInput;
 use crate::components::overlay::render_overlay;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG};
+use crate::motion::{duration_base, EASE_STANDARD, RADIUS_LG};
 
 // ---------------------------------------------------------------------------
 // Output passed to the save callback
@@ -356,7 +356,7 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),

@@ -14,7 +14,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
 use rust_i18n::t;
 
-use crabport_core::config::{self, StartupPage};
+use crabport_core::config::{self, AnimationSpeed, StartupPage};
 use crabport_core::credential::HostEntry;
 
 use crate::app_state::AppState;
@@ -80,6 +80,7 @@ pub struct SettingsWindow {
     theme_dropdown_open: bool,
     font_family_dropdown_open: bool,
     startup_dropdown_open: bool,
+    animation_speed_dropdown_open: bool,
     /// Search input backing the terminal font-family dropdown. Lets the
     /// user type to filter the (potentially long) list of installed fonts.
     font_search_input: Entity<InputState>,
@@ -191,6 +192,7 @@ impl SettingsWindow {
             theme_dropdown_open: false,
             font_family_dropdown_open: false,
             startup_dropdown_open: false,
+            animation_speed_dropdown_open: false,
             font_search_input,
             font_size_input,
             font_size_focused: false,
@@ -503,6 +505,95 @@ impl SettingsWindow {
                 .max(32)
                 .step(1);
 
+        // --- Animation speed dropdown ---
+        // Four tiers map to multipliers 1.25× / 1.0× / 0.75× / 0.5×. The
+        // selected index is resolved back to an `AnimationSpeed` variant
+        // via the parallel `animation_speed_items` list. On change we both
+        // persist to config and push the live multiplier into `motion.rs`
+        // so every open window picks up the new speed on its next frame —
+        // no restart needed.
+        let current_speed = config::snapshot().appearance.animation_speed;
+        let animation_speed_items: [(AnimationSpeed, &str); 4] = [
+            (
+                AnimationSpeed::Slow,
+                "window.settings.appearance.animation_speed_slow",
+            ),
+            (
+                AnimationSpeed::Standard,
+                "window.settings.appearance.animation_speed_standard",
+            ),
+            (
+                AnimationSpeed::Fast,
+                "window.settings.appearance.animation_speed_fast",
+            ),
+            (
+                AnimationSpeed::Fastest,
+                "window.settings.appearance.animation_speed_fastest",
+            ),
+        ];
+        let speed_idx = animation_speed_items
+            .iter()
+            .position(|(s, _)| *s == current_speed)
+            .unwrap_or(1);
+        let animation_speed_dropdown = {
+            let h_for_toggle = handle.clone();
+            let h_for_change = handle.clone();
+            let items_for_change = animation_speed_items.clone();
+            let mut dd = Dropdown::new("settings-animation-speed")
+                .is_open(self.animation_speed_dropdown_open)
+                .selected(speed_idx);
+            for (_, key) in &animation_speed_items {
+                dd = dd.item_with_value(t!(*key).to_string(), (*key).to_string());
+            }
+            dd.on_toggle(move |_w, cx| {
+                h_for_toggle.update(cx, |view, cx| {
+                    view.animation_speed_dropdown_open = !view.animation_speed_dropdown_open;
+                    cx.notify();
+                });
+            })
+            .on_change(move |idx, _w, cx| {
+                let speed = items_for_change
+                    .get(idx)
+                    .map(|(s, _)| *s)
+                    .unwrap_or(AnimationSpeed::Standard);
+                let _ = config::update(|cfg| {
+                    cfg.appearance.animation_speed = speed;
+                });
+                // Push the new multiplier into the global motion cache so
+                // every `duration_*()` call picks it up on the next render.
+                //
+                // We deliberately do NOT call `gpui_animation::reset_all_transitions()`
+                // here: clearing the `states` map forces the next render's
+                // `with_state_default` to rebuild every element's state from
+                // `Default::default()`, and `animated_handle` then sees a diff
+                // between the default and the live (e.g. hovered) style —
+                // launching a transition from the default to the current
+                // visual for EVERY element on screen, which looks far worse
+                // than the alternative.
+                //
+                // Instead, leave the registry alone. Active animations keep
+                // their old `duration` and finish within ≤320ms (the longest
+                // baseline token). New transitions started after this point
+                // pick up the new multiplier via the `duration_*()` calls.
+                // The handoff is imperceptible because the only visible
+                // effect of the speed change is on animations that START
+                // after the switch — and those use the new value.
+                //
+                // `refresh_windows` schedules a repaint of every live window
+                // so open views pick up the new multiplier on their next
+                // render. (Debug builds show transient stutter on speed
+                // change because `animation_tick`'s per-frame `refresh_windows`
+                // + DashMap lock contention is amplified without compiler
+                // optimizations; release builds don't exhibit this.)
+                crate::motion::set_speed_multiplier(speed.multiplier());
+                cx.refresh_windows();
+                h_for_change.update(cx, |view, cx| {
+                    view.animation_speed_dropdown_open = false;
+                    cx.notify();
+                });
+            })
+        };
+
         // Build the pane from declarative sections.
         div()
             .size_full()
@@ -555,6 +646,16 @@ impl SettingsWindow {
                                     }
                                 }),
                         ),
+                    ),
+            )
+            // --- Animation speed ---
+            .child(
+                Section::new()
+                    .header(t!("window.settings.appearance.section_animation"))
+                    .desc(t!("window.settings.appearance.animation_speed_desc"))
+                    .field(
+                        t!("window.settings.appearance.animation_speed_label").to_string(),
+                        div().w(px(180.0)).child(animation_speed_dropdown),
                     ),
             )
     }

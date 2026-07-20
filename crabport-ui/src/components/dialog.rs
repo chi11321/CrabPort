@@ -44,7 +44,7 @@ use gpui_animation::animation::TransitionExt;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::overlay::render_overlay;
-use crate::motion::{DURATION_BASE, EASE_LINEAR, RADIUS_LG, RADIUS_MD};
+use crate::motion::{EASE_LINEAR, RADIUS_LG, RADIUS_MD, duration_base};
 
 // ---------------------------------------------------------------------------
 // Severity
@@ -356,7 +356,7 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_LINEAR,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),

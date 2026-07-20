@@ -33,7 +33,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_fast};
 
 /// A single saved snippet, mirroring the Store row.
 #[derive(Clone, Debug)]
@@ -238,7 +238,7 @@ impl Render for SnippetsPanel {
                                     cb(cmd_for_run.clone(), cx);
                                 }
                             })
-                            .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                            .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
                                 if *hovered {
                                     el.bg(rgb(surface_hover()))
                                 } else {
@@ -289,7 +289,7 @@ impl Render for SnippetsPanel {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
                             })
-                            .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                            .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
                                 if *hovered {
                                     el.bg(rgb(surface_hover()))
                                 } else {
@@ -335,7 +335,7 @@ impl Render for SnippetsPanel {
                             })
                             .transition_when_else(
                                 is_hovered,
-                                DURATION_FAST,
+                                duration_fast(),
                                 EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
@@ -381,7 +381,7 @@ impl Render for SnippetsPanel {
                                     ))
                                     .transition_when_else(
                                         is_hovered,
-                                        DURATION_FAST,
+                                        duration_fast(),
                                         EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),

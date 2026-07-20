@@ -11,7 +11,7 @@ use gpui_animation::animation::TransitionExt;
 use rust_i18n::t;
 
 use crate::color::*;
-use crate::motion::{DURATION_FAST, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_fast};
 
 use super::view::{SftpTabView, join_remote_path};
 use crate::components::host_selector::PanelSide;
@@ -70,7 +70,7 @@ pub(super) fn render_action_button(
                 })
             })
         })
-        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
             } else {

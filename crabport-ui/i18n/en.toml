@@ -358,6 +358,13 @@ terminal_desc = "Choose the monospace font and size used by every terminal tab."
 terminal_font_family = "Font family"
 terminal_font_size = "Font size"
 terminal_expand_panel = "Expand panel on connect"
+section_animation = "Animation"
+animation_speed_desc = "Scale the duration of UI transitions. Higher tiers are snappier; Standard is the tuned baseline."
+animation_speed_label = "Animation speed"
+animation_speed_slow = "Slow"
+animation_speed_standard = "Standard"
+animation_speed_fast = "Fast"
+animation_speed_fastest = "Fastest"
 
 [window.settings.keybinds]
 section_shortcuts = "Shortcuts"

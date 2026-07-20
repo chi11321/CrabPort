@@ -27,7 +27,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, DURATION_INSTANT, EASE_STANDARD, RADIUS_MD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, RADIUS_SM, duration_base, duration_instant};
 
 // ---------------------------------------------------------------------------
 // ContextMenuItem
@@ -349,7 +349,7 @@ fn render_context_menu(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
@@ -380,7 +380,7 @@ fn render_context_menu(
                 .with_transition(menu_id)
                 .transition_when_else(
                     open,
-                    DURATION_BASE,
+                    duration_base(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),
@@ -479,7 +479,7 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         // eases in/out on mouse enter/leave. `DURATION_BASE` (150ms) is
         // deliberately slightly slower than the old `DURATION_FAST`
         // (100ms) so the hover feels perceptible rather than snapping.
-        .transition_on_hover(DURATION_BASE, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_base(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg)
             } else {
@@ -494,7 +494,7 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         // value each render.
         .transition_when_else(
             disabled,
-            DURATION_INSTANT,
+            duration_instant(),
             EASE_STANDARD,
             move |state| state.text_color(rgb(muted_color)),
             move |state| state.text_color(rgb(label_color)),

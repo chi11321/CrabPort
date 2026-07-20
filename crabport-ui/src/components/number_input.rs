@@ -44,7 +44,7 @@ use gpui_animation::animation::TransitionExt;
 use gpui_component::input::{Input, InputEvent, InputState};
 
 use crate::color::*;
-use crate::motion::{DURATION_FAST, EASE_LINEAR, RADIUS_MD};
+use crate::motion::{EASE_LINEAR, RADIUS_MD, duration_fast};
 
 // ---------------------------------------------------------------------------
 // StyledNumberInput
@@ -248,7 +248,7 @@ impl RenderOnce for StyledNumberInput {
             .border_1()
             .border_color(rgb(base_border))
             .with_transition(shell_id)
-            .transition_on_hover(DURATION_FAST, EASE_LINEAR, move |hovered, el| {
+            .transition_on_hover(duration_fast(), EASE_LINEAR, move |hovered, el| {
                 if has_error || focused {
                     el
                 } else if *hovered {

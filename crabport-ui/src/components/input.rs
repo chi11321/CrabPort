@@ -48,7 +48,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{Sizable, Size};
 
 use crate::color::*;
-use crate::motion::{DURATION_FAST, EASE_LINEAR, RADIUS_MD};
+use crate::motion::{EASE_LINEAR, RADIUS_MD, duration_fast};
 
 // ---------------------------------------------------------------------------
 // Shared label + shell + error column builder
@@ -319,7 +319,7 @@ impl RenderOnce for StyledInput {
             .border_1()
             .border_color(rgb(base_border))
             .with_transition(shell_id)
-            .transition_on_hover(DURATION_FAST, EASE_LINEAR, move |hovered, el| {
+            .transition_on_hover(duration_fast(), EASE_LINEAR, move |hovered, el| {
                 if has_error || focused {
                     el // don't override error / focus border on hover
                 } else if *hovered {

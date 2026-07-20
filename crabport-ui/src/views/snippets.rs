@@ -37,7 +37,7 @@ use crate::components::button::Button;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::group_header::group_header;
-use crate::motion::{DURATION_FAST, DURATION_MODERATE, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{duration_fast, duration_moderate, EASE_STANDARD, RADIUS_MD};
 use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
 // ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ impl Render for SnippetsView {
                                         .with_transition(body_id)
                                         .transition_when_else(
                                             !favorites_collapsed,
-                                            DURATION_MODERATE,
+                                            duration_moderate(),
                                             EASE_STANDARD,
                                             move |el| {
                                                 el.h(px(fav_count as f32 * 62.0 - 4.0)).opacity(1.0)
@@ -597,7 +597,7 @@ impl Render for SnippetsView {
                                         .with_transition(body_id)
                                         .transition_when_else(
                                             !is_collapsed,
-                                            DURATION_MODERATE,
+                                            duration_moderate(),
                                             EASE_STANDARD,
                                             move |el| {
                                                 el.h(px(member_count as f32 * 62.0 - 4.0))
@@ -724,7 +724,7 @@ fn snippet_row(
         })
         .transition_when_else(
             is_highlighted,
-            DURATION_FAST,
+            duration_fast(),
             EASE_STANDARD,
             |el| el.bg(rgb(surface_active())),
             |el| el.bg(rgb(bg_base())),
@@ -777,7 +777,7 @@ fn snippet_row(
                 .with_transition(star_id)
                 .transition_when_else(
                     star_visible,
-                    DURATION_FAST,
+                    duration_fast(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0),
                     |el| el.opacity(0.0),

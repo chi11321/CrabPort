@@ -37,7 +37,7 @@ use rust_i18n::t;
 use crate::color::*;
 use crate::components::input::StyledInput;
 use crate::components::notification::{Notification, NotificationLevel};
-use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_fast};
 
 /// A single previously-run terminal command entry.
 ///
@@ -240,7 +240,7 @@ impl Render for HistoryCommandPanel {
                                 }
                             })
                             .transition_on_hover(
-                                DURATION_FAST,
+                                duration_fast(),
                                 EASE_STANDARD,
                                 move |hovered, el| {
                                     if *hovered {
@@ -315,7 +315,7 @@ impl Render for HistoryCommandPanel {
                                 }
                             })
                             .transition_on_hover(
-                                DURATION_FAST,
+                                duration_fast(),
                                 EASE_STANDARD,
                                 move |hovered, el| {
                                     if *hovered {
@@ -375,7 +375,7 @@ impl Render for HistoryCommandPanel {
                             })
                             .transition_when_else(
                                 is_hovered,
-                                DURATION_FAST,
+                                duration_fast(),
                                 EASE_STANDARD,
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
@@ -420,7 +420,7 @@ impl Render for HistoryCommandPanel {
                                     ))
                                     .transition_when_else(
                                         is_hovered,
-                                        DURATION_FAST,
+                                        duration_fast(),
                                         EASE_STANDARD,
                                         |el| el.opacity(1.0),
                                         |el| el.opacity(0.0),
@@ -497,7 +497,7 @@ impl Render for HistoryCommandPanel {
                                         }
                                     })
                                     .transition_on_hover(
-                                        DURATION_FAST,
+                                        duration_fast(),
                                         EASE_STANDARD,
                                         |hovered, el| {
                                             if *hovered {

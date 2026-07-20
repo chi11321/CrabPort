@@ -4,7 +4,7 @@ use gpui_animation::animation::TransitionExt;
 use crate::app::SidebarItem;
 use crate::color::*;
 use crate::components::button::Button;
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 
 pub fn render_sidebar(
     selected: SidebarItem,
@@ -20,7 +20,7 @@ pub fn render_sidebar(
         .with_transition("sidebar-container")
         .transition_when_else(
             show,
-            DURATION_SLOWER,
+            duration_slower(),
             EASE_STANDARD,
             |el| el.w(px(180.0)),
             |el| el.w_0(),

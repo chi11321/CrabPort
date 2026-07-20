@@ -24,7 +24,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_base};
 
 /// A translucent overlay shown over a drop target while external files
 /// are being dragged over it. Fades in/out with a 150ms ease.
@@ -98,7 +98,7 @@ impl RenderOnce for DropZoneOverlay {
             .with_transition(self.id)
             .transition_when_else(
                 active,
-                DURATION_BASE,
+                duration_base(),
                 EASE_STANDARD,
                 |el| el.opacity(1.0).bg(rgba((btn_primary_bg() << 8) | 0x20)),
                 |el| el.opacity(0.0).bg(rgba(0x00000000)),

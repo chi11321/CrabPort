@@ -7,7 +7,7 @@ use rust_i18n::t;
 use std::rc::Rc;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, DURATION_FAST, EASE_LINEAR, RADIUS_LG, RADIUS_SM};
+use crate::motion::{EASE_LINEAR, RADIUS_LG, RADIUS_SM, duration_base, duration_fast};
 use crate::views::sessions::ConnectionHost;
 
 // ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ fn render_overlay(
         .with_transition(overlay_id)
         .transition_when_else(
             is_open,
-            DURATION_BASE,
+            duration_base(),
             EASE_LINEAR,
             |el| el.bg(rgba(command_overlay())),
             |el| el.bg(rgba(0x00000000)),
@@ -264,7 +264,7 @@ fn render_dialog(
         .with_transition(dialog_id)
         .transition_when_else(
             is_open,
-            DURATION_BASE,
+            duration_base(),
             EASE_LINEAR,
             |el| el.opacity(1.0).mt_0(),
             |el| el.opacity(0.0).mt(px(-16.0)),
@@ -395,7 +395,7 @@ fn command_item(
             })
         })
         .with_transition(id.clone())
-        .transition_on_hover(DURATION_FAST, EASE_LINEAR, |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_LINEAR, |hovered, el| {
             if *hovered {
                 el.bg(rgb(command_item_hover()))
             } else {

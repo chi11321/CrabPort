@@ -1,5 +1,5 @@
 use crate::components::segmented_control::{Segment, SegmentedControl};
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
@@ -210,7 +210,7 @@ impl RenderOnce for Tabs {
                 .with_transition(panel_id)
                 .transition_when_else(
                     is_active,
-                    DURATION_SLOWER,
+                    duration_slower(),
                     EASE_STANDARD,
                     |state| state.opacity(1.),
                     |state| state.opacity(0.),
@@ -244,7 +244,7 @@ impl RenderOnce for Tabs {
             let target = DefiniteLength::Fraction(-(i as f32));
             track = track.transition_when_else(
                 active == i,
-                DURATION_SLOWER,
+                duration_slower(),
                 EASE_STANDARD,
                 move |state| state.left(target),
                 |state| state,
@@ -273,7 +273,7 @@ impl RenderOnce for Tabs {
             for (i, h) in sizing_heights.into_iter().enumerate() {
                 sizing = sizing.transition_when_else(
                     active == i,
-                    DURATION_SLOWER,
+                    duration_slower(),
                     EASE_STANDARD,
                     move |state| state.h(h).max_h(h),
                     |state| state,
@@ -289,7 +289,7 @@ impl RenderOnce for Tabs {
             for (i, h) in pane_heights.into_iter().enumerate() {
                 area = area.transition_when_else(
                     active == i,
-                    DURATION_SLOWER,
+                    duration_slower(),
                     EASE_STANDARD,
                     move |state| state.max_h(h),
                     |state| state,
