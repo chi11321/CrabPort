@@ -12,6 +12,7 @@ pub mod tunnels;
 pub use context::AppCtx;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
@@ -33,6 +34,28 @@ use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::credential::HostKind as CoreHostKind;
 use crabport_core::{config, config::StartupPage};
+
+// ---- MainAppHandle: process-global weak handle to the main CrabportApp ----
+
+/// Process-global [`Global`] holding a weak handle to the main-window's
+/// `CrabportApp` entity. Set by [`open_main_window`] once the entity is
+/// constructed; read by the macOS `on_open_urls` / argv launch path so
+/// the "Open in CrabPort" Finder entry point can drive
+/// [`CrabportApp::add_tab_with_cwd`] without reaching into the window
+/// hierarchy.
+///
+/// `WeakEntity` (not `Entity`) is deliberate: the main window stays alive
+/// for the whole process lifetime on macOS (closing hides to the Dock),
+/// so `upgrade()` only fails in the brief startup window before
+/// [`open_main_window`] runs, or during a future multi-window refactor
+/// where the window has been released. Callers handle `None` by falling
+/// back to `open_main_window(cx)`.
+#[derive(Clone, Default)]
+pub struct MainAppHandle {
+    pub weak: Option<WeakEntity<CrabportApp>>,
+}
+
+impl Global for MainAppHandle {}
 
 // ---- CrabPortTab trait ----
 
@@ -625,6 +648,21 @@ impl Render for CrabportApp {
 /// for the persistent store, `WindowRegistry` for singleton auxiliary
 /// windows.
 pub fn open_main_window(cx: &mut App) {
+    open_main_window_with_path(None, cx)
+}
+
+/// Open the main window, and if `initial_path` is given, also open a
+/// local-terminal tab cd'd into that path. This is the macOS "Open in
+/// CrabPort" entry point for the **first-launch** case: `main.rs`
+/// inspects `std::env::args()` before the run loop starts, and if a
+/// path argument is present, passes it here so the very first thing
+/// the user sees is a terminal in the right folder (instead of Home
+/// → user has to manually open a new tab).
+///
+/// The `on_open_urls` path (Finder drop on a running app) routes
+/// through [`handle_open_urls`] instead, which talks to the already-
+/// constructed `CrabportApp`.
+pub fn open_main_window_with_path(initial_path: Option<PathBuf>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1200.0), px(800.0)), cx)),
         // Hide the system title bar on every platform so our in-app tab
@@ -671,9 +709,30 @@ pub fn open_main_window(cx: &mut App) {
     };
 
     cx.open_window(options, |_window, cx| {
-        cx.new(|cx| {
+        cx.new(move |cx| {
             let app = cx.new(|cx| CrabportApp::new(_window, cx));
             app.update(cx, |app, cx| app.wire(cx));
+
+            // Publish a weak handle to the just-created `CrabportApp` so
+            // the macOS `on_open_urls` / argv launch path (registered in
+            // `main.rs`) can drive `add_tab_with_cwd` on the existing
+            // instance instead of having to walk the window tree. This
+            // is set after `wire` so the app is fully constructed.
+            cx.set_global(MainAppHandle {
+                weak: Some(app.downgrade()),
+            });
+
+            // First-launch argv path: if the user launched CrabPort with a
+            // folder argument (e.g. via the macOS Services / Automator
+            // "Open in CrabPort" action, or directly from the shell),
+            // open a local-terminal tab in that folder right away. We do
+            // this after `wire` + `set_global` so the app is ready to
+            // accept the tab.
+            if let Some(path) = initial_path.clone() {
+                app.update(cx, |app, cx| {
+                    app.add_tab_with_cwd(Some(path), cx);
+                });
+            }
 
             // Window-close behavior differs by platform:
             //
@@ -764,4 +823,192 @@ pub fn reopen_main_window_if_closed(cx: &mut App) {
         return;
     }
     open_main_window(cx);
+}
+
+/// Handle URLs received via macOS `application:openURLs:` (or the
+/// Windows/Linux equivalents wired through GPUI's `on_open_urls`).
+///
+/// This is the "app already running" half of the "Open in CrabPort"
+/// entry point. The other half (first launch) is handled in `main.rs`
+/// via `std::env::args()` + [`open_main_window_with_path`].
+///
+/// Recognised URL shapes:
+/// - `file:///absolute/path` → folder (or file's parent) opened in a
+///   new local-terminal tab. This is what macOS LaunchServices delivers
+///   when the user invokes a Service / drag-and-drop on a folder and the
+///   app is already running.
+/// - `crabport:///absolute/path` → same as above, via our own URL
+///   scheme (`CFBundleURLSchemes = [crabport]` in `Info.plist`).
+/// - `crabport://open?path=/...` → same, with an explicit `path`
+///   query param (more robust against URL-encoding edge cases).
+///
+/// Unknown URLs are logged and dropped — we never spawn a tab for a
+/// URL we can't resolve.
+///
+/// If the main app isn't up yet (e.g. URLs arrive during the brief
+/// launch window before [`open_main_window`] runs), we fall back to
+/// opening the main window with the first resolved path. This is rare
+/// but keeps the flow robust.
+pub fn handle_open_urls(urls: Vec<String>, cx: &mut App) {
+    // Resolve each URL to a folder path. Files resolve to their parent
+    // dir (so "Open in CrabPort" on a file opens a terminal in the
+    // containing folder, matching what users expect from Finder's
+    // "New Terminal at Folder" Service).
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for url in &urls {
+        match resolve_url_to_folder(url) {
+            Ok(p) => paths.push(p),
+            Err(reason) => {
+                tracing::warn!("open-url: ignoring URL {:?}: {}", url, reason);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return;
+    }
+    // Drive each resolved path onto the main app. If the app entity
+    // isn't reachable (start-up race), open the main window with the
+    // first path so the user still ends up in the right folder.
+    let weak = cx
+        .try_global::<MainAppHandle>()
+        .and_then(|h| h.weak.clone());
+    let Some(weak) = weak else {
+        tracing::info!("open-url: MainAppHandle not yet set, opening main window with first path");
+        open_main_window_with_path(Some(paths.into_iter().next().unwrap()), cx);
+        return;
+    };
+    let Some(app) = weak.upgrade() else {
+        tracing::info!("open-url: main app entity dropped, reopening main window with first path");
+        open_main_window_with_path(Some(paths.into_iter().next().unwrap()), cx);
+        return;
+    };
+    // Bring the app to the front so the user sees the new tab —
+    // `activate(true)` unhides / focuses, matching Dock-reopen.
+    cx.activate(true);
+    for path in paths {
+        app.update(cx, |app, cx| {
+            app.add_tab_with_cwd(Some(path), cx);
+        });
+    }
+}
+
+/// Parse a single URL received via `on_open_urls` and resolve it to a
+/// local folder path.
+///
+/// Returns `Err(reason)` (not an io::Error) so the caller can log a
+/// human-readable explanation without pulling in extra error types.
+///
+/// Public so the binary crate (`main.rs`) can reuse it for argv parsing
+/// (the first-launch path of the "Open in CrabPort" entry point).
+pub fn resolve_url_to_folder_pub(url: &str) -> Result<PathBuf, String> {
+    resolve_url_to_folder(url)
+}
+
+fn resolve_url_to_folder(url: &str) -> Result<PathBuf, String> {
+    // `file://` URLs: take the path component as-is. `file:///abs/path`
+    // → `/abs/path`. We don't use the `url` crate (extra dep) — a hand-
+    // rolled parse is fine here because the shape is strict.
+    if let Some(rest) = url.strip_prefix("file://") {
+        let path = rest;
+        return resolve_path_string(path)
+            .ok_or_else(|| format!("file:// URL with empty or relative path: {url:?}"));
+    }
+    // `crabport://` URLs: our own scheme.
+    // Two shapes:
+    //   crabport:///absolute/path   (path-only, host empty)
+    //   crabport://open?path=/...   (host=open, query=path=)
+    if let Some(rest) = url.strip_prefix("crabport://") {
+        // Shape A: `crabport:///abs/path` — the third `/` means empty
+        // host + absolute path. We keep the leading `/` in `rest` so
+        // `resolve_path_string` recognises it as absolute.
+        if rest.starts_with('/') {
+            return resolve_path_string(rest)
+                .ok_or_else(|| format!("crabport:// URL with empty path: {url:?}"));
+        }
+        // Shape B: `crabport://open?path=/...` — host="open",
+        // query string starts after `?`.
+        if let Some(query_start) = rest.find('?') {
+            let query = &rest[query_start + 1..];
+            for pair in query.split('&') {
+                if let Some(val) = pair.strip_prefix("path=") {
+                    // URL-decode the value. Only decode `%XX` hex + `+`
+                    // (the two escapes `application:openURLs:` / Finder
+                    // emit for paths). Not a full URL decoder — paths
+                    // with `%` not followed by two hex digits are left
+                    // as-is.
+                    let decoded = url_decode(val);
+                    return resolve_path_string(&decoded).ok_or_else(|| {
+                        format!("crabport://open?path= with invalid path: {url:?}")
+                    });
+                }
+            }
+        }
+        return Err(format!("unrecognised crabport:// URL shape: {url:?}"));
+    }
+    Err(format!("unsupported URL scheme: {url:?}"))
+}
+
+/// Best-effort URL decoder for the `path=` query value in
+/// `crabport://open?path=...`. Decodes `%XX` hex escapes and `+` → space.
+/// Leaves invalid `%` sequences untouched instead of erroring so the
+/// path is still usable (most paths don't contain literal `%`).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_digit(bytes[i + 1]);
+                let lo = hex_digit(bytes[i + 2]);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Resolve a path string (taken from a `file://` or `crabport://` URL)
+/// to a folder on disk. Files resolve to their parent directory so a
+/// user right-clicking a file still gets a terminal in the folder that
+/// contains it (matching Finder's "New Terminal at Folder" Service).
+///
+/// Returns `None` if the path is empty or relative.
+fn resolve_path_string(p: &str) -> Option<PathBuf> {
+    if p.is_empty() || !p.starts_with('/') {
+        return None;
+    }
+    let path = PathBuf::from(p);
+    // If the path is a regular file, cd into its parent folder — that's
+    // the conventional behaviour for "Open Terminal Here" on a file.
+    // Symlinks / directories are used as-is. We do a single `metadata`
+    // call (follows symlinks) so a symlink to a directory resolves to
+    // the target directory.
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => path.parent().map(|p| p.to_path_buf()),
+        _ => Some(path),
+    }
 }

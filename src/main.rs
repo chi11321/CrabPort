@@ -65,7 +65,63 @@ fn main() {
         eprintln!("crabport: reopen requested — re-opening main window");
         reopen_main_window_if_closed(cx);
     });
-    app.run(|cx| {
+    // macOS: receive `application:openURLs:` events. This is the "app
+    // already running" half of the "Open in CrabPort" entry point —
+    // when the user invokes a Service / drag-drop on a running app,
+    // LaunchServices routes the URLs here instead of spawning a new
+    // process. We resolve each URL to a folder path and open a local-
+    // terminal tab cd'd into it.
+    //
+    // On Windows/Linux this is also wired (GPUI has implementations for
+    // all three platforms), but the single-instance lock means a second
+    // launch `exit(0)`s before the URLs arrive — so there it only fires
+    // if the app is the sole instance, same as the argv path. The macOS
+    // case is the primary target because Finder's "Open in CrabPort"
+    // Service delivers to a running app via this callback.
+    //
+    // GPUI's `on_open_urls` callback signature is `FnMut(Vec<String>)`
+    // with no `&mut App` — unlike `on_reopen`. To still reach the app
+    // state from the callback we hand it an `AsyncApp` via a shared
+    // slot that `app.run` fills in once the app is constructed (this
+    // is the same pattern Zed uses for its URL handler). URLs only
+    // arrive after `applicationDidFinishLaunching:`, so the slot is
+    // always populated by the time the callback fires.
+    let async_app_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::AsyncApp>));
+    let slot_for_cb = async_app_slot.clone();
+    app.on_open_urls(move |urls| {
+        let Some(async_app) = slot_for_cb.borrow().clone() else {
+            eprintln!("crabport: open-urls arrived before app launched, ignoring: {urls:?}");
+            return;
+        };
+        // `handle_open_urls` needs `&mut App`. `AsyncApp::update` gives
+        // us that on the main thread; errors only happen if the app
+        // was dropped (process tear-down), in which case we log + drop.
+        let _ = async_app.update(|cx| {
+            crabport_ui::app::handle_open_urls(urls, cx);
+        });
+    });
+    app.run(move |cx| {
+        // Fill the AsyncApp slot that `on_open_urls` uses to reach the app
+        // state. `cx.to_async()` returns an `AsyncApp` holding a `Weak<…>`
+        // — cheap to clone, safe to keep across the launch boundary.
+        let async_app = cx.to_async();
+        *async_app_slot.borrow_mut() = Some(async_app.clone());
+
+        // macOS Services: register our `openInCrabPort:userData:error:`
+        // selector on GPUI's app delegate class so CrabPort appears in
+        // the system Services menu (Finder → right-click folder →
+        // Services → "Open Folder in CrabPort"). Must run before the
+        // run loop starts dispatching events, and on the main thread —
+        // both are satisfied here. The `set_async_app` call hands the
+        // selector the same `AsyncApp` we just stored in the local slot,
+        // so Services and `on_open_urls` share one entry point.
+        #[cfg(target_os = "macos")]
+        {
+            crabport_ui::macos_services::set_async_app(async_app);
+            if let Err(e) = crabport_ui::macos_services::register_services_handler() {
+                eprintln!("crabport: failed to register macOS Service handler: {e}");
+            }
+        }
         // Register all keybinds from the catalog (reads config.toml
         // overrides, falls back to platform defaults).
         //
@@ -145,6 +201,49 @@ fn main() {
         // no-op / ignored, but the call is harmless.
         cx.set_menus(crabport_ui::menus::app_menus());
 
-        open_main_window(cx);
+        // Inspect argv for a path argument. This is the first-launch half
+        // of the "Open in CrabPort" macOS entry point: when the user
+        // invokes the Service / Automator action (or runs
+        // `crabport /some/folder` from the shell) the OS spawns the
+        // binary with the path as argv[1]. We resolve it to a folder
+        // (files → parent dir) so the very first thing the user sees is
+        // a local-terminal tab cd'd into the right place.
+        //
+        // The "app already running" half is handled by `on_open_urls`
+        // above — macOS LaunchServices routes those URLs to the existing
+        // instance instead of spawning a new process, so the two paths
+        // are mutually exclusive: argv only fires on first launch,
+        // `on_open_urls` only fires when already running.
+        let initial_path = std::env::args().nth(1).and_then(|a| {
+            // Accept both bare paths and `file://` / `crabport://` URLs.
+            // If the arg looks like a URL, route it through the same
+            // resolver `on_open_urls` uses; otherwise treat it as a
+            // raw filesystem path.
+            if a.starts_with("file://") || a.starts_with("crabport://") {
+                match crabport_ui::app::resolve_url_to_folder_pub(&a) {
+                    Ok(p) => Some(p),
+                    Err(reason) => {
+                        eprintln!("crabport: ignoring argv URL {:?}: {}", a, reason);
+                        None
+                    }
+                }
+            } else if a.starts_with('/') || a.starts_with("./") || a.starts_with("../") {
+                Some(std::path::PathBuf::from(a))
+            } else {
+                // Relative-looking arg without prefix — resolve
+                // against the process cwd so `crabport sub/dir`
+                // works from the shell.
+                let abs = std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join(&a))
+                    .filter(|p| p.exists());
+                abs
+            }
+        });
+        if initial_path.is_some() {
+            crabport_ui::app::open_main_window_with_path(initial_path, cx);
+        } else {
+            open_main_window(cx);
+        }
     });
 }

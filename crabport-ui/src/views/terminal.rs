@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -177,6 +178,16 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
+        Self::new_with_cwd(count, None, cx)
+    }
+
+    /// Like [`new`](Self::new) but spawns the local PTY child shell in
+    /// `cwd` when given. Used by the macOS "Open in CrabPort" entry
+    /// point (Finder folder right-click / `crabport://` URL scheme) so
+    /// the terminal tab opens already cd'd into the user-selected
+    /// folder, instead of the GUI app's default cwd (`/` on macOS).
+    /// `None` is equivalent to [`new`](Self::new).
+    pub fn new_with_cwd(count: u64, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
         // Spawn the local PTY *asynchronously* via `PendingPtyBackend`.
@@ -196,7 +207,7 @@ impl TerminalView {
         // mirrors how `add_ssh_tab` / `add_telnet_tab` already work —
         // heavy I/O off the UI thread, status streamed in via events.
         let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
-            crabport_terminal::pty::PendingPtyBackend::new(cols as u16, rows as u16),
+            crabport_terminal::pty::PendingPtyBackend::new_with_cwd(cols as u16, rows as u16, cwd),
         );
         // Pre-seed the overlay with a "Starting local shell…" log line so
         // the spinner shown during `PendingPtyBackend` construction isn't

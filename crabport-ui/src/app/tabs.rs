@@ -31,6 +31,19 @@ impl CrabportApp {
     }
 
     pub fn add_tab(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.add_tab_with_cwd(None, cx)
+    }
+
+    /// Open a new local-terminal tab, optionally starting the child shell
+    /// in `cwd`. Used by the macOS "Open in CrabPort" entry point so a
+    /// folder right-clicked in Finder opens a terminal already cd'd
+    /// into it. `None` is equivalent to the process cwd and is what the
+    /// in-app "+" tab button and command palette use.
+    pub fn add_tab_with_cwd(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab {
@@ -40,7 +53,7 @@ impl CrabportApp {
             is_remote: false,
         });
 
-        let terminal_view = cx.new(|cx| TerminalView::new(id, cx));
+        let terminal_view = cx.new(|cx| TerminalView::new_with_cwd(id, cwd, cx));
 
         // When the local PTY child exits, automatically close the tab
         let app_handle = cx.entity().clone();
