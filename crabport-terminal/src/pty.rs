@@ -32,6 +32,8 @@
 //! `cmd.exe` (see `default_shell`). On Unix, `alacritty_terminal` resolves
 //! the login shell from `passwd`/`$SHELL`.
 
+use std::path::PathBuf;
+
 // Imports used only by the Unix implementation.
 #[cfg(unix)]
 use std::{
@@ -437,9 +439,20 @@ pub struct PtyBackend {
 #[cfg(unix)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Spawn the local PTY with an optional working directory. `None` falls
+    /// back to the current process cwd (alacritty's default); `Some(p)` is
+    /// forwarded to `Options::working_directory`, which alacritty applies
+    /// via `chdir` in the child's `pre_exec` hook (see
+    /// `alacritty_terminal::tty::unix`). Used by the "Open in CrabPort"
+    /// macOS Finder / URL-scheme entry point so a folder right-clicked in
+    /// Finder opens a local terminal tab already cd'd into it.
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> std::io::Result<Self> {
         let (event_tx, event_rx) = broadcast(1024);
         let _event_rx = event_rx.deactivate();
-        Self::build(cols, rows, event_tx, _event_rx)
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
     }
 
     /// Construct a `PtyBackend` that broadcasts on an externally-owned
@@ -448,15 +461,17 @@ impl PtyBackend {
     pub(crate) fn new_with_event_tx(
         cols: u16,
         rows: u16,
+        cwd: Option<PathBuf>,
         event_tx: async_broadcast::Sender<BackendEvent>,
     ) -> std::io::Result<Self> {
         let _event_rx = event_tx.new_receiver().deactivate();
-        Self::build(cols, rows, event_tx, _event_rx)
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
     }
 
     fn build(
         cols: u16,
         rows: u16,
+        cwd: Option<PathBuf>,
         event_tx: async_broadcast::Sender<BackendEvent>,
         _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
     ) -> std::io::Result<Self> {
@@ -491,6 +506,12 @@ impl PtyBackend {
         if let Some((program, args)) = default_shell() {
             options.shell = Some(tty::Shell::new(program, args));
         }
+        // If a cwd was requested (e.g. "Open in CrabPort" from Finder),
+        // pass it to alacritty. The Unix tty path `chdir`s into it in the
+        // child's `pre_exec`; an invalid path is silently ignored by
+        // alacritty, which is the behaviour we want (fall back to the
+        // process cwd rather than failing the whole PTY).
+        options.working_directory = cwd;
 
         let pty = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
 
@@ -663,9 +684,18 @@ impl PtyBackend {
 #[cfg(windows)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Spawn the local PTY with an optional working directory. See the
+    /// Unix impl of [`PtyBackend::new_with_cwd`] for the rationale
+    /// (macOS Finder / URL-scheme entry point). On Windows, alacritty's
+    /// ConPTY path honours `Options::working_directory` via the child
+    /// process creation flags.
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> std::io::Result<Self> {
         let (event_tx, event_rx) = async_broadcast::broadcast(1024);
         let _event_rx = event_rx.deactivate();
-        Self::build(cols, rows, event_tx, _event_rx)
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
     }
 
     /// Construct a `PtyBackend` that broadcasts on an externally-owned
@@ -674,15 +704,17 @@ impl PtyBackend {
     pub(crate) fn new_with_event_tx(
         cols: u16,
         rows: u16,
+        cwd: Option<PathBuf>,
         event_tx: async_broadcast::Sender<BackendEvent>,
     ) -> std::io::Result<Self> {
         let _event_rx = event_tx.new_receiver().deactivate();
-        Self::build(cols, rows, event_tx, _event_rx)
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
     }
 
     fn build(
         cols: u16,
         rows: u16,
+        cwd: Option<PathBuf>,
         event_tx: async_broadcast::Sender<BackendEvent>,
         _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
     ) -> std::io::Result<Self> {
@@ -699,6 +731,9 @@ impl PtyBackend {
             options.shell = Some(tty::Shell::new(program, args));
         }
         options.drain_on_exit = true;
+        // Pass through the requested cwd (alacritty's ConPTY path honours
+        // it when spawning the child).
+        options.working_directory = cwd;
 
         let window_size = WindowSize {
             num_lines: rows,
@@ -1039,6 +1074,15 @@ impl PendingPtyBackend {
     /// Construct a non-blocking local PTY launcher. Returns immediately;
     /// the real `PtyBackend` is built on a background thread.
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Like [`new`](Self::new) but spawns the child shell in `cwd` when
+    /// given. Used by the "Open in CrabPort" macOS Finder / URL-scheme
+    /// entry point so the launched terminal starts in the right folder
+    /// instead of the app's process cwd (which, for a GUI-launched app on
+    /// macOS, is usually `/`).
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> Self {
         let (event_tx, event_rx) = async_broadcast::broadcast(1024);
         let _event_rx = event_rx.deactivate();
         let (command_tx, command_rx) = unbounded::<Command>();
@@ -1053,7 +1097,8 @@ impl PendingPtyBackend {
 
         std::thread::spawn(move || {
             tracing::debug!("pending-pty: spawning real PtyBackend on worker");
-            match PtyBackend::new_with_event_tx(cols, rows, state_for_worker.event_tx.clone()) {
+            match PtyBackend::new_with_event_tx(cols, rows, cwd, state_for_worker.event_tx.clone())
+            {
                 Ok(backend) => {
                     // Bridge the buffered command queue onto the real
                     // backend's writer task by forwarding any pending

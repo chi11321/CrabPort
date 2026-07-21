@@ -44,6 +44,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # process from running while the first is alive.
 fs2 = "0.4"
 
+# macOS-only: used by `macos_services.rs` to dynamically add a Service
+# selector (`openInCrabPort:userData:error:`) to GPUI's app delegate
+# class at runtime via `class_addMethod`. The `objc` crate is already a
+# transitive dep through GPUI, but Rust requires direct dep for the
+# macro/type to resolve in our own crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
 # Windows-only: needed by `components/window_controls.rs` to read the native
 # HWND out of a GPUI `Window` and call `ShowWindowAsync` for proper
 # maximize/restore toggling (gpui's `zoom_window()` only ever maximizes on
@@ -54,3 +62,12 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[lints.rust]
+# The `objc` 0.2.7 crate's `class!` / `msg_send!` / `sel!` macros
+# internally reference `cfg(feature = "cargo-clippy")`, which Rust
+# 1.80+ flags as an unknown cfg value (it expects `clippy` as the
+# feature name, not `cargo-clippy`). We declare it as a known-but-
+# unused feature so the build doesn't drown in upstream warnings.
+# Other unexpected cfgs still warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

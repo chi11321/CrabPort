@@ -5,6 +5,8 @@ pub mod color;
 pub mod components;
 pub mod keybinds;
 pub mod layouts;
+#[cfg(target_os = "macos")]
+pub mod macos_services;
 pub mod menus;
 pub mod motion;
 pub mod theme;

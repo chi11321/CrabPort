@@ -13,6 +13,19 @@ identifier = "org.eu.tachibana-kanade.crabport"
 # is the single source of truth — no duplication, no build-time assert.
 copyright = "Copyright © 2026 ch1ll321"
 icon = ["app-icon.icns", "app-icon.png"]
+# Register the `crabport://` URL scheme so macOS LaunchServices routes
+# `crabport://...` URLs to this app. Our `on_open_urls` handler in
+# `main.rs` resolves them to a folder path and opens a local-terminal
+# tab cd'd into it. This is the "Open in CrabPort" entry point for
+# the URL-scheme flavour (the other flavour, folder right-click via
+# `CFBundleDocumentTypes`, is wired through `Info.plist.ext` below).
+osx_url_schemes = ["crabport"]
+# Merge `Info.plist.ext` into the generated `Info.plist`. We use this to
+# declare `CFBundleDocumentTypes` for `public.folder` so the app appears
+# in Finder's "Open With" menu for folders — clicking it opens a local-
+# terminal tab in that folder via `application:openURLs:` (Finder passes
+# the folder as a `file://` URL).
+osx_info_plist_exts = ["Info.plist.ext"]
 
 [dependencies]
 crabport-ui = { path = "crabport-ui" }
