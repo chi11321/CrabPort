@@ -154,7 +154,11 @@ unsafe fn register_selector_unchecked() {
 
     let success =
         unsafe { class_addMethod(cls, sel, imp, SELECTOR_ENCODING.as_ptr() as *const i8) };
-    // `BOOL` is `bool` on 64-bit macOS — direct truthiness check.
+    // The objc crate's `class_addMethod` returns `BOOL`, which is type-aliased
+    // to `bool` on arm64 but `i8` on x86_64. Normalize to a Rust `bool` so the
+    // truthiness check is arch-independent. Since the return type varies by
+    // target, we go through a `{integer}` comparison via `as i32`.
+    let success: bool = (success as i32) != 0;
     if success {
         tracing::info!(
             "macos_services: registered `openInCrabPort:userData:error:` \
