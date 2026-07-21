@@ -55,6 +55,19 @@ pub enum BackendEvent {
     /// most-recent-first (already reversed by the backend) so the UI can
     /// render it verbatim.
     HistoryLoaded(Vec<String>),
+    /// The shell's current working directory and/or foreground process
+    /// changed. Emitted by the local PTY backend's process watcher (which
+    /// uses `tcgetpgrp` + `sysinfo` to inspect the foreground process
+    /// group on every PTY data event — no shell integration required).
+    /// The UI uses this to update the tab title to reflect the live cwd
+    /// and shell name (e.g. `Downloads-zsh`). The process name is the
+    /// basename of the foreground process's executable (e.g. `zsh`,
+    /// `bash`, `python`) — when the user runs `bash` inside a zsh tab,
+    /// the title updates to reflect the new shell.
+    ProcessChanged {
+        cwd: std::path::PathBuf,
+        process_name: String,
+    },
 }
 
 /// Byte-level progress snapshot for a transfer stage.
@@ -477,6 +490,9 @@ impl TerminalSession {
                                         // Handled in the outer loop (not here,
                                         // inside the term lock) — drain ignores it.
                                     }
+                                    Ok(BackendEvent::ProcessChanged { .. }) => {
+                                        // UI-only event; ignore during batch drain.
+                                    }
                                     Err(_) => break, // queue drained
                                 }
                             }
@@ -508,6 +524,13 @@ impl TerminalSession {
                                 history.push_back(c);
                             }
                             drop(history);
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
+                        // Cwd change: the session doesn't need to do
+                        // anything — the `TerminalView` listens on the same
+                        // backend event stream and updates the tab title.
+                        // Wake up so any subscriber that cares repaints.
+                        BackendEvent::ProcessChanged { .. } => {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                     },

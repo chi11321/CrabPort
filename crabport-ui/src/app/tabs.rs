@@ -55,13 +55,16 @@ impl CrabportApp {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
-        // Tab title: the cwd's path, abbreviated with `~` when inside
-        // home. Falls back to the old `Terminal-<id>` shape only if we
-        // somehow couldn't resolve a cwd (very unusual — `dirs::home_dir`
-        // basically always succeeds on macOS/Linux/Windows).
+        // Tab title: `<dir>-<shell>` (e.g. `Downloads-zsh`). The shell
+        // name is derived from `$SHELL` here as an initial guess; once the
+        // PTY reader's `ProcessWatcher` fires, it corrects this to the
+        // actual foreground process name. Falls back to `Terminal-<id>`
+        // only if cwd resolution fails (very unusual).
         let title = cwd
             .as_ref()
-            .and_then(|p| abbreviate_path_with_home(p))
+            .map(|p| {
+                tab_title_from_process(p, &shell_basename().unwrap_or_else(|| "sh".to_string()))
+            })
             .unwrap_or_else(|| format!("Terminal-{}", id));
 
         self.tabs.push(Tab {
@@ -197,6 +200,7 @@ impl CrabportApp {
         // focus (e.g. via Tab cycling), so `split_active_pane` and the
         // toolbar follow keyboard focus, not just mouse clicks.
         self.register_pane_focus_callback(&terminal_view, cx);
+        self.register_cwd_changed_callback(&terminal_view, cx);
 
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
@@ -417,6 +421,7 @@ impl CrabportApp {
         // focus (e.g. via Tab cycling), so `split_active_pane` and the
         // toolbar follow keyboard focus, not just mouse clicks.
         self.register_pane_focus_callback(&terminal_view, cx);
+        self.register_cwd_changed_callback(&terminal_view, cx);
 
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
@@ -514,6 +519,7 @@ impl CrabportApp {
         // focus (e.g. via Tab cycling), so `split_active_pane` and the
         // toolbar follow keyboard focus, not just mouse clicks.
         self.register_pane_focus_callback(&terminal_view, cx);
+        self.register_cwd_changed_callback(&terminal_view, cx);
 
         self.terminal_views.insert(id, terminal_view.clone());
         self.init_split_for_tab(id, terminal_view.clone());
@@ -1136,6 +1142,33 @@ impl CrabportApp {
         });
     }
 
+    /// Wire a freshly-created pane's `on_cwd_changed` callback so that when
+    /// the foreground process changes (cwd and/or process name), the tab
+    /// title updates to reflect it. Used by `add_tab` / `add_ssh_tab` /
+    /// `add_telnet_tab`. Split panes don't register this — the tab title
+    /// follows the *primary* pane's process, not whichever split the user
+    /// is currently in.
+    fn register_cwd_changed_callback(
+        &mut self,
+        view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let app_handle = cx.entity().downgrade();
+        view.update(cx, |v, _cx| {
+            v.set_on_cwd_changed(move |tab_id, path, process_name, cx| {
+                let _ = app_handle.update(cx, |app, cx| {
+                    if let Some(tab) = app.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        let new_title = tab_title_from_process(&path, &process_name);
+                        if tab.title != new_title {
+                            tab.title = new_title;
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        });
+    }
+
     /// Begin a divider drag for the split whose first child is `pane_id`.
     /// `bounds` is the split container's pixel rect, captured at drag start
     /// so subsequent mouse moves can convert cursor → ratio.
@@ -1231,30 +1264,45 @@ impl CrabportApp {
     }
 }
 
-/// Render `path` as a tab title, replacing the home prefix with `~`.
-/// Returns `None` if `path` is empty or not absolute. Examples:
-/// - `/Users/weed` → `~`
-/// - `/Users/weed/projects/foo` → `~/projects/foo`
-/// - `/etc` → `/etc`
-/// - `relative/path` → `None`
-fn abbreviate_path_with_home(path: &std::path::Path) -> Option<String> {
-    if path.as_os_str().is_empty() {
-        return None;
+/// Build a tab title from a cwd path + command line:
+/// `<cwd目录名> — <command>`. The command is the process name
+/// plus its arguments (e.g. `ssh root@192.168.30.1`). Examples:
+/// - `/Users/weed/Downloads` + `zsh` → `Downloads — zsh`
+/// - `/Users/weed/Downloads` + `ssh root@192.168.30.1` → `Downloads — ssh root@192.168.30.1`
+/// - `/` + `zsh` → `/ — zsh`
+fn tab_title_from_process(path: &std::path::Path, command: &str) -> String {
+    let dir_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        // Root path `/` has no file_name — fall back to the path itself.
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{} — {}", dir_name, command)
+}
+
+/// Return the basename of the current shell (e.g. `zsh`, `bash`), or
+/// `None` if it can't be determined. Used only as the initial tab title
+/// guess before the `ProcessWatcher` reports the actual foreground
+/// process.
+fn shell_basename() -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::env::var("SHELL").ok().and_then(|s| {
+            std::path::Path::new(&s)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
     }
-    let home = dirs::home_dir()?;
-    if path == home {
-        return Some("~".to_string());
-    }
-    if let Ok(rest) = path.strip_prefix(&home) {
-        let s = rest.to_string_lossy();
-        if s.is_empty() {
-            return Some("~".to_string());
+    #[cfg(windows)]
+    {
+        // Mirror `default_shell()`'s cascade without needing to share the
+        // function (it's private to `crabport_terminal`).
+        use std::process::Command;
+        if Command::new("where").arg("pwsh.exe").output().is_ok() {
+            Some("pwsh".to_string())
+        } else if Command::new("where").arg("powershell.exe").output().is_ok() {
+            Some("powershell".to_string())
+        } else {
+            Some("cmd".to_string())
         }
-        return Some(format!("~/{}", s));
     }
-    // Absolute path outside home: show it verbatim.
-    if path.is_absolute() {
-        return Some(path.display().to_string());
-    }
-    None
 }
