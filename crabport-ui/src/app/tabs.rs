@@ -37,18 +37,36 @@ impl CrabportApp {
     /// Open a new local-terminal tab, optionally starting the child shell
     /// in `cwd`. Used by the macOS "Open in CrabPort" entry point so a
     /// folder right-clicked in Finder opens a terminal already cd'd
-    /// into it. `None` is equivalent to the process cwd and is what the
-    /// in-app "+" tab button and command palette use.
+    /// into it. `None` defaults to the user's home directory — better
+    /// than the GUI app's process cwd (which is `/` on macOS and can't
+    /// be `cd`'d out of by a naive user).
     pub fn add_tab_with_cwd(
         &mut self,
         cwd: Option<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) -> u64 {
+        // `None` → default to the user's home directory. We resolve this
+        // here (rather than letting `PendingPtyBackend` inherit the
+        // process cwd) because GUI-launched macOS apps start with cwd `/`,
+        // and a fresh tab landing in `/` is a poor default. SSH / Telnet
+        // tabs bypass this entirely (they have their own login shell).
+        let cwd = cwd.or_else(|| dirs::home_dir());
+
         let id = self.next_tab_id;
         self.next_tab_id += 1;
+
+        // Tab title: the cwd's path, abbreviated with `~` when inside
+        // home. Falls back to the old `Terminal-<id>` shape only if we
+        // somehow couldn't resolve a cwd (very unusual — `dirs::home_dir`
+        // basically always succeeds on macOS/Linux/Windows).
+        let title = cwd
+            .as_ref()
+            .and_then(|p| abbreviate_path_with_home(p))
+            .unwrap_or_else(|| format!("Terminal-{}", id));
+
         self.tabs.push(Tab {
             id,
-            title: format!("Terminal-{}", id),
+            title,
             kind: TabKind::Terminal,
             is_remote: false,
         });
@@ -1211,4 +1229,32 @@ impl CrabportApp {
         self.panel_open.insert(tab_id, !current);
         cx.notify();
     }
+}
+
+/// Render `path` as a tab title, replacing the home prefix with `~`.
+/// Returns `None` if `path` is empty or not absolute. Examples:
+/// - `/Users/weed` → `~`
+/// - `/Users/weed/projects/foo` → `~/projects/foo`
+/// - `/etc` → `/etc`
+/// - `relative/path` → `None`
+fn abbreviate_path_with_home(path: &std::path::Path) -> Option<String> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    if path == home {
+        return Some("~".to_string());
+    }
+    if let Ok(rest) = path.strip_prefix(&home) {
+        let s = rest.to_string_lossy();
+        if s.is_empty() {
+            return Some("~".to_string());
+        }
+        return Some(format!("~/{}", s));
+    }
+    // Absolute path outside home: show it verbatim.
+    if path.is_absolute() {
+        return Some(path.display().to_string());
+    }
+    None
 }
