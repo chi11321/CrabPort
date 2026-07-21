@@ -169,6 +169,14 @@ pub struct TerminalView {
     /// app can surface a toast notification. Mirrors the
     /// `on_sftp_progress_changed` / `on_backend_closed` callback pattern.
     on_sftp_transfer_finished: Option<Rc<dyn Fn(SftpTransferKind, bool, String, &mut App)>>,
+    /// Invoked when the shell's cwd changes (detected via OSC 7 escape
+    /// sequences emitted by shell integration). The app uses this to
+    /// update the tab title to reflect the live cwd. Mirrors the
+    /// `on_backend_closed` callback pattern. The callback receives the
+    /// pane's tab id (the `count` passed to `new`/`with_backend...`), the
+    /// new cwd, and the foreground process name (e.g. `zsh`, `cargo`), so
+    /// the app can find the right tab to update its title.
+    on_cwd_changed: Option<Rc<dyn Fn(u64, std::path::PathBuf, String, &mut App)>>,
     /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
     /// session. Used by the Tunnels panel to start "borrowed" tunnels that
     /// reuse this tab's SSH connection instead of opening a dedicated owned
@@ -493,6 +501,20 @@ impl TerminalView {
                         // so the History panel picks up the new list.
                         let _ = entity.update(cx, |_, cx| cx.notify());
                     }
+                    crabport_terminal::terminal::BackendEvent::ProcessChanged {
+                        cwd,
+                        process_name,
+                    } => {
+                        // Foreground process changed (cwd and/or name).
+                        // Forward to the app so it can update the tab title.
+                        let _ = entity.update(cx, |this, cx| {
+                            let cb = this.on_cwd_changed.clone();
+                            let tab_id = this.count;
+                            if let Some(cb) = cb {
+                                cx.defer(move |cx| cb(tab_id, cwd, process_name, cx));
+                            }
+                        });
+                    }
                 }
             }
         })
@@ -673,6 +695,7 @@ impl TerminalView {
             sftp_progress: None,
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
+            on_cwd_changed: None,
             tunnel_source: None,
         }
     }
@@ -907,6 +930,16 @@ impl TerminalView {
         f: impl Fn(SftpTransferKind, bool, String, &mut App) + 'static,
     ) {
         self.on_sftp_transfer_finished = Some(Rc::new(f));
+    }
+
+    /// Sets the callback invoked when the foreground process changes (new
+    /// cwd or new process name). The callback receives this pane's tab id
+    /// (`count`), the new cwd, and the process name (e.g. `zsh`, `cargo`).
+    pub fn set_on_cwd_changed(
+        &mut self,
+        f: impl Fn(u64, std::path::PathBuf, String, &mut App) + 'static,
+    ) {
+        self.on_cwd_changed = Some(Rc::new(f));
     }
 
     /// Set the callback invoked when this pane receives keyboard focus. The
@@ -1194,6 +1227,18 @@ impl TerminalView {
                         // Repaint so the History panel picks up the
                         // freshly-loaded command history.
                         let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
+                    crabport_terminal::terminal::BackendEvent::ProcessChanged {
+                        cwd,
+                        process_name,
+                    } => {
+                        let _ = entity.update(cx, |this, cx| {
+                            let cb = this.on_cwd_changed.clone();
+                            let tab_id = this.count;
+                            if let Some(cb) = cb {
+                                cx.defer(move |cx| cb(tab_id, cwd, process_name, cx));
+                            }
+                        });
                     }
                 }
             }

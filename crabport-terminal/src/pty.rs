@@ -436,6 +436,120 @@ pub struct PtyBackend {
 // Unix implementation
 // ===========================================================================
 
+/// Snapshot of the foreground process running in a PTY.
+#[cfg(unix)]
+struct FgProcessSnapshot {
+    sys: sysinfo::System,
+    /// What we need from each process: cwd + command line + exe name.
+    refresh: sysinfo::ProcessRefreshKind,
+    /// Cached values from the last successful [`Self::probe`]. Used to
+    /// detect changes without broadcasting redundant events.
+    prev_cwd: Option<std::path::PathBuf>,
+    prev_cmd: Option<String>,
+    /// Master side of the PTY pair. `tcgetpgrp` on this fd returns the
+    /// foreground process group leader.
+    pty_fd: std::os::fd::RawFd,
+    /// PID of the direct child (the shell we spawned). Used as a
+    /// fallback when `tcgetpgrp` returns 0 (no fg pgid assigned yet).
+    shell_pid: u32,
+}
+
+#[cfg(unix)]
+impl FgProcessSnapshot {
+    fn new(pty_fd: std::os::fd::RawFd, shell_pid: u32) -> Self {
+        // Only ask sysinfo for the fields we actually read — cwd, cmd,
+        // and exe. Skipping everything else (cpu, memory, tasks, …)
+        // keeps each refresh cheap since we call it on every PTY data
+        // chunk.
+        let refresh = sysinfo::ProcessRefreshKind::nothing()
+            .with_cwd(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_exe(sysinfo::UpdateKind::Always)
+            .without_tasks();
+        Self {
+            sys: sysinfo::System::new(),
+            refresh,
+            prev_cwd: None,
+            prev_cmd: None,
+            pty_fd,
+            shell_pid,
+        }
+    }
+
+    /// Probe the current foreground process. Returns `Some((cwd, cmdline))`
+    /// if the cwd or command string differs from the previous probe.
+    ///
+    /// Should be called whenever the PTY delivers data — that covers both
+    /// `cd` (the shell redraws its prompt) and foreground command
+    /// invocations (the program writes output), so no timer is needed.
+    fn probe(&mut self) -> Option<(std::path::PathBuf, String)> {
+        let pid = self.resolve_fg_pid()?;
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            self.refresh,
+        );
+        let info = self.sys.process(pid)?;
+
+        let cwd = info.cwd().map(std::path::PathBuf::from);
+        let cmdline = build_command_line(info);
+
+        let cwd_differs = cwd.as_deref() != self.prev_cwd.as_deref();
+        let cmd_differs = cmdline.as_deref() != self.prev_cmd.as_deref();
+
+        if !cwd_differs && !cmd_differs {
+            return None;
+        }
+
+        self.prev_cwd = cwd.clone();
+        self.prev_cmd = cmdline.clone();
+
+        // If sysinfo couldn't read the cwd (e.g. permission denied on
+        // `/proc/<pid>/cwd`), fall back to an empty path so the title
+        // still shows the command part.
+        let cwd = cwd.unwrap_or_default();
+        let cmdline = cmdline.unwrap_or_else(|| "sh".to_string());
+        Some((cwd, cmdline))
+    }
+
+    /// Determine which PID to inspect. Prefers the foreground process
+    /// group leader (via `tcgetpgrp`); falls back to the shell child
+    /// if no fg pgid is set yet (e.g. during early startup).
+    fn resolve_fg_pid(&self) -> Option<sysinfo::Pid> {
+        let fg = unsafe { libc::tcgetpgrp(self.pty_fd) };
+        if fg > 0 {
+            return Some(sysinfo::Pid::from_u32(fg as u32));
+        }
+        if self.shell_pid > 0 {
+            return Some(sysinfo::Pid::from_u32(self.shell_pid));
+        }
+        None
+    }
+}
+
+/// Turn a `sysinfo::Process` into a human-readable command string:
+/// the executable's basename followed by its arguments. For a shell
+/// at rest this yields just `zsh`; for `ssh root@1.2.3.4` it yields
+/// `ssh root@1.2.3.4`.
+#[cfg(unix)]
+fn build_command_line(proc_info: &sysinfo::Process) -> Option<String> {
+    let exe_name = proc_info.name().to_str()?;
+    // `cmd()` returns the full argv as `Vec<OsString>`-like. We skip
+    // argv[0] (the program path / name) since we already have a cleaner
+    // basename from `name()`.
+    let trailing_args: Vec<&str> = proc_info
+        .cmd()
+        .iter()
+        .skip(1)
+        .filter_map(|a| a.to_str())
+        .collect();
+    if trailing_args.is_empty() {
+        Some(exe_name.to_string())
+    } else {
+        Some(format!("{} {}", exe_name, trailing_args.join(" ")))
+    }
+}
+
 #[cfg(unix)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
@@ -517,6 +631,11 @@ impl PtyBackend {
 
         let reader = pty.lock().file().try_clone()?;
         let mut writer = pty.lock().file().try_clone()?;
+        // Master fd + child pid for the foreground-process snapshot
+        // (Unix only). Grabbed here so the reader thread closure can
+        // construct a `FgProcessSnapshot` without holding the `pty` lock.
+        let master_fd = pty.lock().file().as_raw_fd();
+        let child_pid = pty.lock().child().id();
 
         let (command_tx, command_rx) = unbounded::<Command>();
 
@@ -526,6 +645,11 @@ impl PtyBackend {
             thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
+                // On every PTY data chunk, probe the foreground process
+                // (cwd + command line) via tcgetpgrp + sysinfo. A `cd` or
+                // any foreground command causes the shell to write bytes,
+                // so this fires naturally without a timer.
+                let mut snapshot = FgProcessSnapshot::new(master_fd, child_pid);
 
                 loop {
                     match reader.read(&mut buf) {
@@ -540,6 +664,15 @@ impl PtyBackend {
                             let _ = smol::block_on(
                                 event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())),
                             );
+                            if let Some((cwd, name)) = snapshot.probe() {
+                                tracing::debug!("process watcher: {} in {}", name, cwd.display());
+                                let _ = smol::block_on(event_tx.broadcast(
+                                    BackendEvent::ProcessChanged {
+                                        cwd,
+                                        process_name: name,
+                                    },
+                                ));
+                            }
                         }
 
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {

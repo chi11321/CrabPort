@@ -121,35 +121,6 @@ cargo install cargo-bundle --locked
 
 > Windows 暂不使用 cargo-bundle 打包：其 v0.11.0 的 MSI 打包器存在一个将字符串写入二进制列的 bug，因此 CI 与本地均直接压缩 `.exe` 分发。
 
-### macOS 系统集成（Services 菜单 / “在此处打开终端”）
-
-CrabPort 在 macOS 上注册了两个系统级入口，可以“从 Finder 直接在指定文件夹打开一个本地终端 tab”：
-
-1. **Services 菜单**（推荐）
-   - 在 Finder 里右键任意文件夹 → `Services` → `Open Folder in CrabPort`
-   - 也可以在任何应用的菜单栏 → `App Name` → `Services` 里找到
-   - 还可在 `系统设置 → 键盘 → 键盘快捷键 → 服务` 里给它设快捷键
-   - 如果菜单里看不到该项，去服务设置里勾选启用；首次可能还要跑一下 `/System/Library/CoreServices/pbs -update` 让系统重新扫描服务
-
-2. **“打开方式”**（备选）
-   - 右键文件夹 → `打开方式` → `CrabPort`
-   - 这是 `CFBundleDocumentTypes` 声明的，跟 Services 是不同的机制但效果一样
-
-3. **URL scheme**（可被脚本 / 其他 app 调用）
-   - `open -a CrabPort "crabport:///tmp"` → 打开 `/tmp`
-   - `open -a CrabPort "file:///tmp"` → 同上（也接受文件 URL，会取父目录）
-   - 可在 shell 脚本、Alfred、Raycast 等里用
-
-4. **命令行 argv**（首次启动）
-   - `crabport /some/folder` → 直接在指定目录打开本地终端 tab
-   - 仅在 app 未运行时生效；已运行时走 URL scheme
-
-实现细节：
-- PTY 子 shell 通过 alacritty 的 `Options::working_directory` 在 `pre_exec` 里 `chdir` 进目标目录
-- Services selector (`openInCrabPort:userData:error:`) 通过 ObjC runtime 的 `class_addMethod` 动态挂到 GPUI 的 `GPUIApplicationDelegate` 类上（GPUI 0.2.2 没有暴露自定义 selector 的入口，这是唯一不打 fork 的办法）
-- `NSApplication.servicesProvider` 设置为 app delegate，让 AppKit 把 Service 调用路由过来
-- `NSUpdateDynamicServices()` 让 LaunchServices 重新扫描 `NSServices` 声明
-
 ## 数据存储位置
 
 应用数据存储在系统标准目录下：
