@@ -141,7 +141,7 @@ impl CommandView {
 impl Render for CommandView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let is_open = self.open;
-        let search = render_search_bar(self.search_state.as_ref());
+        let search = render_search_bar(self.search_state.as_ref(), is_open);
         let on_close = self.on_close.clone();
         let on_select_host = self.on_select_host.clone();
         let on_new_connection = self.on_new_connection.clone();
@@ -163,39 +163,51 @@ impl Render for CommandView {
 // Extracted render helpers
 // ---------------------------------------------------------------------------
 
-fn render_search_bar(search_state: Option<&Entity<InputState>>) -> AnyElement {
-    if let Some(state) = search_state {
-        gpui_component::input::Input::new(state)
-            .prefix(
-                svg()
-                    .path("icons/search.svg")
-                    .size_4()
-                    .text_color(rgb(text_muted())),
-            )
-            .appearance(false)
-            .bordered(false)
-            .into_any_element()
+fn render_search_bar(search_state: Option<&Entity<InputState>>, is_open: bool) -> AnyElement {
+    // Only mount the live Input when the palette is open. When closed, we
+    // render the placeholder shell instead — otherwise the Input's
+    // focus_handle stays live in the (opacity-0) dialog and the cursor
+    // keeps blinking / receiving keystrokes through the hidden layer.
+    if is_open {
+        if let Some(state) = search_state {
+            gpui_component::input::Input::new(state)
+                .prefix(
+                    svg()
+                        .path("icons/search.svg")
+                        .size_4()
+                        .text_color(rgb(text_muted())),
+                )
+                .appearance(false)
+                .bordered(false)
+                .into_any_element()
+        } else {
+            placeholder_search_bar()
+        }
     } else {
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .h_8()
-            .child(
-                svg()
-                    .path("icons/search.svg")
-                    .size_4()
-                    .text_color(rgb(text_muted())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(rgb(text_muted()))
-                    .child(t!("new_connection.search").to_string()),
-            )
-            .into_any_element()
+        placeholder_search_bar()
     }
+}
+
+fn placeholder_search_bar() -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h_8()
+        .child(
+            svg()
+                .path("icons/search.svg")
+                .size_4()
+                .text_color(rgb(text_muted())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .text_color(rgb(text_muted()))
+                .child(t!("new_connection.search").to_string()),
+        )
+        .into_any_element()
 }
 
 fn render_overlay(

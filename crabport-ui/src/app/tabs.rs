@@ -137,6 +137,16 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        // Mkdir: silent on success (the directory listing
+                        // refresh surfaces the new folder); only failures toast.
+                        (SftpTransferKind::Mkdir, true) => return,
+                        (SftpTransferKind::Mkdir, false) => (
+                            t!("sftp.notif_mkdir_failed_title").to_string(),
+                            t!("sftp.notif_mkdir_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -336,6 +346,16 @@ impl CrabportApp {
                         (SftpTransferKind::Delete, false) => (
                             t!("sftp.notif_delete_failed_title").to_string(),
                             t!("sftp.notif_delete_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
+                        // Mkdir: silent on success (the directory listing
+                        // refresh surfaces the new folder); only failures toast.
+                        (SftpTransferKind::Mkdir, true) => return,
+                        (SftpTransferKind::Mkdir, false) => (
+                            t!("sftp.notif_mkdir_failed_title").to_string(),
+                            t!("sftp.notif_mkdir_failed_msg", message = message.as_str())
                                 .to_string(),
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),

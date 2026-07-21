@@ -412,6 +412,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                             crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
+                            crabport_terminal::terminal::SftpTransferKind::Mkdir => "Mkdir",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -833,6 +834,14 @@ impl TerminalView {
         self.session.sftp_delete(remote_path);
     }
 
+    /// Create a directory on the remote host (non-recursive). Completion is
+    /// reported through the backend's event stream; on success the SFTP
+    /// listing is auto-refreshed by the terminal's `SftpTransferFinished`
+    /// handler.
+    pub fn sftp_mkdir(&self, remote_path: &str) {
+        self.backend.sftp_mkdir(remote_path);
+    }
+
     /// Rename a remote file or directory. Forwards directly to the backend
     /// (`TerminalSession` doesn't expose a wrapper yet) via the cloned
     /// `backend` `Arc`. Completion is reported through the backend's event
@@ -1120,6 +1129,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                             crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
+                            crabport_terminal::terminal::SftpTransferKind::Mkdir => "Mkdir",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         let _ = entity.update(cx, |this, cx| {

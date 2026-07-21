@@ -11,6 +11,7 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
+use gpui_component::input::InputState;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::v_virtual_list;
 use rust_i18n::t;
@@ -26,10 +27,9 @@ use crate::motion::{EASE_STANDARD, duration_fast};
 
 use super::drag::LocalFileDragValue;
 use super::drag::SftpDragValue;
-use super::helpers::render_action_button;
+use super::helpers::render_panel_ellipsis_button;
 use super::helpers::{
-    trigger_batch_download, trigger_remote_download_from_button, trigger_remote_to_remote_transfer,
-    trigger_upload, trigger_upload_from_local,
+    trigger_batch_download, trigger_remote_to_remote_transfer, trigger_upload_from_local,
 };
 use super::view::{PanelHost, SftpTabView, join_remote_path, remote_parent};
 
@@ -145,6 +145,44 @@ fn render_column_header(id_prefix: &str) -> impl IntoElement {
                 .text_xs()
                 .text_color(rgb(text_muted()))
                 .child(t!("sftp_tab.col_modified").to_string()),
+        )
+}
+
+/// Render the inline "new folder" input row shown above the file list when
+/// the user has triggered "new folder" from the ellipsis menu. The input
+/// is pre-seeded with a unique default name by `start_make_folder`; Enter
+/// commits, Escape / blur cancels (the latter is wired in `start_make_folder`
+/// via `cx.on_blur`).
+///
+/// Layout matches a single file row (icon + name) so it reads as a pending
+/// new entry rather than a foreign floating dialog.
+fn render_mkdir_input(id: SharedString, input: Entity<InputState>) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("{id}-row")))
+        .w_full()
+        .h(px(26.0))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .bg(rgba((surface_hover() << 8) | 0x55))
+        .border_b_1()
+        .border_color(rgb(border()))
+        // Icon spacer — matches the 14px folder icon in each row.
+        .child(
+            svg()
+                .path("icons/folder.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(rgb(text_muted())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(StyledInput::new(id, input).xsmall()),
         )
 }
 
@@ -342,6 +380,8 @@ impl SftpTabView {
         let entity_for_list = entity.clone();
         let renaming_entry = panel.renaming.clone();
         let rename_input = panel.rename_input.clone();
+        let mkdir_pending = panel.mkdir_pending.is_some();
+        let mkdir_input = panel.mkdir_input.clone();
 
         let id_prefix = match side {
             PanelSide::Left => "sftp-tab-left",
@@ -377,6 +417,8 @@ impl SftpTabView {
                             .gap_1()
                             .px_2()
                             .h(px(26.0))
+                            .max_w(px(160.0))
+                            .min_w_0()
                             .rounded(px(4.0))
                             .bg(rgb(surface_hover()))
                             .on_click({
@@ -399,12 +441,14 @@ impl SftpTabView {
                                 svg()
                                     .path("icons/folder.svg")
                                     .size(px(12.0))
+                                    .flex_shrink_0()
                                     .text_color(rgb(text_muted())),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
+                                    .truncate()
                                     .child(t!("sftp_tab.local").to_string()),
                             ),
                     )
@@ -424,68 +468,37 @@ impl SftpTabView {
                                 ),
                             )
                         }),
-                    ),
-            )
-            // Action button row: refresh / mkdir
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mb_1()
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-refresh")),
-                        "icons/refresh-cw.svg",
-                        t!("sftp.refresh").to_string(),
-                        true,
+                    )
+                    // Ellipsis overflow menu: refresh / new folder /
+                    // toggle hidden / close panel.
+                    .child(render_panel_ellipsis_button(
+                        side,
+                        entity.clone(),
+                        self.context_menu.clone(),
                         tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            move |_w, cx| {
-                                let _ = entity.update(cx, |view, cx| {
-                                    let panel = view.panel_mut(side);
-                                    panel.local_entries =
-                                        SftpTabView::read_local_dir(&panel.local_cwd);
-                                    panel.selected.clear();
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-mkdir")),
-                        "icons/plus.svg",
-                        t!("sftp_tab.mkdir").to_string(),
-                        true,
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            move |_w, cx| {
-                                let _ = entity.update(cx, |view, cx| {
-                                    // Create "New Folder" with a unique name.
-                                    let panel = view.panel_mut(side);
-                                    let base = "New Folder";
-                                    let mut name = base.to_string();
-                                    let mut i = 1;
-                                    while panel.local_cwd.join(&name).exists() {
-                                        name = format!("{base} ({i})");
-                                        i += 1;
-                                    }
-                                    let path = panel.local_cwd.join(&name);
-                                    let _ = std::fs::create_dir(&path);
-                                    panel.local_entries =
-                                        SftpTabView::read_local_dir(&panel.local_cwd);
-                                    cx.notify();
-                                });
-                            }
-                        },
+                        panel.show_hidden,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
                     )),
             )
             // Column header — outside the scroll container so the
             // scrollbar (absolute top_0..bottom_0 inside the container
             // below) only spans the file-list area, not the header.
             .child(render_column_header(id_prefix))
+            // Inline "new folder" input — shown above the list when the
+            // user has triggered "new folder" from the ellipsis menu.
+            // Press Enter to commit, click away / Esc to cancel.
+            .when(mkdir_pending, |el| {
+                el.when_some(mkdir_input.clone(), |el, input| {
+                    el.child(render_mkdir_input(
+                        SharedString::from(format!("{id_prefix}-mkdir")),
+                        input,
+                    ))
+                })
+            })
             .child(
                 div()
                     .relative()
@@ -1015,7 +1028,6 @@ impl SftpTabView {
         let scroll_handle = panel.scroll.clone();
         let cwd = panel.remote_cwd.clone();
         let path_input = panel.path_input.clone();
-        let on_navigate = panel.on_navigate.clone();
         let on_download = panel.on_download.clone();
         let on_upload = panel.on_upload.clone();
         let on_upload_batch = panel.on_upload_batch.clone();
@@ -1037,6 +1049,8 @@ impl SftpTabView {
         let entity_for_list = entity.clone();
         let renaming_entry = panel.renaming.clone();
         let rename_input = panel.rename_input.clone();
+        let mkdir_pending = panel.mkdir_pending.is_some();
+        let mkdir_input = panel.mkdir_input.clone();
         let context_menu = self.context_menu.clone();
         let alert_controller = self.alert_controller.clone();
 
@@ -1090,6 +1104,8 @@ impl SftpTabView {
                             .gap_1()
                             .px_2()
                             .h(px(26.0))
+                            .max_w(px(160.0))
+                            .min_w_0()
                             .rounded(px(4.0))
                             .bg(rgb(surface_hover()))
                             .on_click({
@@ -1112,12 +1128,14 @@ impl SftpTabView {
                                 svg()
                                     .path("icons/server.svg")
                                     .size(px(12.0))
+                                    .flex_shrink_0()
                                     .text_color(rgb(text_muted())),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
+                                    .truncate()
                                     .child(host_label),
                             ),
                     )
@@ -1137,83 +1155,37 @@ impl SftpTabView {
                                 ),
                             )
                         }),
-                    ),
-            )
-            // Action buttons: download / upload / refresh
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mb_1()
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-download")),
-                        "icons/download.svg",
-                        t!("sftp.download").to_string(),
-                        on_download.is_some(),
+                    )
+                    // Ellipsis overflow menu: download / upload / refresh /
+                    // new folder / toggle hidden / close panel.
+                    .child(render_panel_ellipsis_button(
+                        side,
+                        entity.clone(),
+                        self.context_menu.clone(),
                         tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_download = on_download.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_remote_download_from_button(
-                                    entity.clone(),
-                                    side,
-                                    on_download.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-upload")),
-                        "icons/upload.svg",
-                        t!("sftp.upload").to_string(),
-                        on_upload.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_upload = on_upload.clone();
-                            let on_upload_batch = on_upload_batch.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_upload(
-                                    entity.clone(),
-                                    side,
-                                    on_upload.as_ref(),
-                                    on_upload_batch.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-refresh")),
-                        "icons/refresh-cw.svg",
-                        t!("sftp.refresh").to_string(),
-                        on_navigate.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let on_navigate = on_navigate.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                let cb = on_navigate.as_ref();
-                                let cwd = cwd.as_ref();
-                                if let (Some(cb), Some(cwd)) = (cb, cwd) {
-                                    cb(cwd.as_str().to_string(), cx);
-                                }
-                            }
-                        },
+                        panel.show_hidden,
+                        true,
+                        on_download.clone(),
+                        on_upload.clone(),
+                        on_upload_batch.clone(),
+                        cwd.clone(),
                     )),
             )
             // Column header — outside the scroll container so the
             // scrollbar (absolute top_0..bottom_0 inside the container
             // below) only spans the file-list area, not the header.
             .child(render_column_header(id_prefix))
+            // Inline "new folder" input — shown above the list when the
+            // user has triggered "new folder" from the ellipsis menu.
+            // Press Enter to commit, click away / Esc to cancel.
+            .when(mkdir_pending, |el| {
+                el.when_some(mkdir_input.clone(), |el, input| {
+                    el.child(render_mkdir_input(
+                        SharedString::from(format!("{id_prefix}-mkdir")),
+                        input,
+                    ))
+                })
+            })
             .child(
                 div()
                     .relative()
@@ -1920,8 +1892,17 @@ impl SftpTabView {
                                 current_status,
                                 &log_entries,
                                 // Encode side into the count so left/right
-                                // panels don't share transition IDs.
-                                connect_count * 2 + side as u64,
+                                // panels don't share transition IDs. The
+                                // `100_000` offset keeps SFTP panel overlay
+                                // IDs out of the SSH tab pane-id space
+                                // (pane IDs start at 1 and grow slowly);
+                                // without this, an SFTP panel's overlay
+                                // transition ID would collide with an SSH
+                                // tab's, and whichever rendered second
+                                // would inherit the other's cached
+                                // transition state (e.g. "already faded
+                                // out"), making the overlay invisible.
+                                100_000 + connect_count * 2 + side as u64,
                                 spinner_rot,
                                 on_reconnect,
                             ),
