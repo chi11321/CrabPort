@@ -34,7 +34,7 @@ use crate::layouts::toolbar::{
     BAR_HEIGHT, BAR_WIDTH, ToolbarProps, ToolbarSlot, color_accent, format_byte_ratio,
     format_memory, format_rate, human_bytes, status_color, truncate_path_middle,
 };
-use crate::motion::{duration_slower, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 use crate::views::terminal::SftpProgress;
 
 // ---------------------------------------------------------------------------
@@ -301,9 +301,12 @@ fn cpu_slot(show_metrics: bool, cpu: Option<CpuStats>, visible: bool) -> Toolbar
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("cpu-bar-fill")
-                                .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
-                                    el.w(px(filled_w))
-                                }),
+                                .transition_when(
+                                    true,
+                                    duration_slower(),
+                                    EASE_STANDARD,
+                                    move |el| el.w(px(filled_w)),
+                                ),
                         ),
                 )
                 .child(div().text_xs().child(label))
@@ -369,9 +372,12 @@ fn disk_slot(show_metrics: bool, disk: Option<DiskStats>, visible: bool) -> Tool
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("disk-bar-fill")
-                                .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
-                                    el.w(px(filled_w))
-                                }),
+                                .transition_when(
+                                    true,
+                                    duration_slower(),
+                                    EASE_STANDARD,
+                                    move |el| el.w(px(filled_w)),
+                                ),
                         ),
                 )
                 .child(div().text_xs().child(label))
@@ -444,6 +450,7 @@ impl SftpProgressDisplay {
             SftpTransferKind::Rename => t!("sftp.rename").to_string(),
             SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
             SftpTransferKind::Delete => t!("sftp.delete").to_string(),
+            SftpTransferKind::Mkdir => t!("sftp.mkdir").to_string(),
         };
         let (stage_label, stage_color) = match p.stage {
             SftpTransferStage::Compress => {
@@ -463,6 +470,7 @@ impl SftpProgressDisplay {
             SftpTransferKind::Rename => "icons/terminal-toolbar/edit.svg",
             SftpTransferKind::Edit => "icons/terminal-toolbar/arrow-up-to-line.svg",
             SftpTransferKind::Delete => "icons/terminal-toolbar/arrow-up-to-line.svg",
+            SftpTransferKind::Mkdir => "icons/terminal-toolbar/arrow-up-to-line.svg",
         };
         let detail = truncate_path_middle(&p.message, 40);
         Self {

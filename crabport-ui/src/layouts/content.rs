@@ -588,6 +588,14 @@ pub fn render_content(
         }) as Rc<dyn Fn(String, &mut App)>
     });
 
+    let sftp_mkdir: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
+        Rc::new(move |remote_path: String, cx: &mut App| {
+            entity.read_with(cx, |view, _cx| {
+                view.sftp_mkdir(&remote_path);
+            });
+        }) as Rc<dyn Fn(String, &mut App)>
+    });
+
     // ---- Panel capability flags ----
     //
     // Each right-hand panel pane is shown only when the active terminal's
@@ -624,6 +632,7 @@ pub fn render_content(
             sftp_delete,
             sftp_rename,
             sftp_edit,
+            sftp_mkdir,
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),

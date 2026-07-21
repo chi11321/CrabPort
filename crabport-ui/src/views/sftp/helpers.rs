@@ -1,5 +1,5 @@
-//! Free helper functions for the SFTP tab view: action button rendering
-//! and the batch download / upload orchestration flows.
+//! Free helper functions for the SFTP tab view: the ellipsis (overflow)
+//! menu button rendering and the batch download / upload orchestration flows.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -11,65 +11,68 @@ use gpui_animation::animation::TransitionExt;
 use rust_i18n::t;
 
 use crate::color::*;
+use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::motion::{EASE_STANDARD, duration_fast};
 
 use super::view::{SftpTabView, join_remote_path};
 use crate::components::host_selector::PanelSide;
 
 // ---------------------------------------------------------------------------
-// Action button (ghost, tooltip via TooltipController)
+// Panel ellipsis (overflow) menu button
 // ---------------------------------------------------------------------------
 
-pub(super) fn render_action_button(
-    id: impl Into<SharedString>,
-    icon: &'static str,
-    tooltip_text: String,
-    enabled: bool,
+/// Render the ellipsis button shown at the right of a panel's path bar.
+///
+/// Clicking it opens a [`ContextMenuController`] anchored to the click
+/// position with these actions: download (remote only) / upload (remote
+/// only) / refresh / new folder / toggle hidden files / close
+/// (disconnect). The menu is non-sticky — every item click both invokes
+/// its handler and dismisses the menu. The "show hidden files" item is
+/// labelled to reflect the *current* state so the user can tell at a
+/// glance whether hidden files are visible.
+///
+/// `show_hidden` is the panel's current state, read by the caller (which
+/// has `&SftpTabView`). We take it as a param rather than reading inside
+/// the element builder because the panel borrow isn't available at click
+/// time.
+///
+/// `on_download` / `on_upload` / `on_upload_batch` / `cwd` are only
+/// `Some` for remote panels — local panels don't show the download/upload
+/// items. They're threaded through here rather than re-read at click time
+/// because they're cheap `Rc` clones captured per-render.
+pub(super) fn render_panel_ellipsis_button(
+    side: PanelSide,
+    entity: WeakEntity<SftpTabView>,
+    context_menu: Option<Entity<crate::components::context_menu::ContextMenuController>>,
     tooltip_ctrl: Option<Entity<crate::components::tooltip::TooltipController>>,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
+    show_hidden: bool,
+    is_remote: bool,
+    on_download: Option<Rc<dyn Fn(String, String, &mut App)>>,
+    on_upload: Option<Rc<dyn Fn(String, String, &mut App)>>,
+    on_upload_batch: Option<Rc<dyn Fn(Vec<(String, String)>, &mut App)>>,
+    cwd: Option<Arc<String>>,
 ) -> impl IntoElement {
-    let color = if enabled { text_muted() } else { 0x45475a };
-    let hover_bg = surface_hover();
-    let to_color = |c: u32| rgba(if c <= 0xFFFFFF { (c << 8) | 0xFF } else { c });
-    let rest_bg = to_color(0x00000000);
-    let hover_bg_rgba = to_color(hover_bg);
-    let id = id.into();
-    let btn_id = ElementId::Name(format!("{}-btn", id).into());
-    let tooltip_text_clone = tooltip_text.clone();
+    let id_prefix = match side {
+        PanelSide::Left => "sftp-tab-left",
+        PanelSide::Right => "sftp-tab-right",
+    };
+    let btn_id = ElementId::Name(format!("{id_prefix}-ellipsis-btn").into());
+    // Resting background is a faint surface tint (alpha ~30%) rather than
+    // fully transparent — the panel reads better with a visible button.
+    let rest_bg = rgba((surface_hover() << 8) | 0x33);
+    let hover_bg_rgba = rgba((surface_hover() << 8) | 0xFF);
+    let tooltip_text = t!("sftp_tab.actions").to_string();
+
     div()
         .id(btn_id.clone())
         .flex()
         .items_center()
         .justify_center()
-        .size(px(24.0))
+        .size(px(26.0))
+        .flex_shrink_0()
         .rounded(px(4.0))
         .bg(rest_bg)
-        .when(!enabled, |el| el.cursor_not_allowed())
-        .when(enabled, |el| {
-            el.on_click(move |_e, w, cx| {
-                on_click(w, cx);
-                cx.stop_propagation();
-            })
-        })
         .with_transition(btn_id)
-        // on_hover must come AFTER with_transition (on the AnimatedWrapper)
-        // and BEFORE transition_on_hover — otherwise transition_on_hover
-        // registers a second hover handler and GPUI panics.
-        .when_some(tooltip_ctrl, |el, ctrl| {
-            el.when(enabled, |el| {
-                el.on_hover(move |hovered, w, cx| {
-                    if *hovered {
-                        ctrl.update(cx, |t, cx| {
-                            t.show(tooltip_text_clone.clone(), w.mouse_position(), cx);
-                        });
-                    } else {
-                        ctrl.update(cx, |t, cx| {
-                            t.hide(cx);
-                        });
-                    }
-                })
-            })
-        })
         .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
@@ -77,11 +80,154 @@ pub(super) fn render_action_button(
                 el.bg(rest_bg)
             }
         })
-        .child(svg().path(icon).size(px(14.0)).text_color(rgb(color)))
-}
+        .when_some(tooltip_ctrl.clone(), |el, ctrl| {
+            el.on_hover(move |hovered, w, cx| {
+                if *hovered {
+                    ctrl.update(cx, |t, cx| {
+                        t.show(tooltip_text.clone(), w.mouse_position(), cx);
+                    });
+                } else {
+                    ctrl.update(cx, |t, cx| {
+                        t.hide(cx);
+                    });
+                }
+            })
+        })
+        .on_click(move |e, _w, cx| {
+            let Some(ref cm) = context_menu else {
+                return;
+            };
+            // Resolve the current show_hidden state at click time so the
+            // menu reflects the latest toggle (the user may have changed
+            // it since the last render).
+            let cur_show_hidden = entity
+                .read_with(cx, |view, _cx| view.panel(side).show_hidden)
+                .unwrap_or(show_hidden);
+            let cur_hidden_label = if cur_show_hidden {
+                t!("sftp_tab.hide_hidden").to_string()
+            } else {
+                t!("sftp_tab.show_hidden").to_string()
+            };
+            let refresh_label = t!("sftp.refresh").to_string();
+            let mkdir_label = t!("sftp_tab.mkdir").to_string();
+            let close_label = t!("sftp_tab.close_panel").to_string();
+            let download_label = t!("sftp.download").to_string();
+            let upload_label = t!("sftp.upload").to_string();
 
-// ---------------------------------------------------------------------------
-// Batch download / upload orchestration
+            let mut items: Vec<ContextMenuItem> = Vec::new();
+
+            // Download / upload items are only meaningful for remote panels.
+            if is_remote {
+                if on_download.is_some() {
+                    let entity = entity.clone();
+                    let on_download = on_download.clone();
+                    let cwd = cwd.clone();
+                    items.push(
+                        ContextMenuItem::new(download_label.clone(), move |_w, cx| {
+                            trigger_remote_download_from_button(
+                                entity.clone(),
+                                side,
+                                on_download.as_ref(),
+                                cwd.as_ref(),
+                                cx,
+                            );
+                        })
+                        .with_icon("icons/download.svg"),
+                    );
+                }
+                if on_upload.is_some() {
+                    let entity = entity.clone();
+                    let on_upload = on_upload.clone();
+                    let on_upload_batch = on_upload_batch.clone();
+                    let cwd = cwd.clone();
+                    items.push(
+                        ContextMenuItem::new(upload_label.clone(), move |_w, cx| {
+                            trigger_upload(
+                                entity.clone(),
+                                side,
+                                on_upload.as_ref(),
+                                on_upload_batch.as_ref(),
+                                cwd.as_ref(),
+                                cx,
+                            );
+                        })
+                        .with_icon("icons/upload.svg"),
+                    );
+                }
+                // If we added transfer items, separate them from the
+                // filesystem actions with a divider.
+                if !items.is_empty() {
+                    items.last_mut().unwrap().divider_after = true;
+                }
+            }
+
+            items.push(
+                ContextMenuItem::new(refresh_label.clone(), {
+                    let entity = entity.clone();
+                    move |_w, cx| {
+                        let _ = entity.update(cx, |view, cx| {
+                            view.refresh_listing(side, cx);
+                        });
+                    }
+                })
+                .with_icon("icons/refresh-cw.svg"),
+            );
+            items.push(
+                ContextMenuItem::new(mkdir_label.clone(), {
+                    let entity = entity.clone();
+                    move |w, cx| {
+                        let _ = entity.update(cx, |view, cx| {
+                            view.start_make_folder(side, w, cx);
+                        });
+                    }
+                })
+                .with_icon("icons/plus.svg"),
+            );
+            items.push(
+                ContextMenuItem::new(cur_hidden_label, {
+                    let entity = entity.clone();
+                    move |_w, cx| {
+                        let _ = entity.update(cx, |view, cx| {
+                            view.toggle_hidden(side, cx);
+                        });
+                    }
+                })
+                .with_icon("icons/eye.svg"),
+            );
+            // Close is the destructive action — separate + style it.
+            items.last_mut().unwrap().divider_after = true;
+            items.push(
+                ContextMenuItem::new(close_label.clone(), {
+                    let entity = entity.clone();
+                    move |w, cx| {
+                        let _ = entity.update(cx, |view, cx| {
+                            view.disconnect_panel(side, w, cx);
+                        });
+                    }
+                })
+                .with_icon("icons/close.svg")
+                .danger(true),
+            );
+
+            let state = ContextMenuState {
+                position: e.position(),
+                items,
+                header: None,
+                open: false,
+                sticky: false,
+            };
+            cm.update(cx, |c, cx| {
+                c.show(state, cx);
+            });
+            cx.stop_propagation();
+        })
+        .child(
+            svg()
+                .path("icons/ellipsis.svg")
+                .size(px(14.0))
+                .text_color(rgb(text_muted())),
+        )
+}
 // ---------------------------------------------------------------------------
 
 /// Drive a batch SFTP download (re-uses the side-panel flow).

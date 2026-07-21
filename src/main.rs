@@ -42,6 +42,7 @@ fn main() {
     // held for the entire process lifetime (until `main` returns / the OS
     // reaps the process); `fs2` releases the lock on drop, so even an abrupt
     // `terminate:` / SIGKILL frees it via the OS.
+    #[cfg(not(debug_assertions))]
     let _single_instance_guard = AppState::acquire_single_instance_lock();
 
     let app = Application::new().with_assets(CrabportAssets::new());

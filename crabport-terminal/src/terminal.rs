@@ -81,6 +81,9 @@ pub enum SftpTransferKind {
     /// Delete a remote file or directory. Success shows "deleted";
     /// failure shows "delete failed".
     Delete,
+    /// Create a directory. Success is silent (the next directory refresh
+    /// surfaces the new folder); failure shows "mkdir failed".
+    Mkdir,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -183,6 +186,13 @@ pub trait CrabPortTerminal: Send + Sync {
     /// if the remote doesn't support tar. Completion is reported via
     /// [`BackendEvent::SftpTransferFinished`] for the batch.
     fn sftp_upload_batch(&self, _items: &[(String, String)]) {}
+
+    /// Create a directory on the remote host at `remote_path`. Parent
+    /// directories must already exist (SFTP `mkdir` is not recursive).
+    /// Completion is reported via [`BackendEvent::SftpTransferFinished`]
+    /// with `kind = Mkdir` (a synthetic kind — there's no actual transfer,
+    /// but we reuse the event so the UI's existing finish handling applies).
+    fn sftp_mkdir(&self, _remote_path: &str) {}
 
     /// Delete a remote file or directory at `remote_path`. The backend
     /// stats the path to decide between `remove_file` and `remove_dir`.
@@ -768,6 +778,13 @@ impl TerminalSession {
     /// `BackendEvent::SftpTransferFinished`.
     pub fn sftp_delete(&self, remote_path: &str) {
         self.backend.sftp_delete(remote_path);
+    }
+
+    /// Create a directory on the remote host (non-recursive — parent must
+    /// exist). Completion is reported via the backend's event stream as
+    /// `BackendEvent::SftpTransferFinished` with `kind = Mkdir`.
+    pub fn sftp_mkdir(&self, remote_path: &str) {
+        self.backend.sftp_mkdir(remote_path);
     }
 
     pub fn scroll(&self, delta: i32) {
