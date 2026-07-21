@@ -33,6 +33,14 @@ use crate::motion::RADIUS_MD;
 // text block. Anyone needing the full text can find it in the source tree.
 const LICENSE_NAME: &str = "Apache License 2.0";
 
+// All in-app icons (the SVGs under `assets/icons/`) are sourced from
+// lucide (https://lucide.dev), an open-source icon set released under
+// the ISC License. The full license text ships alongside the source at
+// `THIRD-PARTY-LICENSES/lucide-icons-ISC.txt`. We display it as a
+// separate attribution row so users know where the iconography comes
+// from.
+const ICONS_NAME: &str = "lucide (ISC License)";
+
 // Build-time-generated dependency table. See `crabport-ui/build.rs`.
 include!(concat!(env!("OUT_DIR"), "/about_dependencies.rs"));
 
@@ -220,6 +228,28 @@ impl AboutWindow {
                             .text_sm()
                             .text_color(rgb(text_muted()))
                             .child(LICENSE_NAME),
+                    ),
+            )
+            // --- Icons attribution block ---
+            // All SVG icons bundled with CrabPort are from the lucide icon
+            // set (https://lucide.dev), licensed under the ISC License.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_primary()))
+                            .child(t!("window.about.icons").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_muted()))
+                            .child(ICONS_NAME),
                     ),
             )
             // --- Dependencies block ---

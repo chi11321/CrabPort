@@ -321,6 +321,7 @@ favorites = "Favorites"
 [window.about]
 title = "About CrabPort"
 license = "License"
+icons = "Icons"
 dependencies = "Dependencies"
 
 [window.about.tab]

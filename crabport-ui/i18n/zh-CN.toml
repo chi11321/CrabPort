@@ -320,6 +320,7 @@ favorites = "收藏"
 [window.about]
 title = "关于 CrabPort"
 license = "许可证"
+icons = "图标"
 dependencies = "依赖"
 
 [window.about.tab]
