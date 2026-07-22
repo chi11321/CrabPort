@@ -198,38 +198,21 @@ impl TerminalView {
     pub fn new_with_cwd(count: u64, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        // Spawn the local PTY synchronously.
-        //
-        // Previously this went through `PendingPtyBackend` (a worker thread
-        // that constructs the real `PtyBackend` off the UI thread), but the
-        // async path introduced a 120 Hz spinner pump that repainted the
-        // whole window during the ConPTY construction window — on Windows
-        // PowerShell that gap is 200–500 ms, so the async version made the
-        // UI feel *more* sluggish, not less. The synchronous version blocks
-        // briefly but only for the actual PTY construction time, with no
-        // pump-driven repaint storm on top.
+        // Local PTY creation can fail on platforms without a usable
+        // pseudoterminal (e.g. older Windows builds without ConPTY, or
+        // headless CI hosts without a controlling TTY). Rather than panic
+        // — which aborts the whole app under the `panic = abort` release
+        // profile — surface the error in the connection overlay so the
+        // user sees what went wrong and can still use remote sessions.
         let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
             match crabport_terminal::pty::PtyBackend::new_with_cwd(cols as u16, rows as u16, cwd) {
                 Ok(b) => Arc::new(b),
-                Err(e) => Arc::new(crabport_terminal::pty::FailedPtyBackend::new(format!(
-                    "Failed to spawn local PTY: {e}"
-                ))),
+                Err(e) => {
+                    tracing::error!("failed to create local PTY backend: {e}");
+                    Arc::new(crabport_terminal::pty::FailedPtyBackend::new(e.to_string()))
+                }
             };
-        // Hidden overlay — local terminals never show a connecting spinner.
-        let overlay: SharedOverlayState =
-            Arc::new(Mutex::new(ConnectionOverlayState::new_hidden()));
-        Self::with_backend_and_host_and_overlay(
-            backend,
-            cols,
-            rows,
-            String::new(),
-            None,
-            overlay,
-            None,
-            None,
-            count,
-            cx,
-        )
+        Self::with_backend(backend, cols, rows, None, None, count, cx)
     }
 
     pub fn with_backend(
