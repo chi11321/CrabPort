@@ -198,28 +198,24 @@ impl TerminalView {
     pub fn new_with_cwd(count: u64, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        // Spawn the local PTY *asynchronously* via `PendingPtyBackend`.
+        // Spawn the local PTY synchronously.
         //
-        // On Windows, `PtyBackend::new` synchronously calls
-        // `CreatePseudoConsole` + `CreateProcessW` (which spawns
-        // `pwsh.exe` / `powershell.exe`) + `RegisterWaitForSingleObject`,
-        // which can take 200–500 ms — especially the first PowerShell
-        // launch in a session. Doing this on the gpui foreground thread
-        // stalls the render loop and produces a visible "hang" when the
-        // user opens the first local terminal tab.
-        //
-        // `PendingPtyBackend` returns immediately and constructs the real
-        // `PtyBackend` on a background thread. Unlike remote (SSH / Telnet)
-        // sessions, local terminals do **not** show a connecting overlay —
-        // the spinner pump repaints at ~120 Hz which freezes the whole
-        // window during the PTY construction window. Instead the terminal
-        // area stays blank until the first PTY byte arrives, matching the
-        // pre-async UX (brief blank, then content appears).
-        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
-            crabport_terminal::pty::PendingPtyBackend::new_with_cwd(cols as u16, rows as u16, cwd),
-        );
-        // Hidden overlay — keeps the field non-optional for remote
-        // reconnect paths but never renders for local terminals.
+        // Previously this went through `PendingPtyBackend` (a worker thread
+        // that constructs the real `PtyBackend` off the UI thread), but the
+        // async path introduced a 120 Hz spinner pump that repainted the
+        // whole window during the ConPTY construction window — on Windows
+        // PowerShell that gap is 200–500 ms, so the async version made the
+        // UI feel *more* sluggish, not less. The synchronous version blocks
+        // briefly but only for the actual PTY construction time, with no
+        // pump-driven repaint storm on top.
+        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
+            match crabport_terminal::pty::PtyBackend::new_with_cwd(cols as u16, rows as u16, cwd) {
+                Ok(b) => Arc::new(b),
+                Err(e) => Arc::new(crabport_terminal::pty::FailedPtyBackend::new(format!(
+                    "Failed to spawn local PTY: {e}"
+                ))),
+            };
+        // Hidden overlay — local terminals never show a connecting spinner.
         let overlay: SharedOverlayState =
             Arc::new(Mutex::new(ConnectionOverlayState::new_hidden()));
         Self::with_backend_and_host_and_overlay(
