@@ -227,7 +227,7 @@ impl SftpTabView {
     /// entries. Sorting is the same as [`Self::read_local_dir`].
     pub(super) fn read_local_dir_filtered(
         path: &Path,
-        show_hidden: bool,
+        _show_hidden: bool,
     ) -> Vec<crabport_sftp::FileEntry> {
         use std::time::UNIX_EPOCH;
         let mut out: Vec<crabport_sftp::FileEntry> = Vec::new();
@@ -239,7 +239,7 @@ impl SftpTabView {
                 // Skip hidden files on Unix for a cleaner listing, unless the
                 // user has explicitly enabled "show hidden files".
                 #[cfg(unix)]
-                if !show_hidden && name.starts_with('.') {
+                if !_show_hidden && name.starts_with('.') {
                     continue;
                 }
                 let size = metadata.as_ref().filter(|m| !m.is_dir()).map(|m| m.len());

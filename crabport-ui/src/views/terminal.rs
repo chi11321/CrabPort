@@ -515,6 +515,15 @@ impl TerminalView {
                             }
                         });
                     }
+                    crabport_terminal::terminal::BackendEvent::Ready => {
+                        // The backend finished async construction
+                        // (`PendingPtyBackend` installed the real
+                        // `PtyBackend`). The wakeup listener below re-reads
+                        // `monitor().status()` and flips the overlay out of
+                        // the "Connecting" spinner, so nothing to do here
+                        // but repaint so the fade-out kicks in immediately.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -1239,6 +1248,12 @@ impl TerminalView {
                                 cx.defer(move |cx| cb(tab_id, cwd, process_name, cx));
                             }
                         });
+                    }
+                    crabport_terminal::terminal::BackendEvent::Ready => {
+                        // See comment in the constructor's backend-event
+                        // loop — the wakeup listener handles the
+                        // status flip; we just need to repaint.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
                     }
                 }
             }

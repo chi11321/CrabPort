@@ -68,6 +68,19 @@ pub enum BackendEvent {
         cwd: std::path::PathBuf,
         process_name: String,
     },
+    /// The backend finished its async construction and is ready to
+    /// read/write. Emitted by [`crate::pty::PendingPtyBackend`] once the
+    /// real `PtyBackend` has been installed on the worker thread.
+    ///
+    /// This is needed on Windows where `PtyBackend::new` runs on a
+    /// background thread (200–500 ms for `CreatePseudoConsole` + spawning
+    /// `pwsh.exe`). Without an explicit signal, the UI would keep the
+    /// "Connecting" spinner running at ~120 Hz until the first PTY byte
+    /// arrives — which for PowerShell can be another second or more
+    /// after the backend itself is ready. Broadcasting `Ready` lets the
+    /// UI check `monitor().status()` immediately and flip to `Local`,
+    /// stopping the spinner pump as soon as the backend is usable.
+    Ready,
 }
 
 /// Byte-level progress snapshot for a transfer stage.
@@ -493,6 +506,12 @@ impl TerminalSession {
                                     Ok(BackendEvent::ProcessChanged { .. }) => {
                                         // UI-only event; ignore during batch drain.
                                     }
+                                    Ok(BackendEvent::Ready) => {
+                                        // UI-only event; ignore during
+                                        // batch drain. The outer match
+                                        // handles it (wakeup → status
+                                        // check).
+                                    }
                                     Err(_) => break, // queue drained
                                 }
                             }
@@ -531,6 +550,18 @@ impl TerminalSession {
                         // backend event stream and updates the tab title.
                         // Wake up so any subscriber that cares repaints.
                         BackendEvent::ProcessChanged { .. } => {
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
+                        // Backend finished async construction (e.g.
+                        // `PendingPtyBackend` installed the real `PtyBackend`).
+                        // The session itself has nothing to do — the UI's
+                        // wakeup listener re-reads `monitor().status()` and
+                        // flips the overlay out of the "Connecting" spinner.
+                        // Without this, the spinner would keep running at
+                        // ~120 Hz until the first PTY `Data` byte arrives,
+                        // which on Windows PowerShell can be a second or more
+                        // after the backend is already usable.
+                        BackendEvent::Ready => {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                     },

@@ -99,6 +99,7 @@ use crate::terminal::{
 ///
 /// If the user has explicitly set `LANG` to something real (e.g.
 /// `zh_CN.UTF-8`), we respect it.
+#[cfg(unix)]
 fn ensure_utf8_locale() {
     // A locale is "good" if it's non-empty and not the `C` / `POSIX`
     // default (which is ASCII-only). We don't otherwise validate the name —
@@ -1256,6 +1257,16 @@ impl PendingPtyBackend {
                     // directly (see `PendingPtyBackend` impl).
                     let _ = state_for_worker.backend.set(Arc::new(backend));
                     state_for_worker.done.store(true, AtomicOrdering::SeqCst);
+                    // Signal readiness so the UI can stop the "Connecting"
+                    // spinner immediately. Without this, the spinner pump
+                    // would keep repainting at ~120 Hz until the first PTY
+                    // `Data` byte arrives — on Windows PowerShell that gap
+                    // can be a second or more, which makes the whole window
+                    // feel sluggish even though the backend itself is
+                    // already usable. The UI's wakeup listener re-reads
+                    // `monitor().status()` (now `Local`) and flips the
+                    // overlay to fade out.
+                    let _ = state_for_worker.event_tx.try_broadcast(BackendEvent::Ready);
                     tracing::debug!("pending-pty: real backend installed");
                 }
                 Err(e) => {
