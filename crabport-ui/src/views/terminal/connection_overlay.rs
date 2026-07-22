@@ -116,13 +116,21 @@ impl ConnectionOverlayState {
         }
     }
 
-    /// Create an overlay seeded with a "Starting local shell…" log entry.
-    /// Used by `TerminalView::new` so the overlay shown while the local
-    /// `PendingPtyBackend` is constructing the real `PtyBackend` has a
-    /// visible status line instead of just an empty spinner.
-    pub fn new_local_starting() -> Self {
+    /// Create an overlay that is permanently hidden — used by local
+    /// terminal tabs so the connection spinner (which repaints at
+    /// ~120 Hz while `status == Connecting`) never kicks in.
+    ///
+    /// On Windows, `PendingPtyBackend` constructs the real `PtyBackend`
+    /// on a worker thread (200–500 ms for `CreatePseudoConsole` +
+    /// spawning `pwsh.exe`). Driving the spinner at 120 Hz during that
+    /// window stalls the whole window's render loop — the user sees a
+    /// frozen UI instead of a brief blank terminal. The synchronous
+    /// (pre-async) version had the same UX: brief blank terminal, then
+    /// content appears. Local terminals don't need a connecting overlay
+    /// at all, so we start hidden and stay hidden.
+    pub fn new_hidden() -> Self {
         let mut s = Self::new();
-        s.log(ConnectionLogLevel::Info, "Starting local shell…");
+        s.hidden = true;
         s
     }
 

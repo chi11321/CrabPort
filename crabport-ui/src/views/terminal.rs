@@ -209,19 +209,19 @@ impl TerminalView {
         // user opens the first local terminal tab.
         //
         // `PendingPtyBackend` returns immediately and constructs the real
-        // `PtyBackend` on a background thread, broadcasting status via
-        // `BackendEvent` so the connection overlay can show a spinner and
-        // the side panel waits until the shell is actually ready. This
-        // mirrors how `add_ssh_tab` / `add_telnet_tab` already work —
-        // heavy I/O off the UI thread, status streamed in via events.
+        // `PtyBackend` on a background thread. Unlike remote (SSH / Telnet)
+        // sessions, local terminals do **not** show a connecting overlay —
+        // the spinner pump repaints at ~120 Hz which freezes the whole
+        // window during the PTY construction window. Instead the terminal
+        // area stays blank until the first PTY byte arrives, matching the
+        // pre-async UX (brief blank, then content appears).
         let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
             crabport_terminal::pty::PendingPtyBackend::new_with_cwd(cols as u16, rows as u16, cwd),
         );
-        // Pre-seed the overlay with a "Starting local shell…" log line so
-        // the spinner shown during `PendingPtyBackend` construction isn't
-        // an empty box.
+        // Hidden overlay — keeps the field non-optional for remote
+        // reconnect paths but never renders for local terminals.
         let overlay: SharedOverlayState =
-            Arc::new(Mutex::new(ConnectionOverlayState::new_local_starting()));
+            Arc::new(Mutex::new(ConnectionOverlayState::new_hidden()));
         Self::with_backend_and_host_and_overlay(
             backend,
             cols,
