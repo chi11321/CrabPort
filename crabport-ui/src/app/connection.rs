@@ -26,6 +26,17 @@ impl CrabportApp {
 
     /// Create a new ConnectionFormView entity, wire its callbacks, and open it.
     pub fn open_connection_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_connection_form_with_kind(None, window, cx);
+    }
+
+    /// Like [`open_connection_form`] but pre-selects a connection type tab.
+    /// `kind = None` defaults to SSH (the form's built-in default).
+    pub fn open_connection_form_with_kind(
+        &mut self,
+        kind: Option<crate::views::sessions::ConnectionKind>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // If one is already open, just bring it to front
         if let Some(ref mut form) = self.connection_form {
             form.open(window, cx);
@@ -134,6 +145,26 @@ impl CrabportApp {
                         proxy_id,
                         group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
                         startup_command: startup_command.clone(),
+                        serial_baud_rate: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.serial_baud_rate(cx)),
+                        serial_data_bits: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.serial_data_bits(cx)),
+                        serial_parity: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.serial_parity(cx)),
+                        serial_stop_bits: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.serial_stop_bits(cx)),
+                        serial_flow_control: app
+                            .connection_form
+                            .as_ref()
+                            .and_then(|f| f.serial_flow_control(cx)),
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -182,6 +213,30 @@ impl CrabportApp {
                                 cx,
                             );
                         }
+                        ConnectionKind::Serial => {
+                            let f = app.connection_form.as_ref().unwrap();
+                            // Device path is entered in the host field.
+                            let device = f.host_text(cx);
+                            let baud = f.serial_baud_rate(cx).unwrap_or(115200);
+                            let data_bits = f.serial_data_bits(cx).unwrap_or(8);
+                            let parity = f.serial_parity(cx).unwrap_or_else(|| "none".to_string());
+                            let stop_bits = f.serial_stop_bits(cx).unwrap_or(1);
+                            let flow_control = f
+                                .serial_flow_control(cx)
+                                .unwrap_or_else(|| "none".to_string());
+                            app.add_serial_tab(
+                                &name,
+                                Some(row_id),
+                                &device,
+                                baud,
+                                data_bits,
+                                &parity,
+                                stop_bits,
+                                &flow_control,
+                                Some(&startup_command),
+                                cx,
+                            );
+                        }
                         _ => {
                             app.add_ssh_tab(
                                 &name,
@@ -205,6 +260,13 @@ impl CrabportApp {
                 });
             }
         }));
+
+        // Pre-select the connection type tab if the caller requested one.
+        // Must happen before `form.open()` so the default port is set for
+        // the right kind.
+        if let Some(k) = kind {
+            form.kind = k;
+        }
 
         form.open(window, cx);
         self.connection_form = Some(form);

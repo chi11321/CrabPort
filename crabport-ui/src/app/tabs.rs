@@ -11,6 +11,8 @@ use crate::components::button::Button;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitTree};
+use crabport_serial::backend::SerialBackend;
+use crabport_serial::session::SerialConnectionInfo;
 use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_telnet::backend::TelnetBackend;
@@ -289,6 +291,7 @@ impl CrabportApp {
                 overlay,
                 Some(info_for_view),
                 None, // no TelnetConnectionInfo for SSH
+                None, // no SerialConnectionInfo for SSH
                 id,
                 cx,
             )
@@ -501,11 +504,108 @@ impl CrabportApp {
                 overlay,
                 None,                // no SshConnectionInfo for telnet
                 Some(info_for_view), // TelnetConnectionInfo for reconnect
+                None,                // no SerialConnectionInfo for telnet
                 id,
                 cx,
             )
         });
         // Auto-close the tab when the telnet session ends.
+        let app_handle = cx.entity().clone();
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_backend_closed(move |cx| {
+                app_handle.update(cx, |app, cx| {
+                    app.close_tab(id, cx);
+                });
+            });
+        });
+
+        // Sync the split tree's active pane when this pane receives keyboard
+        // focus (e.g. via Tab cycling), so `split_active_pane` and the
+        // toolbar follow keyboard focus, not just mouse clicks.
+        self.register_pane_focus_callback(&terminal_view, cx);
+        self.register_cwd_changed_callback(&terminal_view, cx);
+
+        self.terminal_views.insert(id, terminal_view.clone());
+        self.init_split_for_tab(id, terminal_view.clone());
+
+        self.active_tab_id = id;
+        id
+    }
+
+    /// Open a Serial terminal tab. Mirrors `add_telnet_tab` but uses the
+    /// `SerialBackend` (local serial port, raw bytes, no protocol
+    /// negotiation / SFTP / tunnels). Unlike SSH/Telnet, `SerialBackend`
+    /// takes no cols/rows (serial has no terminal size — resize is a no-op).
+    /// The tab title is the device path (e.g. `/dev/ttyUSB0`).
+    pub fn add_serial_tab(
+        &mut self,
+        name: &str,
+        host_id: Option<i64>,
+        device: &str,
+        baud_rate: u32,
+        data_bits: u8,
+        parity: &str,
+        stop_bits: u8,
+        flow_control: &str,
+        startup_command: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab {
+            id,
+            title: name.to_string(),
+            kind: TabKind::Terminal,
+            is_remote: true,
+        });
+
+        let mut info = SerialConnectionInfo::new(device)
+            .with_baud_rate(baud_rate)
+            .with_data_bits(data_bits)
+            .with_parity(parity)
+            .with_stop_bits(stop_bits)
+            .with_flow_control(flow_control);
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
+        }
+        let info_for_view = info.clone();
+
+        // Serial has no host-key verification, but the connection overlay is
+        // still used for status logging ("Opening serial port …",
+        // "Connected to … @ … baud").
+        let overlay: crate::views::terminal::connection_overlay::SharedOverlayState =
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::views::terminal::connection_overlay::ConnectionOverlayState::new(),
+            ));
+        let overlay_cb = overlay.clone();
+
+        let backend = Arc::new(SerialBackend::new(
+            info,
+            Arc::new(move |msg: String| {
+                overlay_cb.lock().log(
+                    crate::views::terminal::connection_overlay::ConnectionLogLevel::Info,
+                    msg,
+                );
+            }),
+        ));
+        let terminal_view = cx.new(|cx| {
+            TerminalView::with_backend_and_host_and_overlay(
+                backend,
+                80,
+                24,
+                name.to_string(),
+                host_id,
+                overlay,
+                None,                // no SshConnectionInfo for serial
+                None,                // no TelnetConnectionInfo for serial
+                Some(info_for_view), // SerialConnectionInfo for reconnect
+                id,
+                cx,
+            )
+        });
+        // Auto-close the tab when the serial session ends.
         let app_handle = cx.entity().clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_backend_closed(move |cx| {
@@ -689,6 +789,7 @@ impl CrabportApp {
             let overlay = src.read_with(cx, |v, _| v.overlay_state());
             let ssh_info = src.read_with(cx, |v, _| v.ssh_info().cloned());
             let telnet_info = src.read_with(cx, |v, _| v.telnet_info().cloned());
+            let serial_info = src.read_with(cx, |v, _| v.serial_info().cloned());
             let tunnel_source = src.read_with(cx, |v, _| v.tunnel_source_arc());
             // Share the source pane's command history so all split panes of
             // this tab see the same list in the History panel.
@@ -706,6 +807,7 @@ impl CrabportApp {
                         overlay,
                         ssh_info,
                         telnet_info,
+                        serial_info,
                         count,
                         Some(shared_history),
                         cx,
@@ -736,6 +838,39 @@ impl CrabportApp {
                         host,
                         host_id,
                         overlay,
+                        None,
+                        Some(info),
+                        None, // no SerialConnectionInfo for telnet
+                        count,
+                        Some(shared_history),
+                        cx,
+                    )
+                })
+            } else if let Some(info) = serial_info {
+                // Serial fallback: create a new connection. Serial has no
+                // channel multiplexing, so like Telnet we open a fresh
+                // `SerialBackend` for the split pane.
+                let overlay_cb = overlay.clone();
+                let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
+                    SerialBackend::new(
+                        info.clone(),
+                        Arc::new(move |msg: String| {
+                            overlay_cb.lock().log(
+                                crate::views::terminal::connection_overlay::ConnectionLogLevel::Info,
+                                msg,
+                            );
+                        }),
+                    ),
+                );
+                cx.new(|cx| {
+                    TerminalView::with_backend_and_host_and_overlay_and_history(
+                        backend,
+                        80,
+                        24,
+                        host,
+                        host_id,
+                        overlay,
+                        None,
                         None,
                         Some(info),
                         count,

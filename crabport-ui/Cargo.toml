@@ -9,6 +9,7 @@ crabport-terminal = { path = "../crabport-terminal" }
 crabport-ssh = { path = "../crabport-ssh" }
 crabport-sftp = { path = "../crabport-sftp" }
 crabport-telnet = { path = "../crabport-telnet" }
+crabport-serial = { path = "../crabport-serial" }
 gpui = { version = "0.2", default-features = false, features = ["font-kit"] }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 parking_lot = "0.12"

@@ -13,6 +13,8 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, NamedColor},
 };
 use crabport_core::keybind::{self, KeyAction, TerminalAction};
+use crabport_serial::backend::SerialBackend;
+use crabport_serial::session::SerialConnectionInfo;
 use crabport_ssh::CrabPortTunnel;
 use crabport_ssh::backend::HostKeyInfo;
 use crabport_ssh::session::SshConnectionInfo;
@@ -142,6 +144,7 @@ pub struct TerminalView {
     count: u64,
     ssh_info: Option<SshConnectionInfo>,
     telnet_info: Option<TelnetConnectionInfo>,
+    serial_info: Option<SerialConnectionInfo>,
     on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
     /// Invoked when this pane receives keyboard focus, passing this pane's
     /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
@@ -212,7 +215,7 @@ impl TerminalView {
                     Arc::new(crabport_terminal::pty::FailedPtyBackend::new(e.to_string()))
                 }
             };
-        Self::with_backend(backend, cols, rows, None, None, count, cx)
+        Self::with_backend(backend, cols, rows, None, None, None, count, cx)
     }
 
     pub fn with_backend(
@@ -221,6 +224,7 @@ impl TerminalView {
         rows: usize,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -231,6 +235,7 @@ impl TerminalView {
             String::new(),
             ssh_info,
             telnet_info,
+            serial_info,
             count,
             cx,
         )
@@ -243,6 +248,7 @@ impl TerminalView {
         host: String,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -256,6 +262,7 @@ impl TerminalView {
             overlay,
             ssh_info,
             telnet_info,
+            serial_info,
             count,
             cx,
         )
@@ -270,6 +277,7 @@ impl TerminalView {
         overlay: SharedOverlayState,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -282,6 +290,7 @@ impl TerminalView {
             overlay,
             ssh_info,
             telnet_info,
+            serial_info,
             count,
             None,
             cx,
@@ -306,6 +315,7 @@ impl TerminalView {
         overlay: SharedOverlayState,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         shared_history: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>>,
         cx: &mut Context<Self>,
@@ -676,6 +686,7 @@ impl TerminalView {
             count,
             ssh_info,
             telnet_info,
+            serial_info,
             on_backend_closed: None,
             on_focused: None,
             on_split_request: None,
@@ -1006,6 +1017,11 @@ impl TerminalView {
         self.telnet_info.as_ref()
     }
 
+    /// Serial connection info, if this is a Serial tab.
+    pub fn serial_info(&self) -> Option<&SerialConnectionInfo> {
+        self.serial_info.as_ref()
+    }
+
     /// The shared connection-overlay state (host-key prompt, etc.).
     pub fn overlay_state(&self) -> SharedOverlayState {
         self.overlay.clone()
@@ -1072,7 +1088,7 @@ impl TerminalView {
     }
 
     pub fn reconnect(&mut self, cx: &mut Context<Self>) {
-        // Try SSH first, then telnet.
+        // Try SSH first, then Telnet, then Serial.
         let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
             if let Some(info) = self.ssh_info.clone() {
                 let verifier = crate::views::terminal::connection_overlay::make_host_key_verifier(
@@ -1094,6 +1110,14 @@ impl TerminalView {
                     info,
                     80,
                     24,
+                    Arc::new(move |msg: String| {
+                        overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
+                    }),
+                ))
+            } else if let Some(info) = self.serial_info.clone() {
+                let overlay_cb = self.overlay.clone();
+                Arc::new(SerialBackend::new(
+                    info,
                     Arc::new(move |msg: String| {
                         overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
                     }),
