@@ -1230,7 +1230,6 @@ impl PendingPtyBackend {
         let state_for_worker = state.clone();
 
         std::thread::spawn(move || {
-            tracing::debug!("pending-pty: spawning real PtyBackend on worker");
             match PtyBackend::new_with_event_tx(cols, rows, cwd, state_for_worker.event_tx.clone())
             {
                 Ok(backend) => {

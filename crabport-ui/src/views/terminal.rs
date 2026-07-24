@@ -201,20 +201,18 @@ impl TerminalView {
     pub fn new_with_cwd(count: u64, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        // Local PTY creation can fail on platforms without a usable
-        // pseudoterminal (e.g. older Windows builds without ConPTY, or
-        // headless CI hosts without a controlling TTY). Rather than panic
-        // — which aborts the whole app under the `panic = abort` release
-        // profile — surface the error in the connection overlay so the
-        // user sees what went wrong and can still use remote sessions.
-        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
-            match crabport_terminal::pty::PtyBackend::new_with_cwd(cols as u16, rows as u16, cwd) {
-                Ok(b) => Arc::new(b),
-                Err(e) => {
-                    tracing::error!("failed to create local PTY backend: {e}");
-                    Arc::new(crabport_terminal::pty::FailedPtyBackend::new(e.to_string()))
-                }
-            };
+        // Local PTY creation must stay off the UI thread: on Windows,
+        // `PtyBackend::new_with_cwd` synchronously runs `CreatePseudoConsole`
+        // + `CreateProcessW` (spawning `pwsh.exe` / `powershell.exe`), which
+        // takes 200–500 ms and would freeze the whole window. We use
+        // `PendingPtyBackend`, which returns immediately and constructs the
+        // real `PtyBackend` on a worker thread. Construction failures are
+        // surfaced by the worker itself (it broadcasts `Error` + `Closed` and
+        // flips `status()` to `Disconnected`), so the UI's connection overlay
+        // still shows the error without any synchronous fallback here.
+        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
+            crabport_terminal::pty::PendingPtyBackend::new_with_cwd(cols as u16, rows as u16, cwd),
+        );
         Self::with_backend(backend, cols, rows, None, None, None, count, cx)
     }
 

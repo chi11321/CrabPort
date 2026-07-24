@@ -1430,14 +1430,44 @@ fn shell_basename() -> Option<String> {
     #[cfg(windows)]
     {
         // Mirror `default_shell()`'s cascade without needing to share the
-        // function (it's private to `crabport_terminal`).
-        use std::process::Command;
-        if Command::new("where").arg("pwsh.exe").output().is_ok() {
+        // function (it's private to `crabport_terminal`). We must NOT spawn
+        // `where.exe` here — this runs on the UI thread when a new local
+        // terminal tab is created, and `CreateProcess(where.exe)`+
+        // PATH walk can take hundreds of milliseconds to multiple seconds
+        // (antivirus scanning, large PATH, slow disk), visibly freezing
+        // the whole window. Instead we do a pure in-process PATHEXT-aware
+        // PATH walk — same result, no child process. The result is only a
+        // first-guess tab title anyway; the PTY's `ProcessWatcher`
+        // overwrites it with the real foreground-process name once the
+        // shell is up.
+        if which_executable_on_path("pwsh.exe").is_some() {
             Some("pwsh".to_string())
-        } else if Command::new("where").arg("powershell.exe").output().is_ok() {
+        } else if which_executable_on_path("powershell.exe").is_some() {
             Some("powershell".to_string())
         } else {
             Some("cmd".to_string())
         }
     }
+}
+
+/// PATHEXT-aware PATH walk — returns `Some(())` if `program` resolves on
+/// `PATH` (or is an absolute path that exists), `None` otherwise. Mirrors
+/// `crabport_terminal::pty::which_executable` but inlined here to avoid
+/// leaking that helper across the crate boundary.
+#[cfg(windows)]
+fn which_executable_on_path(program: &str) -> Option<()> {
+    if program.contains('\\') || program.contains('/') {
+        return std::path::Path::new(program).is_file().then_some(());
+    }
+    let path = std::env::var("PATH").ok()?;
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".to_string());
+    for ext in pathext.split(';') {
+        for dir in path.split(';') {
+            let candidate = std::path::Path::new(dir).join(format!("{}{}", program, ext));
+            if candidate.is_file() {
+                return Some(());
+            }
+        }
+    }
+    None
 }
