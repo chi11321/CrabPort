@@ -1429,23 +1429,27 @@ fn shell_basename() -> Option<String> {
     }
     #[cfg(windows)]
     {
-        // Mirror `default_shell()`'s cascade without needing to share the
-        // function (it's private to `crabport_terminal`). We must NOT spawn
+        // Mirror `default_shell()`'s cascade. We must NOT spawn
         // `where.exe` here — this runs on the UI thread when a new local
         // terminal tab is created, and `CreateProcess(where.exe)`+
         // PATH walk can take hundreds of milliseconds to multiple seconds
         // (antivirus scanning, large PATH, slow disk), visibly freezing
-        // the whole window. Instead we do a pure in-process PATHEXT-aware
-        // PATH walk — same result, no child process. The result is only a
-        // first-guess tab title anyway; the PTY's `ProcessWatcher`
-        // overwrites it with the real foreground-process name once the
-        // shell is up.
+        // the whole window. Instead we check fixed absolute paths (the
+        // inbox PowerShell and cmd are at well-known locations on every
+        // Windows 10+ install) plus a pure in-process PATHEXT-aware PATH
+        // walk for `pwsh.exe` (whose install location varies). The result
+        // is only a first-guess tab title anyway; the PTY's
+        // `ProcessWatcher` overwrites it once the shell is up.
         if which_executable_on_path("pwsh.exe").is_some() {
             Some("pwsh".to_string())
-        } else if which_executable_on_path("powershell.exe").is_some() {
+        } else if std::path::Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            .is_file()
+        {
             Some("powershell".to_string())
-        } else {
+        } else if std::path::Path::new(r"C:\Windows\System32\cmd.exe").is_file() {
             Some("cmd".to_string())
+        } else {
+            None
         }
     }
 }

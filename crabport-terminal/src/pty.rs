@@ -149,16 +149,36 @@ fn default_shell() -> Option<(String, Vec<String>)> {
         // Prefer PowerShell 7+ (`pwsh.exe`) when the user has installed
         // it — it's a noticeable upgrade over the inbox Windows
         // PowerShell (faster, cross-platform, better Unicode handling).
+        // `pwsh.exe` doesn't have a single canonical install path
+        // (`C:\Program Files\PowerShell\<7|6|7-preview>\pwsh.exe`),
+        // so we still rely on PATH lookup for it. Most users who install
+        // PowerShell 7 either let the installer add its dir to PATH, or
+        // run it via `winget`/`scoop` which also adds PATH.
         if which_executable("pwsh.exe").is_some() {
             return Some(("pwsh.exe".to_string(), vec![]));
         }
-        // Fall back to inbox Windows PowerShell — always present on
-        // Windows 10+. This matches alacritty's own `tty::windows::cmdline`
-        // default (`Shell::new("powershell".to_owned(), Vec::new())`).
-        if which_executable("powershell.exe").is_some() {
-            return Some(("powershell.exe".to_string(), vec![]));
+        // Inbox Windows PowerShell — present at a well-known path on
+        // every Windows 10+ install. Don't rely on PATH here: GUI apps
+        // (especially when launched from Explorer) sometimes inherit a
+        // PATH that's missing `System32\WindowsPowerShell\v1.0`, which
+        // would silently demote the user to `cmd.exe`. The absolute path
+        // is stable across installs and SKUs, so we check it directly
+        // and pass the absolute path to alacritty's `tty::Shell`.
+        const INBOX_PWSH: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        if std::path::Path::new(INBOX_PWSH).is_file() {
+            return Some((INBOX_PWSH.to_string(), vec![]));
         }
-        // Last resort: the legacy Windows command prompt. Always present.
+        // Last resort: the legacy Windows command prompt. Also at a
+        // well-known path; check it directly so we don't depend on PATH.
+        const INBOX_CMD: &str = r"C:\Windows\System32\cmd.exe";
+        if std::path::Path::new(INBOX_CMD).is_file() {
+            return Some((INBOX_CMD.to_string(), vec![]));
+        }
+        // Truly nothing found — let alacritty's own default kick in
+        // (it also tries to spawn `powershell` then `cmd` via PATH).
+        tracing::warn!(
+            "default_shell: neither pwsh.exe on PATH, inbox powershell.exe, nor cmd.exe found"
+        );
         Some(("cmd.exe".to_string(), vec![]))
     }
     #[cfg(not(target_os = "windows"))]
