@@ -498,6 +498,23 @@ pub struct HostEntry {
     /// Empty string means no startup command.
     #[serde(default)]
     pub startup_command: String,
+    /// Serial baud rate (e.g. 115200). Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_baud_rate: Option<u32>,
+    /// Serial data bits: 5, 6, 7, or 8. Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_data_bits: Option<u8>,
+    /// Serial parity: "none", "odd", or "even". Stored as TEXT; default
+    /// "none". Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_parity: Option<String>,
+    /// Serial stop bits: 1 or 2. Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_stop_bits: Option<u8>,
+    /// Serial flow control: "none", "software", or "hardware". Stored as
+    /// TEXT; default "none". Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_flow_control: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

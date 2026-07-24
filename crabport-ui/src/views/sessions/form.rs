@@ -14,8 +14,9 @@ use crate::components::dropdown::Dropdown;
 use crate::components::input::{StyledInput, StyledPasswordInput};
 use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{duration_base, EASE_STANDARD, RADIUS_LG};
+use crate::motion::{EASE_STANDARD, RADIUS_LG, duration_base};
 use crabport_core::credential::PrivateKeyKind;
+use crabport_serial::available_ports as available_serial_ports;
 
 // ---------------------------------------------------------------------------
 // Connection type
@@ -94,6 +95,24 @@ pub struct ConnectionFormState {
     // Startup command — sent to the remote shell once the session is ready.
     // Multi-line textarea: each line becomes one command.
     pub startup_command_input: Entity<InputState>,
+    // Serial config (only used when kind == Serial). The device path is
+    // entered in the existing `host_input` (repurposed as "Device" when
+    // Serial is selected).
+    pub serial_baud_rate_input: Entity<InputState>,
+    pub serial_data_bits: u8,
+    pub serial_parity: String,
+    pub serial_stop_bits: u8,
+    pub serial_flow_control: String,
+    /// Open state for the data-bits dropdown in the Serial tab.
+    pub serial_data_bits_open: bool,
+    /// Open state for the parity dropdown in the Serial tab.
+    pub serial_parity_open: bool,
+    /// Open state for the stop-bits dropdown in the Serial tab.
+    pub serial_stop_bits_open: bool,
+    /// Open state for the flow-control dropdown in the Serial tab.
+    pub serial_flow_control_open: bool,
+    /// Open state for the serial-port selector dropdown in the Serial tab.
+    pub serial_port_open: bool,
     // Focus states
     pub name_focused: bool,
     pub host_focused: bool,
@@ -145,6 +164,11 @@ impl ConnectionFormState {
         let group_search_input = cx.new(|cx| InputState::new(window, cx));
         let startup_command_input =
             cx.new(|cx| InputState::new(window, cx).multi_line(true).rows(3));
+        let serial_baud_rate_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value("115200", window, cx);
+            state
+        });
 
         Self {
             active: false,
@@ -162,6 +186,16 @@ impl ConnectionFormState {
             proxy_url_input,
             proxy_id: None,
             startup_command_input,
+            serial_baud_rate_input,
+            serial_data_bits: 8,
+            serial_parity: "none".to_string(),
+            serial_stop_bits: 1,
+            serial_flow_control: "none".to_string(),
+            serial_data_bits_open: false,
+            serial_parity_open: false,
+            serial_stop_bits_open: false,
+            serial_flow_control_open: false,
+            serial_port_open: false,
             name_focused: false,
             host_focused: false,
             port_focused: false,
@@ -197,7 +231,7 @@ impl ConnectionFormState {
             let default_port = match self.kind {
                 ConnectionKind::SSH => "22",
                 ConnectionKind::Telnet => "23",
-                ConnectionKind::Serial => "22",
+                ConnectionKind::Serial => "",
             };
             self.port_input.update(cx, |state, cx| {
                 state.set_value(default_port, window, cx);
@@ -271,6 +305,27 @@ impl ConnectionFormState {
         self.startup_command_input.read(cx).text().to_string()
     }
 
+    pub fn serial_baud_rate(&self, cx: &App) -> Option<u32> {
+        let text = self.serial_baud_rate_input.read(cx).text().to_string();
+        text.parse::<u32>().ok()
+    }
+
+    pub fn serial_data_bits(&self, _cx: &App) -> Option<u8> {
+        Some(self.serial_data_bits)
+    }
+
+    pub fn serial_parity(&self, _cx: &App) -> Option<String> {
+        Some(self.serial_parity.clone())
+    }
+
+    pub fn serial_stop_bits(&self, _cx: &App) -> Option<u8> {
+        Some(self.serial_stop_bits)
+    }
+
+    pub fn serial_flow_control(&self, _cx: &App) -> Option<String> {
+        Some(self.serial_flow_control.clone())
+    }
+
     /// Validate the form against the required-field rules. Populates
     /// `self.errors` and returns `true` if the form is valid (no errors).
     ///
@@ -284,7 +339,7 @@ impl ConnectionFormState {
     ///   is optional).
     /// - Proxy = Custom: proxy URL is required.
     /// - Name is optional in all modes.
-    /// - Serial has no required fields yet (placeholder backend).
+    /// - Serial: the device path (host field) is required.
     pub fn validate(&mut self, cx: &App) -> bool {
         let mut errors = ValidationErrors::default();
 
@@ -295,6 +350,15 @@ impl ConnectionFormState {
             }
             if self.user_text(cx).trim().is_empty() {
                 errors.user = Some(t!("connection_form.error_user_required").into());
+            }
+        }
+
+        // Serial requires a device path (entered in the host field). Baud
+        // rate parsing is best-effort: an unparseable value falls back to
+        // the default at connect time, so it isn't a hard validation error.
+        if self.kind == ConnectionKind::Serial {
+            if self.host_text(cx).trim().is_empty() {
+                errors.host = Some(t!("connection_form.error_device_required").into());
             }
         }
 
@@ -413,6 +477,16 @@ pub struct ConnectionFormView {
     proxy_kind: ProxyKind,
     proxy_url_input: Entity<InputState>,
     startup_command_input: Entity<InputState>,
+    serial_baud_rate_input: Entity<InputState>,
+    serial_data_bits: u8,
+    serial_parity: String,
+    serial_stop_bits: u8,
+    serial_flow_control: String,
+    serial_data_bits_open: bool,
+    serial_parity_open: bool,
+    serial_stop_bits_open: bool,
+    serial_flow_control_open: bool,
+    serial_port_open: bool,
     name_focused: bool,
     host_focused: bool,
     port_focused: bool,
@@ -450,6 +524,16 @@ impl ConnectionFormView {
             proxy_kind: state.proxy_kind,
             proxy_url_input: state.proxy_url_input.clone(),
             startup_command_input: state.startup_command_input.clone(),
+            serial_baud_rate_input: state.serial_baud_rate_input.clone(),
+            serial_data_bits: state.serial_data_bits,
+            serial_parity: state.serial_parity.clone(),
+            serial_stop_bits: state.serial_stop_bits,
+            serial_flow_control: state.serial_flow_control.clone(),
+            serial_data_bits_open: state.serial_data_bits_open,
+            serial_parity_open: state.serial_parity_open,
+            serial_stop_bits_open: state.serial_stop_bits_open,
+            serial_flow_control_open: state.serial_flow_control_open,
+            serial_port_open: state.serial_port_open,
             name_focused: state.name_focused,
             host_focused: state.host_focused,
             port_focused: state.port_focused,
@@ -496,6 +580,16 @@ impl RenderOnce for ConnectionFormView {
                 self.proxy_kind,
                 self.proxy_url_input,
                 self.startup_command_input,
+                self.serial_baud_rate_input,
+                self.serial_data_bits,
+                self.serial_parity,
+                self.serial_stop_bits,
+                self.serial_flow_control,
+                self.serial_data_bits_open,
+                self.serial_parity_open,
+                self.serial_stop_bits_open,
+                self.serial_flow_control_open,
+                self.serial_port_open,
                 self.name_focused,
                 self.host_focused,
                 self.port_focused,
@@ -540,6 +634,16 @@ fn render_dialog(
     proxy_kind: ProxyKind,
     proxy_url_input: Entity<InputState>,
     startup_command_input: Entity<InputState>,
+    serial_baud_rate_input: Entity<InputState>,
+    serial_data_bits: u8,
+    serial_parity: String,
+    serial_stop_bits: u8,
+    serial_flow_control: String,
+    serial_data_bits_open: bool,
+    serial_parity_open: bool,
+    serial_stop_bits_open: bool,
+    serial_flow_control_open: bool,
+    serial_port_open: bool,
     name_focused: bool,
     host_focused: bool,
     port_focused: bool,
@@ -908,13 +1012,155 @@ fn render_dialog(
                                     t!("new_connection.serial").to_string(),
                                     div()
                                         .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_sm()
-                                        .text_color(rgb(text_muted()))
-                                        .child(t!("connection_form.coming_soon").to_string()),
+                                        .flex_col()
+                                        .gap_4()
+                                        // Serial port selector — enumerates
+                                        // available serial ports on the
+                                        // system via `serialport`. The
+                                        // selected device path is stored in
+                                        // the `host_input` field (which the
+                                        // backend reads as the device path).
+                                        .child(render_serial_port_selector(
+                                            serial_port_open,
+                                            host_input.clone(),
+                                            host_focused,
+                                            errors.host.clone(),
+                                            app.clone(),
+                                            cx,
+                                        ))
+                                        // Baud rate (text input)
+                                        .child(
+                                            div().child(
+                                                StyledInput::new(
+                                                    "serial-baud",
+                                                    serial_baud_rate_input.clone(),
+                                                )
+                                                .label(t!("connection_form.baud_rate").to_string())
+                                                .focused(false),
+                                            ),
+                                        )
+                                        // Data bits dropdown (8 / 7 / 6 / 5)
+                                        .child(render_serial_dropdown(
+                                            "serial-data-bits".to_string(),
+                                            t!("connection_form.data_bits").to_string(),
+                                            serial_data_bits_open,
+                                            vec![
+                                                ("8".to_string(), "8".to_string()),
+                                                ("7".to_string(), "7".to_string()),
+                                                ("6".to_string(), "6".to_string()),
+                                                ("5".to_string(), "5".to_string()),
+                                            ],
+                                            match serial_data_bits {
+                                                8 => 0,
+                                                7 => 1,
+                                                6 => 2,
+                                                _ => 3,
+                                            },
+                                            app.clone(),
+                                            SerialField::DataBits,
+                                        ))
+                                        // Parity dropdown (none / odd / even)
+                                        .child(render_serial_dropdown(
+                                            "serial-parity".to_string(),
+                                            t!("connection_form.parity").to_string(),
+                                            serial_parity_open,
+                                            vec![
+                                                (
+                                                    t!("connection_form.parity_none").to_string(),
+                                                    "none".to_string(),
+                                                ),
+                                                (
+                                                    t!("connection_form.parity_odd").to_string(),
+                                                    "odd".to_string(),
+                                                ),
+                                                (
+                                                    t!("connection_form.parity_even").to_string(),
+                                                    "even".to_string(),
+                                                ),
+                                            ],
+                                            match serial_parity.as_str() {
+                                                "odd" => 1,
+                                                "even" => 2,
+                                                _ => 0,
+                                            },
+                                            app.clone(),
+                                            SerialField::Parity,
+                                        ))
+                                        // Stop bits dropdown (1 / 2)
+                                        .child(render_serial_dropdown(
+                                            "serial-stop-bits".to_string(),
+                                            t!("connection_form.stop_bits").to_string(),
+                                            serial_stop_bits_open,
+                                            vec![
+                                                ("1".to_string(), "1".to_string()),
+                                                ("2".to_string(), "2".to_string()),
+                                            ],
+                                            if serial_stop_bits == 2 { 1 } else { 0 },
+                                            app.clone(),
+                                            SerialField::StopBits,
+                                        ))
+                                        // Flow control dropdown (none / software / hardware)
+                                        .child(render_serial_dropdown(
+                                            "serial-flow-control".to_string(),
+                                            t!("connection_form.flow_control").to_string(),
+                                            serial_flow_control_open,
+                                            vec![
+                                                (
+                                                    t!("connection_form.flow_none").to_string(),
+                                                    "none".to_string(),
+                                                ),
+                                                (
+                                                    t!("connection_form.flow_software").to_string(),
+                                                    "software".to_string(),
+                                                ),
+                                                (
+                                                    t!("connection_form.flow_hardware").to_string(),
+                                                    "hardware".to_string(),
+                                                ),
+                                            ],
+                                            match serial_flow_control.as_str() {
+                                                "software" => 1,
+                                                "hardware" => 2,
+                                                _ => 0,
+                                            },
+                                            app.clone(),
+                                            SerialField::FlowControl,
+                                        ))
+                                        // Startup command — sent to the serial
+                                        // device once the connection is ready.
+                                        .child(
+                                            StyledInput::new(
+                                                "serial-startup-command",
+                                                startup_command_input.clone(),
+                                            )
+                                            .label(
+                                                t!("connection_form.startup_command").to_string(),
+                                            )
+                                            .multi_line(true)
+                                            .rows(3)
+                                            .focused(startup_command_focused),
+                                        ),
                                 )
-                                .height(px(80.0)),
+                                .height(px({
+                                    let field_h = 57.0;
+                                    // device + baud + 4 dropdowns + startup
+                                    // + 16px bottom padding so the startup
+                                    // command isn't flush against the pane edge.
+                                    field_h
+                                        + 16.0
+                                        + field_h
+                                        + 16.0
+                                        + field_h
+                                        + 16.0
+                                        + field_h
+                                        + 16.0
+                                        + field_h
+                                        + 16.0
+                                        + field_h
+                                        + 16.0
+                                        + 85.0
+                                        + 16.0
+                                })),
                             )
                             .on_change({
                                 let app = app.clone();
@@ -930,7 +1176,7 @@ fn render_dialog(
                                             let new_port = match form.kind {
                                                 ConnectionKind::SSH => "22",
                                                 ConnectionKind::Telnet => "23",
-                                                ConnectionKind::Serial => "22",
+                                                ConnectionKind::Serial => "",
                                             };
                                             if cur == "22" || cur == "23" || cur.is_empty() {
                                                 form.port_input.update(cx, |state, cx| {
@@ -1075,6 +1321,193 @@ fn render_host_port_row(
                     .focused(port_focused),
             ),
         )
+}
+
+/// Which serial-config field a [`render_serial_dropdown`] dropdown controls.
+/// Used by the `on_change` / `on_toggle` callbacks to update the right field
+/// on `ConnectionFormState`.
+#[derive(Clone, Copy)]
+enum SerialField {
+    DataBits,
+    Parity,
+    StopBits,
+    FlowControl,
+}
+
+/// Render a serial-port selector dropdown. Enumerates available serial
+/// ports on the system at render time via `serialport::available_ports()`.
+/// The selected device path is written into the `host_input` field (which
+/// the backend reads as the serial device path). If no ports are found,
+/// the dropdown shows a placeholder and remains disabled.
+fn render_serial_port_selector(
+    is_open: bool,
+    host_input: Entity<InputState>,
+    _host_focused: bool,
+    host_error: Option<SharedString>,
+    app: Entity<CrabportApp>,
+    cx: &App,
+) -> impl IntoElement {
+    let ports = available_serial_ports();
+    let current_device = host_input.read(cx).text().to_string();
+
+    let label_div = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_muted()))
+        .child(t!("connection_form.serial_port").to_string())
+        .when_some(host_error, |el, e| {
+            el.child(
+                div()
+                    .text_color(rgb(input_border_error()))
+                    .text_xs()
+                    .child(e),
+            )
+        });
+
+    let selected_idx = ports.iter().position(|(name, _)| *name == current_device);
+
+    let no_ports = ports.is_empty();
+
+    let mut dropdown = Dropdown::new("serial-port-selector")
+        .placeholder(if no_ports {
+            t!("connection_form.serial_no_ports").to_string()
+        } else {
+            t!("connection_form.serial_port_none").to_string()
+        })
+        .is_open(is_open)
+        .disabled(no_ports);
+
+    for (name, desc) in &ports {
+        dropdown = dropdown.item_with_value(desc.clone(), name.clone());
+    }
+    if let Some(idx) = selected_idx {
+        dropdown = dropdown.selected(idx);
+    }
+
+    dropdown = dropdown.on_toggle({
+        let app = app.clone();
+        move |_w, cx| {
+            app.update(cx, |app, cx| {
+                if let Some(ref mut form) = app.connection_form {
+                    form.serial_port_open = !form.serial_port_open;
+                    cx.notify();
+                }
+            });
+        }
+    });
+
+    dropdown = dropdown.on_change({
+        let app = app.clone();
+        let ports = ports.clone();
+        move |idx, w, cx| {
+            let device = ports
+                .get(idx)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_default();
+            if !device.is_empty() {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.connection_form {
+                        form.host_input.update(cx, |state, cx| {
+                            state.set_value(&device, w, cx);
+                        });
+                        form.serial_port_open = false;
+                        cx.notify();
+                    }
+                });
+            }
+        }
+    });
+
+    label_div.child(dropdown)
+}
+/// parity, stop bits, or flow control). The dropdown is fully controlled —
+/// open state lives on `ConnectionFormState` and is toggled via `on_toggle`;
+/// the selected value is written back via `on_change`.
+#[allow(clippy::too_many_arguments)]
+fn render_serial_dropdown(
+    id: String,
+    label: String,
+    is_open: bool,
+    items: Vec<(String, String)>,
+    selected: usize,
+    app: Entity<CrabportApp>,
+    field: SerialField,
+) -> impl IntoElement {
+    let label_div = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_muted()))
+        .child(label);
+
+    let mut dropdown = Dropdown::new(gpui::ElementId::Name(id.into()))
+        .is_open(is_open)
+        .selected(selected);
+    for (lbl, _val) in &items {
+        dropdown = dropdown.item(lbl.clone());
+    }
+    dropdown = dropdown.on_toggle({
+        let app = app.clone();
+        move |_w, cx| {
+            app.update(cx, |app, cx| {
+                if let Some(ref mut form) = app.connection_form {
+                    match field {
+                        SerialField::DataBits => {
+                            form.serial_data_bits_open = !form.serial_data_bits_open
+                        }
+                        SerialField::Parity => form.serial_parity_open = !form.serial_parity_open,
+                        SerialField::StopBits => {
+                            form.serial_stop_bits_open = !form.serial_stop_bits_open
+                        }
+                        SerialField::FlowControl => {
+                            form.serial_flow_control_open = !form.serial_flow_control_open
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        }
+    });
+    dropdown = dropdown.on_change({
+        let app = app.clone();
+        let items = items.clone();
+        move |idx, _w, cx| {
+            let value = items.get(idx).map(|(_, v)| v.clone()).unwrap_or_default();
+            app.update(cx, |app, cx| {
+                if let Some(ref mut form) = app.connection_form {
+                    match field {
+                        SerialField::DataBits => {
+                            if let Ok(b) = value.parse::<u8>() {
+                                form.serial_data_bits = b;
+                            }
+                            form.serial_data_bits_open = false;
+                        }
+                        SerialField::Parity => {
+                            form.serial_parity = value;
+                            form.serial_parity_open = false;
+                        }
+                        SerialField::StopBits => {
+                            if let Ok(b) = value.parse::<u8>() {
+                                form.serial_stop_bits = b;
+                            }
+                            form.serial_stop_bits_open = false;
+                        }
+                        SerialField::FlowControl => {
+                            form.serial_flow_control = value;
+                            form.serial_flow_control_open = false;
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        }
+    });
+    label_div.child(dropdown)
 }
 
 fn render_buttons(

@@ -387,12 +387,24 @@ impl CrabportApp {
                             });
                         }
                         _ => {
+                            let kind = match ct {
+                                ConnectionType::SSH => {
+                                    Some(crate::views::sessions::ConnectionKind::SSH)
+                                }
+                                ConnectionType::Telnet => {
+                                    Some(crate::views::sessions::ConnectionKind::Telnet)
+                                }
+                                ConnectionType::Serial => {
+                                    Some(crate::views::sessions::ConnectionKind::Serial)
+                                }
+                                _ => None,
+                            };
                             a.update(cx, |app, _cx| {
                                 app.activate_tab(0);
                                 app.sidebar_item = SidebarItem::Sessions;
                             });
                             a.update(cx, |app, cx| {
-                                app.open_connection_form(w, cx);
+                                app.open_connection_form_with_kind(kind, w, cx);
                             });
                         }
                     }

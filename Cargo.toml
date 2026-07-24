@@ -57,6 +57,7 @@ members = [
     "crabport-tunnel",
     "crabport-proxy",
     "crabport-telnet",
+    "crabport-serial",
 ]
 
 # Single source of truth for the project version. Every member crate

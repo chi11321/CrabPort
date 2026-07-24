@@ -951,6 +951,7 @@ impl SftpTabView {
                 overlay,
                 Some(info_for_view),
                 None,
+                None, // no SerialConnectionInfo for SFTP
                 pane_id,
                 cx,
             )

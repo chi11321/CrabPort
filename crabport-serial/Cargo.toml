@@ -1,0 +1,14 @@
+[package]
+name = "crabport-serial"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crabport-terminal = { path = "../crabport-terminal" }
+crabport-core = { path = "../crabport-core" }
+serialport = { version = "4", default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "sync"] }
+async-broadcast = "0.7"
+async-channel = "2.5"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+parking_lot = "0.12"
