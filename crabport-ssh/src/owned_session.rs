@@ -21,7 +21,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crabport_terminal::terminal::RemoteStatus;
 
-use crate::backend::{TOKIO, connect_russh};
+use crate::TOKIO;
+use crate::backend::connect_russh;
 use crate::crabport_tunnel::CrabPortTunnel;
 use crate::handler::{HostKeyVerifier, SshHandler};
 use crate::keys::decode_private_key;

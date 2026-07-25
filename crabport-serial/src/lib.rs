@@ -7,7 +7,7 @@
 pub mod backend;
 pub mod session;
 
-pub use backend::{SerialBackend, TOKIO};
+pub use backend::SerialBackend;
 pub use session::SerialConnectionInfo;
 
 /// Enumerate available serial ports on the system.

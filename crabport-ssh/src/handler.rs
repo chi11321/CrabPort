@@ -207,7 +207,7 @@ impl client::Handler for SshHandler {
         // Spawn the bridge on the shared SSH tokio runtime. The handler must
         // return promptly so the russh event loop keeps draining other
         // channels.
-        crate::backend::TOKIO.spawn(async move {
+        crate::TOKIO.spawn(async move {
             let tcp = match TcpStream::connect((target_host.as_str(), target_port)).await {
                 Ok(s) => s,
                 Err(e) => {

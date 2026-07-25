@@ -21,25 +21,19 @@
 //! `BackendEvent`s to the frontend. This keeps the blocking I/O off the
 //! tokio runtime while still using async broadcast for delivery.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
 use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::RwLock;
-use tokio::runtime::Runtime;
 
+use crabport_terminal::runtime::TOKIO;
 use crabport_terminal::terminal::{
     BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus,
 };
 
 use crate::session::SerialConnectionInfo;
-
-/// Tokio runtime shared by all serial backends. The serialport crate's
-/// I/O is blocking, so we run reads on a dedicated OS thread and bridge
-/// to async via the broadcaster task spawned here.
-pub static TOKIO: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to create tokio runtime for serial"));
 
 #[derive(Debug)]
 enum Command {

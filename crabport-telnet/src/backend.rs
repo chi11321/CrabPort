@@ -25,14 +25,15 @@
 //! credentials are sent automatically (mirroring how `SshBackend` handles
 //! password auth).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
 use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{runtime::Runtime, select};
+use tokio::select;
 
+use crabport_terminal::runtime::TOKIO;
 use crabport_terminal::terminal::{
     BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus,
 };
@@ -58,16 +59,6 @@ mod opt {
     pub const TERMINAL_TYPE: u8 = 24;
     pub const NAWS: u8 = 31;
 }
-
-// ---------------------------------------------------------------------------
-// Tokio runtime (the proxy stream is tokio-based, same as SSH)
-// ---------------------------------------------------------------------------
-
-/// Tokio runtime shared by all telnet backends in this process. The proxy
-/// crate returns a tokio `AsyncRead + AsyncWrite` stream, so we need a tokio
-/// runtime to drive it — same rationale as `crabport_ssh::backend::TOKIO`.
-pub static TOKIO: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to create tokio runtime for telnet"));
 
 // ---------------------------------------------------------------------------
 // Internal command queue (frontend → backend)
