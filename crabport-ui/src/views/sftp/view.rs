@@ -286,9 +286,12 @@ impl SftpTabView {
                 Self::read_local_dir_filtered(&panel.local_cwd, panel.show_hidden);
             panel.selected.clear();
             panel.renaming = None;
-            // Remember the new cwd as the last synced path so the input
-            // overwrite guard in `sync_path_input` doesn't fight the user.
-            panel.last_synced_path = Some(panel.local_cwd.to_string_lossy().into_owned());
+            // NOTE: do NOT touch `last_synced_path` here. Leaving it at the
+            // previous cwd lets `sync_path_input` (called next render from
+            // `set_state`) see `last != actual` and overwrite the input text
+            // to match the new cwd. Setting it to the new cwd would trick the
+            // guard into thinking the input is already synced, so the text
+            // would stay stale after navigation.
             cx.notify();
         }
     }
