@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="420" viewBox="0 0 1200 420"
+     role="img" aria-labelledby="roadmap-title roadmap-desc">
+  <title id="roadmap-title">CrabPort 路线图</title>
+  <desc id="roadmap-desc">已完成：设置面板、可配置主题、SSH/Telnet/串口/本地终端连接、SFTP 文件管理、端口转发/SSH 隧道、代理连接、命令历史与片段。待办：终端会话同步、插件系统。</desc>
+
+  <rect width="1200" height="420" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="418" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+
+  <defs>
+    <symbol id="check" viewBox="0 0 16 16">
+      <circle cx="8" cy="8" r="7" fill="#6366f1"/>
+      <path d="M4.5 8.5 l2.5 2.5 l4.5 -5" fill="none" stroke="#0f1116" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="todo" viewBox="0 0 16 16">
+      <circle cx="8" cy="8" r="7" fill="none" stroke="#6b7080" stroke-width="1.6"/>
+    </symbol>
+  </defs>
+
+  <text x="48" y="50"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="16" letter-spacing="3" fill="#6366f1" font-weight="600">
+    路线图
+  </text>
+  <text x="48" y="82"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+        font-size="26" font-weight="600" fill="#e6e9ef">
+    已完成的，与接下来的
+  </text>
+
+  <!-- 左列：已完成 -->
+  <g transform="translate(48 120)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" letter-spacing="2" fill="#4ade80" font-weight="600">已完成</text>
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="19" fill="#e6e9ef">
+      <use href="#check" x="0" y="20" width="16" height="16"/>
+      <text x="28" y="34">设置面板</text>
+      <use href="#check" x="0" y="58" width="16" height="16"/>
+      <text x="28" y="72">可配置主题色彩</text>
+      <use href="#check" x="0" y="96" width="16" height="16"/>
+      <text x="28" y="110">SSH、Telnet、串口、本地终端</text>
+      <use href="#check" x="0" y="134" width="16" height="16"/>
+      <text x="28" y="148">SFTP 文件管理</text>
+      <use href="#check" x="0" y="172" width="16" height="16"/>
+      <text x="28" y="186">端口转发 / SSH 隧道</text>
+      <use href="#check" x="0" y="210" width="16" height="16"/>
+      <text x="28" y="224">代理连接</text>
+      <use href="#check" x="0" y="248" width="16" height="16"/>
+      <text x="28" y="262">命令历史与代码片段</text>
+    </g>
+  </g>
+
+  <line x1="740" y1="120" x2="740" y2="380" stroke="#23262f" stroke-width="1"/>
+
+  <!-- 右列：待办 -->
+  <g transform="translate(792 120)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" letter-spacing="2" fill="#818cf8" font-weight="600">待办</text>
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="19" fill="#c1c5d0">
+      <use href="#todo" x="0" y="20" width="16" height="16"/>
+      <text x="28" y="34">终端会话同步</text>
+      <use href="#todo" x="0" y="58" width="16" height="16"/>
+      <text x="28" y="72">插件系统</text>
+    </g>
+    <g transform="translate(0 130)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#6b7080">
+      <text x="0" y="0">// 更多在路上</text>
+      <rect x="0" y="14" width="9" height="16" fill="#c8cce4" opacity="0.5"/>
+    </g>
+  </g>
+</svg>

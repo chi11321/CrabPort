@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="600" viewBox="0 0 1200 600"
+     role="img" aria-labelledby="features-title features-desc">
+  <title id="features-title">CrabPort features</title>
+  <desc id="features-desc">A 3x3 grid of feature cards: multi-tab terminal, SFTP file panel, SSH tunnels, proxy routing, serial connections, encrypted credentials, command history and snippets, configurable themes, and a settings panel.</desc>
+
+  <rect width="1200" height="600" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="598" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+
+  <defs>
+    <symbol id="port-dot" viewBox="0 0 12 12">
+      <circle cx="6" cy="6" r="5" fill="none" stroke="#6366f1" stroke-width="1.5"/>
+      <circle cx="6" cy="6" r="2" fill="#6366f1"/>
+    </symbol>
+  </defs>
+
+  <!-- title -->
+  <text x="48" y="50"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="16" letter-spacing="3" fill="#6366f1" font-weight="600">
+    FEATURES
+  </text>
+  <text x="48" y="82"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif"
+        font-size="26" font-weight="600" fill="#e6e9ef">
+    What it does
+  </text>
+
+  <!-- 3x3 grid: card 352x150, gap 16, origin (48, 110) -->
+  <!-- Row 0 -->
+  <g transform="translate(48 110)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- terminal icon -->
+    <rect x="20" y="22" width="44" height="32" rx="6" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <text x="30" y="43" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700" fill="#4ade80">&gt;_</text>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Multi-tab terminal</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">SSH, Telnet, serial, and local</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">terminal sessions in one window.</text>
+  </g>
+
+  <g transform="translate(416 110)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- folder icon -->
+    <path d="M20 30 h18 l6 8 h20 v20 h-44 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">SFTP file panel</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Browse remote directories with</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">batch upload and download.</text>
+  </g>
+
+  <g transform="translate(784 110)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- tunnel icon: nested arrows -->
+    <path d="M24 50 h24 M36 38 l12 12 l-12 12" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M48 50 h24 M60 38 l12 12 l-12 12" fill="none" stroke="#818cf8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">SSH tunnels</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Local, Remote, and Dynamic</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">port forwarding.</text>
+  </g>
+
+  <!-- Row 1 -->
+  <g transform="translate(48 276)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- proxy diamond -->
+    <path d="M42 22 l16 16 l-16 16 l-16 -16 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
+    <circle cx="42" cy="38" r="3" fill="#6366f1"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Proxy routing</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Direct, SOCKS5, or HTTP(S),</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">configured per host.</text>
+  </g>
+
+  <g transform="translate(416 276)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- serial plug icon -->
+    <rect x="26" y="24" width="28" height="14" rx="3" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <path d="M34 38 v8 M40 38 v8 M46 38 v8" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Serial connections</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Pick a port; set baud, data bits,</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">parity, stop bits, flow control.</text>
+  </g>
+
+  <g transform="translate(784 276)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- lock icon -->
+    <rect x="26" y="34" width="28" height="20" rx="4" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <path d="M31 34 v-6 a9 9 0 0 1 18 0 v6" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <circle cx="40" cy="44" r="3" fill="#6366f1"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Encrypted credentials</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Stored locally with strong</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">encryption at rest.</text>
+  </g>
+
+  <!-- Row 2 -->
+  <g transform="translate(48 442)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- history clock icon -->
+    <circle cx="40" cy="38" r="15" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <path d="M40 30 v8 l6 4" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">History &amp; snippets</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Auto-captured, searchable,</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">one-click to run again.</text>
+  </g>
+
+  <g transform="translate(416 442)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- theme swatches -->
+    <rect x="26" y="28" width="16" height="20" rx="3" fill="#6366f1"/>
+    <rect x="44" y="28" width="16" height="20" rx="3" fill="#4ade80"/>
+    <rect x="62" y="28" width="16" height="20" rx="3" fill="#22d3ee"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Configurable themes</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Multiple built-in presets,</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">driven by config.toml.</text>
+  </g>
+
+  <g transform="translate(784 442)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <!-- gear icon -->
+    <circle cx="40" cy="38" r="10" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <path d="M40 22 v6 M40 54 v6 M24 38 h6 M54 38 h6 M29 27 l4 4 M51 49 l-4 -4 M51 27 l-4 4 M29 49 l4 -4" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">Settings panel</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">Language, theme, and</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" fill="#8b90a0">appearance, all adjustable.</text>
+  </g>
+</svg>
