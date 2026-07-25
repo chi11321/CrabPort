@@ -1466,6 +1466,7 @@ dependencies = [
  "parking_lot",
  "smol",
  "sysinfo 0.35.2",
+ "tokio",
  "tracing",
 ]
 

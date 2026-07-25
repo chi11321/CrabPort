@@ -11,5 +11,9 @@
 pub mod backend;
 pub mod session;
 
-pub use backend::{TOKIO, TelnetBackend};
+pub use backend::TelnetBackend;
+// Re-export the shared tokio runtime so existing callers using
+// `crabport_telnet::TOKIO` keep working. The runtime itself lives in
+// `crabport-terminal` so it's shared with the SSH and serial backends.
+pub use crabport_terminal::runtime::TOKIO;
 pub use session::TelnetConnectionInfo;

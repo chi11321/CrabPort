@@ -216,7 +216,7 @@ impl TunnelManager {
 
         let source = self.source.clone();
 
-        let join = crate::backend::TOKIO.spawn(async move {
+        let join = crate::TOKIO.spawn(async move {
             loop {
                 // Accept next inbound connection. Errors here are transient
                 // (e.g. EMFILE); log and continue. A real EOF on the listener
@@ -248,7 +248,7 @@ impl TunnelManager {
 
                 // Open the direct-tcpip channel and bridge. Each connection
                 // gets its own task so the accept loop stays responsive.
-                crate::backend::TOKIO.spawn(async move {
+                crate::TOKIO.spawn(async move {
                     let channel = {
                         let h = handle.lock().await;
                         match h
@@ -413,7 +413,7 @@ impl TunnelManager {
 
         let source = self.source.clone();
 
-        let join = crate::backend::TOKIO.spawn(async move {
+        let join = crate::TOKIO.spawn(async move {
             loop {
                 let (tcp, peer) = match listener.accept().await {
                     Ok(p) => p,
@@ -436,7 +436,7 @@ impl TunnelManager {
 
                 // Each SOCKS connection is handled in its own task: parse the
                 // handshake, open the channel, bridge.
-                crate::backend::TOKIO.spawn(async move {
+                crate::TOKIO.spawn(async move {
                     let (tcp, target_host, target_port) =
                         match socks5_handshake(tcp).await {
                             Ok(t) => t,

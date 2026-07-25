@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
 use async_channel::{Sender as MpscSender, unbounded};
@@ -9,10 +9,11 @@ use russh::{
     client::{self, Msg},
 };
 use tokio::task::AbortHandle;
-use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
+use tokio::{select, sync::Mutex as TokioMutex};
 
 use crabport_core::credential::{ProxyConfig, build_startup_command_bytes};
 use crabport_sftp::CrabPortSftp;
+use crabport_terminal::runtime::TOKIO;
 use crabport_terminal::terminal::{BackendEvent, RemoteMetrics, RemoteStatus};
 
 use crate::crabport_tunnel::CrabPortTunnel;
@@ -50,15 +51,6 @@ where
 // the split.
 #[allow(unused_imports)]
 pub use crate::handler::{HostKeyInfo, HostKeyVerifier, HostKeyVerifyFuture};
-
-// ---------------------------------------------------------------------------
-// Tokio runtime for russh (russh internally requires tokio)
-// ---------------------------------------------------------------------------
-
-/// Tokio runtime shared by all SSH backends in this process. russh requires
-/// a tokio runtime, so we lazily create one and reuse it across connects.
-pub static TOKIO: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to create tokio runtime for SSH"));
 
 // ---------------------------------------------------------------------------
 // Internal command queue

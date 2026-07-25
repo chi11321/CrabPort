@@ -7,7 +7,8 @@ use crabport_terminal::terminal::{
     BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus, SftpTransferKind,
 };
 
-use crate::backend::{Command, SshBackend, TOKIO};
+use crate::TOKIO;
+use crate::backend::{Command, SshBackend};
 use crate::transfer::SftpTransferHandle;
 
 impl CrabPortTerminal for SshBackend {

@@ -16,7 +16,11 @@ pub mod session;
 mod crabport_tunnel;
 mod owned_session;
 
-pub use backend::{SshBackend, TOKIO};
+pub use backend::SshBackend;
+// Re-export the shared tokio runtime so existing callers using
+// `crabport_ssh::TOKIO` keep working. The runtime itself lives in
+// `crabport-terminal` so it's shared with the telnet and serial backends.
+pub use crabport_terminal::runtime::TOKIO;
 pub use crabport_tunnel::{CrabPortTunnel, TunnelManager};
 pub use handler::{HostKeyInfo, HostKeyVerifier, HostKeyVerifyFuture, SshHandler};
 pub use owned_session::OwnedSession;
