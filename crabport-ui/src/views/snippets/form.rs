@@ -13,9 +13,7 @@
 
 use std::rc::Rc;
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
@@ -23,12 +21,10 @@ use crabport_core::credential::{GroupEntry, GroupKind};
 
 use crate::app::CrabportApp;
 use crate::app_state::AppState;
-use crate::color::*;
-use crate::components::button::Button;
-use crate::components::dropdown::Dropdown;
-use crate::components::input::StyledInput;
+use crate::components::form::{
+    form_dialog, form_footer, form_title, group_dropdown, label_block, text_field,
+};
 use crate::components::overlay::render_overlay;
-use crate::motion::{duration_base, EASE_STANDARD, RADIUS_LG};
 
 // ---------------------------------------------------------------------------
 // Output passed to the save callback
@@ -80,9 +76,6 @@ pub struct SnippetFormState {
     /// textarea. The `StyledInput` also receives `.multi_line(true).rows(5)`
     /// at render time to size the shell.
     pub command_input: Entity<InputState>,
-    // Focus states (mirrors TunnelFormState)
-    pub name_focused: bool,
-    pub command_focused: bool,
     /// Open/close animation state. `true` while the overlay is visible
     /// (drives the backdrop fade + dialog slide-in transition).
     pub open: bool,
@@ -114,8 +107,6 @@ impl SnippetFormState {
             editing_id: None,
             name_input,
             command_input,
-            name_focused: false,
-            command_focused: false,
             open: false,
             errors: SnippetValidationErrors::default(),
             favorite: false,
@@ -238,8 +229,6 @@ pub struct SnippetFormView {
     editing: bool,
     name_input: Entity<InputState>,
     command_input: Entity<InputState>,
-    name_focused: bool,
-    command_focused: bool,
     errors: SnippetValidationErrors,
     group_id: Option<i64>,
     group_dropdown_open: bool,
@@ -256,8 +245,6 @@ impl SnippetFormView {
             editing: state.editing_id.is_some(),
             name_input: state.name_input.clone(),
             command_input: state.command_input.clone(),
-            name_focused: state.name_focused,
-            command_focused: state.command_focused,
             errors: state.errors.clone(),
             group_id: state.group_id,
             group_dropdown_open: state.group_dropdown_open,
@@ -271,8 +258,6 @@ impl SnippetFormView {
 
 impl RenderOnce for SnippetFormView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let on_close_for_dialog = self.on_close.clone();
-
         // Load snippet groups from the store so newly-created groups appear
         // without a round-trip through the app state (mirrors how the tunnel
         // form receives `hosts` pre-loaded).
@@ -284,23 +269,8 @@ impl RenderOnce for SnippetFormView {
         render_overlay(
             ElementId::Name("snippet-edit-overlay".into()),
             self.open,
-            self.on_close,
-            render_dialog(
-                self.open,
-                self.editing,
-                self.name_input,
-                self.command_input,
-                self.name_focused,
-                self.command_focused,
-                self.errors,
-                self.group_id,
-                self.group_dropdown_open,
-                self.group_search_input,
-                groups,
-                self.app,
-                on_close_for_dialog,
-                self.on_save,
-            ),
+            self.on_close.clone(),
+            render_dialog(self, groups),
         )
     }
 }
@@ -309,24 +279,20 @@ impl RenderOnce for SnippetFormView {
 // Render helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn render_dialog(
-    open: bool,
-    editing: bool,
-    name_input: Entity<InputState>,
-    command_input: Entity<InputState>,
-    name_focused: bool,
-    command_focused: bool,
-    errors: SnippetValidationErrors,
-    group_id: Option<i64>,
-    group_dropdown_open: bool,
-    group_search_input: Entity<InputState>,
-    groups: Vec<GroupEntry>,
-    app: Entity<CrabportApp>,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: Option<Rc<dyn Fn(SnippetFormOutput, &mut Window, &mut App) + 'static>>,
-) -> impl IntoElement {
-    let dialog_id = ElementId::Name("snippet-edit-dialog".into());
+fn render_dialog(view: SnippetFormView, groups: Vec<GroupEntry>) -> impl IntoElement {
+    let SnippetFormView {
+        open,
+        editing,
+        name_input,
+        command_input,
+        errors,
+        group_id,
+        group_dropdown_open,
+        group_search_input,
+        app,
+        on_close,
+        on_save,
+    } = view;
 
     let title = if editing {
         t!("snippets.edit_title").to_string()
@@ -334,48 +300,16 @@ fn render_dialog(
         t!("snippets.new_button").to_string()
     };
 
-    div()
-        .id(dialog_id.clone())
-        .w(px(420.0))
-        .bg(rgb(bg_base()))
-        .border_1()
-        .border_color(rgb(border()))
-        .rounded(RADIUS_LG)
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .p_6()
-        .gap_4()
-        .opacity(0.0)
-        .mt(px(-16.0))
-        .when(open, |el| {
-            el.on_click(|_, _, cx| {
-                cx.stop_propagation();
-            })
-        })
-        .with_transition(dialog_id)
-        .transition_when_else(
-            open,
-            duration_base(),
-            EASE_STANDARD,
-            |el| el.opacity(1.0).mt_0(),
-            |el| el.opacity(0.0).mt(px(-16.0)),
-        )
+    form_dialog("snippet-edit-dialog", open, 420.0, |d| d.p_6())
         // Title
-        .child(
-            div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(text_primary()))
-                .child(title),
-        )
+        .child(form_title(title))
         // Name
-        .child(
-            StyledInput::new("snippet-edit-name", name_input)
-                .label(t!("snippets.name").to_string())
-                .focused(name_focused)
-                .when_some(errors.name.clone(), |el, e| el.error(e)),
-        )
+        .child(text_field(
+            "snippet-edit-name",
+            name_input,
+            t!("snippets.name").to_string(),
+            errors.name.clone(),
+        ))
         // Group dropdown
         .child(render_group_selector(
             group_id,
@@ -387,12 +321,14 @@ fn render_dialog(
         // Command (multi-line)
         .child(
             div().child(
-                StyledInput::new("snippet-edit-command", command_input)
-                    .label(t!("snippets.command").to_string())
-                    .multi_line(true)
-                    .rows(5)
-                    .focused(command_focused)
-                    .when_some(errors.command.clone(), |el, e| el.error(e)),
+                text_field(
+                    "snippet-edit-command",
+                    command_input,
+                    t!("snippets.command").to_string(),
+                    errors.command.clone(),
+                )
+                .multi_line(true)
+                .rows(5),
             ),
         )
         // Buttons
@@ -407,61 +343,48 @@ fn render_buttons(
     let overlay_id = ElementId::Name("snippet-edit-overlay".into());
     let dialog_id = ElementId::Name("snippet-edit-dialog".into());
 
-    div()
-        .flex()
-        .flex_row()
-        .gap_3()
-        .justify_end()
-        .child(
-            Button::new("snippet-edit-cancel")
-                .centered(true)
-                .child(t!("snippets.cancel").to_string())
-                .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_close {
-                        cb(w, cx);
-                    }
-                }),
-        )
-        .child(
-            Button::new("snippet-edit-save")
-                .primary()
-                .centered(true)
-                .child(t!("snippets.save").to_string())
-                .on_click(move |_e, w, cx| {
-                    // Reset the overlay/dialog transitions so the next open
-                    // starts fresh (mirrors tunnel form's save button).
-                    gpui_animation::reset_transition(&overlay_id);
-                    gpui_animation::reset_transition(&dialog_id);
-                    // Validate required fields before building the output. If
-                    // invalid, per-field errors are shown and the save flow is
-                    // aborted (no toast — per-field errors are sufficient).
-                    let output: Option<SnippetFormOutput> = app.update(cx, |app, cx| {
-                        let valid = app
-                            .snippet_form
-                            .as_mut()
-                            .map(|form| form.validate(cx))
-                            .unwrap_or(true);
-                        if !valid {
-                            cx.notify();
-                            return None;
-                        }
-                        app.snippet_form.as_ref().map(|form| form.output(cx))
-                    });
-                    if let Some(out) = output {
-                        if let Some(ref cb) = on_save {
-                            cb(out, w, cx);
-                        }
-                    }
-                }),
-        )
+    form_footer(
+        "snippet-edit-cancel",
+        t!("snippets.cancel").to_string(),
+        on_close,
+        "snippet-edit-save",
+        t!("snippets.save").to_string(),
+        move |_e, w, cx| {
+            // Reset the overlay/dialog transitions so the next open
+            // starts fresh (mirrors tunnel form's save button).
+            gpui_animation::reset_transition(&overlay_id);
+            gpui_animation::reset_transition(&dialog_id);
+            // Validate required fields before building the output. If
+            // invalid, per-field errors are shown and the save flow is
+            // aborted (no toast — per-field errors are sufficient).
+            let output: Option<SnippetFormOutput> = app.update(cx, |app, cx| {
+                let valid = app
+                    .snippet_form
+                    .as_mut()
+                    .map(|form| form.validate(cx))
+                    .unwrap_or(true);
+                if !valid {
+                    cx.notify();
+                    return None;
+                }
+                app.snippet_form.as_ref().map(|form| form.output(cx))
+            });
+            if let Some(out) = output {
+                if let Some(ref cb) = on_save {
+                    cb(out, w, cx);
+                }
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Group dropdown
 // ---------------------------------------------------------------------------
 
-/// Group dropdown. Items = `[connection_form.group_none] ++ groups`. Mirrors
-/// `render_host_selector` in the tunnel form.
+/// Group dropdown. Items = `[tunnel_form.group_none] ++ groups`. Mirrors
+/// `render_host_selector` in the tunnel form. Reuses the `tunnel_form.*`
+/// i18n keys and an empty-string "None" sentinel (both preserved as-is).
 fn render_group_selector(
     group_id: Option<i64>,
     dropdown_open: bool,
@@ -469,74 +392,21 @@ fn render_group_selector(
     group_search_input: Entity<InputState>,
     app: Entity<CrabportApp>,
 ) -> impl IntoElement {
-    let label_div = div()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(text_muted()))
-        .child(t!("tunnel_form.group").to_string());
-
-    // Index 0 = "None" (ungrouped); following indices map to groups[i-1].
-    let selected_idx =
-        group_id.and_then(|id| groups.iter().position(|g| g.id == id).map(|i| i + 1));
-
-    let mut dropdown = Dropdown::new("snippet-group-dropdown")
-        .placeholder(t!("tunnel_form.group").to_string())
-        .is_open(dropdown_open)
-        .searchable(group_search_input)
-        .on_create({
-            let app = app.clone();
-            move |name, _w, cx| {
-                app.update(cx, |app, cx| {
-                    let kind = crabport_core::credential::GroupKind::Snippet;
-                    if let Ok(gid) = crate::app_state::AppState::store(cx)
-                        .lock()
-                        .add_group(&name, kind, None)
-                    {
-                        if let Some(ref mut form) = app.snippet_form {
-                            form.group_id = Some(gid);
-                            form.group_dropdown_open = false;
-                            cx.notify();
-                        }
-                    }
-                });
-            }
-        })
-        .on_toggle({
-            let app = app.clone();
-            move |_w, cx| {
-                app.update(cx, |app, cx| {
-                    if let Some(ref mut form) = app.snippet_form {
-                        form.group_dropdown_open = !form.group_dropdown_open;
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .on_change({
-            let app = app.clone();
-            let groups = groups.clone();
-            move |index, _w, cx| {
-                app.update(cx, |app, cx| {
-                    if let Some(ref mut form) = app.snippet_form {
-                        form.group_id = if index == 0 {
-                            None
-                        } else {
-                            groups.get(index - 1).map(|g| g.id)
-                        };
-                        form.group_dropdown_open = false;
-                        cx.notify();
-                    }
-                });
-            }
-        });
-
-    dropdown = dropdown.item_with_value(t!("tunnel_form.group_none").to_string(), "");
-    for g in &groups {
-        dropdown = dropdown.item_with_value(g.name.clone(), g.id.to_string());
-    }
-    if let Some(idx) = selected_idx {
-        dropdown = dropdown.selected(idx);
-    }
-
-    label_div.child(dropdown)
+    label_block(t!("tunnel_form.group").to_string()).child(group_dropdown(
+        "snippet-group-dropdown",
+        t!("tunnel_form.group").to_string(),
+        t!("tunnel_form.group_none").to_string(),
+        "",
+        GroupKind::Snippet,
+        group_id,
+        dropdown_open,
+        group_search_input,
+        groups,
+        app,
+        |app| {
+            app.snippet_form
+                .as_mut()
+                .map(|f| (&mut f.group_id, &mut f.group_dropdown_open))
+        },
+    ))
 }
