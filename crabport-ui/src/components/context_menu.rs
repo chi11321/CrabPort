@@ -87,6 +87,45 @@ impl ContextMenuItem {
     }
 }
 
+/// A `.danger(true)` menu item that raises a Danger-severity confirmation
+/// alert before running `on_confirm` — the shared shape of every "Delete …"
+/// context-menu entry (rows and group headers alike).
+///
+/// `make_alert` returns `(title, description, confirm_label)` and runs when
+/// the item is *clicked* (not when the menu is built), preserving the
+/// existing i18n resolution timing. The cancel label is always
+/// `terminal.host_key_cancel`.
+pub fn confirm_delete_item(
+    label: impl Into<SharedString>,
+    alert_controller: Option<Entity<crate::components::dialog::AlertController>>,
+    make_alert: impl Fn() -> (SharedString, Option<SharedString>, SharedString) + 'static,
+    on_confirm: Rc<dyn Fn(&mut Window, &mut App)>,
+) -> ContextMenuItem {
+    use crate::components::dialog::{AlertSeverity, AlertState};
+    ContextMenuItem::new(label, move |_w, cx| {
+        let Some(ref ac) = alert_controller else {
+            return;
+        };
+        let (title, description, confirm_label) = make_alert();
+        let on_confirm = on_confirm.clone();
+        ac.update(cx, |c, cx| {
+            c.show(
+                AlertState {
+                    severity: AlertSeverity::Danger,
+                    title,
+                    description,
+                    confirm_label,
+                    cancel_label: rust_i18n::t!("terminal.host_key_cancel").to_string().into(),
+                    on_confirm: Some(on_confirm),
+                    ..AlertState::default()
+                },
+                cx,
+            );
+        });
+    })
+    .danger(true)
+}
+
 // ---------------------------------------------------------------------------
 // ContextMenuState
 // ---------------------------------------------------------------------------
