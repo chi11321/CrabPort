@@ -471,6 +471,16 @@ saved_title = "Saved as snippet"
 saved_msg = "Saved \"%{command}\" to snippets."
 save_failed_title = "Failed to save snippet"
 
+[connection_history]
+empty = "No connections yet"
+clear = "Clear"
+clear_title = "Clear connection history"
+clear_prompt = "Delete all recorded connection events? This cannot be undone."
+clear_confirm = "Clear All"
+delete = "Delete"
+status_success = "Success"
+status_failed = "Failed"
+
 [version_check.update_available]
 title = "Update available"
 message = "A new version of CrabPort is available: %{current} → %{latest}."

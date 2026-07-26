@@ -251,6 +251,7 @@ impl CrabportApp {
             cx.new(|_cx| crate::views::snippets::SnippetsView::new(app_entity.clone()));
         let tunnels_view =
             cx.new(|_cx| crate::views::tunnels::TunnelsView::new(app_entity.clone()));
+        let history_view = cx.new(|_cx| crate::views::history::HistoryView::new());
         let alert = cx.new(|_cx| AlertController::new());
         let context_menu = cx.new(|_cx| ContextMenuController::new());
         let tooltip = cx.new(|_cx| crate::components::tooltip::TooltipController::new());
@@ -311,6 +312,7 @@ impl CrabportApp {
             sessions_view,
             snippets_view,
             tunnels_view,
+            history_view,
         };
 
         Self {

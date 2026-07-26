@@ -266,17 +266,15 @@ pub fn render_content(
                     });
                     snippets_view.clone().into_any_element()
                 }
-                SidebarItem::History => div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_color(rgb(text_muted()))
-                            .child(selected.label().to_string()),
-                    )
-                    .into_any_element(),
+                SidebarItem::History => {
+                    // Push the shared overlay hosts into the view before
+                    // render (mirrors the Snippets / Tunnels arms).
+                    let history_view = &ctx.history_view;
+                    history_view.update(cx, |view, cx| {
+                        view.set_state(context_menu.clone(), alert_controller.clone(), cx);
+                    });
+                    history_view.clone().into_any_element()
+                }
             }
         }
         Some(TabKind::Terminal) => {

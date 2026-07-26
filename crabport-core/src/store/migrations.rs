@@ -117,6 +117,11 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/013_hosts_jump_host_id.sql"),
         on_error: OnError::WarnAndContinue,
     },
+    Migration {
+        name: "connection_history",
+        sql: include_str!("migrations/014_connection_history.sql"),
+        on_error: OnError::Fail,
+    },
 ];
 
 /// Bring the database up to the latest schema version.
@@ -181,11 +186,15 @@ mod tests {
                 .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(version, MIGRATIONS.len() as i64);
-            // Column from the last migration must exist (prepare fails if not).
+            // Schema from late migrations must exist (prepare fails if not).
             store
                 .db
                 .prepare("SELECT jump_host_id FROM hosts")
                 .expect("migration 13 column missing");
+            store
+                .db
+                .prepare("SELECT status, error FROM connection_history")
+                .expect("migration 14 table missing");
         }
 
         {

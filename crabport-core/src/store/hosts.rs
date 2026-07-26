@@ -220,7 +220,7 @@ impl Store {
     }
 }
 
-fn host_kind_str(k: HostKind) -> &'static str {
+pub(crate) fn host_kind_str(k: HostKind) -> &'static str {
     match k {
         HostKind::Ssh => "Ssh",
         HostKind::Telnet => "Telnet",
@@ -228,7 +228,7 @@ fn host_kind_str(k: HostKind) -> &'static str {
     }
 }
 
-fn parse_host_kind(s: &str) -> HostKind {
+pub(crate) fn parse_host_kind(s: &str) -> HostKind {
     match s {
         "Telnet" => HostKind::Telnet,
         "Serial" => HostKind::Serial,
