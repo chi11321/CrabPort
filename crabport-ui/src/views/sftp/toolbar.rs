@@ -12,7 +12,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{duration_slower, EASE_STANDARD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_slower};
 use crate::views::sftp::TransferHistoryController;
 
 // ---------------------------------------------------------------------------

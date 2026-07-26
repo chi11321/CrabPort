@@ -7,8 +7,9 @@
 //! menu, and drag-and-drop. The remote panel's SSH connection is driven
 //! by a hidden `TerminalView` (passed in via `set_state` each render).
 
-mod drag;
+pub(crate) mod drag;
 mod helpers;
+pub(crate) mod pane;
 mod panel;
 pub mod toolbar;
 pub mod transfer_history;
