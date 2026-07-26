@@ -269,6 +269,11 @@ impl CrabportApp {
         if let Some(p) = proxy_config {
             info = info.with_proxy(p);
         }
+        // Resolve the jump-host (bastion) chain, if configured on the host.
+        let jump_hosts = super::connection::resolve_jump_chain(cx, host.jump_host_id);
+        if !jump_hosts.is_empty() {
+            info = info.with_jump_hosts(jump_hosts);
+        }
 
         // The tunnel start logic touches tokio I/O (`TcpListener::bind`, the
         // SSH connect path, russh channels) so it MUST run on the shared

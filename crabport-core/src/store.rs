@@ -389,8 +389,27 @@ impl Store {
                 });
         }
 
+        // Migration 13: add `jump_host_id` to `hosts`.
+        //
+        // FK back into `hosts` — the jump host (bastion) this host connects
+        // through, mirroring OpenSSH's `ProxyJump`. `ON DELETE SET NULL` so
+        // deleting a jump host degrades its dependents to direct connections
+        // instead of cascading. NULL (the default) means direct connection.
+        // Errors are ignored — on a fresh DB the column may already exist.
+        if current < 13 {
+            let _ = self
+                .db
+                .execute_batch(
+                    "ALTER TABLE hosts ADD COLUMN jump_host_id INTEGER REFERENCES hosts(id) ON DELETE SET NULL;",
+                )
+                .map_err(|e| {
+                    tracing::warn!("store: migration 13 (hosts.jump_host_id) failed: {e}");
+                    e
+                });
+        }
+
         // Record the latest migration version
-        let latest = 12;
+        let latest = 13;
         if current < latest {
             self.db
                 .execute(

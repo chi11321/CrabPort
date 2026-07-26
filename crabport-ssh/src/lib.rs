@@ -4,6 +4,7 @@
 //! and bridges data between the terminal parser and the SSH channel.
 
 mod handler;
+mod jump;
 mod keys;
 mod monitor;
 mod terminal;

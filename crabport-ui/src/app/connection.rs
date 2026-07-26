@@ -79,6 +79,7 @@ impl CrabportApp {
                         private_key_kind,
                         proxy_config,
                         startup_command,
+                        jump_host_id,
                     ) = {
                         let f = app.connection_form.as_ref().unwrap();
                         let n = f.name_text(cx);
@@ -91,7 +92,13 @@ impl CrabportApp {
                         let (pk, pk_kind) = f.private_key_value(cx);
                         let pc = f.proxy_config(cx);
                         let sc = f.startup_command_text(cx);
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc)
+                        // Jump hosts only apply to SSH connections.
+                        let jh = if kind == ConnectionKind::SSH {
+                            f.jump_host_id
+                        } else {
+                            None
+                        };
+                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc, jh)
                     };
                     app.close_connection_form(cx);
 
@@ -165,6 +172,7 @@ impl CrabportApp {
                             .connection_form
                             .as_ref()
                             .and_then(|f| f.serial_flow_control(cx)),
+                        jump_host_id,
                     };
                     let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
 
@@ -238,6 +246,9 @@ impl CrabportApp {
                             );
                         }
                         _ => {
+                            // Resolve the jump-host (bastion) chain, if one
+                            // was selected in the form.
+                            let jump_hosts = resolve_jump_chain(cx, jump_host_id);
                             app.add_ssh_tab(
                                 &name,
                                 Some(row_id),
@@ -252,6 +263,7 @@ impl CrabportApp {
                                 passphrase_arg,
                                 proxy_config,
                                 Some(&startup_command),
+                                jump_hosts,
                                 cx,
                             );
                         }
@@ -326,6 +338,108 @@ impl CrabportApp {
         }
         valid
     }
+}
+
+/// Resolve a saved host's jump-host chain into connect-ready hop infos.
+///
+/// Follows `jump_host_id` links starting at `first_jump_id`, resolving each
+/// hop's credential + proxy, and returns the chain in CONNECTION order:
+/// index 0 is the outermost bastion (the hop we TCP-connect to first), the
+/// last entry is the hop that opens the tunnel to the actual target.
+///
+/// Guards: non-SSH hosts terminate the chain (jump hosts must be SSH), and
+/// a visited-set stops cycles (A→B→A) — the chain simply ends where the
+/// cycle would close.
+pub fn resolve_jump_chain(
+    cx: &App,
+    first_jump_id: Option<i64>,
+) -> Vec<crabport_ssh::session::JumpHostInfo> {
+    use crabport_ssh::session::JumpHostInfo;
+
+    let store = AppState::store(cx);
+    let mut chain: Vec<JumpHostInfo> = Vec::new();
+    let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut next = first_jump_id;
+
+    while let Some(id) = next {
+        if !visited.insert(id) {
+            tracing::warn!("resolve_jump_chain: cycle detected at host {id} — truncating chain");
+            break;
+        }
+        let Some(host) = store.lock().find_host(id).ok().flatten() else {
+            tracing::warn!("resolve_jump_chain: jump host {id} not found — truncating chain");
+            break;
+        };
+        if host.kind != CoreHostKind::Ssh {
+            tracing::warn!(
+                "resolve_jump_chain: jump host {id} is not an SSH host — truncating chain"
+            );
+            break;
+        }
+
+        let cred = host
+            .credential_id
+            .and_then(|cid| store.lock().find_credential(cid).ok().flatten());
+        let (password, private_key, passphrase) = match cred {
+            Some(c) if c.kind == CoreCredentialKind::Certificate => (
+                String::new(),
+                (!c.private_key.is_empty()).then(|| c.private_key.clone()),
+                (!c.secret.is_empty()).then(|| c.secret.clone()),
+            ),
+            Some(c) => (c.secret.clone(), None, None),
+            None => (String::new(), None, None),
+        };
+        let proxy = host
+            .proxy_id
+            .and_then(|pid| store.lock().find_proxy_config(pid).ok().flatten());
+
+        chain.push(JumpHostInfo {
+            host: host.host.clone(),
+            port: host.port,
+            username: host.username.clone(),
+            password,
+            private_key,
+            passphrase,
+            proxy,
+        });
+        next = host.jump_host_id;
+    }
+
+    // The walk goes from the target's own jump outward (innermost hop
+    // first); the connection is established outermost hop first — reverse.
+    chain.reverse();
+    chain
+}
+
+/// Returns true if setting `candidate_jump_id` as `host_id`'s jump host
+/// would create a cycle — i.e. the candidate's own jump chain (including
+/// the candidate itself) already passes through `host_id`.
+///
+/// The dropdown filters such candidates out up front
+/// (`render_jump_host_selector`); this is the save-time backstop for stale
+/// form state (e.g. another edit re-linked hosts while the form was open).
+pub fn jump_would_cycle(cx: &App, host_id: i64, candidate_jump_id: i64) -> bool {
+    let store = AppState::store(cx);
+    let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut cur = Some(candidate_jump_id);
+    while let Some(id) = cur {
+        if id == host_id {
+            return true;
+        }
+        if !visited.insert(id) {
+            // Pre-existing cycle that doesn't involve `host_id` — adding
+            // this link doesn't make things worse; connect-time resolution
+            // truncates it anyway.
+            return false;
+        }
+        cur = store
+            .lock()
+            .find_host(id)
+            .ok()
+            .flatten()
+            .and_then(|h| h.jump_host_id);
+    }
+    false
 }
 
 /// Persist (or update, or remove) the proxy row linked to a host.

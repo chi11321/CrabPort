@@ -19,7 +19,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control FROM hosts ORDER BY favorite DESC, last_login DESC, id",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control, jump_host_id FROM hosts ORDER BY favorite DESC, last_login DESC, id",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -36,6 +36,7 @@ impl Store {
                 let serial_parity: Option<String> = row.get(14)?;
                 let serial_stop_bits: Option<i64> = row.get(15)?;
                 let serial_flow_control: Option<String> = row.get(16)?;
+                let jump_host_id: Option<i64> = row.get(17)?;
                 Ok(HostEntry {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -54,6 +55,7 @@ impl Store {
                     serial_parity,
                     serial_stop_bits: serial_stop_bits.map(|v| v as u8),
                     serial_flow_control,
+                    jump_host_id,
                 })
             })
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -68,7 +70,7 @@ impl Store {
     pub fn add_host(&self, host: &HostEntry) -> Result<i64, StoreError> {
         self.db
             .execute(
-                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                "INSERT INTO hosts (name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control, jump_host_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     host.name,
                     host.host,
@@ -86,6 +88,7 @@ impl Store {
                     host.serial_parity,
                     host.serial_stop_bits.map(|v| v as i64),
                     host.serial_flow_control,
+                    host.jump_host_id,
                 ],
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
@@ -102,7 +105,7 @@ impl Store {
     pub fn update_host(&self, host: &HostEntry) -> Result<(), StoreError> {
         self.db
             .execute(
-                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8, proxy_id=?9, group_id=?10, startup_command=?11, serial_baud_rate=?12, serial_data_bits=?13, serial_parity=?14, serial_stop_bits=?15, serial_flow_control=?16 WHERE id=?17",
+                "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind=?6, last_login=?7, favorite=?8, proxy_id=?9, group_id=?10, startup_command=?11, serial_baud_rate=?12, serial_data_bits=?13, serial_parity=?14, serial_stop_bits=?15, serial_flow_control=?16, jump_host_id=?17 WHERE id=?18",
                 params![
                     host.name,
                     host.host,
@@ -120,6 +123,7 @@ impl Store {
                     host.serial_parity,
                     host.serial_stop_bits.map(|v| v as i64),
                     host.serial_flow_control,
+                    host.jump_host_id,
                     host.id,
                 ],
             )
@@ -131,7 +135,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control FROM hosts WHERE id=?1",
+                "SELECT id, name, host, port, username, credential_id, kind, last_login, favorite, proxy_id, group_id, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control, jump_host_id FROM hosts WHERE id=?1",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -147,6 +151,7 @@ impl Store {
             let serial_parity: Option<String> = row.get(14)?;
             let serial_stop_bits: Option<i64> = row.get(15)?;
             let serial_flow_control: Option<String> = row.get(16)?;
+            let jump_host_id: Option<i64> = row.get(17)?;
             Ok(HostEntry {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -165,6 +170,7 @@ impl Store {
                 serial_parity,
                 serial_stop_bits: serial_stop_bits.map(|v| v as u8),
                 serial_flow_control,
+                jump_host_id,
             })
         })
         .optional()

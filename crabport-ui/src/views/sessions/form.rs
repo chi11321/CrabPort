@@ -92,6 +92,16 @@ pub struct ConnectionFormState {
     /// When editing an existing host, this is the row id of the proxy currently
     /// linked to it (so we can UPDATE instead of INSERT). `None` for new hosts.
     pub proxy_id: Option<i64>,
+    // Jump host (bastion) — FK into the `hosts` table. `None` = direct
+    // connection. Only meaningful for SSH connections; the selected host
+    // must itself be an SSH host (the dropdown only lists those).
+    pub jump_host_id: Option<i64>,
+    /// Open state for the jump-host dropdown in the SSH tab.
+    pub jump_host_dropdown_open: bool,
+    /// When editing an existing host, its row id — used to exclude the host
+    /// from its own jump-host dropdown (a host can't jump through itself).
+    /// `None` for new connections.
+    pub editing_host_id: Option<i64>,
     // Startup command — sent to the remote shell once the session is ready.
     // Multi-line textarea: each line becomes one command.
     pub startup_command_input: Entity<InputState>,
@@ -185,6 +195,9 @@ impl ConnectionFormState {
             proxy_kind: ProxyKind::None,
             proxy_url_input,
             proxy_id: None,
+            jump_host_id: None,
+            jump_host_dropdown_open: false,
+            editing_host_id: None,
             startup_command_input,
             serial_baud_rate_input,
             serial_data_bits: 8,
@@ -476,6 +489,9 @@ pub struct ConnectionFormView {
     private_key_path_input: Entity<InputState>,
     proxy_kind: ProxyKind,
     proxy_url_input: Entity<InputState>,
+    jump_host_id: Option<i64>,
+    jump_host_dropdown_open: bool,
+    editing_host_id: Option<i64>,
     startup_command_input: Entity<InputState>,
     serial_baud_rate_input: Entity<InputState>,
     serial_data_bits: u8,
@@ -523,6 +539,9 @@ impl ConnectionFormView {
             private_key_path_input: state.private_key_path_input.clone(),
             proxy_kind: state.proxy_kind,
             proxy_url_input: state.proxy_url_input.clone(),
+            jump_host_id: state.jump_host_id,
+            jump_host_dropdown_open: state.jump_host_dropdown_open,
+            editing_host_id: state.editing_host_id,
             startup_command_input: state.startup_command_input.clone(),
             serial_baud_rate_input: state.serial_baud_rate_input.clone(),
             serial_data_bits: state.serial_data_bits,
@@ -579,6 +598,9 @@ impl RenderOnce for ConnectionFormView {
                 self.private_key_path_input,
                 self.proxy_kind,
                 self.proxy_url_input,
+                self.jump_host_id,
+                self.jump_host_dropdown_open,
+                self.editing_host_id,
                 self.startup_command_input,
                 self.serial_baud_rate_input,
                 self.serial_data_bits,
@@ -633,6 +655,9 @@ fn render_dialog(
     private_key_path_input: Entity<InputState>,
     proxy_kind: ProxyKind,
     proxy_url_input: Entity<InputState>,
+    jump_host_id: Option<i64>,
+    jump_host_dropdown_open: bool,
+    editing_host_id: Option<i64>,
     startup_command_input: Entity<InputState>,
     serial_baud_rate_input: Entity<InputState>,
     serial_data_bits: u8,
@@ -875,6 +900,16 @@ fn render_dialog(
                                             proxy_url_error: errors.proxy_url.clone(),
                                             app: app.clone(),
                                         })
+                                        // Jump host (bastion) selector — lists
+                                        // saved SSH hosts to route this
+                                        // connection through (ProxyJump-style).
+                                        .child(render_jump_host_selector(
+                                            jump_host_id,
+                                            jump_host_dropdown_open,
+                                            editing_host_id,
+                                            app.clone(),
+                                            cx,
+                                        ))
                                         // Startup command — sent to the remote shell
                                         // once the SSH session is ready.
                                         .child(
@@ -915,8 +950,11 @@ fn render_dialog(
                                         0.0
                                     };
                                     let proxy_h = 16.0 + 21.0 + 4.0 + 35.0 + 8.0 + proxy_pane;
+                                    // Jump-host selector: gap + label + gap +
+                                    // dropdown (mirrors the group selector).
+                                    let jump_h = 16.0 + 21.0 + 4.0 + 35.0;
                                     let startup_h = 16.0 + 85.0;
-                                    auth_h + proxy_h + startup_h
+                                    auth_h + proxy_h + jump_h + startup_h
                                 })),
                             )
                             .pane(
@@ -1286,6 +1324,121 @@ fn render_group_selector(
     dropdown = dropdown.item_with_value(t!("connection_form.group_none").to_string(), "none");
     for g in &groups {
         dropdown = dropdown.item_with_value(g.name.clone(), g.id.to_string());
+    }
+    if let Some(idx) = selected_idx {
+        dropdown = dropdown.selected(idx);
+    }
+
+    label_div.child(dropdown)
+}
+
+/// Jump-host (bastion) selector for the SSH pane. Lists every saved SSH
+/// host except those that would create a cycle with the host being edited:
+/// the host itself, and any host whose own jump chain already passes
+/// through it (if A jumps via B, then B must not offer A — nor may C offer
+/// A when A→B→C). The first item is always "None" (direct connection).
+/// Only the FK is stored on the host row — credentials/proxy of the jump
+/// host are resolved from its own entry at connect time.
+fn render_jump_host_selector(
+    jump_host_id: Option<i64>,
+    dropdown_open: bool,
+    editing_host_id: Option<i64>,
+    app: Entity<CrabportApp>,
+    cx: &App,
+) -> impl IntoElement {
+    use crate::app_state::AppState;
+    use crabport_core::credential::HostKind as CoreHostKind;
+
+    let all_hosts = AppState::store(cx).lock().hosts().unwrap_or_default();
+
+    // id → jump_host_id links for chain walking.
+    let jump_links: std::collections::HashMap<i64, Option<i64>> =
+        all_hosts.iter().map(|h| (h.id, h.jump_host_id)).collect();
+
+    // Returns true if following `start`'s jump chain (including `start`
+    // itself) reaches `target`. A visited set guards against walking a
+    // pre-existing cycle in the data forever.
+    let chain_reaches = |start: i64, target: i64| -> bool {
+        let mut visited = std::collections::HashSet::new();
+        let mut cur = Some(start);
+        while let Some(id) = cur {
+            if id == target {
+                return true;
+            }
+            if !visited.insert(id) {
+                return false;
+            }
+            cur = jump_links.get(&id).copied().flatten();
+        }
+        false
+    };
+
+    // Candidate jump hosts: saved SSH hosts whose selection would NOT
+    // create a cycle. New connections (`editing_host_id == None`) can't be
+    // referenced by anything yet, so everything qualifies.
+    let hosts: Vec<(i64, String)> = all_hosts
+        .into_iter()
+        .filter(|h| h.kind == CoreHostKind::Ssh)
+        .filter(|h| editing_host_id.is_none_or(|eid| !chain_reaches(h.id, eid)))
+        .map(|h| {
+            let label = if h.name.trim().is_empty() {
+                format!("{}@{}:{}", h.username, h.host, h.port)
+            } else {
+                h.name.clone()
+            };
+            (h.id, label)
+        })
+        .collect();
+
+    let label_div = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_muted()))
+        .child(t!("connection_form.jump_host").to_string());
+
+    // Index 0 = "None" (direct); hosts start at index 1.
+    let selected_idx =
+        jump_host_id.and_then(|id| hosts.iter().position(|(hid, _)| *hid == id).map(|i| i + 1));
+
+    let mut dropdown = Dropdown::new("conn-form-jump-host-dropdown")
+        .placeholder(t!("connection_form.jump_host_none").to_string())
+        .is_open(dropdown_open)
+        .on_toggle({
+            let app = app.clone();
+            move |_w, cx| {
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.connection_form {
+                        form.jump_host_dropdown_open = !form.jump_host_dropdown_open;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .on_change({
+            let app = app.clone();
+            let hosts = hosts.clone();
+            move |index, _w, cx| {
+                let new_jump = if index == 0 {
+                    None
+                } else {
+                    hosts.get(index - 1).map(|(id, _)| *id)
+                };
+                app.update(cx, |app, cx| {
+                    if let Some(ref mut form) = app.connection_form {
+                        form.jump_host_id = new_jump;
+                        form.jump_host_dropdown_open = false;
+                        cx.notify();
+                    }
+                });
+            }
+        });
+
+    dropdown = dropdown.item_with_value(t!("connection_form.jump_host_none").to_string(), "none");
+    for (id, label) in &hosts {
+        dropdown = dropdown.item_with_value(label.clone(), id.to_string());
     }
     if let Some(idx) = selected_idx {
         dropdown = dropdown.selected(idx);

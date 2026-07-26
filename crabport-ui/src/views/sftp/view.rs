@@ -839,6 +839,9 @@ impl SftpTabView {
             .proxy_id
             .and_then(|pid| store.lock().find_proxy_config(pid).ok().flatten());
 
+        // Resolve the jump-host (bastion) chain, if configured.
+        let jump_hosts = crate::app::connection::resolve_jump_chain(cx, host.jump_host_id);
+
         Some(ResolvedHost {
             name: host.name,
             host: host.host,
@@ -849,6 +852,7 @@ impl SftpTabView {
             passphrase: passphrase.map(|s| s.to_string()),
             proxy: proxy_config,
             startup_command: host.startup_command,
+            jump_hosts,
         })
     }
 
@@ -911,6 +915,9 @@ impl SftpTabView {
         }
         if !resolved.startup_command.is_empty() {
             info = info.with_startup_command(&resolved.startup_command);
+        }
+        if !resolved.jump_hosts.is_empty() {
+            info = info.with_jump_hosts(resolved.jump_hosts);
         }
         let info_for_view = info.clone();
         let cols: usize = 80;
@@ -1425,6 +1432,9 @@ struct ResolvedHost {
     passphrase: Option<String>,
     proxy: Option<crabport_core::credential::ProxyConfig>,
     startup_command: String,
+    /// Jump-host (bastion) chain in connection order (outermost first).
+    /// Empty means a direct connection.
+    jump_hosts: Vec<crabport_ssh::session::JumpHostInfo>,
 }
 
 impl CrabPortTab for SftpTabView {
