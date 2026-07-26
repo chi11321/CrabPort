@@ -93,31 +93,12 @@ impl AboutWindow {
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         // Slightly taller than the original single-pane About so the License
         // tab has room for a scrollable text block + dependency list.
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
-            // See `app::open_main_window` for the per-platform titlebar
-            // rationale. `appears_transparent: true` is required on Windows
-            // (not just macOS) to actually strip the system title bar;
-            // the GPUI default leaves it visible. The `title` is kept on
-            // every platform so the taskbar / window switcher / Expose all
-            // show "About CrabPort" instead of a blank name.
-            titlebar: Some(TitlebarOptions {
-                title: Some(t!("window.about.title").to_string().into()),
-                appears_transparent: true,
-                #[cfg(target_os = "macos")]
-                traffic_light_position: Some(point(px(12.0), px(14.0))),
-                ..Default::default()
-            }),
-            #[cfg(target_os = "macos")]
-            window_background: WindowBackgroundAppearance::Blurred,
-            #[cfg(target_os = "linux")]
-            window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(Size {
-                width: px(520.0),
-                height: px(360.0),
-            }),
-            ..Default::default()
-        };
+        let options = crate::windows::aux_window_options(
+            t!("window.about.title").to_string().into(),
+            size(px(640.0), px(480.0)),
+            size(px(520.0), px(360.0)),
+            cx,
+        );
 
         let version = env!("CARGO_PKG_VERSION").into();
 

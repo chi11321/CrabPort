@@ -8,6 +8,17 @@ use std::rc::Rc;
 // Button
 // ---------------------------------------------------------------------------
 
+/// Generates one `pub fn name(mut self, color: u32) -> Self` builder setter
+/// per `name => field` pair.
+macro_rules! color_setters {
+    ( $( $name:ident => $field:ident ),+ $(,)? ) => {
+        $( pub fn $name(mut self, color: u32) -> Self {
+            self.$field = color;
+            self
+        } )+
+    };
+}
+
 #[derive(IntoElement)]
 pub struct Button {
     id: ElementId,
@@ -128,35 +139,14 @@ impl Button {
 
     // -- Color overrides --
 
-    pub fn bg(mut self, color: u32) -> Self {
-        self.bg = color;
-        self
-    }
-
-    pub fn bg_hover(mut self, color: u32) -> Self {
-        self.bg_hover = color;
-        self
-    }
-
-    pub fn bg_selected(mut self, color: u32) -> Self {
-        self.bg_selected = color;
-        self
-    }
-
-    pub fn bg_disabled(mut self, color: u32) -> Self {
-        self.bg_disabled = color;
-        self
-    }
-
-    pub fn border_color(mut self, color: u32) -> Self {
-        self.border = color;
-        self
-    }
-
-    pub fn text_disabled_color(mut self, color: u32) -> Self {
-        self.text_disabled = color;
-        self
-    }
+    color_setters!(
+        bg => bg,
+        bg_hover => bg_hover,
+        bg_selected => bg_selected,
+        bg_disabled => bg_disabled,
+        border_color => border,
+        text_disabled_color => text_disabled,
+    );
 
     // -- Content & behavior --
 

@@ -66,15 +66,18 @@ fn theme_fields() -> Vec<FieldDef> {
             )+
         };
     }
+    // The four button-flavor tables share the same seven fields.
+    macro_rules! button_groups {
+        ($out:ident; $($g:ident),+ $(,)?) => {
+            $( group!($out; $g: bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled); )+
+        };
+    }
     let mut v: Vec<FieldDef> = Vec::new();
     group!(v; base: bg_base, bg_sidebar, bg_tab_bar);
     group!(v; border: border);
     group!(v; surface: surface_hover, surface_active);
     group!(v; text: text_primary, text_muted);
-    group!(v; button: bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled);
-    group!(v; button_primary: bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled);
-    group!(v; button_ghost: bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled);
-    group!(v; tab_button: bg, bg_hover, bg_selected, bg_pressed, bg_disabled, border, text_disabled);
+    button_groups!(v; button, button_primary, button_ghost, tab_button);
     group!(v; input: bg, bg_focused, bg_disabled, text_disabled, border, border_hover, border_focused, border_error, placeholder, selection);
     group!(v; command: overlay, bg, border, item_hover, item_active, group_label);
     group!(v; terminal: fg, bg, cursor, black, red, green, yellow, blue, magenta, cyan, white, bright_black, bright_red, bright_green, bright_yellow, bright_blue, bright_magenta, bright_cyan, bright_white);
@@ -128,27 +131,12 @@ impl ThemeEditorWindow {
     /// callers should normally go through [`crate::windows::focus_or_open`]
     /// for the singleton check).
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(760.0), px(820.0)), cx)),
-            // See `app::open_main_window` for the per-platform titlebar
-            // rationale (same setup as Settings/About).
-            titlebar: Some(TitlebarOptions {
-                title: Some(t!("window.theme_editor.title").to_string().into()),
-                appears_transparent: true,
-                #[cfg(target_os = "macos")]
-                traffic_light_position: Some(point(px(12.0), px(14.0))),
-                ..Default::default()
-            }),
-            #[cfg(target_os = "macos")]
-            window_background: WindowBackgroundAppearance::Blurred,
-            #[cfg(target_os = "linux")]
-            window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(Size {
-                width: px(600.0),
-                height: px(480.0),
-            }),
-            ..Default::default()
-        };
+        let options = crate::windows::aux_window_options(
+            t!("window.theme_editor.title").to_string().into(),
+            size(px(760.0), px(820.0)),
+            size(px(600.0), px(480.0)),
+            cx,
+        );
 
         cx.open_window(options, |window, cx| {
             cx.new(|cx| {
