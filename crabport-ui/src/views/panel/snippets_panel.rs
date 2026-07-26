@@ -21,19 +21,13 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::animation::TransitionExt;
-use gpui_component::input::InputState;
 use gpui_component::label::Label;
-use gpui_component::scroll::Scrollbar;
-use gpui_component::scroll::ScrollbarShow;
-use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use gpui_component::v_virtual_list;
 use rust_i18n::t;
 
+use super::scaffold::{self, PanelListState};
 use crate::color::*;
-use crate::components::input::StyledInput;
-use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_fast};
 
 /// A single saved snippet, mirroring the Store row.
 #[derive(Clone, Debug)]
@@ -44,30 +38,20 @@ pub struct Snippet {
 }
 
 /// Snippets panel view.
+#[derive(Default)]
 pub struct SnippetsPanel {
     snippets: Arc<Vec<Snippet>>,
     on_run: Option<Rc<dyn Fn(String, &mut App)>>,
     on_paste: Option<Rc<dyn Fn(String, &mut App)>>,
     /// Global tooltip host for button hover tooltips.
     tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
-    search_input: Option<Entity<InputState>>,
-    search_query: String,
-    scroll_handle: VirtualListScrollHandle,
-    hovered_row: Option<usize>,
+    /// Shared search / scroll / hover state.
+    list: PanelListState,
 }
 
 impl SnippetsPanel {
     pub fn new() -> Self {
-        Self {
-            snippets: Arc::new(Vec::new()),
-            on_run: None,
-            on_paste: None,
-            tooltip: None,
-            search_input: None,
-            search_query: String::new(),
-            scroll_handle: VirtualListScrollHandle::new(),
-            hovered_row: None,
-        }
+        Self::default()
     }
 
     /// Update the snippet list + callbacks from the active context.
@@ -84,21 +68,15 @@ impl SnippetsPanel {
         cx: &mut Context<Self>,
     ) {
         // Lazily init the search InputState on the first call.
-        if self.search_input.is_none() {
-            let entity = cx
-                .new(|cx| InputState::new(window, cx).placeholder(t!("panel.search").to_string()));
-            cx.subscribe(
-                &entity,
-                |this, input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::Change { .. } = event {
-                        this.search_query = input.read(cx).value().to_string();
-                        cx.notify();
-                    }
-                },
-            )
-            .detach();
-            self.search_input = Some(entity);
-        }
+        self.list.ensure_search_input(
+            "panel.search",
+            |this, query, cx| {
+                this.list.search_query = query;
+                cx.notify();
+            },
+            window,
+            cx,
+        );
 
         // Re-read snippets from the Store. Cheap (small table) and keeps
         // the panel in sync with saves from anywhere in the app.
@@ -127,27 +105,12 @@ impl SnippetsPanel {
         }
     }
 
-    /// The filtered view of `self.snippets` for the current `search_query`.
+    /// The filtered view of `self.snippets` for the current search query.
     /// Case-insensitive substring match on both name and command.
     fn filtered(&self) -> Vec<usize> {
-        let q = self.search_query.trim().to_lowercase();
-        if q.is_empty() {
-            return (0..self.snippets.len()).collect();
-        }
-        self.snippets
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                s.name.to_lowercase().contains(&q) || s.command.to_lowercase().contains(&q)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-}
-
-impl Default for SnippetsPanel {
-    fn default() -> Self {
-        Self::new()
+        scaffold::filter_indices(&self.snippets, &self.list.search_query, |s, q| {
+            s.name.to_lowercase().contains(q) || s.command.to_lowercase().contains(q)
+        })
     }
 }
 
@@ -157,31 +120,16 @@ const ROW_HEIGHT: f32 = 28.0;
 
 impl Render for SnippetsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let search_input = self.search_input.clone();
+        let search_input = self.list.search_input.clone();
         let on_run = self.on_run.clone();
         let on_paste = self.on_paste.clone();
         let tooltip = self.tooltip.clone();
-        let scroll_handle = self.scroll_handle.clone();
+        let scroll_handle = self.list.scroll_handle.clone();
 
         // Compute the filtered list + per-row data once per render.
-        let filtered_indices = self.filtered();
-        let filtered: Vec<Snippet> = filtered_indices
-            .iter()
-            .map(|&i| self.snippets[i].clone())
-            .collect();
-        let hovered_row = self.hovered_row;
-
-        // Pre-compute item sizes for the virtual list.
-        let item_sizes = Rc::new(
-            (0..filtered.len())
-                .map(|_| Size {
-                    width: px(0.0),
-                    height: px(ROW_HEIGHT),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let filtered_for_list = Arc::new(filtered);
-        let is_empty = filtered_for_list.is_empty();
+        let (filtered_for_list, item_sizes, is_empty) =
+            scaffold::prepare_list_items(&self.snippets, &self.filtered(), ROW_HEIGHT);
+        let hovered_row = self.list.hovered_row;
 
         let list = v_virtual_list(
             cx.entity(),
@@ -200,268 +148,93 @@ impl Render for SnippetsPanel {
                         let cmd = s.command.clone();
                         let is_hovered = hovered_row == Some(i);
                         let row_id = ElementId::Name(format!("snippet-{i}").into());
-                        let row_id_for_transition = row_id.clone();
 
                         // Run button: writes command + Enter into the active
                         // terminal, executing it immediately.
                         let cmd_for_run = cmd.clone();
                         let on_run_for_btn = on_run.clone();
-                        let tooltip_run = tooltip.clone();
-                        let run_btn = div()
-                            .id(ElementId::Name(format!("snippet-run-{i}").into()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(20.0))
-                            .rounded(px(4.0))
-                            .bg(rgba(0x00000000))
-                            .with_transition(ElementId::Name(format!("snippet-run-{i}").into()))
-                            .on_hover(move |hovered, w, cx| {
-                                if let Some(ref tc) = tooltip_run {
-                                    if *hovered {
-                                        tc.update(cx, |t, cx| {
-                                            t.show(
-                                                t!("panel.run_tooltip").to_string(),
-                                                w.mouse_position(),
-                                                cx,
-                                            );
-                                        });
-                                    } else {
-                                        tc.update(cx, |t, cx| {
-                                            t.hide(cx);
-                                        });
-                                    }
-                                }
-                            })
-                            .on_click(move |_e, _w, cx| {
+                        let run_btn = scaffold::panel_icon_button(
+                            format!("snippet-run-{i}"),
+                            20.0,
+                            false,
+                            "icons/file-terminal.svg",
+                            "panel.run_tooltip",
+                            tooltip.clone(),
+                            move |_e, _w, cx| {
                                 if let Some(cb) = on_run_for_btn.as_ref() {
                                     cb(cmd_for_run.clone(), cx);
                                 }
-                            })
-                            .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
-                                if *hovered {
-                                    el.bg(rgb(surface_hover()))
-                                } else {
-                                    el.bg(rgba(0x00000000))
-                                }
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/file-terminal.svg")
-                                    .size(px(13.0))
-                                    .text_color(rgb(text_muted())),
-                            );
+                            },
+                        );
 
                         // Paste button: writes the command text (no Enter)
                         // so the user can edit before running. Uses
                         // `write_raw` to avoid re-capturing as history.
                         let cmd_for_paste = cmd.clone();
                         let on_paste_for_btn = on_paste.clone();
-                        let tooltip_paste = tooltip.clone();
-                        let paste_btn = div()
-                            .id(ElementId::Name(format!("snippet-paste-{i}").into()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(20.0))
-                            .rounded(px(4.0))
-                            .bg(rgba(0x00000000))
-                            .with_transition(ElementId::Name(format!("snippet-paste-{i}").into()))
-                            .on_hover(move |hovered, w, cx| {
-                                if let Some(ref tc) = tooltip_paste {
-                                    if *hovered {
-                                        tc.update(cx, |t, cx| {
-                                            t.show(
-                                                t!("panel.paste_tooltip").to_string(),
-                                                w.mouse_position(),
-                                                cx,
-                                            );
-                                        });
-                                    } else {
-                                        tc.update(cx, |t, cx| {
-                                            t.hide(cx);
-                                        });
-                                    }
-                                }
-                            })
-                            .on_click(move |_e, _w, cx| {
+                        let paste_btn = scaffold::panel_icon_button(
+                            format!("snippet-paste-{i}"),
+                            20.0,
+                            false,
+                            "icons/clipboard-copy.svg",
+                            "panel.paste_tooltip",
+                            tooltip.clone(),
+                            move |_e, _w, cx| {
                                 if let Some(cb) = on_paste_for_btn.as_ref() {
                                     cb(cmd_for_paste.clone(), cx);
                                 }
-                            })
-                            .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
-                                if *hovered {
-                                    el.bg(rgb(surface_hover()))
-                                } else {
-                                    el.bg(rgba(0x00000000))
-                                }
-                            })
-                            .child(
-                                svg()
-                                    .path("icons/clipboard-copy.svg")
-                                    .size(px(13.0))
-                                    .text_color(rgb(text_muted())),
-                            );
+                            },
+                        );
 
-                        div()
-                            .id(row_id.clone())
-                            .h(px(ROW_HEIGHT))
-                            .w_full()
-                            .relative()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .rounded(px(4.0))
-                            .with_transition(row_id_for_transition)
-                            .on_hover({
-                                let entity = entity.clone();
-                                move |hovered, _w, cx| {
-                                    let _ = entity.update(cx, |view, cx| {
-                                        if *hovered {
-                                            view.hovered_row = Some(i);
-                                        } else if view.hovered_row == Some(i) {
-                                            // Only clear if we still own the
-                                            // hover — another row may have
-                                            // already claimed it (prevents
-                                            // the bottom-to-top glitch where
-                                            // `false` fires after `true`).
-                                            view.hovered_row = None;
-                                        }
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .transition_when_else(
-                                is_hovered,
-                                duration_fast(),
-                                EASE_STANDARD,
-                                |el| el.bg(rgba((surface_hover() << 8) | 0x60)),
-                                |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
-                            )
-                            // Snippet name fills the full row width so long
-                            // names don't shift when the hover buttons fade
-                            // in — the buttons overlay on top (below).
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(rgb(text_primary()))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(Label::new(if name.is_empty() {
-                                        cmd.clone()
-                                    } else {
-                                        name
-                                    })),
-                            )
-                            // Buttons: absolutely positioned over the right
-                            // edge of the row, layered above the snippet name
-                            // with a transparent background so they don't
-                            // displace the text when they fade in.
-                            .child(
-                                div()
-                                    .id(ElementId::Name(format!("snippet-btns-{i}").into()))
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .pr_2()
-                                    .bg(rgba(0x00000000))
-                                    .opacity(0.0)
-                                    .with_transition(ElementId::Name(
-                                        format!("snippet-btns-{i}").into(),
-                                    ))
-                                    .transition_when_else(
-                                        is_hovered,
-                                        duration_fast(),
-                                        EASE_STANDARD,
-                                        |el| el.opacity(1.0),
-                                        |el| el.opacity(0.0),
-                                    )
-                                    .child(run_btn)
-                                    .child(paste_btn),
-                            )
+                        scaffold::row_hover_chrome(
+                            scaffold::row_base(row_id.clone(), ROW_HEIGHT).relative(),
+                            row_id,
+                            is_hovered,
+                            entity.clone(),
+                            i,
+                            |view: &mut Self| Some(&mut view.list.hovered_row),
+                        )
+                        // Snippet name fills the full row width so long
+                        // names don't shift when the hover buttons fade
+                        // in — the buttons overlay on top (below).
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(rgb(text_primary()))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(Label::new(if name.is_empty() {
+                                    cmd.clone()
+                                } else {
+                                    name
+                                })),
+                        )
+                        // Buttons: absolutely positioned over the right
+                        // edge of the row, layered above the snippet name
+                        // with a transparent background so they don't
+                        // displace the text when they fade in.
+                        .child(scaffold::hover_button_strip(
+                            format!("snippet-btns-{i}"),
+                            is_hovered,
+                            [run_btn.into_any_element(), paste_btn.into_any_element()],
+                        ))
                     })
                     .collect::<Vec<_>>()
             },
         )
         .track_scroll(&scroll_handle);
 
-        div()
-            .h_full()
-            .w_full()
-            .min_h_0()
-            .overflow_hidden()
-            .flex()
-            .flex_col()
-            .pt_1()
-            .px_1()
-            // Search input
-            .when_some(search_input, |el, input| {
-                el.child(
-                    div().mb_1().child(
-                        StyledInput::new("snippet-search", input).xsmall().prefix(
-                            svg()
-                                .path("icons/search.svg")
-                                .size(px(12.0))
-                                .text_color(rgb(text_muted())),
-                        ),
-                    ),
-                )
-            })
-            // List + scrollbar, or empty-state placeholder.
-            .when_else(
-                is_empty,
-                |el| {
-                    el.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_color(rgb(text_muted()))
-                                    .text_sm()
-                                    .child(t!("sidebar.snippets").to_string()),
-                            ),
-                    )
-                },
-                |el| {
-                    el.child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .border_1()
-                            .border_color(rgb(border()))
-                            .bg(rgb(bg_tab_bar()))
-                            .rounded(RADIUS_MD)
-                            .overflow_hidden()
-                            .child(list)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(px(16.0))
-                                    .child(
-                                        Scrollbar::vertical(&scroll_handle)
-                                            .scrollbar_show(ScrollbarShow::Hover),
-                                    ),
-                            ),
-                    )
-                },
-            )
+        scaffold::panel_shell(
+            "snippet-search",
+            search_input,
+            scaffold::SearchRow::Bare,
+            is_empty,
+            t!("sidebar.snippets").to_string(),
+            list,
+            &scroll_handle,
+        )
     }
 }
