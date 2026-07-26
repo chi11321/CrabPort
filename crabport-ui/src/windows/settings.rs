@@ -612,7 +612,21 @@ impl SettingsWindow {
                 Section::new()
                     .header(t!("window.settings.appearance.section_theme"))
                     .desc(t!("window.settings.appearance.theme_desc"))
-                    .bare(div().w(px(240.0)).child(theme_dropdown)),
+                    .bare(div().w(px(240.0)).child(theme_dropdown))
+                    // Opens the Theme Editor window seeded from the theme
+                    // that's currently applied.
+                    .bare(
+                        Button::new("settings-edit-theme")
+                            .child(t!("window.settings.appearance.edit_theme").to_string())
+                            .w_auto()
+                            .centered(true)
+                            .on_click(|_e, _w, cx| {
+                                crate::windows::registry::focus_or_open(
+                                    crate::windows::AuxWindowKind::ThemeEditor,
+                                    cx,
+                                );
+                            }),
+                    ),
             )
             // --- Terminal font ---
             .child(

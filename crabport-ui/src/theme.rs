@@ -293,3 +293,19 @@ pub fn is_builtin(id: &str) -> bool {
         .iter()
         .any(|it| it.entry.id == id && it.entry.source == ThemeSource::Builtin)
 }
+
+/// Write `cfg` to `{data_dir}/crabport/themes/{cfg.name}.toml` and refresh
+/// the catalog so the new/updated theme is immediately selectable.
+///
+/// The caller is responsible for making `cfg.name` a filesystem-safe id (see
+/// the Theme Editor's slug sanitizer). Saving under a built-in id is allowed
+/// and overrides that built-in — same rule as hand-dropped files.
+pub fn save_custom_theme(cfg: &ThemeConfig) -> Result<PathBuf, String> {
+    let dir = themes_dir().ok_or_else(|| "no data directory available".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.toml", cfg.name));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    refresh_catalog();
+    Ok(path)
+}
