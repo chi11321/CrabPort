@@ -223,6 +223,7 @@ impl CrabportApp {
         passphrase: Option<&str>,
         proxy: Option<crabport_core::credential::ProxyConfig>,
         startup_command: Option<&str>,
+        jump_hosts: Vec<crabport_ssh::session::JumpHostInfo>,
         cx: &mut Context<Self>,
     ) -> u64 {
         let id = self.next_tab_id;
@@ -245,6 +246,9 @@ impl CrabportApp {
             if !sc.is_empty() {
                 info = info.with_startup_command(sc);
             }
+        }
+        if !jump_hosts.is_empty() {
+            info = info.with_jump_hosts(jump_hosts);
         }
         let info_for_view = info.clone();
         let cols: usize = 80;

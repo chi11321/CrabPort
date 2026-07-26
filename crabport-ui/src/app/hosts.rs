@@ -157,6 +157,11 @@ impl CrabportApp {
                 );
             }
             _ => {
+                // Resolve the jump-host (bastion) chain, if configured.
+                let jump_hosts = super::connection::resolve_jump_chain(
+                    cx,
+                    stored.as_ref().and_then(|h| h.jump_host_id),
+                );
                 self.add_ssh_tab(
                     &host.name,
                     Some(host_id),
@@ -168,6 +173,7 @@ impl CrabportApp {
                     passphrase,
                     proxy_config,
                     startup_command.as_deref(),
+                    jump_hosts,
                     cx,
                 );
             }
@@ -324,6 +330,15 @@ impl CrabportApp {
             });
         }
 
+        // Restore the jump-host selection (if any) and record the host being
+        // edited so the jump-host dropdown can exclude it (a host can't jump
+        // through itself).
+        form.editing_host_id = Some(host_id);
+        form.jump_host_id = stored_host
+            .as_ref()
+            .and_then(|h| h.jump_host_id)
+            .filter(|&jid| jid != host_id);
+
         // Restore the serial config (if any) so the user can edit it. Only
         // meaningful for `HostKind::Serial`, but harmless to copy regardless.
         if let Some(ref h) = stored_host {
@@ -462,6 +477,25 @@ impl CrabportApp {
                         serial_parity,
                         serial_stop_bits,
                         serial_flow_control,
+                        // Jump hosts only apply to SSH; drop selections that
+                        // would create a cycle (self-reference, or a chain
+                        // that already passes through this host) — the
+                        // dropdown filters these, this is the save-time
+                        // backstop for stale form state.
+                        jump_host_id: if kind == ConnectionKind::SSH {
+                            app.connection_form
+                                .as_ref()
+                                .and_then(|f| f.jump_host_id)
+                                .filter(|&jid| {
+                                    !super::connection::jump_would_cycle(
+                                        cx,
+                                        editing_host_id,
+                                        jid,
+                                    )
+                                })
+                        } else {
+                            None
+                        },
                     };
                     tracing::info!(
                         "edit_host: on_connect — editing_proxy_id={:?}, resolved_entry.proxy_id={:?}",
