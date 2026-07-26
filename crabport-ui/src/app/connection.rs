@@ -142,11 +142,7 @@ impl CrabportApp {
                         port: port_num,
                         username: username.clone(),
                         credential_id: Some(cred_id),
-                        kind: match kind {
-                            ConnectionKind::Telnet => CoreHostKind::Telnet,
-                            ConnectionKind::Serial => CoreHostKind::Serial,
-                            ConnectionKind::SSH => CoreHostKind::Ssh,
-                        },
+                        kind: kind.into(),
                         last_login: None,
                         favorite: false,
                         proxy_id,

@@ -49,6 +49,24 @@ pub struct ConnectionHost {
     pub group_id: Option<i64>,
 }
 
+impl From<crabport_core::credential::HostEntry> for ConnectionHost {
+    fn from(h: crabport_core::credential::HostEntry) -> Self {
+        ConnectionHost {
+            id: h.id,
+            name: h.name,
+            host: h.host,
+            port: h.port,
+            username: h.username,
+            kind: h.kind.into(),
+            credential_id: h.credential_id,
+            last_login: h.last_login,
+            favorite: h.favorite,
+            proxy_id: h.proxy_id,
+            group_id: h.group_id,
+        }
+    }
+}
+
 /// Hosts sidebar view.
 ///
 /// Holds its own hover state (`hovered_host_id`) so the action buttons can

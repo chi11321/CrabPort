@@ -12,8 +12,7 @@ use crate::components::host_selector::PanelSide;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
-    CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
-    PrivateKeyKind,
+    CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, PrivateKeyKind,
 };
 
 use super::CrabportApp;
@@ -41,26 +40,7 @@ impl CrabportApp {
         // Update last_login timestamp
         let _ = AppState::store(cx).lock().touch_host_login(host_id);
         if let Ok(all) = AppState::store(cx).lock().hosts() {
-            self.hosts = all
-                .into_iter()
-                .map(|h| ConnectionHost {
-                    id: h.id,
-                    name: h.name,
-                    host: h.host,
-                    port: h.port,
-                    username: h.username,
-                    kind: match h.kind {
-                        CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-                        CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-                        CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-                    },
-                    credential_id: h.credential_id,
-                    last_login: h.last_login,
-                    favorite: h.favorite,
-                    proxy_id: h.proxy_id,
-                    group_id: h.group_id,
-                })
-                .collect();
+            self.hosts = all.into_iter().map(ConnectionHost::from).collect();
         }
 
         // Try to resolve password and private key from linked credential
@@ -249,11 +229,7 @@ impl CrabportApp {
         // Restore the connection type so the form opens on the correct tab
         // (SSH / Telnet / Serial). Without this the form always defaults to
         // SSH and a saved Telnet host would appear as SSH when edited.
-        form.kind = match h.kind {
-            crate::views::sessions::ConnectionKind::SSH => ConnectionKind::SSH,
-            crate::views::sessions::ConnectionKind::Telnet => ConnectionKind::Telnet,
-            crate::views::sessions::ConnectionKind::Serial => ConnectionKind::Serial,
-        };
+        form.kind = h.kind;
 
         form.name_input.update(cx, |state, cx| {
             state.set_value(&h.name, window, cx);
@@ -459,11 +435,7 @@ impl CrabportApp {
                         port: port_num,
                         username: username.clone(),
                         credential_id: Some(new_cred_id),
-                        kind: match kind {
-                            ConnectionKind::Telnet => CoreHostKind::Telnet,
-                            ConnectionKind::Serial => CoreHostKind::Serial,
-                            ConnectionKind::SSH => CoreHostKind::Ssh,
-                        },
+                        kind: kind.into(),
                         last_login: None,
                         favorite: editing_favorite,
                         proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),

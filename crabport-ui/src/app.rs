@@ -32,7 +32,6 @@ use crate::views::sessions::ConnectionFormState;
 use crate::views::sessions::ConnectionHost;
 use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
-use crabport_core::credential::HostKind as CoreHostKind;
 use crabport_core::{config, config::StartupPage};
 
 // ---- MainAppHandle: process-global weak handle to the main CrabportApp ----
@@ -268,23 +267,7 @@ impl CrabportApp {
             .hosts()
             .unwrap_or_default()
             .into_iter()
-            .map(|h| ConnectionHost {
-                id: h.id,
-                name: h.name,
-                host: h.host,
-                port: h.port,
-                username: h.username,
-                kind: match h.kind {
-                    CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-                    CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-                    CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-                },
-                credential_id: h.credential_id,
-                last_login: h.last_login,
-                favorite: h.favorite,
-                proxy_id: h.proxy_id,
-                group_id: h.group_id,
-            })
+            .map(ConnectionHost::from)
             .collect();
 
         // Load persisted tunnel configs from the store. Tunnels start in the

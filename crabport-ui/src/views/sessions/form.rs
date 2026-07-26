@@ -28,6 +28,30 @@ pub enum ConnectionKind {
     Serial,
 }
 
+// The UI-side kind and the store's `HostKind` are a bijection; keep the
+// two conversions here so call sites stop hand-rolling 3-arm matches.
+impl From<crabport_core::credential::HostKind> for ConnectionKind {
+    fn from(kind: crabport_core::credential::HostKind) -> Self {
+        use crabport_core::credential::HostKind;
+        match kind {
+            HostKind::Ssh => ConnectionKind::SSH,
+            HostKind::Telnet => ConnectionKind::Telnet,
+            HostKind::Serial => ConnectionKind::Serial,
+        }
+    }
+}
+
+impl From<ConnectionKind> for crabport_core::credential::HostKind {
+    fn from(kind: ConnectionKind) -> Self {
+        use crabport_core::credential::HostKind;
+        match kind {
+            ConnectionKind::SSH => HostKind::Ssh,
+            ConnectionKind::Telnet => HostKind::Telnet,
+            ConnectionKind::Serial => HostKind::Serial,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthKind {
     Password,
