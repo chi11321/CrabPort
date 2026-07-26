@@ -1,5 +1,5 @@
 use crate::color::*;
-use crate::motion::{DURATION_BASE, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_SM, RADIUS_XS};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, RADIUS_SM, RADIUS_XS, duration_base, duration_slow};
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 use std::rc::Rc;
@@ -125,7 +125,7 @@ impl RenderOnce for SegmentedControl {
             let target = DefiniteLength::Fraction(i as f32 * seg_width);
             spacer = spacer.transition_when_else(
                 active == i,
-                DURATION_SLOW,
+                duration_slow(),
                 EASE_STANDARD,
                 move |state| state.w(target),
                 |state| state,
@@ -200,7 +200,7 @@ impl RenderOnce for SegmentedControl {
                     }))
                     .bg(rgba(0x24273a00))
                     .with_transition(tab_id)
-                    .transition_on_hover(DURATION_BASE, EASE_STANDARD, move |hovered, state| {
+                    .transition_on_hover(duration_base(), EASE_STANDARD, move |hovered, state| {
                         if *hovered {
                             state.bg(rgba(0x24273a80))
                         } else {
@@ -209,7 +209,7 @@ impl RenderOnce for SegmentedControl {
                     })
                     .transition_when_else(
                         is_active,
-                        DURATION_BASE,
+                        duration_base(),
                         EASE_STANDARD,
                         move |state| state.text_color(rgb(active_color)),
                         move |state| state.text_color(rgb(inactive_color)),

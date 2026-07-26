@@ -7,7 +7,8 @@ use crabport_terminal::terminal::{
     BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus, SftpTransferKind,
 };
 
-use crate::backend::{Command, SshBackend, TOKIO};
+use crate::TOKIO;
+use crate::backend::{Command, SshBackend};
 use crate::transfer::SftpTransferHandle;
 
 impl CrabPortTerminal for SshBackend {
@@ -290,6 +291,34 @@ impl CrabPortTerminal for SshBackend {
                     })
                     .await;
             }
+        });
+    }
+
+    fn sftp_mkdir(&self, remote_path: &str) {
+        // Reuse the SftpTransferHandle so we get the cached session + event
+        // sink. There's no actual transfer, but we emit a `SftpTransferFinished`
+        // so the existing UI finish handling (listing refresh on success,
+        // toast on failure) applies.
+        let backend = SftpTransferHandle {
+            handle: self.handle.clone(),
+            sftp_session: self.sftp_session.clone(),
+            event_tx: Some(self.event_tx.clone()),
+        };
+        let event_tx = self.event_tx.clone();
+        let remote_path = remote_path.to_string();
+        self.spawn_transfer(async move {
+            let result = crate::transfer::sftp_mkdir_impl(&backend, &remote_path).await;
+            let (success, message) = match result {
+                Ok(()) => (true, format!("created directory {remote_path}")),
+                Err(e) => (false, format!("mkdir failed: {e}")),
+            };
+            let _ = event_tx
+                .broadcast(BackendEvent::SftpTransferFinished {
+                    kind: SftpTransferKind::Mkdir,
+                    success,
+                    message,
+                })
+                .await;
         });
     }
 

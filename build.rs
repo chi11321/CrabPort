@@ -28,4 +28,9 @@ fn main() {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn main() {}
+fn main() {
+    // Re-run if the macOS Info.plist extension changes — it's merged
+    // into the generated Info.plist by `cargo-bundle`, but `cargo-bundle`
+    // runs outside of cargo's dependency tracking so we have to opt in.
+    println!("cargo:rerun-if-changed=Info.plist.ext");
+}

@@ -27,7 +27,7 @@ use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, DURATION_INSTANT, EASE_STANDARD, RADIUS_MD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, RADIUS_SM, duration_base, duration_instant};
 
 // ---------------------------------------------------------------------------
 // ContextMenuItem
@@ -85,6 +85,45 @@ impl ContextMenuItem {
         self.divider_after = true;
         self
     }
+}
+
+/// A `.danger(true)` menu item that raises a Danger-severity confirmation
+/// alert before running `on_confirm` — the shared shape of every "Delete …"
+/// context-menu entry (rows and group headers alike).
+///
+/// `make_alert` returns `(title, description, confirm_label)` and runs when
+/// the item is *clicked* (not when the menu is built), preserving the
+/// existing i18n resolution timing. The cancel label is always
+/// `terminal.host_key_cancel`.
+pub fn confirm_delete_item(
+    label: impl Into<SharedString>,
+    alert_controller: Option<Entity<crate::components::dialog::AlertController>>,
+    make_alert: impl Fn() -> (SharedString, Option<SharedString>, SharedString) + 'static,
+    on_confirm: Rc<dyn Fn(&mut Window, &mut App)>,
+) -> ContextMenuItem {
+    use crate::components::dialog::{AlertSeverity, AlertState};
+    ContextMenuItem::new(label, move |_w, cx| {
+        let Some(ref ac) = alert_controller else {
+            return;
+        };
+        let (title, description, confirm_label) = make_alert();
+        let on_confirm = on_confirm.clone();
+        ac.update(cx, |c, cx| {
+            c.show(
+                AlertState {
+                    severity: AlertSeverity::Danger,
+                    title,
+                    description,
+                    confirm_label,
+                    cancel_label: rust_i18n::t!("terminal.host_key_cancel").to_string().into(),
+                    on_confirm: Some(on_confirm),
+                    ..AlertState::default()
+                },
+                cx,
+            );
+        });
+    })
+    .danger(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +388,7 @@ fn render_context_menu(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
@@ -380,7 +419,7 @@ fn render_context_menu(
                 .with_transition(menu_id)
                 .transition_when_else(
                     open,
-                    DURATION_BASE,
+                    duration_base(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),
@@ -479,7 +518,7 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         // eases in/out on mouse enter/leave. `DURATION_BASE` (150ms) is
         // deliberately slightly slower than the old `DURATION_FAST`
         // (100ms) so the hover feels perceptible rather than snapping.
-        .transition_on_hover(DURATION_BASE, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_base(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg)
             } else {
@@ -494,7 +533,7 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
         // value each render.
         .transition_when_else(
             disabled,
-            DURATION_INSTANT,
+            duration_instant(),
             EASE_STANDARD,
             move |state| state.text_color(rgb(muted_color)),
             move |state| state.text_color(rgb(label_color)),

@@ -1,5 +1,5 @@
 use crate::color::*;
-use crate::motion::{DURATION_FAST, DURATION_SLOW, EASE_STANDARD, RADIUS_MD, RADIUS_XS};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, RADIUS_XS, duration_fast, duration_slow};
 use gpui::{prelude::FluentBuilder, *};
 use gpui_animation::animation::TransitionExt;
 use std::rc::Rc;
@@ -7,6 +7,17 @@ use std::rc::Rc;
 // ---------------------------------------------------------------------------
 // Button
 // ---------------------------------------------------------------------------
+
+/// Generates one `pub fn name(mut self, color: u32) -> Self` builder setter
+/// per `name => field` pair.
+macro_rules! color_setters {
+    ( $( $name:ident => $field:ident ),+ $(,)? ) => {
+        $( pub fn $name(mut self, color: u32) -> Self {
+            self.$field = color;
+            self
+        } )+
+    };
+}
 
 #[derive(IntoElement)]
 pub struct Button {
@@ -128,35 +139,14 @@ impl Button {
 
     // -- Color overrides --
 
-    pub fn bg(mut self, color: u32) -> Self {
-        self.bg = color;
-        self
-    }
-
-    pub fn bg_hover(mut self, color: u32) -> Self {
-        self.bg_hover = color;
-        self
-    }
-
-    pub fn bg_selected(mut self, color: u32) -> Self {
-        self.bg_selected = color;
-        self
-    }
-
-    pub fn bg_disabled(mut self, color: u32) -> Self {
-        self.bg_disabled = color;
-        self
-    }
-
-    pub fn border_color(mut self, color: u32) -> Self {
-        self.border = color;
-        self
-    }
-
-    pub fn text_disabled_color(mut self, color: u32) -> Self {
-        self.text_disabled = color;
-        self
-    }
+    color_setters!(
+        bg => bg,
+        bg_hover => bg_hover,
+        bg_selected => bg_selected,
+        bg_disabled => bg_disabled,
+        border_color => border,
+        text_disabled_color => text_disabled,
+    );
 
     // -- Content & behavior --
 
@@ -389,7 +379,7 @@ impl RenderOnce for Button {
                             .bg(rgb(surface_active())),
                     )
                     .with_transition(close_opacity_id)
-                    .transition_on_hover(DURATION_FAST, EASE_STANDARD, |hovered, el| {
+                    .transition_on_hover(duration_fast(), EASE_STANDARD, |hovered, el| {
                         if *hovered {
                             el.opacity(1.)
                         } else {
@@ -430,12 +420,12 @@ impl RenderOnce for Button {
                     })
                     .transition_when_else(
                         self.selected.unwrap_or_default(),
-                        DURATION_SLOW,
+                        duration_slow(),
                         EASE_STANDARD,
                         move |this| this.bg(to_color(bg_selected)),
                         move |this| this.bg(to_color(bg)),
                     )
-                    .transition_on_hover(DURATION_SLOW, EASE_STANDARD, move |hovered, this| {
+                    .transition_on_hover(duration_slow(), EASE_STANDARD, move |hovered, this| {
                         if *hovered {
                             this.bg(to_color(bg_hover))
                         } else {

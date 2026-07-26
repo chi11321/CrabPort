@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -12,12 +13,13 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, NamedColor},
 };
 use crabport_core::keybind::{self, KeyAction, TerminalAction};
+use crabport_serial::backend::SerialBackend;
+use crabport_serial::session::SerialConnectionInfo;
 use crabport_ssh::CrabPortTunnel;
 use crabport_ssh::backend::HostKeyInfo;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_telnet::backend::TelnetBackend;
 use crabport_telnet::session::TelnetConnectionInfo;
-use crabport_terminal::pty::{FailedPtyBackend, PtyBackend};
 use crabport_terminal::terminal::{
     CrabPortMonitor, RemoteStatus, SftpTransferBytes, SftpTransferKind, SftpTransferStage,
     TerminalSession,
@@ -142,7 +144,16 @@ pub struct TerminalView {
     count: u64,
     ssh_info: Option<SshConnectionInfo>,
     telnet_info: Option<TelnetConnectionInfo>,
+    serial_info: Option<SerialConnectionInfo>,
     on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
+    /// Invoked exactly once per connection attempt when the attempt
+    /// resolves: `(true, None)` on the first `Connected` status, or
+    /// `(false, error)` when the backend errors/closes before ever
+    /// connecting (`error` is `None` when the channel closed without an
+    /// error message). The app uses it to record the attempt in the
+    /// persistent connection history. Mirrors the `on_backend_closed`
+    /// callback pattern. Reconnects fire it again (one event per attempt).
+    on_connection_result: Option<Rc<dyn Fn(bool, Option<String>, &mut App)>>,
     /// Invoked when this pane receives keyboard focus, passing this pane's
     /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
     /// and the toolbar follow keyboard focus, not just mouse clicks.
@@ -169,6 +180,14 @@ pub struct TerminalView {
     /// app can surface a toast notification. Mirrors the
     /// `on_sftp_progress_changed` / `on_backend_closed` callback pattern.
     on_sftp_transfer_finished: Option<Rc<dyn Fn(SftpTransferKind, bool, String, &mut App)>>,
+    /// Invoked when the shell's cwd changes (detected via OSC 7 escape
+    /// sequences emitted by shell integration). The app uses this to
+    /// update the tab title to reflect the live cwd. Mirrors the
+    /// `on_backend_closed` callback pattern. The callback receives the
+    /// pane's tab id (the `count` passed to `new`/`with_backend...`), the
+    /// new cwd, and the foreground process name (e.g. `zsh`, `cargo`), so
+    /// the app can find the right tab to update its title.
+    on_cwd_changed: Option<Rc<dyn Fn(u64, std::path::PathBuf, String, &mut App)>>,
     /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
     /// session. Used by the Tunnels panel to start "borrowed" tunnels that
     /// reuse this tab's SSH connection instead of opening a dedicated owned
@@ -178,66 +197,42 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
+        Self::new_with_cwd(count, None, cx)
+    }
+
+    /// Like [`new`](Self::new) but spawns the local PTY child shell in
+    /// `cwd` when given. Used by the macOS "Open in CrabPort" entry
+    /// point (Finder folder right-click / `crabport://` URL scheme) so
+    /// the terminal tab opens already cd'd into the user-selected
+    /// folder, instead of the GUI app's default cwd (`/` on macOS).
+    /// `None` is equivalent to [`new`](Self::new).
+    pub fn new_with_cwd(count: u64, cwd: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let cols: usize = 80;
         let rows: usize = 24;
-        // Local PTY creation can fail on platforms without a usable
-        // pseudoterminal (e.g. older Windows builds without ConPTY, or
-        // headless CI hosts without a controlling TTY). Rather than panic
-        // — which aborts the whole app under the `panic = abort` release
-        // profile — surface the error in the connection overlay so the
-        // user sees what went wrong and can still use remote sessions.
-        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
-            match PtyBackend::new(cols as u16, rows as u16) {
-                Ok(b) => Arc::new(b),
-                Err(e) => {
-                    tracing::error!("failed to create local PTY backend: {e}");
-                    Arc::new(FailedPtyBackend::new(e.to_string()))
-                }
-            };
-        Self::with_backend(backend, cols, rows, None, None, count, cx)
-    }
-
-    pub fn with_backend(
-        backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
-        cols: usize,
-        rows: usize,
-        ssh_info: Option<SshConnectionInfo>,
-        telnet_info: Option<TelnetConnectionInfo>,
-        count: u64,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::with_backend_and_host(
-            backend,
-            cols,
-            rows,
-            String::new(),
-            ssh_info,
-            telnet_info,
-            count,
-            cx,
-        )
-    }
-
-    pub fn with_backend_and_host(
-        backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
-        cols: usize,
-        rows: usize,
-        host: String,
-        ssh_info: Option<SshConnectionInfo>,
-        telnet_info: Option<TelnetConnectionInfo>,
-        count: u64,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let overlay = Arc::new(Mutex::new(ConnectionOverlayState::new()));
+        // Local PTY creation must stay off the UI thread: on Windows,
+        // `PtyBackend::new_with_cwd` synchronously runs `CreatePseudoConsole`
+        // + `CreateProcessW` (spawning `pwsh.exe` / `powershell.exe`), which
+        // takes 200–500 ms and would freeze the whole window. We use
+        // `PendingPtyBackend`, which returns immediately and constructs the
+        // real `PtyBackend` on a worker thread. Construction failures are
+        // surfaced by the worker itself (it broadcasts `Error` + `Closed` and
+        // flips `status()` to `Disconnected`), so the UI's connection overlay
+        // still shows the error without any synchronous fallback here.
+        let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
+            crabport_terminal::pty::PendingPtyBackend::new_with_cwd(cols as u16, rows as u16, cwd),
+        );
+        // Local terminal: empty host label, no persisted host id, a fresh
+        // overlay (drives the PTY-startup spinner), and no connection info.
         Self::with_backend_and_host_and_overlay(
             backend,
             cols,
             rows,
-            host,
+            String::new(),
             None,
-            overlay,
-            ssh_info,
-            telnet_info,
+            Arc::new(Mutex::new(ConnectionOverlayState::new())),
+            None,
+            None,
+            None,
             count,
             cx,
         )
@@ -252,6 +247,7 @@ impl TerminalView {
         overlay: SharedOverlayState,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -264,6 +260,7 @@ impl TerminalView {
             overlay,
             ssh_info,
             telnet_info,
+            serial_info,
             count,
             None,
             cx,
@@ -288,6 +285,7 @@ impl TerminalView {
         overlay: SharedOverlayState,
         ssh_info: Option<SshConnectionInfo>,
         telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
         count: u64,
         shared_history: Option<Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>>,
         cx: &mut Context<Self>,
@@ -348,21 +346,129 @@ impl TerminalView {
         // literal) so it can be captured by the paint closure. Read to render
         // a solid cursor when focused vs. a hollow outline when not focused.
         let is_focused = Arc::new(AtomicBool::new(false));
-        let is_remote = !host.is_empty();
+
+        // Per-attempt listener tasks (backend events, wakeup/status,
+        // overlay fade-out) — one fresh set per connection attempt — plus
+        // the constructor-only ~120 Hz frame pump, which survives
+        // reconnects and is therefore spawned exactly once here.
+        Self::spawn_backend_listeners(&session, &overlay, &needs_repaint, cx);
+        Self::spawn_frame_pump(&overlay, &needs_repaint, cx);
+
+        // Shared atomics for the terminal grid scroll state. These are kept
+        // fresh by the prepaint loop (`display_offset_atomic`, …) and are also
+        // handed to the scrollbar handle so the `gpui_component::Scrollbar`
+        // widget can compute thumb size/position without taking the term lock.
+        let display_offset = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let history_size = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let visible_rows = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let scrollbar_handle = scrollbar_handle::TerminalScrollbarHandle::new_from_atomics(
+            session.clone(),
+            display_offset.clone(),
+            history_size.clone(),
+            visible_rows.clone(),
+        );
+
+        Self {
+            session,
+            backend,
+            focus_handle,
+            font_size,
+            line_height,
+            cell_width,
+            applied_font_signature: None,
+            last_bounds: Arc::new(Mutex::new(None)),
+            selection: Arc::new(Mutex::new(None)),
+            render_cache: Arc::new(Mutex::new(RenderCache::default())),
+            needs_repaint,
+            bindings: keybind::default_bindings(),
+            pending_paste: false,
+            pending_copy: false,
+            scroll_accumulator: 0.0,
+            display_offset,
+            history_size,
+            visible_rows,
+            scrollbar_handle,
+            marked_text: Arc::new(Mutex::new(None)),
+            cursor_bounds: Arc::new(Mutex::new(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(0.0), px(0.0)),
+            ))),
+            is_focused,
+            focus_sub: None,
+            overlay,
+            remote_host: host,
+            host_id,
+            count,
+            ssh_info,
+            telnet_info,
+            serial_info,
+            on_backend_closed: None,
+            on_connection_result: None,
+            on_focused: None,
+            on_split_request: None,
+            on_context_menu: None,
+            sftp_progress: None,
+            on_sftp_progress_changed: None,
+            on_sftp_transfer_finished: None,
+            on_cwd_changed: None,
+            tunnel_source: None,
+        }
+    }
+
+    /// Spawn the per-connection-attempt listener tasks for `session`: the
+    /// backend error/close event loop, the wakeup/status loop, and the
+    /// overlay fade-out watcher. Called by the constructor and by
+    /// [`Self::reconnect`] — each connection attempt gets its own set of
+    /// listeners (the previous attempt's loops exit once their session's
+    /// channels close).
+    ///
+    /// Allocates a fresh `conn_recorded` once-flag per call so each attempt
+    /// records exactly one connection-history event.
+    ///
+    /// The ~120 Hz frame pump is deliberately NOT spawned here: it polls
+    /// the view's shared `overlay` / `needs_repaint` handles, which stay
+    /// the same across reconnects, so the constructor spawns it exactly
+    /// once via [`Self::spawn_frame_pump`] — re-spawning per reconnect
+    /// would leak one timer task per attempt.
+    fn spawn_backend_listeners(
+        session: &Arc<TerminalSession>,
+        overlay: &SharedOverlayState,
+        needs_repaint: &Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
+        // Once-flag for this connection attempt's history event: flipped by
+        // whichever listener resolves the attempt first (wakeup loop on
+        // `Connected`, backend-event loop on error/close before that).
+        let conn_recorded = Arc::new(AtomicBool::new(false));
 
         // Backend error/close events.
         let mut event_rx = session.subscribe_backend();
         let overlay_c = overlay.clone();
         let entity = cx.entity().downgrade();
+        let conn_recorded_ev = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 match event {
                     crabport_terminal::terminal::BackendEvent::Error(err) => {
-                        overlay_c.lock().log(ConnectionLogLevel::Error, err);
-                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        overlay_c.lock().log(ConnectionLogLevel::Error, err.clone());
+                        let _ = entity.update(cx, |this, cx| {
+                            // An error before the first `Connected` means the
+                            // attempt failed — record it. Post-connect errors
+                            // are no-ops here (the flag is already set).
+                            this.fire_connection_result(
+                                &conn_recorded_ev,
+                                false,
+                                Some(err.clone()),
+                                cx,
+                            );
+                            cx.notify();
+                        });
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
                         let _ = entity.update(cx, |this, cx| {
+                            // A close before the first `Connected` (and with
+                            // no prior error) is a silent connect failure.
+                            this.fire_connection_result(&conn_recorded_ev, false, None, cx);
                             if let Some(ref cb) = this.on_backend_closed {
                                 let cb = cb.clone();
                                 cx.defer(move |cx| cb(cx));
@@ -393,6 +499,7 @@ impl TerminalView {
                             crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
                             crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
                             crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
+                            crabport_terminal::terminal::SftpTransferKind::Mkdir => "Mkdir",
                         };
                         overlay_c.lock().log(level, format!("{prefix}: {message}"));
                         // Clear the live progress indicator — the transfer
@@ -462,6 +569,29 @@ impl TerminalView {
                         // so the History panel picks up the new list.
                         let _ = entity.update(cx, |_, cx| cx.notify());
                     }
+                    crabport_terminal::terminal::BackendEvent::ProcessChanged {
+                        cwd,
+                        process_name,
+                    } => {
+                        // Foreground process changed (cwd and/or name).
+                        // Forward to the app so it can update the tab title.
+                        let _ = entity.update(cx, |this, cx| {
+                            let cb = this.on_cwd_changed.clone();
+                            let tab_id = this.count;
+                            if let Some(cb) = cb {
+                                cx.defer(move |cx| cb(tab_id, cwd, process_name, cx));
+                            }
+                        });
+                    }
+                    crabport_terminal::terminal::BackendEvent::Ready => {
+                        // The backend finished async construction
+                        // (`PendingPtyBackend` installed the real
+                        // `PtyBackend`). The wakeup listener below re-reads
+                        // `monitor().status()` and flips the overlay out of
+                        // the "Connecting" spinner, so nothing to do here
+                        // but repaint so the fade-out kicks in immediately.
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -478,14 +608,29 @@ impl TerminalView {
         let history_refreshed = Arc::new(AtomicBool::new(false));
         let history_refreshed_wk = history_refreshed.clone();
         let session_for_refresh = session.clone();
+        let conn_recorded_wk = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
-                let _ = status_entity.update(cx, |this, _cx| {
+                let _ = status_entity.update(cx, |this, cx| {
+                    // A reconnect swaps `this.session` for a fresh one; this
+                    // loop belongs to a single attempt. Once superseded, go
+                    // inert (the loop exits for good when its own wakeup
+                    // channel closes) so a stale attempt can't mirror status
+                    // into the shared overlay, re-resolve the connection
+                    // result, or refresh history on a dead session.
+                    if !Arc::ptr_eq(&session_for_refresh, &this.session) {
+                        return;
+                    }
                     if let Some(m) = this.session.monitor() {
                         let new_status = m.status();
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            // First `Connected` resolves the attempt as a
+                            // success in the connection history.
+                            if new_status == RemoteStatus::Connected {
+                                this.fire_connection_result(&conn_recorded_wk, true, None, cx);
+                            }
                             // Trigger an initial TTY-history read when the
                             // connection first reaches a ready state.
                             if !history_refreshed_wk.swap(true, Ordering::AcqRel)
@@ -504,6 +649,42 @@ impl TerminalView {
         })
         .detach();
 
+        // Spawn the fade-out watcher for both remote and local terminals.
+        // For remote (SSH / Telnet) sessions it hides the overlay after the
+        // connection establishes. For local terminals it hides the overlay
+        // once `PendingPtyBackend` finishes constructing the real `PtyBackend`
+        // and `update_status(Local, ...)` flips `fade_out_started`.
+        {
+            let overlay_fade = overlay.clone();
+            let dirty_fade = needs_repaint.clone();
+            let fade_entity = cx.entity().downgrade();
+            cx.spawn(async move |_this, cx| {
+                loop {
+                    smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                    if overlay_fade.lock().fade_out_started {
+                        break;
+                    }
+                }
+                smol::Timer::after(std::time::Duration::from_millis(600)).await;
+                overlay_fade.lock().mark_hidden();
+                dirty_fade.store(true, Ordering::Release);
+                let _ = fade_entity.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+    }
+
+    /// Spawn the ~120 Hz frame pump: notifies the entity at most ~120
+    /// times a second and only when the dirty flag is set, advances the
+    /// connecting spinner's rotation, and keeps repainting while overlay
+    /// log rows are mid-fade-in. Constructor-only — see
+    /// [`Self::spawn_backend_listeners`] for why `reconnect` must not
+    /// spawn another pump. The loop exits when the entity is dropped.
+    fn spawn_frame_pump(
+        overlay: &SharedOverlayState,
+        needs_repaint: &Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
         // Frame pump: at most ~120Hz, notify only when dirty.
         let dirty_pump = needs_repaint.clone();
         let overlay_dirty_pump = overlay.clone();
@@ -563,82 +744,6 @@ impl TerminalView {
             }
         })
         .detach();
-
-        if is_remote {
-            let overlay_fade = overlay.clone();
-            let dirty_fade = needs_repaint.clone();
-            let fade_entity = cx.entity().downgrade();
-            cx.spawn(async move |_this, cx| {
-                loop {
-                    smol::Timer::after(std::time::Duration::from_millis(50)).await;
-                    if overlay_fade.lock().fade_out_started {
-                        break;
-                    }
-                }
-                smol::Timer::after(std::time::Duration::from_millis(600)).await;
-                overlay_fade.lock().mark_hidden();
-                dirty_fade.store(true, Ordering::Release);
-                let _ = fade_entity.update(cx, |_, cx| cx.notify());
-            })
-            .detach();
-        }
-
-        // Shared atomics for the terminal grid scroll state. These are kept
-        // fresh by the prepaint loop (`display_offset_atomic`, …) and are also
-        // handed to the scrollbar handle so the `gpui_component::Scrollbar`
-        // widget can compute thumb size/position without taking the term lock.
-        let display_offset = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let history_size = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let visible_rows = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let scrollbar_handle = scrollbar_handle::TerminalScrollbarHandle::new_from_atomics(
-            session.clone(),
-            display_offset.clone(),
-            history_size.clone(),
-            visible_rows.clone(),
-        );
-
-        Self {
-            session,
-            backend,
-            focus_handle,
-            font_size,
-            line_height,
-            cell_width,
-            applied_font_signature: None,
-            last_bounds: Arc::new(Mutex::new(None)),
-            selection: Arc::new(Mutex::new(None)),
-            render_cache: Arc::new(Mutex::new(RenderCache::default())),
-            needs_repaint,
-            bindings: keybind::default_bindings(),
-            pending_paste: false,
-            pending_copy: false,
-            scroll_accumulator: 0.0,
-            display_offset,
-            history_size,
-            visible_rows,
-            scrollbar_handle,
-            marked_text: Arc::new(Mutex::new(None)),
-            cursor_bounds: Arc::new(Mutex::new(Bounds::new(
-                point(px(0.0), px(0.0)),
-                size(px(0.0), px(0.0)),
-            ))),
-            is_focused,
-            focus_sub: None,
-            overlay,
-            remote_host: host,
-            host_id,
-            count,
-            ssh_info,
-            telnet_info,
-            on_backend_closed: None,
-            on_focused: None,
-            on_split_request: None,
-            on_context_menu: None,
-            sftp_progress: None,
-            on_sftp_progress_changed: None,
-            on_sftp_transfer_finished: None,
-            tunnel_source: None,
-        }
     }
 
     pub fn monitor(&self) -> Option<&dyn CrabPortMonitor> {
@@ -809,6 +914,14 @@ impl TerminalView {
         self.session.sftp_delete(remote_path);
     }
 
+    /// Create a directory on the remote host (non-recursive). Completion is
+    /// reported through the backend's event stream; on success the SFTP
+    /// listing is auto-refreshed by the terminal's `SftpTransferFinished`
+    /// handler.
+    pub fn sftp_mkdir(&self, remote_path: &str) {
+        self.backend.sftp_mkdir(remote_path);
+    }
+
     /// Rename a remote file or directory. Forwards directly to the backend
     /// (`TerminalSession` doesn't expose a wrapper yet) via the cloned
     /// `backend` `Arc`. Completion is reported through the backend's event
@@ -832,6 +945,32 @@ impl TerminalView {
 
     pub fn set_on_backend_closed(&mut self, f: impl Fn(&mut App) + 'static) {
         self.on_backend_closed = Some(Rc::new(f));
+    }
+
+    /// See [`Self::on_connection_result`]. `success` + optional error text.
+    pub fn set_on_connection_result(
+        &mut self,
+        f: impl Fn(bool, Option<String>, &mut App) + 'static,
+    ) {
+        self.on_connection_result = Some(Rc::new(f));
+    }
+
+    /// Fire `on_connection_result` for the current attempt if it hasn't
+    /// fired yet. `recorded` is the per-attempt once-flag shared by the
+    /// backend-event and wakeup listeners of that attempt.
+    fn fire_connection_result(
+        &self,
+        recorded: &Arc<AtomicBool>,
+        success: bool,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(cb) = self.on_connection_result.clone() {
+            cx.defer(move |cx| cb(success, error, cx));
+        }
     }
 
     /// The stable pane id this view was created with (passed as `count` to
@@ -863,6 +1002,16 @@ impl TerminalView {
         f: impl Fn(SftpTransferKind, bool, String, &mut App) + 'static,
     ) {
         self.on_sftp_transfer_finished = Some(Rc::new(f));
+    }
+
+    /// Sets the callback invoked when the foreground process changes (new
+    /// cwd or new process name). The callback receives this pane's tab id
+    /// (`count`), the new cwd, and the process name (e.g. `zsh`, `cargo`).
+    pub fn set_on_cwd_changed(
+        &mut self,
+        f: impl Fn(u64, std::path::PathBuf, String, &mut App) + 'static,
+    ) {
+        self.on_cwd_changed = Some(Rc::new(f));
     }
 
     /// Set the callback invoked when this pane receives keyboard focus. The
@@ -941,6 +1090,11 @@ impl TerminalView {
         self.telnet_info.as_ref()
     }
 
+    /// Serial connection info, if this is a Serial tab.
+    pub fn serial_info(&self) -> Option<&SerialConnectionInfo> {
+        self.serial_info.as_ref()
+    }
+
     /// The shared connection-overlay state (host-key prompt, etc.).
     pub fn overlay_state(&self) -> SharedOverlayState {
         self.overlay.clone()
@@ -1007,7 +1161,7 @@ impl TerminalView {
     }
 
     pub fn reconnect(&mut self, cx: &mut Context<Self>) {
-        // Try SSH first, then telnet.
+        // Try SSH first, then Telnet, then Serial.
         let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
             if let Some(info) = self.ssh_info.clone() {
                 let verifier = crate::views::terminal::connection_overlay::make_host_key_verifier(
@@ -1033,6 +1187,14 @@ impl TerminalView {
                         overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
                     }),
                 ))
+            } else if let Some(info) = self.serial_info.clone() {
+                let overlay_cb = self.overlay.clone();
+                Arc::new(SerialBackend::new(
+                    info,
+                    Arc::new(move |msg: String| {
+                        overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
+                    }),
+                ))
             } else {
                 return;
             };
@@ -1051,160 +1213,40 @@ impl TerminalView {
         let cols: usize = 80;
         let rows: usize = 24;
 
-        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
+        // Carry the command-history buffer over to the fresh session. Split
+        // panes share this `Arc` with their siblings, so the sharing must
+        // survive a reconnect; a standalone pane simply keeps the history it
+        // had before the drop.
+        let history = self.session.command_history_arc();
+        let session = Arc::new(TerminalSession::new_with_shared_history(
+            backend.clone(),
+            cols,
+            rows,
+            history,
+        ));
         session.start();
+
+        // Re-install command-history persistence: the callback lives on the
+        // session, so without this the fresh session would capture commands
+        // in memory but never write them to the Store again.
+        if let Some(hid) = self.host_id {
+            let store_for_cb = crate::app_state::AppState::store(cx);
+            session.set_on_command(Some(std::sync::Arc::new(move |cmd: &str| {
+                let _ = store_for_cb.lock().add_command(hid, cmd);
+            })));
+        }
 
         self.render_cache.lock().clear_all();
 
-        // Backend events.
-        let mut event_rx = session.subscribe_backend();
-        let overlay_c = self.overlay.clone();
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            while let Ok(event) = event_rx.recv().await {
-                match event {
-                    crabport_terminal::terminal::BackendEvent::Error(err) => {
-                        overlay_c.lock().log(ConnectionLogLevel::Error, err);
-                        let _ = entity.update(cx, |_, cx| cx.notify());
-                    }
-                    crabport_terminal::terminal::BackendEvent::Closed => {
-                        let _ = entity.update(cx, |this, cx| {
-                            if let Some(ref cb) = this.on_backend_closed {
-                                let cb = cb.clone();
-                                cx.defer(move |cx| cb(cx));
-                            } else {
-                                this.overlay
-                                    .lock()
-                                    .log(ConnectionLogLevel::Warning, "Connection closed");
-                            }
-                            cx.notify();
-                        });
-                    }
-                    crabport_terminal::terminal::BackendEvent::SftpTransferFinished {
-                        kind,
-                        success,
-                        message,
-                    } => {
-                        let level = if success {
-                            ConnectionLogLevel::Info
-                        } else {
-                            ConnectionLogLevel::Error
-                        };
-                        let prefix = match kind {
-                            crabport_terminal::terminal::SftpTransferKind::Download => "Download",
-                            crabport_terminal::terminal::SftpTransferKind::Upload => "Upload",
-                            crabport_terminal::terminal::SftpTransferKind::Rename => "Rename",
-                            crabport_terminal::terminal::SftpTransferKind::Edit => "Edit",
-                            crabport_terminal::terminal::SftpTransferKind::Delete => "Delete",
-                        };
-                        overlay_c.lock().log(level, format!("{prefix}: {message}"));
-                        let _ = entity.update(cx, |this, cx| {
-                            this.sftp_progress = None;
-                            if success {
-                                if let Some(cwd) = this
-                                    .session
-                                    .sftp_cwd()
-                                    .as_ref()
-                                    .map(|c| c.as_str().to_string())
-                                {
-                                    this.session.sftp_navigate(&cwd);
-                                }
-                            }
-                            let cb = this.on_sftp_progress_changed.clone();
-                            let cb_kind = kind;
-                            let cb_success = success;
-                            let cb_message = message.clone();
-                            let finished_cb = this.on_sftp_transfer_finished.clone();
-                            cx.notify();
-                            if let Some(cb) = cb {
-                                cx.defer(move |cx| cb(cx));
-                            }
-                            if let Some(cb) = finished_cb {
-                                cx.defer(move |cx| cb(cb_kind, cb_success, cb_message, cx));
-                            }
-                        });
-                    }
-                    crabport_terminal::terminal::BackendEvent::SftpTransferProgress {
-                        kind,
-                        stage,
-                        message,
-                        bytes,
-                    } => {
-                        let _ = entity.update(cx, |this, cx| {
-                            this.sftp_progress = Some(SftpProgress {
-                                kind,
-                                stage,
-                                message,
-                                bytes,
-                            });
-                            let cb = this.on_sftp_progress_changed.clone();
-                            cx.notify();
-                            if let Some(cb) = cb {
-                                cx.defer(move |cx| cb(cx));
-                            }
-                        });
-                    }
-                    crabport_terminal::terminal::BackendEvent::Data(_) => {}
-                    crabport_terminal::terminal::BackendEvent::HistoryLoaded(_) => {
-                        // Repaint so the History panel picks up the
-                        // freshly-loaded command history.
-                        let _ = entity.update(cx, |_, cx| cx.notify());
-                    }
-                }
-            }
-        })
-        .detach();
-
-        // Wakeup → dirty.
-        let mut wakeup_rx = session.subscribe_wakeup();
-        let dirty_wk = self.needs_repaint.clone();
-        let status_entity = cx.entity().downgrade();
-        // One-shot initial TTY-history read on (re)connect — mirrors the
-        // constructor's wakeup loop.
-        let history_refreshed = Arc::new(AtomicBool::new(false));
-        let history_refreshed_wk = history_refreshed.clone();
-        let session_for_refresh = session.clone();
-        cx.spawn(async move |_this, cx| {
-            while let Ok(()) = wakeup_rx.recv().await {
-                let _ = status_entity.update(cx, |this, _cx| {
-                    if let Some(m) = this.session.monitor() {
-                        let new_status = m.status();
-                        let mut ov = this.overlay.lock();
-                        if new_status != ov.status {
-                            ov.update_status(new_status, &this.remote_host);
-                            if !history_refreshed_wk.swap(true, Ordering::AcqRel)
-                                && matches!(
-                                    new_status,
-                                    RemoteStatus::Connected | RemoteStatus::Local
-                                )
-                            {
-                                session_for_refresh.refresh_history();
-                            }
-                        }
-                    }
-                });
-                dirty_wk.store(true, Ordering::Release);
-            }
-        })
-        .detach();
-
-        // Fade watcher.
-        let overlay_fade = self.overlay.clone();
-        let dirty_fade = self.needs_repaint.clone();
-        let fade_entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            loop {
-                smol::Timer::after(std::time::Duration::from_millis(50)).await;
-                if overlay_fade.lock().fade_out_started {
-                    break;
-                }
-            }
-            smol::Timer::after(std::time::Duration::from_millis(600)).await;
-            overlay_fade.lock().mark_hidden();
-            dirty_fade.store(true, Ordering::Release);
-            let _ = fade_entity.update(cx, |_, cx| cx.notify());
-        })
-        .detach();
+        // Fresh per-attempt listeners for the new session (fresh
+        // `conn_recorded` once-flag included). The ~120 Hz frame pump
+        // spawned by the constructor keeps polling the same shared
+        // `overlay` / `needs_repaint` handles across reconnects, so it is
+        // deliberately NOT re-spawned here — re-spawning would leak one
+        // timer task per reconnect.
+        let overlay = self.overlay.clone();
+        let needs_repaint = self.needs_repaint.clone();
+        Self::spawn_backend_listeners(&session, &overlay, &needs_repaint, cx);
 
         self.session = session;
         self.backend = backend;
@@ -1899,18 +1941,45 @@ impl Render for TerminalView {
                         let needs_repaint = needs_repaint.clone();
                         let entity = entity.clone();
                         let line_height = line_height;
+                        let cell_width = cell_width;
+                        let last_bounds = last_bounds_c.clone();
+                        let display_offset_mouse = display_offset_mouse.clone();
                         move |event, _window, cx| {
                             let delta = event.delta.pixel_delta(line_height);
                             let dy = delta.y / line_height;
                             if dy.abs() < 0.001 {
                                 return;
                             }
+                            // Shift bypasses alt-screen / mouse-mode
+                            // forwarding so the user can reach the
+                            // scrollback buffer even inside vim / less.
+                            let shift = event.modifiers.shift;
+                            // Compute the pointer's grid cell for
+                            // mouse-mode wheel reports. Fall back to
+                            // (0, 0) if the bounds aren't known yet or
+                            // the pointer is outside the grid.
+                            let cell = if shift {
+                                (0, 0)
+                            } else if let Some(bounds) = *last_bounds.lock() {
+                                let offset = display_offset_mouse.load(Ordering::Relaxed);
+                                mouse_to_grid(
+                                    event.position,
+                                    bounds,
+                                    cell_width,
+                                    line_height,
+                                    offset,
+                                )
+                                .map(|(c, r)| (c, r.max(0) as usize))
+                                .unwrap_or((0, 0))
+                            } else {
+                                (0, 0)
+                            };
                             let _ = entity.update(cx, |this, _cx| {
                                 this.scroll_accumulator += dy;
                                 let lines = this.scroll_accumulator.trunc() as i32;
                                 if lines != 0 {
                                     this.scroll_accumulator -= lines as f32;
-                                    session.scroll(lines);
+                                    session.handle_wheel(lines, cell, shift);
                                 }
                             });
                             // Notify immediately for low-latency scroll feedback;
@@ -2098,7 +2167,11 @@ impl Render for TerminalView {
                         ),
                 )
             })
-            // Connection overlay (remote sessions only).
+            // Connection overlay — shown for remote sessions (SSH / Telnet)
+            // and during the local-PTY startup window, while
+            // `PendingPtyBackend` is constructing the real `PtyBackend` on a
+            // background thread. Once the local PTY is ready the overlay
+            // fades out via `update_status(RemoteStatus::Local, ...)`.
             //
             // Note: the host-key confirmation prompt is no longer rendered
             // here. It is surfaced via the global `AlertController` (held by
@@ -2106,7 +2179,7 @@ impl Render for TerminalView {
             // pending host key on the active terminal view. That way the
             // dialog overlays the whole window and is unaffected by the
             // terminal container's padding.
-            .when(is_remote, |el| {
+            .when(is_remote || overlay_visible, |el| {
                 let on_reconnect: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)> =
                     Rc::new(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                         this.reconnect(cx);

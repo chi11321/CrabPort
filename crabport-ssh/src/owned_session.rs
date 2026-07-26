@@ -21,9 +21,11 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crabport_terminal::terminal::RemoteStatus;
 
-use crate::backend::{TOKIO, connect_russh};
+use crate::TOKIO;
+use crate::backend::connect_russh;
 use crate::crabport_tunnel::CrabPortTunnel;
 use crate::handler::{HostKeyVerifier, SshHandler};
+use crate::jump::{JumpChainGuard, connect_through_jumps};
 use crate::keys::decode_private_key;
 use crate::known_hosts::KnownHosts;
 use crate::session::SshConnectionInfo;
@@ -91,21 +93,40 @@ impl OwnedSession {
                 host: host_for_handler,
                 port: port_for_handler,
                 known_hosts,
-                verifier: verifier_for_handler,
+                verifier: verifier_for_handler.clone(),
                 reverse_registry: reverse_registry_for_handler,
             };
 
             let config = Arc::new(client::Config::default());
-            let mut sh =
-                match connect_russh(config, &info.proxy, &info.host, info.port, handler).await {
-                    Ok(sh) => sh,
-                    Err(e) => {
-                        tracing::error!("SSH: owned session connect failed: {e}");
-                        *status.write() = RemoteStatus::Disconnected;
-                        let _ = tx.send(Err(format!("connect failed: {e}")));
-                        return;
-                    }
-                };
+            // Direct or through the jump-host chain (mirrors
+            // `SshBackend::new`). The returned guard keeps the intermediate
+            // hop sessions alive; it's parked on this task below.
+            let connect_result = if info.jump_hosts.is_empty() {
+                connect_russh(config, &info.proxy, &info.host, info.port, handler)
+                    .await
+                    .map(|sh| (sh, JumpChainGuard::empty()))
+                    .map_err(|e| e.to_string())
+            } else {
+                connect_through_jumps(
+                    config,
+                    &info.jump_hosts,
+                    &info.host,
+                    info.port,
+                    handler,
+                    verifier_for_handler,
+                    &|_msg| {},
+                )
+                .await
+            };
+            let (mut sh, jump_guard) = match connect_result {
+                Ok(ok) => ok,
+                Err(e) => {
+                    tracing::error!("SSH: owned session connect failed: {e}");
+                    *status.write() = RemoteStatus::Disconnected;
+                    let _ = tx.send(Err(format!("connect failed: {e}")));
+                    return;
+                }
+            };
 
             // Authenticate — key auth if a private key is set, else password.
             if info.uses_key_auth() {
@@ -173,8 +194,12 @@ impl OwnedSession {
             // Keep a long-lived reference on this spawned task so the
             // connection isn't torn down the moment `connect()` returns: the
             // `shared` clone above is dropped at end of scope, but the one
-            // stored under `handle` keeps it alive. Block this task forever
-            // so the runtime doesn't drop the worker; it's cheap (no polling).
+            // stored under `handle` keeps it alive. The jump-chain guard is
+            // parked here too — dropping it would tear down the bastion
+            // sessions the target connection rides on. Block this task
+            // forever so the runtime doesn't drop the worker; it's cheap
+            // (no polling).
+            let _jump_guard = jump_guard;
             std::future::pending::<()>().await;
         });
 

@@ -17,19 +17,31 @@
 //! - [`snippets`] — global command-snippet library
 //! - [`tunnels`] — tunnel CRUD
 //! - [`groups`] — shared group CRUD for hosts/snippets/tunnels
+//! - [`history`] — connection-event history (size-capped)
+//!
+//! Schema migrations live in [`migrations`]: one `.sql` file per migration
+//! under `store/migrations/`, registered in an ordered list. See that
+//! module's docs for the append-only rule and the per-migration error
+//! policy.
 
 mod commands;
 mod credentials;
 mod groups;
+mod history;
 mod hosts;
+mod migrations;
 mod proxies;
 mod snippets;
 mod tunnels;
 
+pub use history::{ConnectionEvent, ConnectionStatus};
+#[cfg(test)]
+mod tests;
+
 use std::fs;
 use std::path::PathBuf;
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::crypto;
 
@@ -78,7 +90,7 @@ impl From<crypto::CryptoError> for StoreError {
 }
 
 // ---------------------------------------------------------------------------
-// Impl: open + migrate + encryption helpers
+// Impl: open + encryption helpers
 // ---------------------------------------------------------------------------
 
 impl Store {
@@ -107,277 +119,9 @@ impl Store {
             key_path,
             enc_key,
         };
-        store.migrate()?;
+        migrations::run(&store.db)?;
         tracing::info!("store: opened {}", db_path.display());
         Ok(store)
-    }
-
-    // -------------------------------------------------------------------
-    // Migrations
-    // -------------------------------------------------------------------
-
-    fn migrate(&self) -> Result<(), StoreError> {
-        // Ensure the schema_version tracking table exists
-        self.db
-            .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-
-        let current: i64 = self
-            .db
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        // Migration 1: initial schema
-        if current < 1 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS hosts (
-                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name          TEXT    NOT NULL,
-                        host          TEXT    NOT NULL,
-                        port          INTEGER NOT NULL DEFAULT 22,
-                        username      TEXT    NOT NULL DEFAULT '',
-                        credential_id INTEGER,
-                        kind          TEXT    NOT NULL DEFAULT 'Ssh'
-                    );
-
-                    CREATE TABLE IF NOT EXISTS credentials (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name         TEXT    NOT NULL,
-                        kind         TEXT    NOT NULL DEFAULT 'Password',
-                        anonymous    INTEGER NOT NULL DEFAULT 0,
-                        secret       BLOB    NOT NULL,
-                        private_key  BLOB    NOT NULL DEFAULT '',
-                        public_key   BLOB    NOT NULL DEFAULT '',
-                        certificate  BLOB    NOT NULL DEFAULT ''
-                    );
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 2: add last_login and favorite to hosts
-        if current < 2 {
-            self.db
-                .execute_batch(
-                    "
-                    ALTER TABLE hosts ADD COLUMN last_login INTEGER;
-                    ALTER TABLE hosts ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 3: command history table. One row per captured
-        // command, scoped to a host (via host_id) so each connection keeps
-        // its own history across app restarts. `created_at` is unix
-        // seconds for ordering (most-recent-first on query).
-        // `updated_at` is bumped when a duplicate command is re-run so the
-        // LRU eviction (by `updated_at`) keeps frequently-used commands.
-        if current < 3 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS command_history (
-                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                        host_id    INTEGER NOT NULL,
-                        command    TEXT    NOT NULL,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_command_history_host
-                        ON command_history (host_id, id DESC);
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 4: snippets table. Global code-snippet library — not
-        // scoped to a host. `name` is the user-facing label, `command` is
-        // the literal text to insert into the terminal.
-        if current < 4 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS snippets (
-                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name       TEXT    NOT NULL,
-                        command    TEXT    NOT NULL,
-                        created_at INTEGER NOT NULL
-                    );
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 5: add `updated_at` column to `command_history` for
-        // existing databases. New databases already get it from migration 3.
-        // `updated_at` is bumped when a duplicate command is re-run so LRU
-        // eviction keeps frequently-used commands alive.
-        if current < 5 {
-            // ALTER TABLE ... ADD COLUMN is idempotent-safe via try/catch:
-            // if the column already exists (e.g. a fresh DB that ran
-            // migration 3 with the column included), this errors and we
-            // ignore it.
-            let _ = self
-                .db
-                .execute_batch(
-                    "ALTER TABLE command_history ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
-                )
-                .map_err(|e| {
-                    tracing::warn!("store: migration 5 (command_history.updated_at) failed: {e}");
-                    e
-                });
-        }
-
-        // Migration 6: add `proxies` table + `proxy_id` FK on `hosts`.
-        // Proxy configs live in their own table so they can be shared
-        // across hosts and managed independently (list / edit / delete
-        // without touching host rows).
-        if current < 6 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS proxies (
-                        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name      TEXT    NOT NULL,
-                        kind      TEXT    NOT NULL DEFAULT 'none',
-                        host      TEXT    NOT NULL DEFAULT '',
-                        port      INTEGER NOT NULL DEFAULT 0,
-                        username  TEXT    NOT NULL DEFAULT '',
-                        password  BLOB,
-                        created_at INTEGER NOT NULL DEFAULT 0
-                    );
-                    ALTER TABLE hosts ADD COLUMN proxy_id INTEGER REFERENCES proxies(id);
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 7: add `tunnels` table. Each row is a persisted SSH
-        // port-forwarding tunnel config, bound to a host via `host_id` (FK
-        // with ON DELETE CASCADE so removing a host cleans up its tunnels).
-        // `kind` is the forwarding direction (local/remote/dynamic); the
-        // bind_*/target_* fields hold the port-forward parameters (their
-        // meaning depends on `kind` — see `TunnelEntry`).
-        if current < 7 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS tunnels (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name         TEXT    NOT NULL,
-                        host_id      INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
-                        kind         TEXT    NOT NULL DEFAULT 'local',
-                        bind_addr    TEXT    NOT NULL DEFAULT '127.0.0.1',
-                        bind_port    INTEGER NOT NULL,
-                        target_host  TEXT    NOT NULL DEFAULT '',
-                        target_port  INTEGER NOT NULL DEFAULT 0,
-                        created_at   INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_tunnels_host ON tunnels (host_id);
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 8: add `private_key_kind` to `credentials`. This records
-        // whether the `private_key` BLOB holds literal PEM key material
-        // ('Content', the historical default) or a filesystem path to a key
-        // file ('Path'). The UI uses it to restore the value into the correct
-        // field (textarea vs read-only path input) when editing a host.
-        // Existing rows default to 'Content'.
-        if current < 8 {
-            let _ = self.db.execute_batch(
-                "ALTER TABLE credentials ADD COLUMN private_key_kind TEXT NOT NULL DEFAULT 'Content';",
-            ).map_err(|e| {
-                tracing::warn!("store: migration 8 (credentials.private_key_kind) failed: {e}");
-                e
-            });
-        }
-
-        // Migration 9: favorites + grouping.
-        //
-        // Adds a shared `groups` table (discriminated by a `kind` column so
-        // the same group name can be reused across hosts / snippets /
-        // tunnels without collision), plus `favorite` + `group_id` columns
-        // on `snippets` and `tunnels`. `hosts` already has `favorite` from
-        // migration 2; it only gets `group_id` here.
-        //
-        // `group_id` uses `ON DELETE SET NULL` so deleting a group drops
-        // its members back to "ungrouped" rather than cascading deletion
-        // (hosts/snippets/tunnels are user data — a group is just a label).
-        if current < 9 {
-            self.db
-                .execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS groups (
-                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name       TEXT    NOT NULL,
-                        kind       TEXT    NOT NULL DEFAULT 'host',
-                        sort_order INTEGER NOT NULL DEFAULT 0,
-                        created_at INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_groups_kind
-                        ON groups (kind, sort_order);
-
-                    ALTER TABLE hosts ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
-
-                    ALTER TABLE snippets ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE snippets ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
-
-                    ALTER TABLE tunnels ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE tunnels ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
-                    ",
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 10: group favorites.
-        //
-        // Adds a `favorite` column to `groups` so an entire group can be
-        // starred and pinned above non-starred groups within the same kind.
-        if current < 10 {
-            self.db
-                .execute_batch("ALTER TABLE groups ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;")
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        // Migration 11: add `startup_command` to `hosts`.
-        //
-        // Stores an optional command (or multi-line script) the user wants to
-        // run automatically once the shell/terminal session is ready — after
-        // the SSH shell starts or the Telnet TCP connection is established.
-        // Empty string (the column default) means no startup command.
-        if current < 11 {
-            let _ = self
-                .db
-                .execute_batch(
-                    "ALTER TABLE hosts ADD COLUMN startup_command TEXT NOT NULL DEFAULT '';",
-                )
-                .map_err(|e| {
-                    tracing::warn!("store: migration 11 (hosts.startup_command) failed: {e}");
-                    e
-                });
-        }
-
-        // Record the latest migration version
-        let latest = 11;
-        if current < latest {
-            self.db
-                .execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    params![latest],
-                )
-                .map_err(|e| StoreError::Db(e.to_string()))?;
-        }
-
-        Ok(())
     }
 
     // -------------------------------------------------------------------

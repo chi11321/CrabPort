@@ -33,6 +33,14 @@ use crate::motion::RADIUS_MD;
 // text block. Anyone needing the full text can find it in the source tree.
 const LICENSE_NAME: &str = "Apache License 2.0";
 
+// All in-app icons (the SVGs under `assets/icons/`) are sourced from
+// lucide (https://lucide.dev), an open-source icon set released under
+// the ISC License. The full license text ships alongside the source at
+// `THIRD-PARTY-LICENSES/lucide-icons-ISC.txt`. We display it as a
+// separate attribution row so users know where the iconography comes
+// from.
+const ICONS_NAME: &str = "lucide (ISC License)";
+
 // Build-time-generated dependency table. See `crabport-ui/build.rs`.
 include!(concat!(env!("OUT_DIR"), "/about_dependencies.rs"));
 
@@ -85,31 +93,12 @@ impl AboutWindow {
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
         // Slightly taller than the original single-pane About so the License
         // tab has room for a scrollable text block + dependency list.
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(640.0), px(480.0)), cx)),
-            // See `app::open_main_window` for the per-platform titlebar
-            // rationale. `appears_transparent: true` is required on Windows
-            // (not just macOS) to actually strip the system title bar;
-            // the GPUI default leaves it visible. The `title` is kept on
-            // every platform so the taskbar / window switcher / Expose all
-            // show "About CrabPort" instead of a blank name.
-            titlebar: Some(TitlebarOptions {
-                title: Some(t!("window.about.title").to_string().into()),
-                appears_transparent: true,
-                #[cfg(target_os = "macos")]
-                traffic_light_position: Some(point(px(12.0), px(14.0))),
-                ..Default::default()
-            }),
-            #[cfg(target_os = "macos")]
-            window_background: WindowBackgroundAppearance::Blurred,
-            #[cfg(target_os = "linux")]
-            window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(Size {
-                width: px(520.0),
-                height: px(360.0),
-            }),
-            ..Default::default()
-        };
+        let options = crate::windows::aux_window_options(
+            t!("window.about.title").to_string().into(),
+            size(px(640.0), px(480.0)),
+            size(px(520.0), px(360.0)),
+            cx,
+        );
 
         let version = env!("CARGO_PKG_VERSION").into();
 
@@ -220,6 +209,28 @@ impl AboutWindow {
                             .text_sm()
                             .text_color(rgb(text_muted()))
                             .child(LICENSE_NAME),
+                    ),
+            )
+            // --- Icons attribution block ---
+            // All SVG icons bundled with CrabPort are from the lucide icon
+            // set (https://lucide.dev), licensed under the ISC License.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_primary()))
+                            .child(t!("window.about.icons").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_muted()))
+                            .child(ICONS_NAME),
                     ),
             )
             // --- Dependencies block ---

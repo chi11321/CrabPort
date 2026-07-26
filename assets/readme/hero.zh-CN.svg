@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="360" viewBox="0 0 1200 360"
+     role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">CrabPort —— 基于 Rust + GPUI 的 SSH / Telnet / 串口 / SFTP / 隧道 / 代理 终端</title>
+  <desc id="hero-desc">左侧：项目类别、名称、一句话价值、端口节点连接示意与平台 / Rust / 许可证元数据。右侧：使用项目 modern-dark 配色的终端 + SFTP 分栏示意。</desc>
+
+  <rect width="1200" height="360" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="358" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+
+  <defs>
+    <symbol id="port-dot" viewBox="0 0 12 12">
+      <circle cx="6" cy="6" r="5" fill="none" stroke="#6366f1" stroke-width="1.5"/>
+      <circle cx="6" cy="6" r="2" fill="#6366f1"/>
+    </symbol>
+  </defs>
+
+  <!-- 左侧：标题块 -->
+  <g id="title-block" transform="translate(64 60)">
+    <text x="0" y="0"
+          font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="16" letter-spacing="3"
+          fill="#6366f1" font-weight="600">
+      跨平台终端 · RUST + GPUI
+    </text>
+
+    <text x="0" y="76"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+          font-size="76" font-weight="700"
+          fill="#e6e9ef" letter-spacing="-1.5">
+      CrabPort
+    </text>
+
+    <text x="0" y="128"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+          font-size="24" font-weight="500"
+          fill="#8b90a0">
+      把 SSH、Telnet、串口、SFTP、隧道
+    </text>
+    <text x="0" y="160"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+          font-size="24" font-weight="500"
+          fill="#8b90a0">
+      与代理收进一个窗口 —— 用 Rust 构建。
+    </text>
+
+    <!-- 端口节点连接示意 -->
+    <g transform="translate(0 200)">
+      <line x1="6" y1="6" x2="150" y2="6" stroke="#2e333f" stroke-width="1.5"/>
+      <line x1="162" y1="6" x2="306" y2="6" stroke="#2e333f" stroke-width="1.5"/>
+      <use href="#port-dot" x="0" y="0" width="12" height="12"/>
+      <use href="#port-dot" x="156" y="0" width="12" height="12"/>
+      <use href="#port-dot" x="312" y="0" width="12" height="12"/>
+      <text x="0" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#6b7080">prod-host</text>
+      <text x="156" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#6b7080">edge-ssh</text>
+      <text x="312" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#6b7080">ttyUSB0</text>
+    </g>
+
+    <!-- 元数据 -->
+    <g transform="translate(0 258)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#8b90a0">
+      <text x="0" y="0">macOS · Linux · Windows</text>
+      <text x="252" y="0">·</text>
+      <text x="272" y="0">Rust 1.91+</text>
+      <text x="400" y="0">·</text>
+      <text x="420" y="0">Apache-2.0</text>
+    </g>
+  </g>
+
+  <!-- 右侧：分栏面板示意 -->
+  <g id="project-proof" transform="translate(720 48)">
+    <rect x="0" y="0" width="416" height="264" rx="12" fill="#0f1116" stroke="#23262f" stroke-width="1"/>
+    <rect x="0" y="0" width="416" height="28" rx="12" fill="#1c1f27"/>
+    <rect x="0" y="16" width="416" height="12" fill="#1c1f27"/>
+    <circle cx="18" cy="14" r="4.5" fill="#f87171"/>
+    <circle cx="34" cy="14" r="4.5" fill="#facc15"/>
+    <circle cx="50" cy="14" r="4.5" fill="#4ade80"/>
+    <g transform="translate(72 7)">
+      <rect x="0" y="0" width="118" height="20" rx="5" fill="#262a34"/>
+      <use href="#port-dot" x="8" y="6" width="10" height="10"/>
+      <text x="24" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#e6e9ef">prod-host</text>
+      <rect x="126" y="3" width="84" height="14" rx="4" fill="none" stroke="#2e333f"/>
+      <text x="136" y="14" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#6b7080">edge-ssh</text>
+    </g>
+
+    <g transform="translate(14 44)">
+      <rect x="0" y="0" width="230" height="206" rx="8" fill="#14161c" stroke="#23262f" stroke-width="1"/>
+      <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#c1c5d0">
+        <text x="12" y="24" font-size="11" fill="#6b7080">Last login: 03:14 on ttys000</text>
+        <text x="12" y="52" fill="#4ade80" font-weight="600">$</text>
+        <text x="22" y="52" fill="#e6e9ef">echo "Hello CrabPort"</text>
+        <text x="12" y="74" fill="#22d3ee">Hello CrabPort</text>
+        <text x="12" y="104" fill="#4ade80" font-weight="600">$</text>
+        <rect x="22" y="92" width="9" height="14" fill="#c8cce4"/>
+      </g>
+    </g>
+
+    <g transform="translate(254 44)">
+      <rect x="0" y="0" width="148" height="206" rx="8" fill="#0f1116" stroke="#23262f" stroke-width="1"/>
+      <text x="12" y="20" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#8b90a0" letter-spacing="1">SFTP · /srv</text>
+      <line x1="12" y1="28" x2="136" y2="28" stroke="#23262f"/>
+
+      <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">
+        <text x="12" y="46" fill="#818cf8">▸</text>
+        <text x="26" y="46" fill="#e6e9ef">relay/</text>
+
+        <text x="12" y="64" fill="#818cf8">▸</text>
+        <text x="26" y="64" fill="#e6e9ef">secrets/</text>
+
+        <use href="#port-dot" x="9" y="73" width="10" height="10"/>
+        <text x="26" y="82" fill="#c1c5d0">deploy.sh</text>
+
+        <use href="#port-dot" x="9" y="91" width="10" height="10"/>
+        <text x="26" y="100" fill="#c1c5d0">compose.yml</text>
+
+        <use href="#port-dot" x="9" y="109" width="10" height="10"/>
+        <text x="26" y="118" fill="#c1c5d0">nginx.conf</text>
+
+        <rect x="9" y="125" width="127" height="16" rx="3" fill="#262a34"/>
+        <use href="#port-dot" x="9" y="129" width="10" height="10"/>
+        <text x="26" y="138" fill="#e6e9ef" font-weight="600">metrics.csv</text>
+        <text x="116" y="138" fill="#4ade80" text-anchor="end">↓</text>
+      </g>
+    </g>
+  </g>
+</svg>

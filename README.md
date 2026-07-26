@@ -1,11 +1,6 @@
-# CrabPort
-
 <p align="center">
-  <strong>现代化的跨平台 SSH / SFTP 客户端，使用 Rust + GPUI 构建</strong>
-</p>
-
-<p align="center">
-  <a href="README.md">中文</a> · <a href="README.en.md">English</a>
+  <img src="./assets/readme/hero.svg" width="100%"
+       alt="CrabPort — a GPU-accelerated Rust terminal for SSH, Telnet, serial, SFTP, tunnels, and proxies">
 </p>
 
 <p align="center">
@@ -15,66 +10,78 @@
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.91%2B-orange.svg">
 </p>
 
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 ---
 
-## 简介
+CrabPort aims to be a cross-platform terminal that brings SSH, Telnet, serial, SFTP, tunnels, and proxy routing into one window — written in Rust and rendered with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the GPU-accelerated UI framework behind the Zed editor.
 
-CrabPort 旨在实现一个简单易用的跨平台 SSH / Telnet 客户端，集终端与 SFTP 文件管理于一体。使用 Rust 编写，UI 基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 编辑器的 GPU 渲染框架）。
+One host entry carries its own credentials, proxy, and serial settings; a terminal tab opens with SFTP, tunnels, and shell history attached when the backend supports them. Credentials are encrypted at rest with AES-256-GCM.
 
-### 核心特性
+## Screenshots
 
-- **多标签终端** — SSH / Telnet / 串口 / 本地终端，多会话切换
-- **SFTP 文件管理** — 可视化目录浏览与批量上传下载
-- **SSH 隧道** — Local / Remote / Dynamic（SOCKS）端口转发
-- **代理连接** — SOCKS5 / HTTP(S) 代理，按主机独立配置
-- **凭据加密存储** — AES-256-GCM 本地加密
-- **命令历史与代码片段** — 自动捕获、搜索、快速执行
-- **可配置主题色彩** — 多套预设主题，`config.toml` 驱动
-- **跨平台** — macOS / Linux / Windows，x64 与 arm64
+![Main UI](assets/screenshots/PixPin_2026-07-25_19-23-34.png)
 
-## 截图
+![Terminal and SFTP panel](assets/screenshots/PixPin_2026-07-25_19-24-09.png)
 
-![主界面](imgs/PixPin_2026-07-01_01-19-29.png)
+![Third view](assets/screenshots/PixPin_2026-07-25_19-24-59.png)
 
-![终端与文件面板](imgs/PixPin_2026-07-01_01-20-00.png)
+## Features
 
-## 下载安装
+<p align="center">
+  <img src="./assets/readme/features.svg" width="100%"
+       alt="Feature grid: multi-tab terminal, SFTP panel, SSH tunnels, proxy routing, serial, encrypted credentials, history and snippets, themes, settings">
+</p>
 
-### 从 Release 下载预编译版本
+## How it fits together
 
-前往 [Releases 页面](https://github.com/chi11321/CrabPort/releases) 下载对应平台的最新版本：
+<p align="center">
+  <img src="./assets/readme/architecture.svg" width="100%"
+       alt="Diagram: host config flows through the proxy layer to an SSH/Telnet/serial backend, which powers a terminal tab with SFTP, tunnels, and history attached">
+</p>
 
-| 平台 | 下载文件 | 说明 |
-|------|----------|------|
-| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.dmg` | 打开 `.dmg` 后将 CrabPort 拖入 `/Applications` |
-| macOS (Intel) | `CrabPort-v*-macos-x86_64.dmg` | 打开 `.dmg` 后将 CrabPort 拖入 `/Applications` |
-| Linux (x64) | `CrabPort-v*-linux-x86_64.AppImage` | 赋予执行权限后双击运行，内置运行时依赖 |
-| Linux (arm64) | `CrabPort-v*-linux-aarch64.AppImage` | 赋予执行权限后双击运行，内置运行时依赖 |
-| Windows (x64) | `CrabPort-v*-windows-x86_64.zip` | 解压后双击 `CrabPort.exe` 运行 |
-| Windows (arm64) | `CrabPort-v*-windows-aarch64.zip` | 解压后双击 `CrabPort.exe` 运行 |
+Each host entry stores its connection kind, credentials, proxy, and serial settings in a local SQLite database. The proxy layer wraps the transport (direct TCP, SOCKS5, or HTTP(S) CONNECT) before handing the stream to the SSH (russh), Telnet (RFC 854), or serial (`serialport`) backend. All backends share a single tokio runtime. SSH backends additionally expose SFTP, tunnels, and shell history to the tab.
 
-> macOS 版本以 `.dmg` 磁盘镜像分发，Linux 版本以 `.AppImage` 分发（内置 X11 / Wayland / Vulkan / fontconfig 等运行时库，无需手动安装系统依赖），Windows 版本以 `.zip` 分发（受 cargo-bundle v0.11.0 的 MSI 打包 bug 影响，暂未提供 `.msi` 安装包）。
+## Download
 
-**macOS 提示**：首次打开可能会提示"无法验证开发者"。右键点击应用 → 选择"打开"即可绕过限制，或在终端执行：
+Grab the latest build from the [Releases page](https://github.com/chi11321/CrabPort/releases):
+
+| Platform | Download | Notes |
+|----------|----------|-------|
+| macOS (Apple Silicon) | `CrabPort-v*-macos-aarch64.dmg` | Open the `.dmg` and drag CrabPort to `/Applications` |
+| macOS (Intel) | `CrabPort-v*-macos-x86_64.dmg` | Open the `.dmg` and drag CrabPort to `/Applications` |
+| Linux (x64) | `CrabPort-v*-linux-x86_64.AppImage` | `chmod +x` and double-click; runtime libraries are bundled |
+| Linux (arm64) | `CrabPort-v*-linux-aarch64.AppImage` | `chmod +x` and double-click; runtime libraries are bundled |
+| Windows (x64) | `CrabPort-v*-windows-x86_64.zip` | Extract and run `CrabPort.exe` |
+| Windows (arm64) | `CrabPort-v*-windows-aarch64.zip` | Extract and run `CrabPort.exe` |
+
+> macOS builds ship as `.dmg`. Linux builds ship as `.AppImage` with the X11 / Wayland / Vulkan / fontconfig runtime bundled, so no manual system-package install is needed. Windows builds ship as a `.zip` because cargo-bundle v0.11.0 has an MSI packaging bug; no `.msi` installer is provided for now.
+
+**macOS first-launch note**: you may see a "cannot verify developer" warning. Right-click the app → select **Open** to bypass, or run in Terminal:
+
 ```bash
 xattr -cr /Applications/CrabPort.app
 ```
 
-### 从源码构建
+## Build from source
 
-#### 前置要求
+### Prerequisites
 
-- **Rust 1.91+**（推荐使用 [rustup](https://rustup.rs/) 安装）
-- 平台原生构建工具链
+- **Rust 1.91+** (install via [rustup](https://rustup.rs/))
+- Platform-native build toolchain
 
-#### 各平台依赖
+### Platform dependencies
 
-**macOS**：Xcode Command Line Tools
+**macOS** — Xcode Command Line Tools:
+
 ```bash
 xcode-select --install
 ```
 
-**Linux**（Debian/Ubuntu）：
+**Linux** (Debian/Ubuntu):
+
 ```bash
 sudo apt-get install -y \
   libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev \
@@ -86,86 +93,67 @@ sudo apt-get install -y \
   libfontconfig1-dev libfreetype6-dev \
   libasound2-dev libpulse-dev libdbus-1-dev \
   libssl-dev pkg-config \
-  squashfs-tools   # 打包 .AppImage 所需的 mksquashfs
+  squashfs-tools   # mksquashfs, required for .AppImage bundling
 ```
 
-**Windows**：MSVC 工具链（随 Visual Studio Build Tools 安装）
+**Windows** — MSVC toolchain (ships with Visual Studio Build Tools).
 
-#### 编译运行
+### Build & run
 
 ```bash
-# 克隆仓库
 git clone https://github.com/chi11321/CrabPort.git
 cd CrabPort
 
-# Debug 模式运行
-cargo run
-
-# Release 模式编译
-cargo build --release
+cargo run                 # debug
+cargo build --release     # release binary
 ```
 
-#### 打包为各平台安装包
+### Bundle platform installers
 
-需先安装 [cargo-bundle](https://github.com/burtonageo/cargo-bundle)：
+Install [cargo-bundle](https://github.com/burtonageo/cargo-bundle) first:
 
 ```bash
 cargo install cargo-bundle --locked
 ```
 
-| 平台 | 命令 | 产物 |
-|------|------|------|
+| Platform | Command | Output |
+|----------|---------|--------|
 | macOS | `cargo bundle --release --format dmg` | `target/release/bundle/dmg/CrabPort_*.dmg` |
 | Linux | `cargo bundle --release --format appimage` | `target/release/bundle/appimage/CrabPort_*.AppImage` |
-| Windows | `cargo build --release` 后手动压缩 `.exe` | `CrabPort.exe`（`.zip`） |
+| Windows | `cargo build --release`, then zip the `.exe` manually | `CrabPort.exe` (`.zip`) |
 
-> Windows 暂不使用 cargo-bundle 打包：其 v0.11.0 的 MSI 打包器存在一个将字符串写入二进制列的 bug，因此 CI 与本地均直接压缩 `.exe` 分发。
+> Windows does not use cargo-bundle: its v0.11.0 MSI bundler has a bug that writes a string into a binary column, so both CI and local builds ship a zipped `.exe` instead.
 
-## 数据存储位置
+## Data storage
 
-应用数据存储在系统标准目录下：
+App data lives under the platform-standard directory:
 
-| 平台 | 路径 |
-|------|------|
+| Platform | Path |
+|----------|------|
 | macOS | `~/Library/Application Support/crabport/` |
 | Linux | `~/.local/share/crabport/` |
 | Windows | `%APPDATA%\crabport\` |
 
-包含以下文件：
-- `crabport.db` — SQLite 数据库（主机、凭据、片段、隧道、代理）
-- `.key` — AES-256 加密密钥（随机生成，请勿删除，否则无法解密已存凭据）
-- `config.toml` — 应用配置（语言等外观设置，原子写入）
+Contents:
 
-## 技术栈
+- `crabport.db` — SQLite database (hosts, credentials, snippets, tunnels, proxies)
+- `.key` — AES-256 encryption key, randomly generated. Do not delete it; stored credentials cannot be decrypted without it.
+- `config.toml` — app configuration (language, theme, appearance); written atomically.
 
-| 领域 | 技术 |
-|------|------|
-| 语言 | Rust 2024 Edition |
-| UI 框架 | [GPUI](https://github.com/zed-industries/zed) |
-| UI 组件库 | [gpui-component](https://github.com/longbridge/gpui-component) |
-| 动画 | [gpui-animation](https://github.com/chi11321/gpui-animation) |
-| SSH 协议 | [russh](https://github.com/Eugeny/russh) |
-| SFTP 协议 | [russh-sftp](https://github.com/AspectUnk/russh-sftp) |
-| 终端模拟 | [alacritty_terminal](https://github.com/alacritty/alacritty) |
-| 数据库 | [rusqlite](https://github.com/rusqlite/rusqlite) (SQLite) |
-| 加密 | [aes-gcm](https://github.com/RustCrypto/AEADs) (AES-256-GCM) |
-| 异步运行时 | [tokio](https://tokio.rs) + [smol](https://github.com/smol-rs/smol) |
-| 国际化 | [rust-i18n](https://github.com/longbridge/rust-i18n) |
+## Tech stack
 
-## 路线图
+<p align="center">
+  <img src="./assets/readme/tech-stack.svg" width="100%"
+       alt="Tech stack: Rust 2024, GPUI + gpui-component + gpui-animation, russh / russh-sftp / alacritty_terminal / serialport, rusqlite / aes-gcm / tokio / smol / rust-i18n">
+</p>
 
-- [x] 设置面板（语言）
-- [x] 端口转发 / SSH 隧道管理（Local / Remote / Dynamic）
-- [x] 代理连接（SOCKS5 / HTTP CONNECT / HTTPS CONNECT）
-- [x] Telnet 连接类型
-- [x] 可配置主题色彩
-- [ ] 设置面板（字体、快捷键自定义）
-- [ ] 终端会话同步（多窗口共享）
-- [ ] 串口连接类型
-- [ ] 插件系统
+## Roadmap
 
-## 许可证
+<p align="center">
+  <img src="./assets/readme/roadmap.svg" width="100%"
+       alt="Roadmap: done — settings, themes, connections, SFTP, tunnels, proxy, history; planned — session sync, plugins">
+</p>
 
-[Apache License 2.0](LICENSE)
+## License
 
-Copyright © 2026 ch1ll321
+[Apache License 2.0](LICENSE) · Copyright © 2026 ch1ll321

@@ -315,6 +315,31 @@ pub(crate) async fn sftp_rename_impl(
     Ok(())
 }
 
+/// Create a directory on the remote host. Parent directories must already
+/// exist (SFTP `mkdir` is not recursive). Returns `Ok(())` if the directory
+/// already exists.
+pub(crate) async fn sftp_mkdir_impl(
+    backend: &SftpTransferHandle,
+    remote_path: &str,
+) -> anyhow::Result<()> {
+    tracing::info!("SFTP mkdir: remote={remote_path}");
+    let s = backend.take_or_open_sftp().await?;
+    let res = s.create_dir(remote_path).await;
+    if res.is_err() {
+        // `create_dir` fails if the directory already exists — re-stat to
+        // confirm: if the path exists as a dir, swallow the error.
+        let meta = s.metadata(remote_path).await;
+        let exists_dir = matches!(meta, Ok(ref m) if m.file_type().is_dir());
+        backend.return_sftp(s, meta.map(|_| ())).await.ok();
+        if exists_dir {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!("mkdir '{remote_path}' failed"));
+    }
+    backend.return_sftp(s, res).await?;
+    Ok(())
+}
+
 /// Open a remote file in the local OS default editor and re-upload on save.
 ///
 /// Downloads the file to a temp path (preserving the extension so the OS

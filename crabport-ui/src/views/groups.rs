@@ -11,20 +11,15 @@
 
 use std::rc::Rc;
 
-use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
 use crabport_core::credential::{GroupEntry, GroupKind};
 
 use crate::app::CrabportApp;
-use crate::color::*;
-use crate::components::button::Button;
-use crate::components::input::StyledInput;
+use crate::components::form::{form_dialog, form_footer, form_title, text_field};
 use crate::components::overlay::render_overlay;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG};
 
 // ---------------------------------------------------------------------------
 // Output passed to the save callback
@@ -53,7 +48,6 @@ pub struct GroupFormState {
     /// callback dispatches to the right store CRUD path.
     pub kind: GroupKind,
     pub name_input: Entity<InputState>,
-    pub name_focused: bool,
     /// Open/close animation state. `true` while the overlay is visible.
     pub open: bool,
     /// Per-field validation error. Populated by `validate()`.
@@ -69,7 +63,6 @@ impl GroupFormState {
             editing_id: None,
             kind: GroupKind::Host,
             name_input,
-            name_focused: false,
             open: false,
             name_error: None,
             on_close: None,
@@ -149,7 +142,6 @@ pub struct GroupFormView {
     open: bool,
     editing: bool,
     name_input: Entity<InputState>,
-    name_focused: bool,
     name_error: Option<SharedString>,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
@@ -162,7 +154,6 @@ impl GroupFormView {
             open: state.open,
             editing: state.editing_id.is_some(),
             name_input: state.name_input.clone(),
-            name_focused: state.name_focused,
             name_error: state.name_error.clone(),
             app,
             on_close: state.on_close.clone(),
@@ -173,22 +164,11 @@ impl GroupFormView {
 
 impl RenderOnce for GroupFormView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let on_close_for_dialog = self.on_close.clone();
-
         render_overlay(
             ElementId::Name("group-form-overlay".into()),
             self.open,
-            self.on_close,
-            render_dialog(
-                self.open,
-                self.editing,
-                self.name_input,
-                self.name_focused,
-                self.name_error,
-                self.app,
-                on_close_for_dialog,
-                self.on_save,
-            ),
+            self.on_close.clone(),
+            render_dialog(self),
         )
     }
 }
@@ -197,18 +177,16 @@ impl RenderOnce for GroupFormView {
 // Render helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn render_dialog(
-    open: bool,
-    editing: bool,
-    name_input: Entity<InputState>,
-    name_focused: bool,
-    name_error: Option<SharedString>,
-    app: Entity<CrabportApp>,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: Option<Rc<dyn Fn(GroupFormOutput, &mut Window, &mut App) + 'static>>,
-) -> impl IntoElement {
-    let dialog_id = ElementId::Name("group-form-dialog".into());
+fn render_dialog(view: GroupFormView) -> impl IntoElement {
+    let GroupFormView {
+        open,
+        editing,
+        name_input,
+        name_error,
+        app,
+        on_close,
+        on_save,
+    } = view;
 
     let title = if editing {
         t!("groups.rename_title").to_string()
@@ -216,50 +194,16 @@ fn render_dialog(
         t!("groups.new_title").to_string()
     };
 
-    div()
-        .id(dialog_id.clone())
-        .w(px(380.0))
-        .bg(rgb(bg_base()))
-        .border_1()
-        .border_color(rgb(border()))
-        .rounded(RADIUS_LG)
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .p_6()
-        .gap_4()
-        .opacity(0.0)
-        .mt(px(-16.0))
-        .when(open, |el| {
-            el.on_click(|_, _, cx| {
-                cx.stop_propagation();
-            })
-        })
-        .with_transition(dialog_id)
-        .transition_when_else(
-            open,
-            DURATION_BASE,
-            EASE_STANDARD,
-            |el| el.opacity(1.0).mt_0(),
-            |el| el.opacity(0.0).mt(px(-16.0)),
-        )
+    form_dialog("group-form-dialog", open, 380.0, |d| d.p_6())
         // Title
-        .child(
-            div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(text_primary()))
-                .child(title),
-        )
+        .child(form_title(title))
         // Name
-        .child(
-            div().child(
-                StyledInput::new("group-form-name", name_input)
-                    .label(t!("groups.name").to_string())
-                    .focused(name_focused)
-                    .when_some(name_error, |el, e| el.error(e)),
-            ),
-        )
+        .child(div().child(text_field(
+            "group-form-name",
+            name_input,
+            t!("groups.name").to_string(),
+            name_error,
+        )))
         // Buttons
         .child(render_buttons(app, on_close, on_save))
 }
@@ -272,49 +216,35 @@ fn render_buttons(
     let overlay_id = ElementId::Name("group-form-overlay".into());
     let dialog_id = ElementId::Name("group-form-dialog".into());
 
-    div()
-        .flex()
-        .flex_row()
-        .gap_3()
-        .justify_end()
-        .child(
-            Button::new("group-form-cancel")
-                .centered(true)
-                .child(t!("groups.cancel").to_string())
-                .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_close {
-                        cb(w, cx);
-                    }
-                }),
-        )
-        .child(
-            Button::new("group-form-save")
-                .primary()
-                .centered(true)
-                .child(t!("groups.save").to_string())
-                .on_click(move |_e, w, cx| {
-                    // Reset the overlay/dialog transitions so the next open
-                    // starts fresh (mirrors snippet form's save button).
-                    gpui_animation::reset_transition(&overlay_id);
-                    gpui_animation::reset_transition(&dialog_id);
-                    // Validate required fields before building the output.
-                    let output: Option<GroupFormOutput> = app.update(cx, |app, cx| {
-                        let valid = app
-                            .group_form
-                            .as_mut()
-                            .map(|form| form.validate(cx))
-                            .unwrap_or(true);
-                        if !valid {
-                            cx.notify();
-                            return None;
-                        }
-                        app.group_form.as_ref().map(|form| form.output(cx))
-                    });
-                    if let Some(out) = output {
-                        if let Some(ref cb) = on_save {
-                            cb(out, w, cx);
-                        }
-                    }
-                }),
-        )
+    form_footer(
+        "group-form-cancel",
+        t!("groups.cancel").to_string(),
+        on_close,
+        "group-form-save",
+        t!("groups.save").to_string(),
+        move |_e, w, cx| {
+            // Reset the overlay/dialog transitions so the next open
+            // starts fresh (mirrors snippet form's save button).
+            gpui_animation::reset_transition(&overlay_id);
+            gpui_animation::reset_transition(&dialog_id);
+            // Validate required fields before building the output.
+            let output: Option<GroupFormOutput> = app.update(cx, |app, cx| {
+                let valid = app
+                    .group_form
+                    .as_mut()
+                    .map(|form| form.validate(cx))
+                    .unwrap_or(true);
+                if !valid {
+                    cx.notify();
+                    return None;
+                }
+                app.group_form.as_ref().map(|form| form.output(cx))
+            });
+            if let Some(out) = output {
+                if let Some(ref cb) = on_save {
+                    cb(out, w, cx);
+                }
+            }
+        },
+    )
 }

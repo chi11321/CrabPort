@@ -60,6 +60,14 @@ pub struct AppearanceConfig {
     /// so it survives restarts alongside other general UI prefs.
     #[serde(default)]
     pub startup: StartupConfig,
+
+    /// Global animation speed multiplier. Stored under `[appearance]` so it
+    /// survives restarts. Affects every `duration_*()` token in
+    /// `crabport-ui::motion` — higher tiers scale all transitions down by
+    /// the corresponding factor (e.g. `Fast` = 0.75× → a 150 ms dialog
+    /// fade completes in ~112 ms). `Standard` is the tuned baseline.
+    #[serde(default)]
+    pub animation_speed: AnimationSpeed,
 }
 
 fn default_panel_width() -> f32 {
@@ -84,11 +92,12 @@ pub struct StartupConfig {
     pub page: StartupPage,
 }
 
-/// The launch target. Serialized as a single-tagged string
+/// The launch target. Serialized as a single tagged string
 /// (`"home"`, `"sftp"`, `"local_terminal"`, `"session:<id>"`)
-/// so hand-editing `config.toml` stays readable.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+/// so hand-editing `config.toml` stays readable — see the manual
+/// `Serialize`/`Deserialize` impls below, which route through
+/// [`StartupPage::to_id`] / [`StartupPage::from_id`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum StartupPage {
     /// Land on the Home (sessions) tab.
     #[default]
@@ -133,6 +142,86 @@ impl StartupPage {
             }
         }
         StartupPage::Home
+    }
+}
+
+impl Serialize for StartupPage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Single string form: `page = "session:7"` instead of the derive's
+        // `page = { session = 7 }` table — readable and grep-able.
+        s.serialize_str(&self.to_id())
+    }
+}
+
+impl<'de> Deserialize<'de> for StartupPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Accept both the documented string form and the legacy derive form
+        // (`{ session = 7 }`) that earlier builds wrote into config.toml, so
+        // upgrading never resets the user's startup page.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Id(String),
+            Legacy(LegacyStartupPage),
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyStartupPage {
+            Home,
+            Sftp,
+            LocalTerminal,
+            Session(i64),
+        }
+        Ok(match Raw::deserialize(d)? {
+            // Unknown / malformed ids fall back to Home inside from_id.
+            Raw::Id(s) => StartupPage::from_id(&s),
+            Raw::Legacy(LegacyStartupPage::Home) => StartupPage::Home,
+            Raw::Legacy(LegacyStartupPage::Sftp) => StartupPage::Sftp,
+            Raw::Legacy(LegacyStartupPage::LocalTerminal) => StartupPage::LocalTerminal,
+            Raw::Legacy(LegacyStartupPage::Session(id)) => StartupPage::Session(id),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Animation speed
+// ---------------------------------------------------------------------------
+
+/// Global animation speed tier. Serialized as a single snake_case word
+/// (`slow` / `standard` / `fast` / `fastest`) so hand-editing `config.toml`
+/// stays readable.
+///
+/// The tier maps to a multiplier applied to every `duration_*()` token in
+/// `crabport-ui::motion` — higher tiers scale durations down by the listed
+/// factor. `Standard` is the tuned baseline (multiplier 1.0×) that the
+/// motion tokens were designed against.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationSpeed {
+    /// 1.25× the baseline duration. For users who find the default motion
+    /// too snappy and want transitions to ease in more noticeably.
+    Slow,
+    /// 1.0× — the tuned baseline. Every `duration_*()` token reads as its
+    /// nominal `DURATION_*` constant value.
+    #[default]
+    Standard,
+    /// 0.75× the baseline. Snappier without feeling instant; good for
+    /// power users who want to cut motion overhead.
+    Fast,
+    /// 0.5× the baseline. Transitions are perceptible but very quick —
+    /// the lower bound before motion starts feeling jumpy.
+    Fastest,
+}
+
+impl AnimationSpeed {
+    /// Multiplier applied to baseline durations. `Standard` returns 1.0.
+    pub fn multiplier(self) -> f32 {
+        match self {
+            AnimationSpeed::Slow => 1.25,
+            AnimationSpeed::Standard => 1.0,
+            AnimationSpeed::Fast => 0.75,
+            AnimationSpeed::Fastest => 0.5,
+        }
     }
 }
 
@@ -195,6 +284,7 @@ impl Default for AppearanceConfig {
             terminal: TerminalConfig::default(),
             panel_width: default_panel_width(),
             startup: StartupConfig::default(),
+            animation_speed: AnimationSpeed::default(),
         }
     }
 }
@@ -221,6 +311,21 @@ pub struct TerminalConfig {
     #[serde(default = "default_terminal_font_size")]
     pub font_size: f32,
 
+    /// Whether the right-hand panel auto-expands when a terminal tab
+    /// finishes connecting. Defaults to `true` so a fresh install mirrors
+    /// the behavior of every prior release (panel slides in once the SSH /
+    /// Telnet session reaches `Connected`, or immediately for local PTY).
+    /// The user can turn it off in Settings if they prefer the terminal to
+    /// occupy the full width and only open the panel on demand via the
+    /// toolbar toggle button.
+    ///
+    /// This is a *default* — the per-tab toggle (`CrabportApp::panel_open`)
+    /// still wins once the user has clicked the button. The setting just
+    /// controls what `panel_open` defaults to for a tab that hasn't been
+    /// toggled yet.
+    #[serde(default = "default_expand_panel_on_connect")]
+    pub expand_panel_on_connect: bool,
+
     /// Per-slot visibility for the bottom toolbar, stored under
     /// `[appearance.terminal.toolbar]`. Each field defaults to `true` so a
     /// fresh install shows every available chip; the user toggles them
@@ -236,11 +341,19 @@ fn default_terminal_font_size() -> f32 {
     13.0
 }
 
+/// Default for `TerminalConfig::expand_panel_on_connect` — `true` so a
+/// fresh install mirrors the pre-setting behavior (panel slides in on
+/// connect).
+fn default_expand_panel_on_connect() -> bool {
+    true
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_family: String::new(),
             font_size: default_terminal_font_size(),
+            expand_panel_on_connect: default_expand_panel_on_connect(),
             toolbar: ToolbarVisibilityConfig::default(),
         }
     }
@@ -855,9 +968,27 @@ bg = "#111111"
     /// keeping the file readable and round-tripping through `to_id`/`from_id`.
     #[test]
     fn startup_page_serializes_as_string() {
-        let toml = toml::to_string(&StartupPage::Session(7)).unwrap();
+        let toml = toml::to_string(&StartupConfig {
+            page: StartupPage::Session(7),
+        })
+        .unwrap();
         assert!(toml.contains("\"session:7\""));
-        let back: StartupPage = toml::from_str(&toml).unwrap();
-        assert_eq!(back, StartupPage::Session(7));
+        let back: StartupConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.page, StartupPage::Session(7));
+    }
+
+    /// Deserialization accepts both the string form and the legacy derive
+    /// form (`page = { session = 7 }`) written by earlier builds, and falls
+    /// back to `Home` on unknown ids instead of failing the whole config.
+    #[test]
+    fn startup_page_deserializes_legacy_and_fallback_forms() {
+        let back: StartupConfig = toml::from_str("page = { session = 7 }").unwrap();
+        assert_eq!(back.page, StartupPage::Session(7));
+
+        let back: StartupConfig = toml::from_str("page = \"local_terminal\"").unwrap();
+        assert_eq!(back.page, StartupPage::LocalTerminal);
+
+        let back: StartupConfig = toml::from_str("page = \"whatever\"").unwrap();
+        assert_eq!(back.page, StartupPage::Home);
     }
 }

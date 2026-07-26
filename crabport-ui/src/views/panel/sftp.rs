@@ -5,7 +5,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
-use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 use rustc_hash::FxHashSet;
@@ -15,7 +14,12 @@ use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_fast};
+use crate::views::sftp::drag::render_drag_chip;
+use crate::views::sftp::pane::{
+    build_entry_rows, cmp_remote_listing, join_remote_path, remote_target_path,
+    render_drag_exit_canvas, render_scrollbar_overlay, render_selection_bar,
+};
 
 /// Drag payload for an SFTP row being dragged within the app.
 /// Dropped onto a terminal area to trigger a download.
@@ -29,34 +33,7 @@ pub struct SftpDragValue {
 impl Render for SftpDragValue {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // A small floating chip showing the file name + icon.
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .bg(rgb(bg_base()))
-            .border_1()
-            .border_color(rgb(border()))
-            .shadow_sm()
-            .child(
-                svg()
-                    .path(if self.is_dir {
-                        "icons/folder.svg"
-                    } else {
-                        "icons/file.svg"
-                    })
-                    .size_3()
-                    .text_color(rgb(text_muted())),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_primary()))
-                    .child(self.name.clone()),
-            )
+        render_drag_chip(self.is_dir, self.name.clone())
     }
 }
 
@@ -116,6 +93,8 @@ pub struct SftpPanel {
     on_rename: Option<Rc<dyn Fn(String, String, &mut App)>>,
     /// Edit callback — invoked with the remote path to download + open locally.
     on_edit: Option<Rc<dyn Fn(String, &mut App)>>,
+    /// Mkdir callback — invoked with the remote path to create.
+    on_mkdir: Option<Rc<dyn Fn(String, &mut App)>>,
     /// When `Some`, a small inline rename-prompt overlay is rendered over the
     /// panel. Holds the entry name being renamed (used as the dialog title
     /// and to resolve the old remote path from the current cwd).
@@ -123,6 +102,13 @@ pub struct SftpPanel {
     /// `InputState` backing the rename-prompt overlay. Lazily created the
     /// first time the user triggers a rename; reused thereafter.
     rename_input: Option<Entity<InputState>>,
+    /// When `Some`, an inline "new folder" input is shown at the top of the
+    /// file list. Holds `()` to signal presence; the actual name comes from
+    /// `mkdir_input`.
+    mkdir_pending: Option<()>,
+    /// `InputState` backing the inline mkdir input. Lazily created on the
+    /// first "new folder" trigger; reused thereafter.
+    mkdir_input: Option<Entity<InputState>>,
     /// Scroll handle for the virtual list. Doubles as the handle for the
     /// custom `Scrollbar::vertical` overlay so the scrollbar style stays
     /// consistent with the rest of the app.
@@ -152,8 +138,11 @@ impl SftpPanel {
             on_delete: None,
             on_rename: None,
             on_edit: None,
+            on_mkdir: None,
             renaming_entry: None,
             rename_input: None,
+            mkdir_pending: None,
+            mkdir_input: None,
             scroll_handle: VirtualListScrollHandle::new(),
             drag_over: false,
         }
@@ -171,6 +160,7 @@ impl SftpPanel {
         on_delete: Option<Rc<dyn Fn(String, &mut App)>>,
         on_rename: Option<Rc<dyn Fn(String, String, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(String, &mut App)>>,
+        on_mkdir: Option<Rc<dyn Fn(String, &mut App)>>,
         active_tab_id: u64,
         context_menu: Entity<crate::components::context_menu::ContextMenuController>,
         alert_controller: Entity<AlertController>,
@@ -238,6 +228,7 @@ impl SftpPanel {
             self.on_delete = on_delete;
             self.on_rename = on_rename;
             self.on_edit = on_edit;
+            self.on_mkdir = on_mkdir;
             return;
         }
 
@@ -300,6 +291,7 @@ impl SftpPanel {
         self.on_delete = on_delete;
         self.on_rename = on_rename;
         self.on_edit = on_edit;
+        self.on_mkdir = on_mkdir;
         self.active_tab_id = Some(active_tab_id);
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
@@ -378,16 +370,8 @@ impl SftpPanel {
             .as_ref()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let old_path = if cwd_str.ends_with('/') {
-            format!("{}{}", cwd_str, entry_name)
-        } else {
-            format!("{}/{}", cwd_str, entry_name)
-        };
-        let new_path = if cwd_str.ends_with('/') {
-            format!("{}{}", cwd_str, new_name)
-        } else {
-            format!("{}/{}", cwd_str, new_name)
-        };
+        let old_path = join_remote_path(&cwd_str, &entry_name);
+        let new_path = join_remote_path(&cwd_str, &new_name);
         if let Some(ref cb) = self.on_rename {
             let cb = cb.clone();
             let old = old_path.clone();
@@ -404,29 +388,91 @@ impl SftpPanel {
         self.renaming_entry = None;
         cx.notify();
     }
+
+    // --- "New folder" inline input flow ---
+
+    /// Begin the "new folder" flow: open an inline input at the top of the
+    /// file list, pre-seeded with "New Folder". The user edits the name +
+    /// presses Enter to commit, or clicks away / presses Escape to cancel.
+    fn start_make_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mkdir_pending = Some(());
+        if self.mkdir_input.is_none() {
+            let entity = cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder("folder name");
+                state.focus(window, cx);
+                state
+            });
+            cx.subscribe(
+                &entity,
+                |this, _input, event: &gpui_component::input::InputEvent, cx| {
+                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                        this.commit_make_folder(cx);
+                    }
+                },
+            )
+            .detach();
+            let blur_handle = entity.read(cx).focus_handle(cx);
+            cx.on_blur(&blur_handle, window, move |this, _window, cx| {
+                if this.mkdir_pending.is_some() {
+                    this.cancel_make_folder(cx);
+                }
+            })
+            .detach();
+            self.mkdir_input = Some(entity);
+        }
+        if let Some(ref input) = self.mkdir_input {
+            input.update(cx, |state, cx| {
+                state.set_value("New Folder", window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Commit the mkdir: read the new name from `mkdir_input`, invoke
+    /// `on_mkdir` with the joined remote path, and close the inline input.
+    fn commit_make_folder(&mut self, cx: &mut Context<Self>) {
+        let name = self.mkdir_input.as_ref().and_then(|input| {
+            let v = input.read(cx).value().to_string();
+            if v.trim().is_empty() { None } else { Some(v) }
+        });
+        let Some(name) = name else {
+            self.cancel_make_folder(cx);
+            return;
+        };
+        self.mkdir_pending = None;
+        let cwd_str = self
+            .cwd
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let remote_path = if cwd_str.ends_with('/') {
+            format!("{}{}", cwd_str, name)
+        } else {
+            format!("{}/{}", cwd_str, name)
+        };
+        if let Some(ref cb) = self.on_mkdir {
+            let cb = cb.clone();
+            let path = remote_path.clone();
+            cx.defer(move |cx| cb(path, cx));
+        }
+        cx.notify();
+    }
+
+    /// Abort the mkdir flow without creating anything.
+    fn cancel_make_folder(&mut self, cx: &mut Context<Self>) {
+        self.mkdir_pending = None;
+        cx.notify();
+    }
 }
 
 impl Render for SftpPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Sort entries alphabetically, directories first
-        let mut sorted: Vec<crabport_sftp::FileEntry> = self.entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
-            (".", _) => std::cmp::Ordering::Less,
-            (_, ".") => std::cmp::Ordering::Greater,
-            ("..", _) => std::cmp::Ordering::Less,
-            (_, "..") => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-
-        // Prepend .. entry
-        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: None,
-            permissions: None,
-            modified: None,
-        }];
-        all_entries.extend(sorted);
+        // Sort entries alphabetically (`.`/`..` first), prepend the `..`
+        // parent row, and precompute the fixed 26px row sizes for the
+        // virtual list — the list never has to measure rows at runtime.
+        let (all_entries, item_sizes) =
+            build_entry_rows(self.entries.iter().cloned().collect(), cmp_remote_listing);
 
         let path_input = self.path_input.clone();
         let entity = _cx.entity().downgrade();
@@ -448,20 +494,6 @@ impl Render for SftpPanel {
             self.context_menu_entry = None;
         }
 
-        // Pre-compute item sizes for the virtual list. All rows share a
-        // fixed height (26px); width is left at 0 so VirtualList uses the
-        // container width. This satisfies the "precompute item sizes"
-        // best practice — the list never has to measure rows at runtime.
-        let item_sizes = Rc::new(
-            all_entries
-                .iter()
-                .map(|_| Size {
-                    width: px(0.0),
-                    height: px(26.0),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let all_entries = Rc::new(all_entries);
         let scroll_handle = self.scroll_handle.clone();
 
         // Clone the action-button callbacks out of `self` so the button
@@ -491,89 +523,44 @@ impl Render for SftpPanel {
             .relative()
             .when_some(path_input, |el, input| {
                 el.child(
-                    div().mb_1().child(
-                        StyledInput::new("sftp-path", input).xsmall().prefix(
-                            svg()
-                                .path("icons/folder.svg")
-                                .size(px(12.0))
-                                .text_color(rgb(text_muted())),
-                        ),
-                    ),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .mb_1()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                StyledInput::new("sftp-path", input).xsmall().prefix(
+                                    svg()
+                                        .path("icons/folder.svg")
+                                        .size(px(12.0))
+                                        .text_color(rgb(text_muted())),
+                                ),
+                            ),
+                        )
+                        // Ellipsis actions menu: upload / download /
+                        // refresh / new folder.
+                        .child(render_panel_ellipsis_button(
+                            _cx.entity().downgrade(),
+                            self.context_menu.clone(),
+                            tooltip_ctrl.clone(),
+                            on_upload.clone(),
+                            on_download.clone(),
+                            on_navigate.clone(),
+                            self.on_mkdir.clone(),
+                            cwd.clone(),
+                            entity.clone(),
+                        )),
                 )
             })
-            // Action button row: upload / download / refresh. Compact
-            // icon-only buttons that sit between the path bar and the
-            // listing. Upload opens a native file picker (multi-select) and
-            // uploads each chosen file into the current cwd. Download does
-            // the same for the multi-selection (re-using the context-menu
-            // batch flow). Refresh re-navigates to the current cwd to force
-            // a listing reload.
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mb_1()
-                    .child(render_sftp_action_button(
-                        "sftp-upload-btn",
-                        "icons/upload.svg",
-                        t!("sftp.upload").to_string(),
-                        on_upload.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_upload = on_upload.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_upload(
-                                    entity.clone(),
-                                    on_upload.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_sftp_action_button(
-                        "sftp-download-btn",
-                        "icons/download.svg",
-                        t!("sftp.download").to_string(),
-                        on_download.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_download = on_download.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_download_from_button(
-                                    entity.clone(),
-                                    on_download.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_sftp_action_button(
-                        "sftp-refresh-btn",
-                        "icons/refresh-cw.svg",
-                        t!("sftp.refresh").to_string(),
-                        on_navigate.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let on_navigate = on_navigate.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                let cb = on_navigate.as_ref();
-                                let cwd = cwd.as_ref();
-                                if let (Some(cb), Some(cwd)) = (cb, cwd) {
-                                    cb(cwd.as_str().to_string(), cx);
-                                }
-                            }
-                        },
-                    )),
-            )
+            // Inline "new folder" input — shown above the list when the
+            // user has triggered "new folder" from the ellipsis menu.
+            .when(self.mkdir_pending.is_some(), |el| {
+                el.when_some(self.mkdir_input.clone(), |el, input| {
+                    el.child(render_mkdir_input("sftp-panel-mkdir".into(), input))
+                })
+            })
             .child(
                 // List + scrollbar. The scrollbar is a pure overlay —
                 // absolutely positioned on top of the list's right edge,
@@ -608,11 +595,7 @@ impl Render for SftpPanel {
                                         .file_name()
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_else(|| local.to_string_lossy().into_owned());
-                                    let remote = if cwd_str.ends_with('/') {
-                                        format!("{}{}", cwd_str, name)
-                                    } else {
-                                        format!("{}/{}", cwd_str, name)
-                                    };
+                                    let remote = join_remote_path(&cwd_str, &name);
                                     if let Some(ref cb) = on_upload {
                                         cb(local.to_string_lossy().into_owned(), remote, cx);
                                     }
@@ -657,22 +640,7 @@ impl Render for SftpPanel {
 
                                         // Build target path for navigation
                                         let cwd_ref = this.cwd.as_ref().map(|s| s.as_str()).unwrap_or("/");
-                                        let target_path = if name == "." {
-                                            cwd_ref.to_string()
-                                        } else if name == ".." {
-                                            let mut parts: Vec<&str> =
-                                                cwd_ref.split('/').filter(|s| !s.is_empty()).collect();
-                                            parts.pop();
-                                            if parts.is_empty() {
-                                                "/".to_string()
-                                            } else {
-                                                format!("/{}", parts.join("/"))
-                                            }
-                                        } else if cwd_ref.ends_with('/') {
-                                            format!("{}{}", cwd_ref, name)
-                                        } else {
-                                            format!("{}/{}", cwd_ref, name)
-                                        };
+                                        let target_path = remote_target_path(cwd_ref, &name);
 
                                         let on_navigate = this.on_navigate.clone();
                                         let on_download = this.on_download.clone();
@@ -831,11 +799,7 @@ impl Render for SftpPanel {
                                                                         && view.selected.contains(e.name.as_str())
                                                                 })
                                                                 .map(|e| {
-                                                                    let p = if cwd_str.ends_with('/') {
-                                                                        format!("{}{}", cwd_str, e.name)
-                                                                    } else {
-                                                                        format!("{}/{}", cwd_str, e.name)
-                                                                    };
+                                                                    let p = join_remote_path(cwd_str, &e.name);
                                                                     (e.name.clone(), e.is_dir, p)
                                                                 })
                                                                 .collect()
@@ -1073,7 +1037,7 @@ impl Render for SftpPanel {
                                             // Hover / context-menu highlight.
                                             .transition_when_else(
                                                 is_highlighted,
-                                                DURATION_FAST,
+                                                duration_fast(),
                                                 EASE_STANDARD,
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
                                                 |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
@@ -1084,26 +1048,10 @@ impl Render for SftpPanel {
                                             // via a separate transition so selection
                                             // changes animate smoothly.
                                             .relative()
-                                            .child(
-                                                div()
-                                                    .id(ElementId::Name(format!("sftp-bar-{i}").into()))
-                                                    .absolute()
-                                                    .top(px(2.0))
-                                                    .bottom(px(2.0))
-                                                    .left_0()
-                                                    .w(px(2.0))
-                                                    .rounded(px(1.0))
-                                                    .bg(rgb(btn_primary_bg()))
-                                                    .opacity(0.0)
-                                                    .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
-                                                    .transition_when_else(
-                                                        is_selected,
-                                                        DURATION_FAST,
-                                                        EASE_STANDARD,
-                                                        |el| el.opacity(1.0),
-                                                        |el| el.opacity(0.0),
-                                                    ),
-                                            )
+                                            .child(render_selection_bar(
+                                                format!("sftp-bar-{i}"),
+                                                is_selected,
+                                            ))
                                             .child(
                                                 svg()
                                                     .path(icon_path)
@@ -1150,18 +1098,7 @@ impl Render for SftpPanel {
                         )
                         .track_scroll(&scroll_handle),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.0))
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
-                            ),
-                    )
+                    .child(render_scrollbar_overlay(&scroll_handle))
                     // Drop-zone overlay: shows a translucent hint with icon
                     // when external files are dragged over the list. Fades
                     // in/out with an eased transition.
@@ -1178,29 +1115,14 @@ impl Render for SftpPanel {
                     // can’t catch this because `Exited` is not a `MouseMoveEvent`.
                     .child({
                         let entity = entity_for_list.clone();
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |_bounds, _state, window, _cx| {
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |event: &FileDropEvent, phase, _window, cx| {
-                                        if phase != DispatchPhase::Capture {
-                                            return;
-                                        }
-                                        if matches!(event, FileDropEvent::Exited) {
-                                            let _ = entity.update(cx, |view, cx| {
-                                                if view.drag_over {
-                                                    view.drag_over = false;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    }
-                                });
-                            },
-                        )
-                        .w_0()
-                        .h_0()
+                        render_drag_exit_canvas(move |cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                if view.drag_over {
+                                    view.drag_over = false;
+                                    cx.notify();
+                                }
+                            });
+                        })
                     })
             )
     }
@@ -1302,73 +1224,184 @@ fn trigger_batch_download(
 }
 
 // ---------------------------------------------------------------------------
-// Action button row (upload / download / refresh)
+// Ellipsis (overflow) menu button — upload / download / refresh / mkdir
 // ---------------------------------------------------------------------------
 
-/// Render a compact icon-only action button for the SFTP toolbar. Uses the
-/// ghost-button colour scheme (transparent bg, subtle hover) so the row reads
-/// as a thin toolbar rather than three prominent buttons.
+/// Render the inline "new folder" input row shown above the file list when
+/// the user has triggered "new folder" from the ellipsis menu. The input
+/// is pre-seeded with "New Folder" by `start_make_folder`; Enter commits,
+/// blur cancels (wired via `cx.on_blur` in `start_make_folder`).
+fn render_mkdir_input(id: SharedString, input: Entity<InputState>) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("{id}-row")))
+        .w_full()
+        .h(px(26.0))
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .bg(rgba((surface_hover() << 8) | 0x55))
+        .border_b_1()
+        .border_color(rgb(border()))
+        .child(
+            svg()
+                .path("icons/folder.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(rgb(text_muted())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(StyledInput::new(id, input).xsmall()),
+        )
+}
+
+/// Render the ellipsis button shown at the right of the path bar.
 ///
-/// `enabled = false` dims the icon and disables the click handler — used when
-/// the corresponding backend callback isn't wired (e.g. no active terminal).
-fn render_sftp_action_button(
-    id: &'static str,
-    icon: &'static str,
-    tooltip: String,
-    enabled: bool,
+/// Clicking it opens a [`ContextMenuController`] anchored to the click
+/// position with these actions: upload, download, refresh, new folder.
+/// The menu is non-sticky — every item click invokes its handler and
+/// dismisses the menu.
+///
+/// `on_upload` / `on_download` / `on_navigate` / `cwd` are threaded through
+/// here as `Rc` clones captured per-render. Items are disabled when the
+/// corresponding callback is `None` (e.g. no active terminal).
+fn render_panel_ellipsis_button(
+    entity: WeakEntity<SftpPanel>,
+    context_menu: Option<Entity<crate::components::context_menu::ContextMenuController>>,
     tooltip_ctrl: Option<Entity<crate::components::tooltip::TooltipController>>,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
+    on_upload: Option<Rc<dyn Fn(String, String, &mut App)>>,
+    on_download: Option<Rc<dyn Fn(String, String, &mut App)>>,
+    on_navigate: Option<Rc<dyn Fn(String, &mut App)>>,
+    on_mkdir: Option<Rc<dyn Fn(String, &mut App)>>,
+    cwd: Option<Arc<String>>,
+    // `entity` is also captured above for use in the click handlers. Kept
+    // as a separate param so we can clone it into each item's closure.
+    _entity_dup: WeakEntity<SftpPanel>,
 ) -> impl IntoElement {
-    let color = if enabled { text_muted() } else { 0x45475a };
-    let hover_bg = surface_hover();
-    let to_color = |c: u32| rgba(if c <= 0xFFFFFF { (c << 8) | 0xFF } else { c });
-    let rest_bg = to_color(0x00000000);
-    let hover_bg_rgba = to_color(hover_bg);
-    let btn_id = ElementId::Name(id.into());
-    let tooltip_text_clone = tooltip.clone();
+    let btn_id = ElementId::Name("sftp-panel-ellipsis-btn".into());
+    // Faint resting bg (alpha ~30%) so the button is visible without
+    // dominating the path bar.
+    let rest_bg = rgba((surface_hover() << 8) | 0x33);
+    let hover_bg_rgba = rgba((surface_hover() << 8) | 0xFF);
+    let tooltip_text = t!("sftp_tab.actions").to_string();
+
     div()
         .id(btn_id.clone())
         .flex()
         .items_center()
         .justify_center()
-        .size(px(24.0))
+        .size(px(26.0))
+        .flex_shrink_0()
         .rounded(px(4.0))
         .bg(rest_bg)
-        .when(!enabled, |el| el.cursor_not_allowed())
-        .when(enabled, |el| {
-            el.on_click(move |_e, w, cx| {
-                on_click(w, cx);
-                cx.stop_propagation();
-            })
-        })
         .with_transition(btn_id)
-        // on_hover must come AFTER with_transition (on the AnimatedWrapper)
-        // and BEFORE transition_on_hover — otherwise transition_on_hover
-        // registers a second hover handler and GPUI panics. Mirrors
-        // `render_action_button` in sftp/helpers.rs.
-        .when_some(tooltip_ctrl, |el, ctrl| {
-            el.when(enabled, |el| {
-                el.on_hover(move |hovered, w, cx| {
-                    if *hovered {
-                        ctrl.update(cx, |t, cx| {
-                            t.show(tooltip_text_clone.clone(), w.mouse_position(), cx);
-                        });
-                    } else {
-                        ctrl.update(cx, |t, cx| {
-                            t.hide(cx);
-                        });
-                    }
-                })
-            })
-        })
-        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg_rgba)
             } else {
                 el.bg(rest_bg)
             }
         })
-        .child(svg().path(icon).size(px(14.0)).text_color(rgb(color)))
+        .when_some(tooltip_ctrl.clone(), |el, ctrl| {
+            el.on_hover(move |hovered, w, cx| {
+                if *hovered {
+                    ctrl.update(cx, |t, cx| {
+                        t.show(tooltip_text.clone(), w.mouse_position(), cx);
+                    });
+                } else {
+                    ctrl.update(cx, |t, cx| {
+                        t.hide(cx);
+                    });
+                }
+            })
+        })
+        .on_click(move |e, _w, cx| {
+            let Some(ref cm) = context_menu else {
+                return;
+            };
+            let upload_label = t!("sftp.upload").to_string();
+            let download_label = t!("sftp.download").to_string();
+            let refresh_label = t!("sftp.refresh").to_string();
+            let mkdir_label = t!("sftp_tab.mkdir").to_string();
+
+            let mut items: Vec<ContextMenuItem> = Vec::new();
+
+            if on_upload.is_some() {
+                let entity = entity.clone();
+                let on_upload = on_upload.clone();
+                let cwd = cwd.clone();
+                items.push(
+                    ContextMenuItem::new(upload_label.clone(), move |_w, cx| {
+                        trigger_upload(entity.clone(), on_upload.as_ref(), cwd.as_ref(), cx);
+                    })
+                    .with_icon("icons/upload.svg"),
+                );
+            }
+            if on_download.is_some() {
+                let entity = entity.clone();
+                let on_download = on_download.clone();
+                let cwd = cwd.clone();
+                items.push(
+                    ContextMenuItem::new(download_label.clone(), move |_w, cx| {
+                        trigger_download_from_button(
+                            entity.clone(),
+                            on_download.as_ref(),
+                            cwd.as_ref(),
+                            cx,
+                        );
+                    })
+                    .with_icon("icons/download.svg"),
+                );
+            }
+            if on_navigate.is_some() {
+                let on_navigate = on_navigate.clone();
+                let cwd = cwd.clone();
+                items.push(
+                    ContextMenuItem::new(refresh_label.clone(), move |_w, cx| {
+                        let cb = on_navigate.as_ref();
+                        let cwd = cwd.as_ref();
+                        if let (Some(cb), Some(cwd)) = (cb, cwd) {
+                            cb(cwd.as_str().to_string(), cx);
+                        }
+                    })
+                    .with_icon("icons/refresh-cw.svg"),
+                );
+            }
+            if on_mkdir.is_some() {
+                let entity = entity.clone();
+                items.push(
+                    ContextMenuItem::new(mkdir_label.clone(), move |w, cx| {
+                        let _ = entity.update(cx, |view, cx| {
+                            view.start_make_folder(w, cx);
+                        });
+                    })
+                    .with_icon("icons/plus.svg"),
+                );
+            }
+
+            let state = ContextMenuState {
+                position: e.position(),
+                items,
+                header: None,
+                open: false,
+                sticky: false,
+            };
+            cm.update(cx, |c, cx| {
+                c.show(state, cx);
+            });
+            cx.stop_propagation();
+        })
+        .child(
+            svg()
+                .path("icons/ellipsis.svg")
+                .size(px(14.0))
+                .text_color(rgb(text_muted())),
+        )
 }
 
 /// Upload button handler: open a native multi-select file picker and upload
@@ -1435,11 +1468,7 @@ fn trigger_upload(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| local.to_string_lossy().into_owned());
-                let remote = if cwd.ends_with('/') {
-                    format!("{}{}", cwd, name)
-                } else {
-                    format!("{}/{}", cwd, name)
-                };
+                let remote = join_remote_path(&cwd, &name);
                 on_upload(local.to_string_lossy().into_owned(), remote, cx);
             }
         });
@@ -1467,11 +1496,7 @@ fn trigger_download_from_button(
             .iter()
             .filter(|e| e.name != "." && e.name != ".." && view.selected.contains(e.name.as_str()))
             .map(|e| {
-                let p = if cwd_str.ends_with('/') {
-                    format!("{}{}", cwd_str, e.name)
-                } else {
-                    format!("{}/{}", cwd_str, e.name)
-                };
+                let p = join_remote_path(cwd_str, &e.name);
                 (e.name.clone(), e.is_dir, p)
             })
             .collect::<Vec<_>>()

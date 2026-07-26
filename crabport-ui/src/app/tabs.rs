@@ -10,7 +10,12 @@ use super::{CrabPortTab, CrabportApp, Tab, TabKind, ToggleCommand};
 use crate::components::button::Button;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::terminal::TerminalView;
+use crate::views::terminal::connection_overlay::{
+    ConnectionLogLevel, ConnectionOverlayState, SharedOverlayState,
+};
 use crate::views::terminal::split::{SplitDir, SplitTree};
+use crabport_serial::backend::SerialBackend;
+use crabport_serial::session::SerialConnectionInfo;
 use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
 use crabport_telnet::backend::TelnetBackend;
@@ -31,18 +36,73 @@ impl CrabportApp {
     }
 
     pub fn add_tab(&mut self, cx: &mut Context<Self>) -> u64 {
+        self.add_tab_with_cwd(None, cx)
+    }
+
+    /// Open a new local-terminal tab, optionally starting the child shell
+    /// in `cwd`. Used by the macOS "Open in CrabPort" entry point so a
+    /// folder right-clicked in Finder opens a terminal already cd'd
+    /// into it. `None` defaults to the user's home directory — better
+    /// than the GUI app's process cwd (which is `/` on macOS and can't
+    /// be `cd`'d out of by a naive user).
+    pub fn add_tab_with_cwd(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        // `None` → default to the user's home directory. We resolve this
+        // here (rather than letting `PendingPtyBackend` inherit the
+        // process cwd) because GUI-launched macOS apps start with cwd `/`,
+        // and a fresh tab landing in `/` is a poor default. SSH / Telnet
+        // tabs bypass this entirely (they have their own login shell).
+        let cwd = cwd.or_else(|| dirs::home_dir());
+
+        // Tab title: `<dir>-<shell>` (e.g. `Downloads-zsh`). The shell
+        // name is derived from `$SHELL` here as an initial guess; once the
+        // PTY reader's `ProcessWatcher` fires, it corrects this to the
+        // actual foreground process name. Falls back to `Terminal-<id>`
+        // (`next_tab_id` is the id `push_tab` is about to assign) only if
+        // cwd resolution fails (very unusual).
+        let title = cwd
+            .as_ref()
+            .map(|p| {
+                tab_title_from_process(p, &shell_basename().unwrap_or_else(|| "sh".to_string()))
+            })
+            .unwrap_or_else(|| format!("Terminal-{}", self.next_tab_id));
+        let id = self.push_tab(title, false);
+
+        let terminal_view = cx.new(|cx| TerminalView::new_with_cwd(id, cwd, cx));
+
+        // When the local PTY child exits, automatically close the tab.
+        self.wire_close_tab_on_backend_closed(&terminal_view, id, cx);
+        self.wire_sftp_transfer_toasts(&terminal_view, cx);
+        self.finish_tab_registration(id, terminal_view, cx);
+        id
+    }
+
+    /// Append a fresh terminal tab to the tab strip and return its id.
+    fn push_tab(&mut self, title: String, is_remote: bool) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab {
             id,
-            title: format!("Terminal-{}", id),
+            title,
             kind: TabKind::Terminal,
-            is_remote: false,
+            is_remote,
         });
+        id
+    }
 
-        let terminal_view = cx.new(|cx| TerminalView::new(id, cx));
-
-        // When the local PTY child exits, automatically close the tab
+    /// Auto-close tab `id` when its terminal backend reports closed (child
+    /// shell exited / remote session ended). Note: deliberately captures a
+    /// STRONG handle to the app entity, matching the original wiring of
+    /// every tab creator.
+    fn wire_close_tab_on_backend_closed(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
         let app_handle = cx.entity().clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_backend_closed(move |cx| {
@@ -51,7 +111,16 @@ impl CrabportApp {
                 });
             });
         });
+    }
 
+    /// Wire the SFTP feedback callbacks onto a freshly created terminal
+    /// view. Used by the local-tab and SSH-tab creators — Telnet / Serial
+    /// tabs have no SFTP and don't call this.
+    fn wire_sftp_transfer_toasts(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
         // Re-render the app when SFTP transfer progress changes so the
         // toolbar (rendered in `render_content`) picks up the latest
         // snapshot. We use a dedicated callback rather than observing the
@@ -66,7 +135,9 @@ impl CrabportApp {
 
         // Surface a toast notification when an SFTP transfer finishes so the
         // user gets clear success/failure feedback even if the SFTP panel is
-        // closed or scrolled out of view.
+        // closed or scrolled out of view. The `t!` lookups stay inside the
+        // closure so the toast text follows the language active at toast
+        // time, not the language at tab-creation time.
         let app_handle = cx.entity().downgrade();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
@@ -137,6 +208,16 @@ impl CrabportApp {
                             NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        // Mkdir: silent on success (the directory listing
+                        // refresh surfaces the new folder); only failures toast.
+                        (SftpTransferKind::Mkdir, true) => return,
+                        (SftpTransferKind::Mkdir, false) => (
+                            t!("sftp.notif_mkdir_failed_title").to_string(),
+                            t!("sftp.notif_mkdir_failed_msg", message = message.as_str())
+                                .to_string(),
+                            NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -151,17 +232,76 @@ impl CrabportApp {
                 });
             });
         });
+    }
 
+    /// Shared tail of every tab creator: wire the pane-focus and
+    /// cwd-changed callbacks, register the view, initialize the single-pane
+    /// split tree, and activate the tab. Callback wiring intentionally
+    /// happens BEFORE `terminal_views.insert` / `init_split_for_tab`.
+    fn finish_tab_registration(
+        &mut self,
+        id: u64,
+        terminal_view: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
         // Sync the split tree's active pane when this pane receives keyboard
         // focus (e.g. via Tab cycling), so `split_active_pane` and the
         // toolbar follow keyboard focus, not just mouse clicks.
         self.register_pane_focus_callback(&terminal_view, cx);
+        self.register_cwd_changed_callback(&terminal_view, cx);
 
         self.terminal_views.insert(id, terminal_view.clone());
-        self.init_split_for_tab(id, terminal_view.clone());
+        self.init_split_for_tab(id, terminal_view);
 
         self.active_tab_id = id;
-        id
+    }
+
+    /// Wire the persistent connection-history recorder onto a freshly
+    /// created remote terminal view. The view fires the callback exactly
+    /// once per connection attempt (including reconnects), and each firing
+    /// inserts one row into the `connection_history` table with this
+    /// connection's metadata plus the attempt's outcome.
+    fn wire_connection_history(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        name: &str,
+        kind: crabport_core::credential::HostKind,
+        address: &str,
+        port: u16,
+        username: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use crabport_core::store::{ConnectionEvent, ConnectionStatus};
+
+        let store = crate::app_state::AppState::store(cx);
+        let app_handle = cx.entity().downgrade();
+        let history_view = self.app_ctx.history_view.clone();
+        let template = ConnectionEvent {
+            id: 0,
+            name: name.to_string(),
+            kind,
+            address: address.to_string(),
+            port,
+            username: username.to_string(),
+            status: ConnectionStatus::Success,
+            error: None,
+            created_at: 0,
+        };
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_connection_result(move |success, error, cx| {
+                let mut event = template.clone();
+                event.status = if success {
+                    ConnectionStatus::Success
+                } else {
+                    ConnectionStatus::Failed
+                };
+                event.error = error;
+                let _ = store.lock().add_connection_event(&event);
+                // Repaint so an open History page picks up the new row.
+                history_view.update(cx, |_, cx| cx.notify());
+                let _ = app_handle.update(cx, |_, cx| cx.notify());
+            });
+        });
     }
 
     pub fn add_ssh_tab(
@@ -176,16 +316,10 @@ impl CrabportApp {
         passphrase: Option<&str>,
         proxy: Option<crabport_core::credential::ProxyConfig>,
         startup_command: Option<&str>,
+        jump_hosts: Vec<crabport_ssh::session::JumpHostInfo>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.tabs.push(Tab {
-            id,
-            title: name.to_string(),
-            kind: TabKind::Terminal,
-            is_remote: true,
-        });
+        let id = self.push_tab(name.to_string(), true);
 
         let mut info = SshConnectionInfo::new(host, username, password).with_port(port);
         if let Some(pk) = private_key {
@@ -199,15 +333,16 @@ impl CrabportApp {
                 info = info.with_startup_command(sc);
             }
         }
+        if !jump_hosts.is_empty() {
+            info = info.with_jump_hosts(jump_hosts);
+        }
         let info_for_view = info.clone();
         let cols: usize = 80;
         let rows: usize = 24;
 
         // Create the overlay state early so the SSH backend callback can write to it
-        let overlay: crate::views::terminal::connection_overlay::SharedOverlayState =
-            std::sync::Arc::new(parking_lot::Mutex::new(
-                crate::views::terminal::connection_overlay::ConnectionOverlayState::new(),
-            ));
+        let overlay: SharedOverlayState =
+            std::sync::Arc::new(parking_lot::Mutex::new(ConnectionOverlayState::new()));
         let overlay_cb = overlay.clone();
 
         // Host-key verifier: pushes a confirmation prompt into the overlay
@@ -222,10 +357,7 @@ impl CrabportApp {
             cols as u16,
             rows as u16,
             Arc::new(move |msg: String| {
-                overlay_cb.lock().log(
-                    crate::views::terminal::connection_overlay::ConnectionLogLevel::Info,
-                    msg,
-                );
+                overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
             }),
             Some(verifier),
         ));
@@ -244,116 +376,26 @@ impl CrabportApp {
                 overlay,
                 Some(info_for_view),
                 None, // no TelnetConnectionInfo for SSH
+                None, // no SerialConnectionInfo for SSH
                 id,
                 cx,
             )
         });
-        // When the SSH session closes, automatically close the tab
-        let app_handle = cx.entity().clone();
-        terminal_view.update(cx, |view, _cx| {
-            view.set_on_backend_closed(move |cx| {
-                app_handle.update(cx, |app, cx| {
-                    app.close_tab(id, cx);
-                });
-            });
-        });
+        // Record this connection attempt (and future reconnects) in the
+        // persistent connection history.
+        self.wire_connection_history(
+            &terminal_view,
+            name,
+            crabport_core::credential::HostKind::Ssh,
+            host,
+            port,
+            username,
+            cx,
+        );
 
-        // Re-render the app when SFTP transfer progress changes so the
-        // toolbar picks up the latest snapshot.
-        let app_handle = cx.entity().downgrade();
-        terminal_view.update(cx, |view, _cx| {
-            view.set_on_sftp_progress_changed(move |cx| {
-                let _ = app_handle.update(cx, |_, cx| cx.notify());
-            });
-        });
-
-        // Surface a toast notification when an SFTP transfer finishes so the
-        // user gets clear success/failure feedback even if the SFTP panel is
-        // closed or scrolled out of view.
-        let app_handle = cx.entity().downgrade();
-        terminal_view.update(cx, |view, _cx| {
-            view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
-                let _ = app_handle.update(cx, |app, cx| {
-                    let (title, message_notif, level, duration) = match (kind, success) {
-                        (SftpTransferKind::Download, true) => (
-                            t!("sftp.notif_download_done_title").to_string(),
-                            t!("sftp.notif_download_done_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Success,
-                            std::time::Duration::from_secs(3),
-                        ),
-                        (SftpTransferKind::Download, false) => (
-                            t!("sftp.notif_download_failed_title").to_string(),
-                            t!("sftp.notif_download_failed_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Danger,
-                            std::time::Duration::from_secs(5),
-                        ),
-                        (SftpTransferKind::Upload, true) => (
-                            t!("sftp.notif_upload_done_title").to_string(),
-                            t!("sftp.notif_upload_done_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Success,
-                            std::time::Duration::from_secs(3),
-                        ),
-                        (SftpTransferKind::Upload, false) => (
-                            t!("sftp.notif_upload_failed_title").to_string(),
-                            t!("sftp.notif_upload_failed_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Danger,
-                            std::time::Duration::from_secs(5),
-                        ),
-                        // Rename: success is silent (no notification), only
-                        // surface a toast on failure.
-                        (SftpTransferKind::Rename, true) => return,
-                        (SftpTransferKind::Rename, false) => (
-                            t!("sftp.notif_rename_failed_title").to_string(),
-                            t!("sftp.notif_rename_failed_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Danger,
-                            std::time::Duration::from_secs(5),
-                        ),
-                        // Edit: success is silent, only upload/save
-                        // failures surface a toast.
-                        (SftpTransferKind::Edit, true) => return,
-                        (SftpTransferKind::Edit, false) => (
-                            t!("sftp.notif_edit_save_failed_title").to_string(),
-                            t!(
-                                "sftp.notif_edit_save_failed_msg",
-                                message = message.as_str()
-                            )
-                            .to_string(),
-                            NotificationLevel::Danger,
-                            std::time::Duration::from_secs(5),
-                        ),
-                        (SftpTransferKind::Delete, true) => (
-                            t!("sftp.notif_delete_done_title").to_string(),
-                            t!("sftp.notif_delete_done_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Success,
-                            std::time::Duration::from_secs(3),
-                        ),
-                        (SftpTransferKind::Delete, false) => (
-                            t!("sftp.notif_delete_failed_title").to_string(),
-                            t!("sftp.notif_delete_failed_msg", message = message.as_str())
-                                .to_string(),
-                            NotificationLevel::Danger,
-                            std::time::Duration::from_secs(5),
-                        ),
-                    };
-                    app.app_ctx.notifications.update(cx, |c, cx| {
-                        c.show(
-                            Notification::new(title)
-                                .level(level)
-                                .message(message_notif)
-                                .duration(duration),
-                            cx,
-                        );
-                    });
-                    cx.notify();
-                });
-            });
-        });
+        // When the SSH session closes, automatically close the tab.
+        self.wire_close_tab_on_backend_closed(&terminal_view, id, cx);
+        self.wire_sftp_transfer_toasts(&terminal_view, cx);
 
         // Wire the `CrabPortTunnel` source captured above into the view so
         // the Tunnels panel can start borrowed tunnels reusing this tab's
@@ -362,15 +404,7 @@ impl CrabportApp {
             view.set_tunnel_source(tunnel_source);
         });
 
-        // Sync the split tree's active pane when this pane receives keyboard
-        // focus (e.g. via Tab cycling), so `split_active_pane` and the
-        // toolbar follow keyboard focus, not just mouse clicks.
-        self.register_pane_focus_callback(&terminal_view, cx);
-
-        self.terminal_views.insert(id, terminal_view.clone());
-        self.init_split_for_tab(id, terminal_view.clone());
-
-        self.active_tab_id = id;
+        self.finish_tab_registration(id, terminal_view, cx);
         id
     }
 
@@ -392,15 +426,6 @@ impl CrabportApp {
         startup_command: Option<&str>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.tabs.push(Tab {
-            id,
-            title: name.to_string(),
-            kind: TabKind::Terminal,
-            is_remote: true,
-        });
-
         let mut info = TelnetConnectionInfo::new(host, username, password).with_port(port);
         if let Some(p) = proxy {
             info = info.with_proxy(p);
@@ -411,63 +436,127 @@ impl CrabportApp {
             }
         }
         let info_for_view = info.clone();
+        self.add_simple_remote_tab(
+            name,
+            host_id,
+            format!("{}@{}", username, host),
+            crabport_core::credential::HostKind::Telnet,
+            host,
+            port,
+            username,
+            Some(info_for_view), // TelnetConnectionInfo for reconnect
+            None,                // no SerialConnectionInfo for telnet
+            move |on_status| Arc::new(TelnetBackend::new(info, 80, 24, on_status)),
+            cx,
+        )
+    }
 
-        let cols: usize = 80;
-        let rows: usize = 24;
+    /// Open a Serial terminal tab. Mirrors `add_telnet_tab` but uses the
+    /// `SerialBackend` (local serial port, raw bytes, no protocol
+    /// negotiation / SFTP / tunnels). Unlike SSH/Telnet, `SerialBackend`
+    /// takes no cols/rows (serial has no terminal size — resize is a no-op).
+    /// The tab title is the device path (e.g. `/dev/ttyUSB0`).
+    pub fn add_serial_tab(
+        &mut self,
+        name: &str,
+        host_id: Option<i64>,
+        device: &str,
+        baud_rate: u32,
+        data_bits: u8,
+        parity: &str,
+        stop_bits: u8,
+        flow_control: &str,
+        startup_command: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let mut info = SerialConnectionInfo::new(device)
+            .with_baud_rate(baud_rate)
+            .with_data_bits(data_bits)
+            .with_parity(parity)
+            .with_stop_bits(stop_bits)
+            .with_flow_control(flow_control);
+        if let Some(sc) = startup_command {
+            if !sc.is_empty() {
+                info = info.with_startup_command(sc);
+            }
+        }
+        let info_for_view = info.clone();
+        // Serial has no port/username — the device path is the address,
+        // port 0 renders as "—".
+        self.add_simple_remote_tab(
+            name,
+            host_id,
+            name.to_string(),
+            crabport_core::credential::HostKind::Serial,
+            device,
+            0,
+            "",
+            None,                // no TelnetConnectionInfo for serial
+            Some(info_for_view), // SerialConnectionInfo for reconnect
+            move |on_status| Arc::new(SerialBackend::new(info, on_status)),
+            cx,
+        )
+    }
 
-        // Telnet has no host-key verification, but the connection overlay is
-        // still used for status logging ("Connecting to …", "TCP connection
-        // established").
-        let overlay: crate::views::terminal::connection_overlay::SharedOverlayState =
-            std::sync::Arc::new(parking_lot::Mutex::new(
-                crate::views::terminal::connection_overlay::ConnectionOverlayState::new(),
-            ));
+    /// Shared implementation of [`Self::add_telnet_tab`] /
+    /// [`Self::add_serial_tab`]: push the tab, create the status overlay,
+    /// build the backend via `make_backend` (which receives the overlay's
+    /// Info-level logging callback), create the view, and wire connection
+    /// history + auto-close + registration. SSH tabs don't go through here
+    /// — their extra steps (host-key verifier, tunnel-source capture, SFTP
+    /// toast wiring) stay explicit in `add_ssh_tab`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_simple_remote_tab(
+        &mut self,
+        name: &str,
+        host_id: Option<i64>,
+        host_label: String,
+        kind: crabport_core::credential::HostKind,
+        address: &str,
+        port: u16,
+        username: &str,
+        telnet_info: Option<TelnetConnectionInfo>,
+        serial_info: Option<SerialConnectionInfo>,
+        make_backend: impl FnOnce(
+            Arc<dyn Fn(String) + Send + Sync>,
+        ) -> Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.push_tab(name.to_string(), true);
+
+        // Telnet / Serial have no host-key verification, but the connection
+        // overlay is still used for status logging ("Connecting to …",
+        // "TCP connection established" / "Opening serial port …").
+        let overlay: SharedOverlayState =
+            std::sync::Arc::new(parking_lot::Mutex::new(ConnectionOverlayState::new()));
         let overlay_cb = overlay.clone();
 
-        let backend = Arc::new(TelnetBackend::new(
-            info,
-            cols as u16,
-            rows as u16,
-            Arc::new(move |msg: String| {
-                overlay_cb.lock().log(
-                    crate::views::terminal::connection_overlay::ConnectionLogLevel::Info,
-                    msg,
-                );
-            }),
-        ));
+        let backend = make_backend(Arc::new(move |msg: String| {
+            overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
+        }));
         let terminal_view = cx.new(|cx| {
             TerminalView::with_backend_and_host_and_overlay(
                 backend,
-                cols,
-                rows,
-                format!("{}@{}", username, host),
+                80,
+                24,
+                host_label,
                 host_id,
                 overlay,
-                None,                // no SshConnectionInfo for telnet
-                Some(info_for_view), // TelnetConnectionInfo for reconnect
+                None, // no SshConnectionInfo for telnet / serial
+                telnet_info,
+                serial_info,
                 id,
                 cx,
             )
         });
-        // Auto-close the tab when the telnet session ends.
-        let app_handle = cx.entity().clone();
-        terminal_view.update(cx, |view, _cx| {
-            view.set_on_backend_closed(move |cx| {
-                app_handle.update(cx, |app, cx| {
-                    app.close_tab(id, cx);
-                });
-            });
-        });
+        // Record this connection attempt (and future reconnects) in the
+        // persistent connection history.
+        self.wire_connection_history(&terminal_view, name, kind, address, port, username, cx);
 
-        // Sync the split tree's active pane when this pane receives keyboard
-        // focus (e.g. via Tab cycling), so `split_active_pane` and the
-        // toolbar follow keyboard focus, not just mouse clicks.
-        self.register_pane_focus_callback(&terminal_view, cx);
+        // Auto-close the tab when the session ends.
+        self.wire_close_tab_on_backend_closed(&terminal_view, id, cx);
 
-        self.terminal_views.insert(id, terminal_view.clone());
-        self.init_split_for_tab(id, terminal_view.clone());
-
-        self.active_tab_id = id;
+        self.finish_tab_registration(id, terminal_view, cx);
         id
     }
 
@@ -514,6 +603,7 @@ impl CrabportApp {
         // Drop this tab's per-tab panel state so the HashMaps don't leak
         // entries for closed tabs.
         self.panel_active_tab.remove(&id);
+        self.panel_open.remove(&id);
         self.app_ctx.tunnels_panel.update(cx, |panel, cx| {
             panel.forget_tab(id);
             cx.notify();
@@ -555,6 +645,33 @@ impl CrabportApp {
         let pane_id = self.alloc_pane_id();
         self.pane_views.insert(pane_id, view);
         self.split_trees.insert(tab_id, SplitTree::single(pane_id));
+    }
+
+    /// Resolve the real pane id (the key in `pane_views`) for `view` by
+    /// entity equality, or `None` if the view isn't registered as a pane.
+    /// Needed because the `count` a `TerminalView` reports is the *tab_id*
+    /// for the primary pane of a terminal tab, not the pane id.
+    fn resolve_pane_id(&self, view: &Entity<TerminalView>) -> Option<u64> {
+        self.pane_views
+            .iter()
+            .find(|(_, v)| **v == *view)
+            .map(|(p, _)| *p)
+    }
+
+    /// Point `terminal_views[tab_id]` at `pane_id`'s view (when the pane is
+    /// registered) so the toolbar / right-hand panel follow the active pane.
+    fn sync_active_pane_view(&mut self, tab_id: u64, pane_id: u64) {
+        if let Some(view) = self.pane_views.get(&pane_id).cloned() {
+            self.terminal_views.insert(tab_id, view);
+        }
+    }
+
+    /// Move keyboard focus to `pane_id` on the next render — where a
+    /// `&mut Window` is available — and record it as the last-focused pane.
+    fn focus_pane_next_frame(&mut self, pane_id: u64, cx: &mut Context<Self>) {
+        self.pending_focus_pane = Some(pane_id);
+        self.last_focused_pane = Some(pane_id);
+        cx.notify();
     }
 
     /// Close the currently-focused pane of `tab_id`. If the tab has only one
@@ -631,60 +748,78 @@ impl CrabportApp {
             let overlay = src.read_with(cx, |v, _| v.overlay_state());
             let ssh_info = src.read_with(cx, |v, _| v.ssh_info().cloned());
             let telnet_info = src.read_with(cx, |v, _| v.telnet_info().cloned());
+            let serial_info = src.read_with(cx, |v, _| v.serial_info().cloned());
             let tunnel_source = src.read_with(cx, |v, _| v.tunnel_source_arc());
             // Share the source pane's command history so all split panes of
             // this tab see the same list in the History panel.
             let shared_history = src.read_with(cx, |v, _| v.command_history_arc());
 
+            // Build the split-pane view. The host / overlay / shared
+            // history are the same for every branch; only the backend, the
+            // connection-info triple, and the tunnel source vary.
+            let overlay_for_view = overlay.clone();
+            let build_view =
+                move |backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+                      ssh_info: Option<SshConnectionInfo>,
+                      telnet_info: Option<TelnetConnectionInfo>,
+                      serial_info: Option<SerialConnectionInfo>,
+                      tunnel_source: Option<Arc<dyn crabport_ssh::CrabPortTunnel>>,
+                      cx: &mut Context<Self>| {
+                    cx.new(|cx| {
+                        TerminalView::with_backend_and_host_and_overlay_and_history(
+                            backend,
+                            80,
+                            24,
+                            host,
+                            host_id,
+                            overlay_for_view,
+                            ssh_info,
+                            telnet_info,
+                            serial_info,
+                            count,
+                            Some(shared_history),
+                            cx,
+                        )
+                        .with_tunnel_source_opt(tunnel_source)
+                    })
+                };
+
             if let Some(backend) = spawned_backend {
                 // SSH channel / local PTY: build the view with the spawned backend.
-                cx.new(|cx| {
-                    TerminalView::with_backend_and_host_and_overlay_and_history(
-                        backend,
-                        80,
-                        24,
-                        host,
-                        host_id,
-                        overlay,
-                        ssh_info,
-                        telnet_info,
-                        count,
-                        Some(shared_history),
-                        cx,
-                    )
-                    .with_tunnel_source_opt(tunnel_source)
-                })
+                build_view(
+                    backend,
+                    ssh_info,
+                    telnet_info,
+                    serial_info,
+                    tunnel_source,
+                    cx,
+                )
             } else if let Some(info) = telnet_info {
                 // Telnet fallback: create a new connection.
                 let overlay_cb = overlay.clone();
-                let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> = Arc::new(
-                    TelnetBackend::new(
+                let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
+                    Arc::new(TelnetBackend::new(
                         info.clone(),
                         80,
                         24,
                         Arc::new(move |msg: String| {
-                            overlay_cb.lock().log(
-                                crate::views::terminal::connection_overlay::ConnectionLogLevel::Info,
-                                msg,
-                            );
+                            overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
                         }),
-                    ),
-                );
-                cx.new(|cx| {
-                    TerminalView::with_backend_and_host_and_overlay_and_history(
-                        backend,
-                        80,
-                        24,
-                        host,
-                        host_id,
-                        overlay,
-                        None,
-                        Some(info),
-                        count,
-                        Some(shared_history),
-                        cx,
-                    )
-                })
+                    ));
+                build_view(backend, None, Some(info), None, None, cx)
+            } else if let Some(info) = serial_info {
+                // Serial fallback: create a new connection. Serial has no
+                // channel multiplexing, so like Telnet we open a fresh
+                // `SerialBackend` for the split pane.
+                let overlay_cb = overlay.clone();
+                let backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal> =
+                    Arc::new(SerialBackend::new(
+                        info.clone(),
+                        Arc::new(move |msg: String| {
+                            overlay_cb.lock().log(ConnectionLogLevel::Info, msg);
+                        }),
+                    ));
+                build_view(backend, None, None, Some(info), None, cx)
             } else {
                 // Ultimate fallback: fresh local PTY.
                 cx.new(|cx| TerminalView::new(count, cx))
@@ -711,17 +846,14 @@ impl CrabportApp {
             tree.split_active(dir, new_pane_id);
             // Sync terminal_views[tab_id] → the now-active pane's view so the
             // toolbar / panel logic keeps reading the focused pane.
-            if let Some(active_view) = self.pane_views.get(&tree.active_pane).cloned() {
-                self.terminal_views.insert(tab_id, active_view);
-            }
+            let active_pane = tree.active_pane;
+            self.sync_active_pane_view(tab_id, active_pane);
         }
         // Move keyboard focus to the newly-created pane so the user can
         // immediately type into it, and its cursor renders solid. Done on
         // the next render (where a `&mut Window` is available) rather than
         // here because `split_active_pane` only has a `&mut Context<Self>`.
-        self.pending_focus_pane = Some(new_pane_id);
-        self.last_focused_pane = Some(new_pane_id);
-        cx.notify();
+        self.focus_pane_next_frame(new_pane_id, cx);
     }
 
     /// Close a single pane by pane id. If it was the last pane in the tab,
@@ -748,17 +880,13 @@ impl CrabportApp {
             Some(new_tree) => {
                 self.split_trees.insert(tab_id, new_tree.clone());
                 // Sync terminal_views[tab_id] → active pane.
-                if let Some(active_view) = self.pane_views.get(&new_tree.active_pane).cloned() {
-                    self.terminal_views.insert(tab_id, active_view);
-                }
+                self.sync_active_pane_view(tab_id, new_tree.active_pane);
                 // Move keyboard focus to the remaining active pane so the
                 // user can keep typing without clicking another pane first.
                 // Mirrors the split-pane path: set `pending_focus_pane` so
                 // the next render (where `&mut Window` is available) grabs
                 // focus, and track it as the last-focused pane.
-                self.pending_focus_pane = Some(new_tree.active_pane);
-                self.last_focused_pane = Some(new_tree.active_pane);
-                cx.notify();
+                self.focus_pane_next_frame(new_tree.active_pane, cx);
             }
         }
     }
@@ -778,9 +906,7 @@ impl CrabportApp {
         // `split_active_pane` targets it even after focus moves to a
         // non-terminal element (e.g. the split toolbar button).
         self.last_focused_pane = Some(pane_id);
-        if let Some(view) = self.pane_views.get(&pane_id).cloned() {
-            self.terminal_views.insert(tab_id, view);
-        }
+        self.sync_active_pane_view(tab_id, pane_id);
         cx.notify();
     }
 
@@ -833,9 +959,7 @@ impl CrabportApp {
         if let Some(tree) = self.split_trees.get_mut(&tab_id) {
             tree.active_pane = pane_id;
         }
-        if let Some(view) = self.pane_views.get(&pane_id).cloned() {
-            self.terminal_views.insert(tab_id, view);
-        }
+        self.sync_active_pane_view(tab_id, pane_id);
         cx.notify();
     }
 
@@ -882,11 +1006,7 @@ impl CrabportApp {
         // pane of a terminal tab is also in `pane_views` (via
         // `init_split_for_tab`), so a single entity-equality scan covers
         // both primary and split panes.
-        let real_pane_id = self
-            .pane_views
-            .iter()
-            .find(|(_, v)| **v == view)
-            .map(|(p, _)| *p);
+        let real_pane_id = self.resolve_pane_id(&view);
         if let Some(pid) = real_pane_id {
             self.last_focused_pane = Some(pid);
         }
@@ -1039,12 +1159,7 @@ impl CrabportApp {
                     // Falls back to the passed-in `pane_id` if the view
                     // isn't in `pane_views` (shouldn't happen, but is a
                     // safe default).
-                    let real_pane_id = app
-                        .pane_views
-                        .iter()
-                        .find(|(_, v)| **v == view_for_focus_cb)
-                        .map(|(p, _)| *p)
-                        .unwrap_or(pane_id);
+                    let real_pane_id = app.resolve_pane_id(&view_for_focus_cb).unwrap_or(pane_id);
                     app.sync_active_pane_from_focus(real_pane_id, cx);
                 });
             });
@@ -1072,13 +1187,35 @@ impl CrabportApp {
                     // to the passed-in `_pane_id` if the view isn't in
                     // `pane_views` (shouldn't happen, but is a safe
                     // default).
-                    let real_pane_id = app
-                        .pane_views
-                        .iter()
-                        .find(|(_, v)| **v == view_for_ctx_cb)
-                        .map(|(p, _)| *p)
-                        .unwrap_or(_pane_id);
+                    let real_pane_id = app.resolve_pane_id(&view_for_ctx_cb).unwrap_or(_pane_id);
                     app.show_terminal_context_menu(real_pane_id, pos, cx);
+                });
+            });
+        });
+    }
+
+    /// Wire a freshly-created pane's `on_cwd_changed` callback so that when
+    /// the foreground process changes (cwd and/or process name), the tab
+    /// title updates to reflect it. Used by `add_tab` / `add_ssh_tab` /
+    /// `add_telnet_tab`. Split panes don't register this — the tab title
+    /// follows the *primary* pane's process, not whichever split the user
+    /// is currently in.
+    fn register_cwd_changed_callback(
+        &mut self,
+        view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let app_handle = cx.entity().downgrade();
+        view.update(cx, |v, _cx| {
+            v.set_on_cwd_changed(move |tab_id, path, process_name, cx| {
+                let _ = app_handle.update(cx, |app, cx| {
+                    if let Some(tab) = app.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        let new_title = tab_title_from_process(&path, &process_name);
+                        if tab.title != new_title {
+                            tab.title = new_title;
+                            cx.notify();
+                        }
+                    }
                 });
             });
         });
@@ -1153,4 +1290,105 @@ impl CrabportApp {
         });
         cx.notify();
     }
+
+    /// Toggle the right-hand panel's visibility for the active terminal tab.
+    /// The actual show/hide animation is driven by `gpui-animation`'s
+    /// `with_transition` in `render_panel` — this just flips a per-tab bool
+    /// and notifies, so the panel slides in/out smoothly rather than
+    /// vanishing instantly.
+    ///
+    /// `None` means the user hasn't toggled this tab yet, so we fall back
+    /// to the configured default (`appearance.terminal.expand_panel_on_connect`).
+    /// Once toggled, the per-tab value wins so the user's explicit choice
+    /// sticks for that tab regardless of the global setting.
+    pub fn toggle_right_panel(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let default_open = crabport_core::config::snapshot()
+            .appearance
+            .terminal
+            .expand_panel_on_connect;
+        let current = self
+            .panel_open
+            .get(&tab_id)
+            .copied()
+            .unwrap_or(default_open);
+        self.panel_open.insert(tab_id, !current);
+        cx.notify();
+    }
+}
+
+/// Build a tab title from a cwd path + command line:
+/// `<cwd目录名> — <command>`. The command is the process name
+/// plus its arguments (e.g. `ssh root@192.168.30.1`). Examples:
+/// - `/Users/weed/Downloads` + `zsh` → `Downloads — zsh`
+/// - `/Users/weed/Downloads` + `ssh root@192.168.30.1` → `Downloads — ssh root@192.168.30.1`
+/// - `/` + `zsh` → `/ — zsh`
+fn tab_title_from_process(path: &std::path::Path, command: &str) -> String {
+    let dir_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        // Root path `/` has no file_name — fall back to the path itself.
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{} — {}", dir_name, command)
+}
+
+/// Return the basename of the current shell (e.g. `zsh`, `bash`), or
+/// `None` if it can't be determined. Used only as the initial tab title
+/// guess before the `ProcessWatcher` reports the actual foreground
+/// process.
+fn shell_basename() -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::env::var("SHELL").ok().and_then(|s| {
+            std::path::Path::new(&s)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+    #[cfg(windows)]
+    {
+        // Mirror `default_shell()`'s cascade. We must NOT spawn
+        // `where.exe` here — this runs on the UI thread when a new local
+        // terminal tab is created, and `CreateProcess(where.exe)`+
+        // PATH walk can take hundreds of milliseconds to multiple seconds
+        // (antivirus scanning, large PATH, slow disk), visibly freezing
+        // the whole window. Instead we check fixed absolute paths (the
+        // inbox PowerShell and cmd are at well-known locations on every
+        // Windows 10+ install) plus a pure in-process PATHEXT-aware PATH
+        // walk for `pwsh.exe` (whose install location varies). The result
+        // is only a first-guess tab title anyway; the PTY's
+        // `ProcessWatcher` overwrites it once the shell is up.
+        if which_executable_on_path("pwsh.exe").is_some() {
+            Some("pwsh".to_string())
+        } else if std::path::Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            .is_file()
+        {
+            Some("powershell".to_string())
+        } else if std::path::Path::new(r"C:\Windows\System32\cmd.exe").is_file() {
+            Some("cmd".to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// PATHEXT-aware PATH walk — returns `Some(())` if `program` resolves on
+/// `PATH` (or is an absolute path that exists), `None` otherwise. Mirrors
+/// `crabport_terminal::pty::which_executable` but inlined here to avoid
+/// leaking that helper across the crate boundary.
+#[cfg(windows)]
+fn which_executable_on_path(program: &str) -> Option<()> {
+    if program.contains('\\') || program.contains('/') {
+        return std::path::Path::new(program).is_file().then_some(());
+    }
+    let path = std::env::var("PATH").ok()?;
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".to_string());
+    for ext in pathext.split(';') {
+        for dir in path.split(';') {
+            let candidate = std::path::Path::new(dir).join(format!("{}{}", program, ext));
+            if candidate.is_file() {
+                return Some(());
+            }
+        }
+    }
+    None
 }

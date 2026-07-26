@@ -17,7 +17,7 @@ use gpui_component::scroll::ScrollableElement as _;
 use rust_i18n::t;
 
 use crate::color::*;
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_MD};
+use crate::motion::{EASE_STANDARD, RADIUS_MD, duration_base};
 use crabport_terminal::terminal::SftpTransferKind;
 
 /// Maximum records kept in memory. Older entries are dropped (FIFO).
@@ -193,7 +193,7 @@ fn render_transfer_history(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_STANDARD,
             |el| el.bg(rgba(0x00000000)),
             |el| el.bg(rgba(0x00000000)),
@@ -219,7 +219,7 @@ fn render_transfer_history(
                 .with_transition(popover_id)
                 .transition_when_else(
                     open,
-                    DURATION_BASE,
+                    duration_base(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0).mt_0(),
                     |el| el.opacity(0.0).mt(px(-4.0)),
@@ -295,6 +295,7 @@ fn render_history_row(idx: usize, record: TransferRecord) -> impl IntoElement {
         SftpTransferKind::Rename => ("icons/terminal-toolbar/edit.svg", term_yellow()),
         SftpTransferKind::Edit => ("icons/terminal-toolbar/arrow-up-to-line.svg", term_green()),
         SftpTransferKind::Delete => ("icons/terminal-toolbar/arrow-up-to-line.svg", term_red()),
+        SftpTransferKind::Mkdir => ("icons/terminal-toolbar/arrow-up-to-line.svg", term_yellow()),
     };
     let status_color = if record.success {
         term_green()
@@ -365,6 +366,7 @@ fn kind_label(kind: SftpTransferKind) -> String {
         SftpTransferKind::Rename => t!("sftp.rename").to_string(),
         SftpTransferKind::Edit => t!("sftp.progress.upload").to_string(),
         SftpTransferKind::Delete => t!("sftp.delete").to_string(),
+        SftpTransferKind::Mkdir => t!("sftp.mkdir").to_string(),
     }
 }
 

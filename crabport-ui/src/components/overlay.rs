@@ -12,7 +12,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
-use crate::motion::{DURATION_BASE, EASE_LINEAR};
+use crate::motion::{EASE_LINEAR, duration_base};
 
 /// Render a full-screen dimmed overlay that fades in/out when `open`
 /// toggles. The overlay occludes + captures clicks while open (so a
@@ -48,7 +48,7 @@ pub fn render_overlay(
         .with_transition(overlay_id)
         .transition_when_else(
             open,
-            DURATION_BASE,
+            duration_base(),
             EASE_LINEAR,
             |el| el.bg(rgba(0x00000080)),
             |el| el.bg(rgba(0x00000000)),

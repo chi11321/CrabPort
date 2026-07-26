@@ -10,6 +10,35 @@ use gpui::*;
 use crate::color::*;
 use crate::components::host_selector::PanelSide;
 
+/// Render the small floating chip (file/folder icon + name) shown while
+/// a file row is being dragged. Shared by every drag-payload `Render`
+/// impl, including `views::panel::sftp::SftpDragValue`.
+pub(crate) fn render_drag_chip(is_dir: bool, name: String) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded(px(4.0))
+        .bg(rgb(bg_base()))
+        .border_1()
+        .border_color(rgb(border()))
+        .shadow_sm()
+        .child(
+            svg()
+                .path(if is_dir {
+                    "icons/folder.svg"
+                } else {
+                    "icons/file.svg"
+                })
+                .size_3()
+                .text_color(rgb(text_muted())),
+        )
+        .child(div().text_xs().text_color(rgb(text_primary())).child(name))
+}
+
 /// Drag payload for a local filesystem row being dragged from a local
 /// panel. Dropped onto the remote panel, it triggers an upload.
 #[derive(Clone, Debug)]
@@ -24,34 +53,7 @@ pub struct LocalFileDragValue {
 
 impl Render for LocalFileDragValue {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .bg(rgb(bg_base()))
-            .border_1()
-            .border_color(rgb(border()))
-            .shadow_sm()
-            .child(
-                svg()
-                    .path(if self.is_dir {
-                        "icons/folder.svg"
-                    } else {
-                        "icons/file.svg"
-                    })
-                    .size_3()
-                    .text_color(rgb(text_muted())),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_primary()))
-                    .child(self.name.clone()),
-            )
+        render_drag_chip(self.is_dir, self.name.clone())
     }
 }
 
@@ -71,33 +73,6 @@ pub struct SftpDragValue {
 
 impl Render for SftpDragValue {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .bg(rgb(bg_base()))
-            .border_1()
-            .border_color(rgb(border()))
-            .shadow_sm()
-            .child(
-                svg()
-                    .path(if self.is_dir {
-                        "icons/folder.svg"
-                    } else {
-                        "icons/file.svg"
-                    })
-                    .size_3()
-                    .text_color(rgb(text_muted())),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_primary()))
-                    .child(self.name.clone()),
-            )
+        render_drag_chip(self.is_dir, self.name.clone())
     }
 }

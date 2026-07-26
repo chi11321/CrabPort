@@ -1,7 +1,7 @@
 //! `SftpTabView` struct definition, non-render `impl` methods, top-level
 //! `Render`, and `CrabPortTab` impl. Panel rendering (`render_panel`)
 //! lives in [`super::panel`] as a separate impl block. Free helpers
-//! (`render_action_button`, `trigger_*`) live in [`super::helpers`].
+//! (`render_panel_ellipsis_button`, `trigger_*`) live in [`super::helpers`].
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -20,6 +20,8 @@ use crate::components::dialog::AlertController;
 use crate::components::host_selector::{HostSelectorOverlay, PanelSide};
 use crate::views::sessions::ConnectionHost;
 use crate::views::terminal::{SftpProgress, TerminalView};
+
+use super::pane::{cmp_dirs_first, join_remote_path};
 
 use crabport_core::credential::{CredentialKind as CoreCredentialKind, HostKind as CoreHostKind};
 use crabport_ssh::backend::SshBackend;
@@ -70,6 +72,15 @@ pub(super) struct PanelState {
     pub remote_cwd: Option<Arc<String>>,
     pub remote_entries: Arc<Vec<crabport_sftp::FileEntry>>,
     pub path_input: Option<Entity<InputState>>,
+    /// Last path string written into the input by `sync_path_input`. Used to
+    /// tell a programmatic overwrite (cwd changed underneath the user) apart
+    /// from the user actively typing in the input — without this, every
+    /// keystroke would trigger a render, and `sync_path_input` would clobber
+    /// the half-typed text.
+    pub last_synced_path: Option<String>,
+    /// Whether hidden files (Unix dotfiles) are shown in the list. Toggled
+    /// by the ellipsis menu's "show hidden files" action.
+    pub show_hidden: bool,
     pub hovered: Option<String>,
     pub selected: FxHashSet<String>,
     pub context_menu_entry: Option<String>,
@@ -77,6 +88,11 @@ pub(super) struct PanelState {
     pub scroll: VirtualListScrollHandle,
     pub renaming: Option<String>,
     pub rename_input: Option<Entity<InputState>>,
+    /// When `Some`, an inline "new folder" input is shown at the top of the
+    /// file list. Holds the placeholder name to seed the input with.
+    /// `None` means no mkdir is in progress.
+    pub mkdir_pending: Option<()>,
+    pub mkdir_input: Option<Entity<InputState>>,
     /// Monotonic connection counter. Incremented every time a new SSH
     /// connection is established on this panel. Used in the connection
     /// overlay's transition ID so the fade-in/fade-out animation replays
@@ -93,14 +109,16 @@ pub(super) struct PanelState {
 }
 
 impl PanelState {
-    fn new_local() -> Self {
+    fn new(host: PanelHost) -> Self {
         Self {
-            host: PanelHost::Local,
+            host,
             local_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
             local_entries: Vec::new(),
             remote_cwd: None,
             remote_entries: Arc::new(Vec::new()),
             path_input: None,
+            last_synced_path: None,
+            show_hidden: false,
             hovered: None,
             selected: FxHashSet::default(),
             context_menu_entry: None,
@@ -108,32 +126,8 @@ impl PanelState {
             scroll: VirtualListScrollHandle::new(),
             renaming: None,
             rename_input: None,
-            connect_count: 0,
-            on_navigate: None,
-            on_download: None,
-            on_upload: None,
-            on_upload_batch: None,
-            on_delete: None,
-            on_rename: None,
-            on_edit: None,
-        }
-    }
-
-    fn new_disconnected() -> Self {
-        Self {
-            host: PanelHost::Disconnected,
-            local_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
-            local_entries: Vec::new(),
-            remote_cwd: None,
-            remote_entries: Arc::new(Vec::new()),
-            path_input: None,
-            hovered: None,
-            selected: FxHashSet::default(),
-            context_menu_entry: None,
-            drag_over: false,
-            scroll: VirtualListScrollHandle::new(),
-            renaming: None,
-            rename_input: None,
+            mkdir_pending: None,
+            mkdir_input: None,
             connect_count: 0,
             on_navigate: None,
             on_download: None,
@@ -151,6 +145,7 @@ impl PanelState {
         self.renaming = None;
         self.context_menu_entry = None;
         self.hovered = None;
+        self.mkdir_pending = None;
     }
 }
 
@@ -179,8 +174,8 @@ pub struct SftpTabView {
 impl SftpTabView {
     pub fn new() -> Self {
         Self {
-            left: PanelState::new_local(),
-            right: PanelState::new_disconnected(),
+            left: PanelState::new(PanelHost::Local),
+            right: PanelState::new(PanelHost::Disconnected),
             context_menu: None,
             alert_controller: None,
             tooltip: None,
@@ -197,6 +192,15 @@ impl SftpTabView {
     /// alphabetically. Does NOT prepend `..` — that's added at render
     /// time so the entries vec stays a pure mirror of the directory.
     pub(super) fn read_local_dir(path: &Path) -> Vec<crabport_sftp::FileEntry> {
+        Self::read_local_dir_filtered(path, false)
+    }
+
+    /// Read a local directory, optionally including hidden (dot-prefixed)
+    /// entries. Sorting is the same as [`Self::read_local_dir`].
+    pub(super) fn read_local_dir_filtered(
+        path: &Path,
+        _show_hidden: bool,
+    ) -> Vec<crabport_sftp::FileEntry> {
         use std::time::UNIX_EPOCH;
         let mut out: Vec<crabport_sftp::FileEntry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(path) {
@@ -204,9 +208,10 @@ impl SftpTabView {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let metadata = entry.metadata().ok();
                 let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                // Skip hidden files on Unix for a cleaner listing.
+                // Skip hidden files on Unix for a cleaner listing, unless the
+                // user has explicitly enabled "show hidden files".
                 #[cfg(unix)]
-                if name.starts_with('.') {
+                if !_show_hidden && name.starts_with('.') {
                     continue;
                 }
                 let size = metadata.as_ref().filter(|m| !m.is_dir()).map(|m| m.len());
@@ -231,11 +236,7 @@ impl SftpTabView {
                 });
             }
         }
-        out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
+        out.sort_by(cmp_dirs_first);
         out
     }
 
@@ -249,9 +250,16 @@ impl SftpTabView {
         let panel = self.panel_mut(side);
         if path.is_dir() {
             panel.local_cwd = path;
-            panel.local_entries = Self::read_local_dir(&panel.local_cwd);
+            panel.local_entries =
+                Self::read_local_dir_filtered(&panel.local_cwd, panel.show_hidden);
             panel.selected.clear();
             panel.renaming = None;
+            // NOTE: do NOT touch `last_synced_path` here. Leaving it at the
+            // previous cwd lets `sync_path_input` (called next render from
+            // `set_state`) see `last != actual` and overwrite the input text
+            // to match the new cwd. Setting it to the new cwd would trick the
+            // guard into thinking the input is already synced, so the text
+            // would stay stale after navigation.
             cx.notify();
         }
     }
@@ -407,7 +415,8 @@ impl SftpTabView {
     fn refresh_local_entries_if_local(&mut self, side: PanelSide) {
         let panel = self.panel_mut(side);
         if matches!(panel.host, PanelHost::Local) {
-            panel.local_entries = Self::read_local_dir(&panel.local_cwd);
+            panel.local_entries =
+                Self::read_local_dir_filtered(&panel.local_cwd, panel.show_hidden);
         }
     }
 
@@ -505,8 +514,14 @@ impl SftpTabView {
 
     /// Sync a panel's path input text with its current cwd.
     /// Called each render after `sync_remote_state`.
+    ///
+    /// We only overwrite the input when the cwd moved away from what we last
+    /// wrote into the input — i.e. a programmatic change (navigation, host
+    /// switch). If the user is mid-edit the live text will differ from the
+    /// last synced value, and we must NOT clobber it. Otherwise every
+    /// keystroke would trigger a render and reset the input.
     fn sync_path_input(&mut self, side: PanelSide, window: &mut Window, _cx: &mut Context<Self>) {
-        let panel = self.panel(side);
+        let panel = self.panel_mut(side);
         let Some(ref input) = panel.path_input else {
             return;
         };
@@ -519,20 +534,36 @@ impl SftpTabView {
                 .unwrap_or_else(|| "/".to_string()),
             PanelHost::Disconnected => "".to_string(),
         };
+        // If we have a previous synced value and the cwd hasn't moved past
+        // it, the user is editing — leave the input alone.
+        if let Some(ref last) = panel.last_synced_path {
+            if *last == actual {
+                // Cwd is still what we last wrote. Either the user is editing
+                // (don't overwrite) or nothing changed (no-op either way).
+                return;
+            }
+        }
+        // Cwd moved. Overwrite the input and remember the new synced value.
         let cur = input.read(_cx).value().to_string();
         if cur != actual {
             input.update(_cx, |state, cx| {
-                state.set_value(actual, window, cx);
+                state.set_value(actual.clone(), window, cx);
             });
         }
+        panel.last_synced_path = Some(actual);
     }
 
-    // --- Rename helpers (remote) ---
+    // --- Rename helpers (shared by local + remote panels) ---
 
-    pub(super) fn start_remote_rename(
+    /// Begin renaming `entry_name` on a panel. `remote` selects which
+    /// commit path Enter triggers; it is baked into the rename input's
+    /// subscription when the input is first created (mirroring the
+    /// original per-kind start functions).
+    pub(super) fn start_rename(
         &mut self,
         side: PanelSide,
         entry_name: String,
+        remote: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -548,7 +579,11 @@ impl SftpTabView {
                 &entity,
                 move |this, _input, event: &gpui_component::input::InputEvent, cx| {
                     if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_remote_rename(side, cx);
+                        if remote {
+                            this.commit_remote_rename(side, cx);
+                        } else {
+                            this.commit_local_rename(side, cx);
+                        }
                     }
                 },
             )
@@ -556,7 +591,7 @@ impl SftpTabView {
             let blur_handle = entity.read(cx).focus_handle(cx);
             cx.on_blur(&blur_handle, window, move |this, _window, cx| {
                 if this.panel(side).renaming.is_some() {
-                    this.cancel_remote_rename(side, cx);
+                    this.cancel_rename(side, cx);
                 }
             })
             .detach();
@@ -572,12 +607,19 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn commit_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        let new_name = self.panel(side).rename_input.as_ref().and_then(|input| {
+    /// Read the pending rename input's value, or `None` if it's empty
+    /// or the input doesn't exist.
+    fn rename_input_value(&self, side: PanelSide, cx: &App) -> Option<String> {
+        self.panel(side).rename_input.as_ref().and_then(|input| {
             let v = input.read(cx).value().to_string();
             if v.is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else { return };
+        })
+    }
+
+    pub(super) fn commit_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        let Some(new_name) = self.rename_input_value(side, cx) else {
+            return;
+        };
         let panel = self.panel_mut(side);
         let Some(entry_name) = panel.renaming.take() else {
             return;
@@ -606,62 +648,10 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn cancel_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        self.panel_mut(side).renaming = None;
-        cx.notify();
-    }
-
-    // --- Rename helpers (local) ---
-
-    pub(super) fn start_local_rename(
-        &mut self,
-        side: PanelSide,
-        entry_name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = self.panel_mut(side);
-        panel.renaming = Some(entry_name.clone());
-        if panel.rename_input.is_none() {
-            let entity = cx.new(|cx| {
-                let state = InputState::new(window, cx).placeholder("new name");
-                state.focus(window, cx);
-                state
-            });
-            cx.subscribe(
-                &entity,
-                move |this, _input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_local_rename(side, cx);
-                    }
-                },
-            )
-            .detach();
-            let blur_handle = entity.read(cx).focus_handle(cx);
-            cx.on_blur(&blur_handle, window, move |this, _window, cx| {
-                if this.panel(side).renaming.is_some() {
-                    this.cancel_local_rename(side, cx);
-                }
-            })
-            .detach();
-            panel.rename_input = Some(entity);
-        }
-        let panel = self.panel_mut(side);
-        if let Some(ref input) = panel.rename_input {
-            input.update(cx, |state, cx| {
-                state.set_value(entry_name, window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
     pub(super) fn commit_local_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        let new_name = self.panel(side).rename_input.as_ref().and_then(|input| {
-            let v = input.read(cx).value().to_string();
-            if v.is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else { return };
+        let Some(new_name) = self.rename_input_value(side, cx) else {
+            return;
+        };
         let panel = self.panel_mut(side);
         let Some(entry_name) = panel.renaming.take() else {
             return;
@@ -682,7 +672,9 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn cancel_local_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+    /// Abort an in-progress rename (local or remote) without invoking
+    /// any callback.
+    pub(super) fn cancel_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
         self.panel_mut(side).renaming = None;
         cx.notify();
     }
@@ -706,12 +698,7 @@ impl SftpTabView {
         let host = store.lock().find_host(host_id).ok().flatten()?;
 
         // Only SSH hosts support SFTP.
-        let host_kind = match host.kind {
-            CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-            CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-            CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-        };
-        if host_kind != crate::views::sessions::ConnectionKind::SSH {
+        if host.kind != CoreHostKind::Ssh {
             return None;
         }
 
@@ -724,32 +711,7 @@ impl SftpTabView {
                 let app = app.clone();
                 cx.defer(move |cx| {
                     app.update(cx, |a, _cx| {
-                        a.hosts = all
-                            .into_iter()
-                            .map(|h| ConnectionHost {
-                                id: h.id,
-                                name: h.name,
-                                host: h.host,
-                                port: h.port,
-                                username: h.username,
-                                kind: match h.kind {
-                                    CoreHostKind::Ssh => {
-                                        crate::views::sessions::ConnectionKind::SSH
-                                    }
-                                    CoreHostKind::Telnet => {
-                                        crate::views::sessions::ConnectionKind::Telnet
-                                    }
-                                    CoreHostKind::Serial => {
-                                        crate::views::sessions::ConnectionKind::Serial
-                                    }
-                                },
-                                credential_id: h.credential_id,
-                                last_login: h.last_login,
-                                favorite: h.favorite,
-                                proxy_id: h.proxy_id,
-                                group_id: h.group_id,
-                            })
-                            .collect();
+                        a.hosts = all.into_iter().map(ConnectionHost::from).collect();
                     });
                 });
             }
@@ -781,6 +743,9 @@ impl SftpTabView {
             .proxy_id
             .and_then(|pid| store.lock().find_proxy_config(pid).ok().flatten());
 
+        // Resolve the jump-host (bastion) chain, if configured.
+        let jump_hosts = crate::app::connection::resolve_jump_chain(cx, host.jump_host_id);
+
         Some(ResolvedHost {
             name: host.name,
             host: host.host,
@@ -791,6 +756,7 @@ impl SftpTabView {
             passphrase: passphrase.map(|s| s.to_string()),
             proxy: proxy_config,
             startup_command: host.startup_command,
+            jump_hosts,
         })
     }
 
@@ -854,6 +820,9 @@ impl SftpTabView {
         if !resolved.startup_command.is_empty() {
             info = info.with_startup_command(&resolved.startup_command);
         }
+        if !resolved.jump_hosts.is_empty() {
+            info = info.with_jump_hosts(resolved.jump_hosts);
+        }
         let info_for_view = info.clone();
         let cols: usize = 80;
         let rows: usize = 24;
@@ -896,6 +865,7 @@ impl SftpTabView {
                 overlay,
                 Some(info_for_view),
                 None,
+                None, // no SerialConnectionInfo for SFTP
                 pane_id,
                 cx,
             )
@@ -997,6 +967,16 @@ impl SftpTabView {
                             crate::components::notification::NotificationLevel::Danger,
                             std::time::Duration::from_secs(5),
                         ),
+                        // Mkdir: silent on success (the listing refresh surfaces
+                        // the new folder); only failures toast.
+                        (SftpTransferKind::Mkdir, true) => return,
+                        (SftpTransferKind::Mkdir, false) => (
+                            t!("sftp.notif_mkdir_failed_title").to_string(),
+                            t!("sftp.notif_mkdir_failed_msg", message = message.as_str())
+                                .to_string(),
+                            crate::components::notification::NotificationLevel::Danger,
+                            std::time::Duration::from_secs(5),
+                        ),
                     };
                     app.app_ctx.notifications.update(cx, |c, cx| {
                         c.show(
@@ -1093,6 +1073,7 @@ impl SftpTabView {
                 state.set_value("/".to_string(), window, cx);
             });
         }
+        panel.last_synced_path = Some("/".to_string());
 
         // We need `window` to persist for future renders; tell GPUI to
         // keep the window's frame pump alive by rendering the terminal.
@@ -1115,7 +1096,7 @@ impl SftpTabView {
 
         let panel = self.panel_mut(side);
         panel.local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        panel.local_entries = Self::read_local_dir(&panel.local_cwd);
+        panel.local_entries = Self::read_local_dir_filtered(&panel.local_cwd, panel.show_hidden);
         panel.remote_cwd = None;
         panel.remote_entries = Arc::new(Vec::new());
         panel.clear_interaction();
@@ -1130,10 +1111,210 @@ impl SftpTabView {
         if let Some(ref input) = panel.path_input {
             let val = panel.local_cwd.to_string_lossy().into_owned();
             input.update(cx, |state, cx| {
-                state.set_value(val, window, cx);
+                state.set_value(val.clone(), window, cx);
             });
+            panel.last_synced_path = Some(val);
         }
 
+        cx.notify();
+    }
+
+    // --- Panel actions driven by the ellipsis menu ---
+
+    /// Toggle whether hidden files (Unix dotfiles) are shown on this panel.
+    ///
+    /// For local panels this is a synchronous re-read of the cwd with the
+    /// new filter. For remote panels there's no client-side filter (the
+    /// backend's `read_dir` returns everything), so we just trigger a fresh
+    /// `sftp_navigate` to the current cwd to re-fetch and re-render.
+    pub(super) fn toggle_hidden(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        let panel = self.panel_mut(side);
+        panel.show_hidden = !panel.show_hidden;
+        let show_hidden = panel.show_hidden;
+        let is_remote = panel.host.is_remote();
+        let local_cwd = panel.local_cwd.clone();
+        let remote_cwd = panel.remote_cwd.clone();
+        let on_navigate = panel.on_navigate.clone();
+        if is_remote {
+            if let (Some(cb), Some(cwd)) = (on_navigate, remote_cwd) {
+                let cwd = cwd.as_str().to_string();
+                cx.defer(move |cx| {
+                    cb(cwd, cx);
+                });
+            }
+        } else {
+            panel.local_entries = Self::read_local_dir_filtered(&local_cwd, show_hidden);
+        }
+        panel.selected.clear();
+        cx.notify();
+    }
+
+    /// Create a new folder ("New Folder" with a uniquified name).
+    ///
+    /// Begin the "new folder" flow: open an inline input at the top of
+    /// the file list, pre-seeded with a unique "New Folder" name. The user
+    /// edits the name + presses Enter to commit, or clicks away / presses
+    /// Escape to cancel.
+    pub(super) fn start_make_folder(
+        &mut self,
+        side: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = self.panel_mut(side);
+        // Build a unique default name. For local panels we can probe the
+        // filesystem; for remote we can't cheaply, so we just use "New Folder"
+        // and let the server fail if it exists (the failure surfaces as a
+        // toast, which is acceptable).
+        let default_name = if panel.host.is_remote() {
+            "New Folder".to_string()
+        } else {
+            let cwd = panel.local_cwd.clone();
+            let base = "New Folder";
+            let mut name = base.to_string();
+            let mut i = 1;
+            while cwd.join(&name).exists() {
+                name = format!("{base} ({i})");
+                i += 1;
+            }
+            name
+        };
+        panel.mkdir_pending = Some(());
+        if panel.mkdir_input.is_none() {
+            let entity = cx.new(|cx| {
+                let state = InputState::new(window, cx).placeholder("folder name");
+                state.focus(window, cx);
+                state
+            });
+            cx.subscribe(
+                &entity,
+                move |this, _input, event: &gpui_component::input::InputEvent, cx| {
+                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
+                        this.commit_make_folder(side, cx);
+                    }
+                },
+            )
+            .detach();
+            let blur_handle = entity.read(cx).focus_handle(cx);
+            cx.on_blur(&blur_handle, window, move |this, _window, cx| {
+                if this.panel(side).mkdir_pending.is_some() {
+                    this.cancel_make_folder(side, cx);
+                }
+            })
+            .detach();
+            panel.mkdir_input = Some(entity);
+        }
+        let panel = self.panel_mut(side);
+        if let Some(ref input) = panel.mkdir_input {
+            input.update(cx, |state, cx| {
+                state.set_value(&default_name, window, cx);
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Commit the mkdir: read the new name from `mkdir_input`, create the
+    /// folder (local `std::fs::create_dir` or remote `sftp_mkdir`), and
+    /// close the inline input.
+    pub(super) fn commit_make_folder(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        let name = self.panel(side).mkdir_input.as_ref().and_then(|input| {
+            let v = input.read(cx).value().to_string();
+            if v.trim().is_empty() { None } else { Some(v) }
+        });
+        let Some(name) = name else {
+            // Empty name → cancel.
+            self.cancel_make_folder(side, cx);
+            return;
+        };
+        let panel = self.panel_mut(side);
+        let _ = panel.mkdir_pending.take();
+        let is_remote = panel.host.is_remote();
+        if is_remote {
+            let remote_cwd = panel.remote_cwd.clone();
+            let term = panel.host.terminal().cloned();
+            let Some(cwd) = remote_cwd else { return };
+            let Some(term) = term else { return };
+            let remote_path = join_remote_path(cwd.as_str(), &name);
+            term.read_with(cx, |view, _cx| {
+                view.sftp_mkdir(&remote_path);
+            });
+        } else {
+            let path = panel.local_cwd.join(&name);
+            let _ = std::fs::create_dir(&path);
+            panel.local_entries =
+                Self::read_local_dir_filtered(&panel.local_cwd, panel.show_hidden);
+        }
+        cx.notify();
+    }
+
+    /// Abort the mkdir flow without creating anything.
+    pub(super) fn cancel_make_folder(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        self.panel_mut(side).mkdir_pending = None;
+        cx.notify();
+    }
+
+    /// Refresh the panel's listing — local re-reads its cwd, remote
+    /// re-navigates to its current cwd.
+    pub(super) fn refresh_listing(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        let panel = self.panel_mut(side);
+        let is_remote = panel.host.is_remote();
+        let local_cwd = panel.local_cwd.clone();
+        let remote_cwd = panel.remote_cwd.clone();
+        let show_hidden = panel.show_hidden;
+        let on_navigate = panel.on_navigate.clone();
+        if is_remote {
+            if let (Some(cb), Some(cwd)) = (on_navigate, remote_cwd) {
+                let cwd = cwd.as_str().to_string();
+                cx.defer(move |cx| {
+                    cb(cwd, cx);
+                });
+            }
+        } else {
+            panel.local_entries = Self::read_local_dir_filtered(&local_cwd, show_hidden);
+            panel.selected.clear();
+            cx.notify();
+        }
+    }
+
+    /// Disconnect the panel from its current host.
+    ///
+    /// For remote panels this closes the underlying SSH/SFTP connection
+    /// (`TerminalView::close`) before dropping the handle. For local panels
+    /// it just flips the host to `Disconnected`. The panel becomes the same
+    /// placeholder that a brand-new SFTP tab starts with — "No host
+    /// connected" + a "Select Host" button.
+    pub(super) fn disconnect_panel(
+        &mut self,
+        side: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = std::mem::replace(&mut self.panel_mut(side).host, PanelHost::Disconnected);
+        if let PanelHost::Remote { terminal, .. } = old {
+            terminal.update(cx, |v, _cx| {
+                v.close();
+            });
+        }
+        let panel = self.panel_mut(side);
+        panel.remote_cwd = None;
+        panel.remote_entries = Arc::new(Vec::new());
+        panel.clear_interaction();
+        panel.on_navigate = None;
+        panel.on_download = None;
+        panel.on_upload = None;
+        panel.on_upload_batch = None;
+        panel.on_delete = None;
+        panel.on_rename = None;
+        panel.on_edit = None;
+        // Reset the path input so the next render shows an empty field
+        // rather than the stale remote path.
+        if let Some(ref input) = panel.path_input {
+            input.update(cx, |state, cx| {
+                state.set_value("".to_string(), window, cx);
+            });
+        }
+        panel.last_synced_path = Some(String::new());
         cx.notify();
     }
 }
@@ -1155,37 +1336,15 @@ struct ResolvedHost {
     passphrase: Option<String>,
     proxy: Option<crabport_core::credential::ProxyConfig>,
     startup_command: String,
+    /// Jump-host (bastion) chain in connection order (outermost first).
+    /// Empty means a direct connection.
+    jump_hosts: Vec<crabport_ssh::session::JumpHostInfo>,
 }
 
 impl CrabPortTab for SftpTabView {
     fn close(&mut self) {
         // Remote terminals are closed when switching hosts or dropping
         // the entity. Nothing extra to do here for the persistent tab.
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Path join helpers (shared with panel.rs / helpers.rs)
-// ---------------------------------------------------------------------------
-
-/// Join a remote path component onto a remote cwd string, handling the
-/// trailing-slash cases. POSIX-style (forward slash).
-pub(super) fn join_remote_path(cwd: &str, name: &str) -> String {
-    if cwd.ends_with('/') {
-        format!("{}{}", cwd, name)
-    } else {
-        format!("{}/{}", cwd, name)
-    }
-}
-
-/// Compute the parent path of a remote cwd string. Returns "/" for root.
-pub(super) fn remote_parent(cwd: &str) -> String {
-    let mut parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-    parts.pop();
-    if parts.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", parts.join("/"))
     }
 }
 

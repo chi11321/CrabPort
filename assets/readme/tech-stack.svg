@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="300" viewBox="0 0 1200 300"
+     role="img" aria-labelledby="stack-title stack-desc">
+  <title id="stack-title">CrabPort tech stack</title>
+  <desc id="stack-desc">Language Rust 2024; UI built on GPUI with gpui-component and gpui-animation; protocols russh, russh-sftp, alacritty_terminal, serialport; data via rusqlite (SQLite) and aes-gcm crypto, with tokio and smol async runtimes and rust-i18n.</desc>
+
+  <rect width="1200" height="300" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="298" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+
+  <defs>
+    <symbol id="port-dot" viewBox="0 0 12 12">
+      <circle cx="6" cy="6" r="5" fill="none" stroke="#6366f1" stroke-width="1.5"/>
+      <circle cx="6" cy="6" r="2" fill="#6366f1"/>
+    </symbol>
+  </defs>
+
+  <!-- title -->
+  <text x="48" y="50"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="16" letter-spacing="3" fill="#6366f1" font-weight="600">
+    TECH STACK
+  </text>
+  <text x="48" y="82"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif"
+        font-size="26" font-weight="600" fill="#e6e9ef">
+    What it is built with
+  </text>
+
+  <!-- 4 columns: card 264x150, gap 16, origin (48, 110) -->
+  <!-- Col 1: Language -->
+  <g transform="translate(48 110)">
+    <rect width="264" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <text x="16" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2" fill="#8b90a0" font-weight="600">LANGUAGE</text>
+    <line x1="16" y1="40" x2="248" y2="40" stroke="#23262f"/>
+    <text x="16" y="66" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#e6e9ef">Rust 2024 Edition</text>
+    <text x="16" y="88" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#6b7080">MSRV 1.91+</text>
+    <use href="#port-dot" x="228" y="120" width="10" height="10"/>
+  </g>
+
+  <!-- Col 2: UI -->
+  <g transform="translate(328 110)">
+    <rect width="264" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <text x="16" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2" fill="#8b90a0" font-weight="600">UI</text>
+    <line x1="16" y1="40" x2="248" y2="40" stroke="#23262f"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e6e9ef">
+      <text x="16" y="62">GPUI</text>
+      <text x="16" y="82">gpui-component</text>
+      <text x="16" y="102">gpui-animation</text>
+    </g>
+  </g>
+
+  <!-- Col 3: Protocols -->
+  <g transform="translate(608 110)">
+    <rect width="264" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <text x="16" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2" fill="#8b90a0" font-weight="600">PROTOCOLS</text>
+    <line x1="16" y1="40" x2="248" y2="40" stroke="#23262f"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e6e9ef">
+      <text x="16" y="62">russh · russh-sftp</text>
+      <text x="16" y="82">alacritty_terminal</text>
+      <text x="16" y="102">serialport</text>
+    </g>
+  </g>
+
+  <!-- Col 4: Data & runtime -->
+  <g transform="translate(888 110)">
+    <rect width="264" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <text x="16" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" letter-spacing="2" fill="#8b90a0" font-weight="600">DATA &amp; RUNTIME</text>
+    <line x1="16" y1="40" x2="248" y2="40" stroke="#23262f"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#e6e9ef">
+      <text x="16" y="62">rusqlite (SQLite)</text>
+      <text x="16" y="82">aes-gcm crypto</text>
+      <text x="16" y="102">tokio · smol</text>
+      <text x="16" y="122">rust-i18n</text>
+    </g>
+  </g>
+</svg>

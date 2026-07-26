@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
 use async_channel::{Sender as MpscSender, unbounded};
@@ -9,14 +9,16 @@ use russh::{
     client::{self, Msg},
 };
 use tokio::task::AbortHandle;
-use tokio::{runtime::Runtime, select, sync::Mutex as TokioMutex};
+use tokio::{select, sync::Mutex as TokioMutex};
 
 use crabport_core::credential::{ProxyConfig, build_startup_command_bytes};
 use crabport_sftp::CrabPortSftp;
+use crabport_terminal::runtime::TOKIO;
 use crabport_terminal::terminal::{BackendEvent, RemoteMetrics, RemoteStatus};
 
 use crate::crabport_tunnel::CrabPortTunnel;
 use crate::handler::SshHandler;
+use crate::jump::{JumpChainGuard, connect_through_jumps};
 use crate::keys::decode_private_key;
 use crate::known_hosts::KnownHosts;
 use crate::monitor::monitor_loop;
@@ -50,15 +52,6 @@ where
 // the split.
 #[allow(unused_imports)]
 pub use crate::handler::{HostKeyInfo, HostKeyVerifier, HostKeyVerifyFuture};
-
-// ---------------------------------------------------------------------------
-// Tokio runtime for russh (russh internally requires tokio)
-// ---------------------------------------------------------------------------
-
-/// Tokio runtime shared by all SSH backends in this process. russh requires
-/// a tokio runtime, so we lazily create one and reuse it across connects.
-pub static TOKIO: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to create tokio runtime for SSH"));
 
 // ---------------------------------------------------------------------------
 // Internal command queue
@@ -120,6 +113,15 @@ pub struct SshBackend {
     /// remote-forward connections to the local target registered by a
     /// `TunnelManager` started from this tab's panel.
     pub(crate) reverse_registry: ReverseForwardRegistry,
+    /// Keeps the intermediate jump-host sessions alive when this connection
+    /// goes through a bastion chain — the target session's transport rides
+    /// a `direct-tcpip` channel of the last hop, so dropping a hop handle
+    /// would kill the whole connection. Shared with every pane backend
+    /// spawned via [`Self::new_channel_backend`] (they reuse the same
+    /// connection), so the chain is only torn down once ALL backends of
+    /// this connection have dropped. `None` for direct connections and
+    /// until the connect task finishes.
+    pub(crate) jump_guard: Arc<PlMutex<Option<JumpChainGuard>>>,
 }
 
 impl SshBackend {
@@ -159,6 +161,9 @@ impl SshBackend {
         let reverse_registry = ReverseForwardRegistry::new();
         let reverse_registry_for_handler = reverse_registry.clone();
 
+        let jump_guard: Arc<PlMutex<Option<JumpChainGuard>>> = Arc::new(PlMutex::new(None));
+        let jump_guard_for_task = jump_guard.clone();
+
         let event_tx2 = event_tx.clone();
         let monitor2 = monitor.clone();
         let on_status2 = on_status.clone();
@@ -187,13 +192,37 @@ impl SshBackend {
                 host: host_for_handler,
                 port: port_for_handler,
                 known_hosts,
-                verifier: verifier_for_handler,
+                verifier: verifier_for_handler.clone(),
                 reverse_registry: reverse_registry_for_handler,
             };
 
             let config = Arc::new(client::Config::default());
-            let mut sh = match connect_russh(config, &info.proxy, &info.host, info.port, handler).await {
-                Ok(sh) => {
+            // Direct: plain (possibly proxied) TCP + handshake. With jump
+            // hosts: connect + authenticate each hop, then run the target
+            // handshake over a `direct-tcpip` channel of the last hop. The
+            // guard keeping the hop sessions alive is parked in the shared
+            // `jump_guard` slot so pane backends (which reuse this
+            // connection) keep it alive too.
+            let connect_result = if info.jump_hosts.is_empty() {
+                connect_russh(config, &info.proxy, &info.host, info.port, handler)
+                    .await
+                    .map(|sh| (sh, JumpChainGuard::empty()))
+                    .map_err(|e| e.to_string())
+            } else {
+                connect_through_jumps(
+                    config,
+                    &info.jump_hosts,
+                    &info.host,
+                    info.port,
+                    handler,
+                    verifier_for_handler,
+                    &*on_status2,
+                )
+                .await
+            };
+            let mut sh = match connect_result {
+                Ok((sh, guard)) => {
+                    *jump_guard_for_task.lock() = Some(guard);
                     on_status2("TCP connection established".into());
                     sh
                 }
@@ -203,9 +232,7 @@ impl SshBackend {
                         let mut m = monitor2.write();
                         m.status = RemoteStatus::Disconnected;
                     }
-                    let _ = event_tx2
-                        .broadcast(BackendEvent::Error(e.to_string()))
-                        .await;
+                    let _ = event_tx2.broadcast(BackendEvent::Error(e)).await;
                     return;
                 }
             };
@@ -528,6 +555,7 @@ impl SshBackend {
             sftp_session,
             transfer_tasks,
             reverse_registry,
+            jump_guard,
         }
     }
 
@@ -642,6 +670,7 @@ impl SshBackend {
             sftp_session: sftp_session2,
             transfer_tasks,
             reverse_registry: self.reverse_registry.clone(),
+            jump_guard: self.jump_guard.clone(),
         })
     }
 

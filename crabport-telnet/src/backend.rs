@@ -25,14 +25,15 @@
 //! credentials are sent automatically (mirroring how `SshBackend` handles
 //! password auth).
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
 use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{runtime::Runtime, select};
+use tokio::select;
 
+use crabport_terminal::runtime::TOKIO;
 use crabport_terminal::terminal::{
     BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus,
 };
@@ -58,16 +59,6 @@ mod opt {
     pub const TERMINAL_TYPE: u8 = 24;
     pub const NAWS: u8 = 31;
 }
-
-// ---------------------------------------------------------------------------
-// Tokio runtime (the proxy stream is tokio-based, same as SSH)
-// ---------------------------------------------------------------------------
-
-/// Tokio runtime shared by all telnet backends in this process. The proxy
-/// crate returns a tokio `AsyncRead + AsyncWrite` stream, so we need a tokio
-/// runtime to drive it — same rationale as `crabport_ssh::backend::TOKIO`.
-pub static TOKIO: LazyLock<Runtime> =
-    LazyLock::new(|| Runtime::new().expect("failed to create tokio runtime for telnet"));
 
 // ---------------------------------------------------------------------------
 // Internal command queue (frontend → backend)
@@ -799,5 +790,32 @@ mod tests {
         let r = al.feed(b"Welcome!", &info);
         assert!(r.is_none());
         assert_eq!(al.phase, LoginPhase::Done);
+    }
+
+    #[test]
+    fn naws_payload_encodes_big_endian_dimensions() {
+        // 80×24 fits in single bytes; 300 (0x012C) exercises the high byte.
+        assert_eq!(
+            naws_payload(80, 24),
+            [IAC, SB, opt::NAWS, 0, 80, 0, 24, IAC, SE]
+        );
+        assert_eq!(
+            naws_payload(300, 100),
+            [IAC, SB, opt::NAWS, 0x01, 0x2C, 0, 100, IAC, SE]
+        );
+    }
+
+    #[test]
+    fn prompt_scan_only_sees_trailing_window() {
+        // The prompt scanners only look at the last 64 bytes, so a prompt
+        // buried in old output followed by >64 bytes of banner is ignored
+        // (prevents re-triggering auto-login on scrollback).
+        let mut buf = b"login: ".to_vec();
+        buf.extend(std::iter::repeat(b'x').take(100));
+        assert!(!has_login_prompt(&buf));
+
+        // But a prompt within the trailing window is found.
+        buf.extend_from_slice(b"\r\nlogin: ");
+        assert!(has_login_prompt(&buf));
     }
 }

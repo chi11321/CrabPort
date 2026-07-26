@@ -50,254 +50,60 @@ pub struct ResolvedBinding {
     pub keystroke: String,
 }
 
+/// Pick the macOS or non-macOS default keystroke at compile time. An empty
+/// string means "no default binding" ([`apply_bindings`] skips empties).
+fn plat(mac: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") { mac } else { other }
+}
+
+/// Expands one line per keybind into a full [`CatalogEntry`]:
+/// `"id" => ActionType, context, default_keystroke, configurable`.
+/// The settings label key is derived from the id
+/// (`window.settings.keybinds.action_<id>`), and `context` feeds both the
+/// entry field and the `KeyBinding` built by the closure, so the two can't
+/// disagree.
+macro_rules! entries {
+    ( $( $id:literal => $action:path, $ctx:expr, $default:expr, $configurable:expr );+ $(;)? ) => {
+        vec![$(
+            CatalogEntry {
+                action_id: $id,
+                label_key: concat!("window.settings.keybinds.action_", $id),
+                default_keystroke: $default,
+                context: $ctx,
+                configurable: $configurable,
+                build: |ks| KeyBinding::new(ks, $action, $ctx),
+            }
+        ),+]
+    };
+}
+
+/// GPUI key context for bindings scoped to a focused terminal.
+const TERM: Option<&str> = Some("CrabPortTerminal");
+
 /// The full list of configurable keybinds. Order is preserved for display.
 /// Returned as a `Vec` because the default keystrokes are platform-
 /// conditional (cfg!) which can't be used in a `const`/`static` context.
 pub fn catalog() -> Vec<CatalogEntry> {
-    vec![
+    entries!(
         // ---- App-level (configurable) ----
-        CatalogEntry {
-            action_id: "toggle_command",
-            label_key: "window.settings.keybinds.action_toggle_command",
-            default_keystroke: default_toggle_command(),
-            context: None,
-            configurable: true,
-            build: |ks| KeyBinding::new(ks, crate::app::ToggleCommand, None),
-        },
-        CatalogEntry {
-            action_id: "open_settings",
-            label_key: "window.settings.keybinds.action_open_settings",
-            default_keystroke: default_open_settings(),
-            context: None,
-            configurable: true,
-            build: |ks| KeyBinding::new(ks, crate::menus::OpenSettings, None),
-        },
-        CatalogEntry {
-            action_id: "open_about",
-            label_key: "window.settings.keybinds.action_open_about",
-            default_keystroke: default_open_about(),
-            context: None,
-            configurable: true,
-            build: |ks| KeyBinding::new(ks, crate::menus::OpenAbout, None),
-        },
+        "toggle_command" => crate::app::ToggleCommand, None, plat("cmd-k", "ctrl-k"), true;
+        "open_settings" => crate::menus::OpenSettings, None, plat("cmd-,", "ctrl-,"), true;
+        "open_about" => crate::menus::OpenAbout, None, plat("cmd-shift-a", "ctrl-shift-a"), true;
         // ---- App-level (not configurable, still registered) ----
-        CatalogEntry {
-            action_id: "quit",
-            label_key: "window.settings.keybinds.action_quit",
-            default_keystroke: default_quit(),
-            context: None,
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::menus::Quit, None),
-        },
-        CatalogEntry {
-            action_id: "hide",
-            label_key: "window.settings.keybinds.action_hide",
-            default_keystroke: default_hide(),
-            context: None,
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::menus::Hide, None),
-        },
-        CatalogEntry {
-            action_id: "minimize",
-            label_key: "window.settings.keybinds.action_minimize",
-            default_keystroke: default_minimize(),
-            context: None,
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::menus::Minimize, None),
-        },
-        CatalogEntry {
-            action_id: "zoom",
-            label_key: "window.settings.keybinds.action_zoom",
-            default_keystroke: default_zoom(),
-            context: None,
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::menus::Zoom, None),
-        },
+        "quit" => crate::menus::Quit, None, plat("cmd-q", "ctrl-q"), false;
+        "hide" => crate::menus::Hide, None, plat("cmd-h", ""), false;
+        "minimize" => crate::menus::Minimize, None, plat("cmd-m", ""), false;
+        "zoom" => crate::menus::Zoom, None, "", false;
         // ---- Terminal context (not configurable) ----
-        CatalogEntry {
-            action_id: "terminal_tab",
-            label_key: "window.settings.keybinds.action_terminal_tab",
-            default_keystroke: "tab",
-            context: Some("CrabPortTerminal"),
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::app::TerminalTab, Some("CrabPortTerminal")),
-        },
-        CatalogEntry {
-            action_id: "terminal_shift_tab",
-            label_key: "window.settings.keybinds.action_terminal_shift_tab",
-            default_keystroke: "shift-tab",
-            context: Some("CrabPortTerminal"),
-            configurable: false,
-            build: |ks| KeyBinding::new(ks, crate::app::TerminalShiftTab, Some("CrabPortTerminal")),
-        },
+        "terminal_tab" => crate::app::TerminalTab, TERM, "tab", false;
+        "terminal_shift_tab" => crate::app::TerminalShiftTab, TERM, "shift-tab", false;
         // ---- Terminal context (configurable) ----
-        CatalogEntry {
-            action_id: "terminal_increase_font",
-            label_key: "window.settings.keybinds.action_terminal_increase_font",
-            default_keystroke: default_font_zoom(),
-            context: Some("CrabPortTerminal"),
-            configurable: true,
-            build: |ks| {
-                KeyBinding::new(
-                    ks,
-                    crate::app::TerminalIncreaseFont,
-                    Some("CrabPortTerminal"),
-                )
-            },
-        },
-        CatalogEntry {
-            action_id: "terminal_decrease_font",
-            label_key: "window.settings.keybinds.action_terminal_decrease_font",
-            default_keystroke: default_font_shrink(),
-            context: Some("CrabPortTerminal"),
-            configurable: true,
-            build: |ks| {
-                KeyBinding::new(
-                    ks,
-                    crate::app::TerminalDecreaseFont,
-                    Some("CrabPortTerminal"),
-                )
-            },
-        },
-        CatalogEntry {
-            action_id: "terminal_reset_font",
-            label_key: "window.settings.keybinds.action_terminal_reset_font",
-            default_keystroke: default_font_reset(),
-            context: Some("CrabPortTerminal"),
-            configurable: true,
-            build: |ks| {
-                KeyBinding::new(ks, crate::app::TerminalResetFont, Some("CrabPortTerminal"))
-            },
-        },
-        CatalogEntry {
-            action_id: "split_vertical",
-            label_key: "window.settings.keybinds.action_split_vertical",
-            default_keystroke: default_split_vertical(),
-            context: Some("CrabPortTerminal"),
-            configurable: true,
-            build: |ks| KeyBinding::new(ks, crate::app::SplitVertical, Some("CrabPortTerminal")),
-        },
-        CatalogEntry {
-            action_id: "split_horizontal",
-            label_key: "window.settings.keybinds.action_split_horizontal",
-            default_keystroke: default_split_horizontal(),
-            context: Some("CrabPortTerminal"),
-            configurable: true,
-            build: |ks| KeyBinding::new(ks, crate::app::SplitHorizontal, Some("CrabPortTerminal")),
-        },
-    ]
-}
-
-// ---------------------------------------------------------------------------
-// Platform-conditional defaults
-// ---------------------------------------------------------------------------
-
-#[cfg(target_os = "macos")]
-fn default_toggle_command() -> &'static str {
-    "cmd-k"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_toggle_command() -> &'static str {
-    "ctrl-k"
-}
-
-#[cfg(target_os = "macos")]
-fn default_open_settings() -> &'static str {
-    "cmd-,"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_open_settings() -> &'static str {
-    "ctrl-,"
-}
-
-#[cfg(target_os = "macos")]
-fn default_open_about() -> &'static str {
-    "cmd-shift-a"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_open_about() -> &'static str {
-    "ctrl-shift-a"
-}
-
-#[cfg(target_os = "macos")]
-fn default_quit() -> &'static str {
-    "cmd-q"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_quit() -> &'static str {
-    "ctrl-q"
-}
-
-#[cfg(target_os = "macos")]
-fn default_hide() -> &'static str {
-    "cmd-h"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_hide() -> &'static str {
-    ""
-}
-
-#[cfg(target_os = "macos")]
-fn default_minimize() -> &'static str {
-    "cmd-m"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_minimize() -> &'static str {
-    ""
-}
-
-#[cfg(target_os = "macos")]
-fn default_zoom() -> &'static str {
-    ""
-}
-#[cfg(not(target_os = "macos"))]
-fn default_zoom() -> &'static str {
-    ""
-}
-
-#[cfg(target_os = "macos")]
-fn default_font_zoom() -> &'static str {
-    "cmd-="
-}
-#[cfg(not(target_os = "macos"))]
-fn default_font_zoom() -> &'static str {
-    "ctrl-="
-}
-
-#[cfg(target_os = "macos")]
-fn default_font_shrink() -> &'static str {
-    "cmd--"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_font_shrink() -> &'static str {
-    "ctrl--"
-}
-
-#[cfg(target_os = "macos")]
-fn default_font_reset() -> &'static str {
-    "cmd-0"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_font_reset() -> &'static str {
-    "ctrl-0"
-}
-
-#[cfg(target_os = "macos")]
-fn default_split_vertical() -> &'static str {
-    "cmd-d"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_split_vertical() -> &'static str {
-    "ctrl-d"
-}
-
-#[cfg(target_os = "macos")]
-fn default_split_horizontal() -> &'static str {
-    "cmd-shift-d"
-}
-#[cfg(not(target_os = "macos"))]
-fn default_split_horizontal() -> &'static str {
-    "ctrl-shift-d"
+        "terminal_increase_font" => crate::app::TerminalIncreaseFont, TERM, plat("cmd-=", "ctrl-="), true;
+        "terminal_decrease_font" => crate::app::TerminalDecreaseFont, TERM, plat("cmd--", "ctrl--"), true;
+        "terminal_reset_font" => crate::app::TerminalResetFont, TERM, plat("cmd-0", "ctrl-0"), true;
+        "split_vertical" => crate::app::SplitVertical, TERM, plat("cmd-d", "ctrl-d"), true;
+        "split_horizontal" => crate::app::SplitHorizontal, TERM, plat("cmd-shift-d", "ctrl-shift-d"), true;
+    )
 }
 
 // ---------------------------------------------------------------------------

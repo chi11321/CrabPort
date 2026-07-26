@@ -12,8 +12,7 @@ use crate::components::host_selector::PanelSide;
 use crate::components::notification::{Notification, NotificationLevel};
 use crate::views::sessions::{AuthKind, ConnectionFormState, ConnectionHost, ConnectionKind};
 use crabport_core::credential::{
-    CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, HostKind as CoreHostKind,
-    PrivateKeyKind,
+    CredentialEntry, CredentialKind as CoreCredentialKind, HostEntry, PrivateKeyKind,
 };
 
 use super::CrabportApp;
@@ -41,26 +40,7 @@ impl CrabportApp {
         // Update last_login timestamp
         let _ = AppState::store(cx).lock().touch_host_login(host_id);
         if let Ok(all) = AppState::store(cx).lock().hosts() {
-            self.hosts = all
-                .into_iter()
-                .map(|h| ConnectionHost {
-                    id: h.id,
-                    name: h.name,
-                    host: h.host,
-                    port: h.port,
-                    username: h.username,
-                    kind: match h.kind {
-                        CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-                        CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-                        CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-                    },
-                    credential_id: h.credential_id,
-                    last_login: h.last_login,
-                    favorite: h.favorite,
-                    proxy_id: h.proxy_id,
-                    group_id: h.group_id,
-                })
-                .collect();
+            self.hosts = all.into_iter().map(ConnectionHost::from).collect();
         }
 
         // Try to resolve password and private key from linked credential
@@ -100,19 +80,20 @@ impl CrabportApp {
                 .flatten()
         });
 
+        // Fetch the full stored host entry to get serial config fields
+        // (baud rate, data bits, etc.) that aren't on the in-memory
+        // ConnectionHost. Also used to resolve the startup command.
+        let stored = AppState::store(cx).lock().find_host(host_id).ok().flatten();
         // Resolve the startup command (if any) from the stored host entry.
-        let startup_command = AppState::store(cx)
-            .lock()
-            .find_host(host_id)
-            .ok()
-            .flatten()
-            .map(|h| h.startup_command)
+        let startup_command = stored
+            .as_ref()
+            .map(|h| h.startup_command.clone())
             .filter(|s| !s.is_empty());
 
         // Dispatch to the matching backend by connection kind. SSH keeps
         // its full auth (password / private key / passphrase); Telnet uses
         // password-only auth (credentials are sent via the terminal prompt
-        // in v1). Serial has no backend yet.
+        // in v1). Serial opens a local serial port (no auth, no proxy).
         match host.kind {
             crate::views::sessions::ConnectionKind::Telnet => {
                 self.add_telnet_tab(
@@ -127,7 +108,40 @@ impl CrabportApp {
                     cx,
                 );
             }
+            crate::views::sessions::ConnectionKind::Serial => {
+                let s = stored.as_ref();
+                // Device path is stored in the host field.
+                let device = host.host.clone();
+                let baud = s.and_then(|h| h.serial_baud_rate).unwrap_or(115200);
+                let data_bits = s.and_then(|h| h.serial_data_bits).unwrap_or(8);
+                let parity = s
+                    .and_then(|h| h.serial_parity.as_deref())
+                    .unwrap_or("none")
+                    .to_string();
+                let stop_bits = s.and_then(|h| h.serial_stop_bits).unwrap_or(1);
+                let flow_control = s
+                    .and_then(|h| h.serial_flow_control.as_deref())
+                    .unwrap_or("none")
+                    .to_string();
+                self.add_serial_tab(
+                    &host.name,
+                    Some(host_id),
+                    &device,
+                    baud,
+                    data_bits,
+                    &parity,
+                    stop_bits,
+                    &flow_control,
+                    startup_command.as_deref(),
+                    cx,
+                );
+            }
             _ => {
+                // Resolve the jump-host (bastion) chain, if configured.
+                let jump_hosts = super::connection::resolve_jump_chain(
+                    cx,
+                    stored.as_ref().and_then(|h| h.jump_host_id),
+                );
                 self.add_ssh_tab(
                     &host.name,
                     Some(host_id),
@@ -139,6 +153,7 @@ impl CrabportApp {
                     passphrase,
                     proxy_config,
                     startup_command.as_deref(),
+                    jump_hosts,
                     cx,
                 );
             }
@@ -214,11 +229,7 @@ impl CrabportApp {
         // Restore the connection type so the form opens on the correct tab
         // (SSH / Telnet / Serial). Without this the form always defaults to
         // SSH and a saved Telnet host would appear as SSH when edited.
-        form.kind = match h.kind {
-            crate::views::sessions::ConnectionKind::SSH => ConnectionKind::SSH,
-            crate::views::sessions::ConnectionKind::Telnet => ConnectionKind::Telnet,
-            crate::views::sessions::ConnectionKind::Serial => ConnectionKind::Serial,
-        };
+        form.kind = h.kind;
 
         form.name_input.update(cx, |state, cx| {
             state.set_value(&h.name, window, cx);
@@ -295,6 +306,35 @@ impl CrabportApp {
             });
         }
 
+        // Restore the jump-host selection (if any) and record the host being
+        // edited so the jump-host dropdown can exclude it (a host can't jump
+        // through itself).
+        form.editing_host_id = Some(host_id);
+        form.jump_host_id = stored_host
+            .as_ref()
+            .and_then(|h| h.jump_host_id)
+            .filter(|&jid| jid != host_id);
+
+        // Restore the serial config (if any) so the user can edit it. Only
+        // meaningful for `HostKind::Serial`, but harmless to copy regardless.
+        if let Some(ref h) = stored_host {
+            if let Some(baud) = h.serial_baud_rate {
+                form.serial_baud_rate_input.update(cx, |state, cx| {
+                    state.set_value(&baud.to_string(), window, cx);
+                });
+            }
+            form.serial_data_bits = h.serial_data_bits.unwrap_or(8);
+            form.serial_parity = h
+                .serial_parity
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+            form.serial_stop_bits = h.serial_stop_bits.unwrap_or(1);
+            form.serial_flow_control = h
+                .serial_flow_control
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+        }
+
         let app = cx.entity().clone();
         let editing_host_id = h.id;
         let editing_cred_id = h.credential_id;
@@ -321,19 +361,7 @@ impl CrabportApp {
                     if !app.validate_connection_form(cx) {
                         return;
                     }
-                    let (
-                        name,
-                        host,
-                        port_num,
-                        username,
-                        password,
-                        passphrase,
-                        auth_kind,
-                        private_key,
-                        private_key_kind,
-                        proxy_config,
-                        startup_command,
-                    ) = {
+                    let (name, host, port_num, username, password, passphrase, auth_kind, private_key, private_key_kind, proxy_config, startup_command, serial_baud_rate, serial_data_bits, serial_parity, serial_stop_bits, serial_flow_control) = {
                         let f = app.connection_form.as_ref().unwrap();
                         tracing::info!(
                             "edit_host: reading form — proxy_kind={:?}, form.proxy_id={:?}, proxy_url={:?}",
@@ -351,7 +379,17 @@ impl CrabportApp {
                         let (pk, pk_kind) = f.private_key_value(cx);
                         let pc = f.proxy_config(cx);
                         let sc = f.startup_command_text(cx);
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc)
+                        // Read serial config from the form so the user's edits
+                        // are persisted (same as every other field). For
+                        // non-serial hosts these are all `None` — the form
+                        // fields stay at their defaults but we only look at
+                        // them when kind == Serial.
+                        let sb = f.serial_baud_rate(cx);
+                        let sd = f.serial_data_bits(cx);
+                        let sp = f.serial_parity(cx);
+                        let ss = f.serial_stop_bits(cx);
+                        let sf = f.serial_flow_control(cx);
+                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc, sb, sd, sp, ss, sf)
                     };
                     app.close_connection_form(cx);
 
@@ -397,11 +435,7 @@ impl CrabportApp {
                         port: port_num,
                         username: username.clone(),
                         credential_id: Some(new_cred_id),
-                        kind: match kind {
-                            ConnectionKind::Telnet => CoreHostKind::Telnet,
-                            ConnectionKind::Serial => CoreHostKind::Serial,
-                            ConnectionKind::SSH => CoreHostKind::Ssh,
-                        },
+                        kind: kind.into(),
                         last_login: None,
                         favorite: editing_favorite,
                         proxy_id: upsert_proxy_for_host(&proxy_config, editing_proxy_id, cx),
@@ -410,6 +444,30 @@ impl CrabportApp {
                             .as_ref()
                             .and_then(|f| f.group_id),
                         startup_command: startup_command.clone(),
+                        serial_baud_rate,
+                        serial_data_bits,
+                        serial_parity,
+                        serial_stop_bits,
+                        serial_flow_control,
+                        // Jump hosts only apply to SSH; drop selections that
+                        // would create a cycle (self-reference, or a chain
+                        // that already passes through this host) — the
+                        // dropdown filters these, this is the save-time
+                        // backstop for stale form state.
+                        jump_host_id: if kind == ConnectionKind::SSH {
+                            app.connection_form
+                                .as_ref()
+                                .and_then(|f| f.jump_host_id)
+                                .filter(|&jid| {
+                                    !super::connection::jump_would_cycle(
+                                        cx,
+                                        editing_host_id,
+                                        jid,
+                                    )
+                                })
+                        } else {
+                            None
+                        },
                     };
                     tracing::info!(
                         "edit_host: on_connect — editing_proxy_id={:?}, resolved_entry.proxy_id={:?}",

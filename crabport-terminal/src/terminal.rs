@@ -55,6 +55,32 @@ pub enum BackendEvent {
     /// most-recent-first (already reversed by the backend) so the UI can
     /// render it verbatim.
     HistoryLoaded(Vec<String>),
+    /// The shell's current working directory and/or foreground process
+    /// changed. Emitted by the local PTY backend's process watcher (which
+    /// uses `tcgetpgrp` + `sysinfo` to inspect the foreground process
+    /// group on every PTY data event — no shell integration required).
+    /// The UI uses this to update the tab title to reflect the live cwd
+    /// and shell name (e.g. `Downloads-zsh`). The process name is the
+    /// basename of the foreground process's executable (e.g. `zsh`,
+    /// `bash`, `python`) — when the user runs `bash` inside a zsh tab,
+    /// the title updates to reflect the new shell.
+    ProcessChanged {
+        cwd: std::path::PathBuf,
+        process_name: String,
+    },
+    /// The backend finished its async construction and is ready to
+    /// read/write. Emitted by [`crate::pty::PendingPtyBackend`] once the
+    /// real `PtyBackend` has been installed on the worker thread.
+    ///
+    /// This is needed on Windows where `PtyBackend::new` runs on a
+    /// background thread (200–500 ms for `CreatePseudoConsole` + spawning
+    /// `pwsh.exe`). Without an explicit signal, the UI would keep the
+    /// "Connecting" spinner running at ~120 Hz until the first PTY byte
+    /// arrives — which for PowerShell can be another second or more
+    /// after the backend itself is ready. Broadcasting `Ready` lets the
+    /// UI check `monitor().status()` immediately and flip to `Local`,
+    /// stopping the spinner pump as soon as the backend is usable.
+    Ready,
 }
 
 /// Byte-level progress snapshot for a transfer stage.
@@ -81,6 +107,9 @@ pub enum SftpTransferKind {
     /// Delete a remote file or directory. Success shows "deleted";
     /// failure shows "delete failed".
     Delete,
+    /// Create a directory. Success is silent (the next directory refresh
+    /// surfaces the new folder); failure shows "mkdir failed".
+    Mkdir,
 }
 
 /// A coarse stage in the gzip/tmp staging flow used by SFTP transfers.
@@ -183,6 +212,13 @@ pub trait CrabPortTerminal: Send + Sync {
     /// if the remote doesn't support tar. Completion is reported via
     /// [`BackendEvent::SftpTransferFinished`] for the batch.
     fn sftp_upload_batch(&self, _items: &[(String, String)]) {}
+
+    /// Create a directory on the remote host at `remote_path`. Parent
+    /// directories must already exist (SFTP `mkdir` is not recursive).
+    /// Completion is reported via [`BackendEvent::SftpTransferFinished`]
+    /// with `kind = Mkdir` (a synthetic kind — there's no actual transfer,
+    /// but we reuse the event so the UI's existing finish handling applies).
+    fn sftp_mkdir(&self, _remote_path: &str) {}
 
     /// Delete a remote file or directory at `remote_path`. The backend
     /// stats the path to decide between `remove_file` and `remove_dir`.
@@ -467,6 +503,15 @@ impl TerminalSession {
                                         // Handled in the outer loop (not here,
                                         // inside the term lock) — drain ignores it.
                                     }
+                                    Ok(BackendEvent::ProcessChanged { .. }) => {
+                                        // UI-only event; ignore during batch drain.
+                                    }
+                                    Ok(BackendEvent::Ready) => {
+                                        // UI-only event; ignore during
+                                        // batch drain. The outer match
+                                        // handles it (wakeup → status
+                                        // check).
+                                    }
                                     Err(_) => break, // queue drained
                                 }
                             }
@@ -498,6 +543,25 @@ impl TerminalSession {
                                 history.push_back(c);
                             }
                             drop(history);
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
+                        // Cwd change: the session doesn't need to do
+                        // anything — the `TerminalView` listens on the same
+                        // backend event stream and updates the tab title.
+                        // Wake up so any subscriber that cares repaints.
+                        BackendEvent::ProcessChanged { .. } => {
+                            let _ = wakeup_tx.try_broadcast(());
+                        }
+                        // Backend finished async construction (e.g.
+                        // `PendingPtyBackend` installed the real `PtyBackend`).
+                        // The session itself has nothing to do — the UI's
+                        // wakeup listener re-reads `monitor().status()` and
+                        // flips the overlay out of the "Connecting" spinner.
+                        // Without this, the spinner would keep running at
+                        // ~120 Hz until the first PTY `Data` byte arrives,
+                        // which on Windows PowerShell can be a second or more
+                        // after the backend is already usable.
+                        BackendEvent::Ready => {
                             let _ = wakeup_tx.try_broadcast(());
                         }
                     },
@@ -770,6 +834,13 @@ impl TerminalSession {
         self.backend.sftp_delete(remote_path);
     }
 
+    /// Create a directory on the remote host (non-recursive — parent must
+    /// exist). Completion is reported via the backend's event stream as
+    /// `BackendEvent::SftpTransferFinished` with `kind = Mkdir`.
+    pub fn sftp_mkdir(&self, remote_path: &str) {
+        self.backend.sftp_mkdir(remote_path);
+    }
+
     pub fn scroll(&self, delta: i32) {
         let mut term = self.term.lock();
         use alacritty_terminal::grid::Scroll;
@@ -782,5 +853,100 @@ impl TerminalSession {
         use alacritty_terminal::grid::Scroll;
         term.scroll_display(Scroll::Bottom);
         let _ = self.wakeup_tx.try_broadcast(());
+    }
+
+    /// Handle a scroll-wheel event with the correct semantics for the
+    /// terminal's current mode, mirroring alacritty's own input handling.
+    ///
+    /// - If the terminal is in a mouse-reporting mode (`MOUSE_MODE`) and
+    ///   the user isn't holding Shift, send a mouse-button-4/5 (wheel
+    ///   up/down) SGR or normal mouse report at the given cell coordinate.
+    ///   This is what `vim`'s `:set mouse=a` and `less` rely on to scroll
+    ///   in-place.
+    /// - Else if the alternate screen is active *and* `ALTERNATE_SCROLL`
+    ///   is enabled (the default when a program enters the alt screen via
+    ///   `\e[?1049h` *and* requests `\e[?1007h`), translate the wheel into
+    ///   application cursor-key sequences (`\eOA` / `\eOB`) so programs
+    ///   like `vim` without mouse support can scroll as if the user were
+    ///   pressing Up/Down. Shift bypasses this (and the mouse-report
+    ///   branch above) so the user can still reach the scrollback when a
+    ///   full-screen app is capturing the wheel.
+    /// - Otherwise, scroll the primary screen's scrollback buffer by `lines`.
+    ///
+    /// `lines` is positive for scroll-down (wheel towards user) and
+    /// negative for scroll-up. `cell` is the 0-based (column, row) of the
+    /// pointer inside the terminal grid; pass `(0, 0)` when the caller
+    /// doesn't track the pointer (the mouse-report payload will then
+    /// report the top-left cell, which still works for programs that
+    /// only care about the button code).
+    /// `shift` should be true when the Shift modifier is held — it forces
+    /// the scrollback branch even in alt-screen / mouse mode.
+    pub fn handle_wheel(&self, lines: i32, cell: (usize, usize), shift: bool) {
+        use alacritty_terminal::term::TermMode;
+
+        let mode = *self.term.lock().mode();
+
+        // (1) Mouse reporting mode — emit a wheel-button report.
+        if mode.intersects(TermMode::MOUSE_MODE) && !shift {
+            // Wheel codes: 64 = up, 65 = down. In GPUI `lines > 0` means
+            // scroll-up (towards history) — matches alacritty's
+            // `new_scroll_y_px > 0 == up` convention.
+            let code: u8 = if lines > 0 { 64 } else { 65 };
+            let count = lines.unsigned_abs() as usize;
+            let (col, row) = cell;
+            let mut buf = Vec::with_capacity(count * 16);
+            for _ in 0..count {
+                if mode.contains(TermMode::SGR_MOUSE) {
+                    // SGR mouse: \e[<button;col;rowM (press) / m (release).
+                    // Wheel buttons fire as press + release in one shot,
+                    // so we emit the press form ("M") — that's what
+                    // xterm and vim's mouse handling expect for wheel.
+                    buf.extend_from_slice(
+                        format!("\x1b[<{};{};{}M", code, col + 1, row + 1).as_bytes(),
+                    );
+                } else {
+                    // Legacy CSI M format: \e[M <32+button> <32+1+col> <32+1+row>.
+                    // Clamp to the legacy 223-cell ceiling; cells beyond
+                    // that are simply dropped (matches xterm).
+                    if col < 222 && row < 222 {
+                        buf.push(0x1b);
+                        buf.push(b'[');
+                        buf.push(b'M');
+                        buf.push(32 + code);
+                        buf.push(32 + 1 + col as u8);
+                        buf.push(32 + 1 + row as u8);
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                self.backend.write(&buf);
+            }
+            return;
+        }
+
+        // (2) Alternate screen + ALTERNATE_SCROLL → cursor keys.
+        // Shift bypasses so the user can reach scrollback in full-screen apps.
+        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !shift {
+            let cmd: u8 = if lines > 0 { b'A' } else { b'B' };
+            let count = lines.unsigned_abs() as usize;
+            // Application cursor keys use `\eO A` (SS3) when APP_CURSOR
+            // is set; otherwise the normal cursor mode `\e[A` is used.
+            let prefix_a = if mode.contains(TermMode::APP_CURSOR) {
+                b'O'
+            } else {
+                b'['
+            };
+            let mut buf = Vec::with_capacity(count * 3);
+            for _ in 0..count {
+                buf.push(0x1b);
+                buf.push(prefix_a);
+                buf.push(cmd);
+            }
+            self.backend.write(&buf);
+            return;
+        }
+
+        // (3) Default: scroll the scrollback buffer.
+        self.scroll(lines);
     }
 }

@@ -4,7 +4,7 @@ use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{DURATION_INSTANT, DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_instant, duration_slower};
 use crate::views::panel::PanelKind;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
@@ -145,9 +145,9 @@ pub fn render_panel(
     // During a drag the duration is zero so width updates are instant;
     // otherwise the 500ms duration drives the smooth show/hide.
     let duration = if dragging {
-        DURATION_INSTANT
+        duration_instant()
     } else {
-        DURATION_SLOWER
+        duration_slower()
     };
     div()
         .id("panel-sidebar")
@@ -173,4 +173,93 @@ pub fn render_panel(
                 .child(tabs.h_full()),
         )
         .into_any_element()
+}
+
+/// Clamp a live drag width to the legal panel range for this window.
+fn clamp_drag_width(width: f32, window: &Window) -> f32 {
+    let eff_max = effective_max_panel_width(f32::from(window.viewport_size().width));
+    width.clamp(MIN_PANEL_WIDTH, eff_max)
+}
+
+/// The resize divider handle between terminal and panel: a narrow strip
+/// with negative margins so it overlaps the panel border while remaining
+/// grabbable. Mouse-down starts a [`PanelDrag`] on the app.
+pub fn render_panel_divider(
+    handle: &Entity<crate::app::CrabportApp>,
+    panel_width: f32,
+) -> impl IntoElement {
+    let handle = handle.clone();
+    div()
+        .id("panel-resize-handle")
+        .flex_shrink_0()
+        .h_full()
+        .w(px(PANEL_DIVIDER_HIT * 2.0))
+        .ml(px(-PANEL_DIVIDER_HIT))
+        .mr(px(-PANEL_DIVIDER_HIT))
+        .cursor_col_resize()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, {
+            move |event, _window, cx| {
+                handle.update(cx, |app, cx| {
+                    app.panel_drag = Some(PanelDrag {
+                        start_width: panel_width,
+                        start_x: f32::from(event.position.x),
+                        width: panel_width,
+                    });
+                    cx.notify();
+                });
+            }
+        })
+}
+
+/// Transparent zero-size canvas whose paint callback registers
+/// window-level mouse listeners for the panel resize drag.
+/// `window.on_mouse_event` can only be called during paint, so this
+/// canvas hooks into the paint phase. The listeners are registered every
+/// frame but no-op when `panel_drag` is `None`.
+pub fn render_panel_drag_canvas(handle: &Entity<crate::app::CrabportApp>) -> impl IntoElement {
+    let handle_for_canvas = handle.clone();
+    canvas(
+        |_bounds, _window, _cx| {},
+        move |_bounds, _state, window, _cx| {
+            let handle_for_move = handle_for_canvas.clone();
+            window.on_mouse_event({
+                let handle = handle_for_move.clone();
+                move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let _ = handle.update(cx, |app, cx| {
+                        if let Some(ref mut drag) = app.panel_drag {
+                            let delta = drag.start_x - f32::from(event.position.x);
+                            let new_width = clamp_drag_width(drag.start_width + delta, window);
+                            if (new_width - drag.width).abs() > 0.01 {
+                                drag.width = new_width;
+                                cx.notify();
+                            }
+                        }
+                    });
+                }
+            });
+            window.on_mouse_event({
+                let handle = handle_for_move.clone();
+                move |_event: &MouseUpEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let _ = handle.update(cx, |app, cx| {
+                        if let Some(drag) = app.panel_drag.take() {
+                            let clamped = clamp_drag_width(drag.width, window);
+                            let _ = crabport_core::config::update(|cfg| {
+                                cfg.appearance.panel_width = clamped;
+                            });
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+        },
+    )
+    .w_0()
+    .h_0()
 }

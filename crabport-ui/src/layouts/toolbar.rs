@@ -42,7 +42,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 
 pub const TOOLBAR_HEIGHT: f32 = 36.0;
 pub const BAR_WIDTH: f32 = 80.0;
@@ -210,7 +210,7 @@ pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
         .with_transition("terminal-toolbar-height")
         .transition_when_else(
             show_toolbar,
-            DURATION_SLOWER,
+            duration_slower(),
             EASE_STANDARD,
             |el| el.h(px(TOOLBAR_HEIGHT)),
             |el| el.h_0(),
@@ -337,29 +337,11 @@ fn build_slot_items(
     items
 }
 
-// ---------------------------------------------------------------------------
-// (removed) render_gear_button
-// ---------------------------------------------------------------------------
-//
-// The earlier implementation used a gear-shaped button in the toolbar
-// that opened the slot-visibility ctxmenu on left-click. It never fired
-// reliably — `with_transition` wraps the element in an `AnimatedWrapper`
-// that doesn't expose `Div`'s mouse-listener API, and even after reordering
-// the calls so `on_mouse_down` was registered on the raw `Stateful<Div>`,
-// clicks still didn't reach the handler (likely because an ancestor
-// `Div` in the terminal view's mouse overlay was intercepting them).
-// The right-click-on-toolbar gesture is more conventional and avoids
-// the whole hit-target problem.
-
-/*
-fn render_gear_button(
-    cm: Entity<ContextMenuController>,
-    slots: Vec<ToolbarSlot>,
-    on_toggle: Rc<dyn Fn(&str, &mut App) + 'static>,
-) -> impl IntoElement {
-    ...
-}
-*/
+// Note: an earlier gear-button that opened the slot-visibility ctxmenu on
+// left-click was removed — `with_transition` wraps the element in an
+// `AnimatedWrapper` that doesn't expose `Div`'s mouse-listener API, and
+// clicks never reliably reached the handler. Right-click-on-toolbar is the
+// supported gesture.
 
 // ---------------------------------------------------------------------------
 // Shared formatting helpers — re-exported for concrete toolbar impls

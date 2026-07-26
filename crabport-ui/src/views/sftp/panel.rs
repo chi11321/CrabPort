@@ -10,8 +10,7 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::animation::TransitionExt;
-use gpui_component::scroll::Scrollbar;
+use gpui_component::input::InputState;
 use gpui_component::v_virtual_list;
 use rust_i18n::t;
 
@@ -22,73 +21,19 @@ use crate::components::dialog::{AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::host_selector::PanelSide;
 use crate::components::input::StyledInput;
-use crate::motion::{DURATION_FAST, EASE_STANDARD};
 
 use super::drag::LocalFileDragValue;
 use super::drag::SftpDragValue;
-use super::helpers::render_action_button;
+use super::helpers::render_panel_ellipsis_button;
 use super::helpers::{
-    trigger_batch_download, trigger_remote_download_from_button, trigger_remote_to_remote_transfer,
-    trigger_upload, trigger_upload_from_local,
+    trigger_batch_download, trigger_remote_to_remote_transfer, trigger_upload_from_local,
 };
-use super::view::{PanelHost, SftpTabView, join_remote_path, remote_parent};
-
-// -----------------------------------------------------------------------
-// Column formatting helpers
-// -----------------------------------------------------------------------
-
-/// Format a byte count as a human-readable string (e.g. "1.2 KB", "3.4 MB").
-/// Returns an empty string for `None` (directories or unavailable).
-fn format_size(opt: Option<u64>) -> String {
-    match opt {
-        None => String::new(),
-        Some(bytes) => {
-            const KB: f64 = 1024.0;
-            const MB: f64 = 1024.0 * 1024.0;
-            const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-            let b = bytes as f64;
-            if b >= GB {
-                format!("{:.1} GB", b / GB)
-            } else if b >= MB {
-                format!("{:.1} MB", b / MB)
-            } else if b >= KB {
-                format!("{:.1} KB", b / KB)
-            } else {
-                format!("{} B", bytes)
-            }
-        }
-    }
-}
-
-/// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM".
-/// Returns an empty string for `None`.
-fn format_modified(opt: Option<i64>) -> String {
-    match opt {
-        None => String::new(),
-        Some(secs) => {
-            // Civil-time conversion from Unix epoch seconds, no external crate.
-            // Algorithm: Howard Hinnant's "days_from_civil" in reverse.
-            let days = secs.div_euclid(86400);
-            let secs_of_day = secs.rem_euclid(86400) as u32;
-            let hour = secs_of_day / 3600;
-            let minute = (secs_of_day % 3600) / 60;
-
-            // Convert days since epoch to (y, m, d).
-            let z = days + 719468; // epoch 1970-01-01 → civil 0000-03-01
-            let era = if z >= 0 { z } else { z - 146096 } / 146097;
-            let doe = z - era * 146097; // [0, 146097)
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-            let y = yoe + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-            let mp = (5 * doy + 2) / 153; // [0, 11]
-            let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-            let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-            let year = if m <= 2 { y + 1 } else { y };
-
-            format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, hour, minute)
-        }
-    }
-}
+use super::pane::{
+    build_entry_rows, cmp_dirs_first, cmp_remote_listing, file_row_visuals, join_remote_path,
+    open_host_selector_handler, other_side, panel_drag_over_tracker, remote_target_path,
+    render_drag_exit_canvas, render_scrollbar_overlay, tab_id_prefix,
+};
+use super::view::{PanelHost, SftpTabView};
 
 /// Render the column header row above the file list. Sticky at the top
 /// of the scroll area.
@@ -148,44 +93,41 @@ fn render_column_header(id_prefix: &str) -> impl IntoElement {
         )
 }
 
-/// Render the 3 metadata columns (size, permissions, modified) for a file row.
-fn render_metadata_columns(
-    size: Option<u64>,
-    permissions: &Option<String>,
-    modified: Option<i64>,
-) -> Div {
+/// Render the inline "new folder" input row shown above the file list when
+/// the user has triggered "new folder" from the ellipsis menu. The input
+/// is pre-seeded with a unique default name by `start_make_folder`; Enter
+/// commits, Escape / blur cancels (the latter is wired in `start_make_folder`
+/// via `cx.on_blur`).
+///
+/// Layout matches a single file row (icon + name) so it reads as a pending
+/// new entry rather than a foreign floating dialog.
+fn render_mkdir_input(id: SharedString, input: Entity<InputState>) -> impl IntoElement {
     div()
+        .id(SharedString::from(format!("{id}-row")))
+        .w_full()
+        .h(px(26.0))
+        .flex_shrink_0()
         .flex()
         .flex_row()
         .items_center()
         .gap_1p5()
+        .px_2()
+        .bg(rgba((surface_hover() << 8) | 0x55))
+        .border_b_1()
+        .border_color(rgb(border()))
+        // Icon spacer — matches the 14px folder icon in each row.
         .child(
-            div()
-                .w(px(80.0))
-                .text_right()
-                .text_xs()
-                .text_color(rgb(text_muted()))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(format_size(size)),
+            svg()
+                .path("icons/folder.svg")
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(rgb(text_muted())),
         )
         .child(
             div()
-                .w(px(90.0))
-                .text_xs()
-                .text_color(rgb(text_muted()))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(permissions.clone().unwrap_or_default()),
-        )
-        .child(
-            div()
-                .w(px(120.0))
-                .text_xs()
-                .text_color(rgb(text_muted()))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(format_modified(modified)),
+                .flex_1()
+                .min_w_0()
+                .child(StyledInput::new(id, input).xsmall()),
         )
 }
 
@@ -226,10 +168,7 @@ impl SftpTabView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let id_prefix = match side {
-            PanelSide::Left => "sftp-tab-left",
-            PanelSide::Right => "sftp-tab-right",
-        };
+        let id_prefix = tab_id_prefix(side);
 
         div()
             .h_full()
@@ -262,22 +201,7 @@ impl SftpTabView {
                 .w(px(140.0))
                 .centered(true)
                 .child(t!("sftp_tab.select_host_btn").to_string())
-                .on_click({
-                    let entity = entity.clone();
-                    move |_e, w, cx| {
-                        let _ = entity.update(cx, |view, cx| {
-                            view.host_selector_open_for = Some(side);
-                            let hosts = view.hosts.clone();
-                            if let Some(ref overlay) = view.host_selector {
-                                overlay.update(cx, |o, cx| {
-                                    o.set_hosts(hosts);
-                                    o.open(w, cx);
-                                });
-                            }
-                            cx.notify();
-                        });
-                    }
-                }),
+                .on_click(open_host_selector_handler(entity, side)),
             )
     }
 
@@ -295,41 +219,16 @@ impl SftpTabView {
     ) -> impl IntoElement {
         let panel = self.panel(side);
         // Sort + prepend ".."
-        let mut sorted: Vec<crabport_sftp::FileEntry> =
-            panel.local_entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: None,
-            permissions: None,
-            modified: None,
-        }];
-        all_entries.extend(sorted);
-
-        let item_sizes = Rc::new(
-            all_entries
-                .iter()
-                .map(|_| Size {
-                    width: px(0.0),
-                    height: px(26.0),
-                })
-                .collect::<Vec<_>>(),
+        let (all_entries, item_sizes) = build_entry_rows(
+            panel.local_entries.iter().cloned().collect(),
+            cmp_dirs_first,
         );
-        let all_entries = Rc::new(all_entries);
         let scroll_handle = panel.scroll.clone();
         let local_cwd = panel.local_cwd.clone();
         let path_input = panel.path_input.clone();
 
         // The "other" panel — for cross-panel operations
-        let other_side = match side {
-            PanelSide::Left => PanelSide::Right,
-            PanelSide::Right => PanelSide::Left,
-        };
+        let other_side = other_side(side);
         let other_panel = self.panel(other_side);
         let _other_is_remote = other_panel.host.is_remote();
         let other_on_download = other_panel.on_download.clone();
@@ -342,11 +241,10 @@ impl SftpTabView {
         let entity_for_list = entity.clone();
         let renaming_entry = panel.renaming.clone();
         let rename_input = panel.rename_input.clone();
+        let mkdir_pending = panel.mkdir_pending.is_some();
+        let mkdir_input = panel.mkdir_input.clone();
 
-        let id_prefix = match side {
-            PanelSide::Left => "sftp-tab-left",
-            PanelSide::Right => "sftp-tab-right",
-        };
+        let id_prefix = tab_id_prefix(side);
 
         div()
             .h_full()
@@ -377,6 +275,8 @@ impl SftpTabView {
                             .gap_1()
                             .px_2()
                             .h(px(26.0))
+                            .max_w(px(160.0))
+                            .min_w_0()
                             .rounded(px(4.0))
                             .bg(rgb(surface_hover()))
                             .on_click({
@@ -399,12 +299,14 @@ impl SftpTabView {
                                 svg()
                                     .path("icons/folder.svg")
                                     .size(px(12.0))
+                                    .flex_shrink_0()
                                     .text_color(rgb(text_muted())),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
+                                    .truncate()
                                     .child(t!("sftp_tab.local").to_string()),
                             ),
                     )
@@ -424,68 +326,37 @@ impl SftpTabView {
                                 ),
                             )
                         }),
-                    ),
-            )
-            // Action button row: refresh / mkdir
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mb_1()
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-refresh")),
-                        "icons/refresh-cw.svg",
-                        t!("sftp.refresh").to_string(),
-                        true,
+                    )
+                    // Ellipsis overflow menu: refresh / new folder /
+                    // toggle hidden / close panel.
+                    .child(render_panel_ellipsis_button(
+                        side,
+                        entity.clone(),
+                        self.context_menu.clone(),
                         tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            move |_w, cx| {
-                                let _ = entity.update(cx, |view, cx| {
-                                    let panel = view.panel_mut(side);
-                                    panel.local_entries =
-                                        SftpTabView::read_local_dir(&panel.local_cwd);
-                                    panel.selected.clear();
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-mkdir")),
-                        "icons/plus.svg",
-                        t!("sftp_tab.mkdir").to_string(),
-                        true,
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            move |_w, cx| {
-                                let _ = entity.update(cx, |view, cx| {
-                                    // Create "New Folder" with a unique name.
-                                    let panel = view.panel_mut(side);
-                                    let base = "New Folder";
-                                    let mut name = base.to_string();
-                                    let mut i = 1;
-                                    while panel.local_cwd.join(&name).exists() {
-                                        name = format!("{base} ({i})");
-                                        i += 1;
-                                    }
-                                    let path = panel.local_cwd.join(&name);
-                                    let _ = std::fs::create_dir(&path);
-                                    panel.local_entries =
-                                        SftpTabView::read_local_dir(&panel.local_cwd);
-                                    cx.notify();
-                                });
-                            }
-                        },
+                        panel.show_hidden,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
                     )),
             )
             // Column header — outside the scroll container so the
             // scrollbar (absolute top_0..bottom_0 inside the container
             // below) only spans the file-list area, not the header.
             .child(render_column_header(id_prefix))
+            // Inline "new folder" input — shown above the list when the
+            // user has triggered "new folder" from the ellipsis menu.
+            // Press Enter to commit, click away / Esc to cancel.
+            .when(mkdir_pending, |el| {
+                el.when_some(mkdir_input.clone(), |el, input| {
+                    el.child(render_mkdir_input(
+                        SharedString::from(format!("{id_prefix}-mkdir")),
+                        input,
+                    ))
+                })
+            })
             .child(
                 div()
                     .relative()
@@ -521,19 +392,10 @@ impl SftpTabView {
                             );
                         }
                     })
-                    .on_drag_move::<SftpDragValue>({
-                        let entity = entity_for_list.clone();
-                        move |e, _w, cx| {
-                            let _ = entity.update(cx, |view, cx| {
-                                let panel = view.panel_mut(side);
-                                let should = e.bounds.contains(&e.event.position);
-                                if panel.drag_over != should {
-                                    panel.drag_over = should;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
+                    .on_drag_move::<SftpDragValue>(panel_drag_over_tracker(
+                        &entity_for_list,
+                        side,
+                    ))
                     .child(
                         v_virtual_list(
                             cx.entity(),
@@ -565,10 +427,7 @@ impl SftpTabView {
                                         let entity = cx.entity().downgrade();
                                         let context_menu = this.context_menu.clone();
                                         let alert_controller = this.alert_controller.clone();
-                                        let other_side = match side {
-                                            PanelSide::Left => PanelSide::Right,
-                                            PanelSide::Right => PanelSide::Left,
-                                        };
+                                        let other_side = super::pane::other_side(side);
                                         let other_on_upload_for_ctx =
                                             this.panel(other_side).on_upload.clone();
                                         let other_on_upload_batch_for_ctx =
@@ -600,7 +459,7 @@ impl SftpTabView {
                                         let drag_is_dir = is_dir;
                                         let drag_source_side = side;
 
-                                        div()
+                                        let row = div()
                                             .id(row_id.clone())
                                             .h(px(26.0))
                                             .w_full()
@@ -682,12 +541,7 @@ impl SftpTabView {
                                                                         && panel.selected.contains(e.name.as_str())
                                                                 })
                                                                 .map(|e| {
-                                                                    let p = cwd_str.clone();
-                                                                    let p = if p.ends_with('/') {
-                                                                        format!("{}{}", p, e.name)
-                                                                    } else {
-                                                                        format!("{}/{}", p, e.name)
-                                                                    };
+                                                                    let p = join_remote_path(&cwd_str, &e.name);
                                                                     (e.name.clone(), e.is_dir, p)
                                                                 })
                                                                 .collect()
@@ -746,7 +600,7 @@ impl SftpTabView {
                                                             t!("sftp.rename").to_string(),
                                                             move |window, cx| {
                                                                 let _ = entity_for_rename.update(cx, |view, cx| {
-                                                                    view.start_local_rename(side, entry_name.clone(), window, cx);
+                                                                    view.start_rename(side, entry_name.clone(), false, window, cx);
                                                                 });
                                                             },
                                                         ));
@@ -824,116 +678,31 @@ impl SftpTabView {
                                                         );
                                                     });
                                                 }
-                                            })
-                                            .with_transition(row_id_for_transition)
-                                            .on_hover({
-                                                let name = name.clone();
-                                                move |hovered, _w, cx| {
-                                                    let _ = entity.update(cx, |view, cx| {
-                                                        let panel = view.panel_mut(side);
-                                                        if *hovered {
-                                                            panel.hovered = Some(name.clone());
-                                                        } else if panel.hovered.as_deref()
-                                                            == Some(name.as_str())
-                                                        {
-                                                            panel.hovered = None;
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            })
-                                            .transition_when_else(
-                                                is_highlighted,
-                                                DURATION_FAST,
-                                                EASE_STANDARD,
-                                                |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
-                                                |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
-                                            )
-                                            .relative()
-                                            .child(
-                                                div()
-                                                    .id(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
-                                                    .absolute()
-                                                    .top(px(2.0))
-                                                    .bottom(px(2.0))
-                                                    .left_0()
-                                                    .w(px(2.0))
-                                                    .rounded(px(1.0))
-                                                    .bg(rgb(btn_primary_bg()))
-                                                    .opacity(0.0)
-                                                    .with_transition(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
-                                                    .transition_when_else(
-                                                        is_selected,
-                                                        DURATION_FAST,
-                                                        EASE_STANDARD,
-                                                        |el| el.opacity(1.0),
-                                                        |el| el.opacity(0.0),
-                                                    ),
-                                            )
-                                            .child(
-                                                svg()
-                                                    .path(icon_path)
-                                                    .size(px(14.0))
-                                                    .flex_shrink_0()
-                                                    .text_color(rgb(text_muted())),
-                                            )
-                                            .when_some(
-                                                if is_renaming { row_rename_input } else { None },
-                                                |el, input| {
-                                                    el.child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .child(
-                                                                StyledInput::new(
-                                                                    format!("{id_prefix}-rename-{i}"),
-                                                                    input,
-                                                                ).xsmall(),
-                                                            ),
-                                                    )
-                                                    .child(render_metadata_columns(
-                                                        entry_size,
-                                                        &entry_permissions,
-                                                        entry_modified,
-                                                    ))
-                                                },
-                                            )
-                                            .when(!is_renaming, |el| {
-                                                el
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .text_xs()
-                                                            .text_color(rgb(text_primary()))
-                                                            .whitespace_nowrap()
-                                                            .overflow_hidden()
-                                                            .child(name.clone()),
-                                                    )
-                                                    .child(render_metadata_columns(
-                                                        entry_size,
-                                                        &entry_permissions,
-                                                        entry_modified,
-                                                    ))
-                                            })
+                                            });
+                                        file_row_visuals(
+                                            row,
+                                            row_id_for_transition,
+                                            id_prefix,
+                                            i,
+                                            name,
+                                            entity,
+                                            side,
+                                            is_highlighted,
+                                            is_selected,
+                                            is_renaming,
+                                            row_rename_input,
+                                            icon_path,
+                                            entry_size,
+                                            entry_permissions,
+                                            entry_modified,
+                                        )
                                     })
                                     .collect::<Vec<_>>()
                             },
                         )
                         .track_scroll(&scroll_handle),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.0))
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
-                            ),
-                    )
+                    .child(render_scrollbar_overlay(&scroll_handle))
                     .child(
                         DropZoneOverlay::new(drag_over)
                             .hint(t!("sftp_tab.drop_download_hint").to_string())
@@ -942,30 +711,15 @@ impl SftpTabView {
                     // Canvas to catch FileDropEvent::Exited for external drags.
                     .child({
                         let entity = entity_for_list.clone();
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |_bounds, _state, window, _cx| {
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |event: &FileDropEvent, phase, _window, cx| {
-                                        if phase != DispatchPhase::Capture {
-                                            return;
-                                        }
-                                        if matches!(event, FileDropEvent::Exited) {
-                                            let _ = entity.update(cx, |view, cx| {
-                                                let panel = view.panel_mut(side);
-                                                if panel.drag_over {
-                                                    panel.drag_over = false;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    }
-                                });
-                            },
-                        )
-                        .w_0()
-                        .h_0()
+                        render_drag_exit_canvas(move |cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                let panel = view.panel_mut(side);
+                                if panel.drag_over {
+                                    panel.drag_over = false;
+                                    cx.notify();
+                                }
+                            });
+                        })
                     }),
             )
     }
@@ -984,38 +738,13 @@ impl SftpTabView {
     ) -> impl IntoElement {
         let panel = self.panel(side);
         // Sort entries: ".", "..", dirs, files — same as sftp.rs.
-        let mut sorted: Vec<crabport_sftp::FileEntry> =
-            panel.remote_entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
-            (".", _) => std::cmp::Ordering::Less,
-            (_, ".") => std::cmp::Ordering::Greater,
-            ("..", _) => std::cmp::Ordering::Less,
-            (_, "..") => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: None,
-            permissions: None,
-            modified: None,
-        }];
-        all_entries.extend(sorted);
-
-        let item_sizes = Rc::new(
-            all_entries
-                .iter()
-                .map(|_| Size {
-                    width: px(0.0),
-                    height: px(26.0),
-                })
-                .collect::<Vec<_>>(),
+        let (all_entries, item_sizes) = build_entry_rows(
+            panel.remote_entries.iter().cloned().collect(),
+            cmp_remote_listing,
         );
-        let all_entries = Rc::new(all_entries);
         let scroll_handle = panel.scroll.clone();
         let cwd = panel.remote_cwd.clone();
         let path_input = panel.path_input.clone();
-        let on_navigate = panel.on_navigate.clone();
         let on_download = panel.on_download.clone();
         let on_upload = panel.on_upload.clone();
         let on_upload_batch = panel.on_upload_batch.clone();
@@ -1037,14 +766,13 @@ impl SftpTabView {
         let entity_for_list = entity.clone();
         let renaming_entry = panel.renaming.clone();
         let rename_input = panel.rename_input.clone();
+        let mkdir_pending = panel.mkdir_pending.is_some();
+        let mkdir_input = panel.mkdir_input.clone();
         let context_menu = self.context_menu.clone();
         let alert_controller = self.alert_controller.clone();
 
         // The "other" panel — for remote-to-remote drag transfers.
-        let other_side = match side {
-            PanelSide::Left => PanelSide::Right,
-            PanelSide::Right => PanelSide::Left,
-        };
+        let other_side = other_side(side);
         let other_panel = self.panel(other_side);
         let other_is_remote = other_panel.host.is_remote();
         let other_on_download_for_r2r = other_panel.on_download.clone();
@@ -1057,10 +785,7 @@ impl SftpTabView {
         // The terminal for rendering (zero-size, keeps frame pump alive)
         let terminal_entity = panel.host.terminal().cloned();
 
-        let id_prefix = match side {
-            PanelSide::Left => "sftp-tab-left",
-            PanelSide::Right => "sftp-tab-right",
-        };
+        let id_prefix = tab_id_prefix(side);
 
         div()
             .h_full()
@@ -1090,6 +815,8 @@ impl SftpTabView {
                             .gap_1()
                             .px_2()
                             .h(px(26.0))
+                            .max_w(px(160.0))
+                            .min_w_0()
                             .rounded(px(4.0))
                             .bg(rgb(surface_hover()))
                             .on_click({
@@ -1112,12 +839,14 @@ impl SftpTabView {
                                 svg()
                                     .path("icons/server.svg")
                                     .size(px(12.0))
+                                    .flex_shrink_0()
                                     .text_color(rgb(text_muted())),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
+                                    .truncate()
                                     .child(host_label),
                             ),
                     )
@@ -1137,83 +866,37 @@ impl SftpTabView {
                                 ),
                             )
                         }),
-                    ),
-            )
-            // Action buttons: download / upload / refresh
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .mb_1()
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-download")),
-                        "icons/download.svg",
-                        t!("sftp.download").to_string(),
-                        on_download.is_some(),
+                    )
+                    // Ellipsis overflow menu: download / upload / refresh /
+                    // new folder / toggle hidden / close panel.
+                    .child(render_panel_ellipsis_button(
+                        side,
+                        entity.clone(),
+                        self.context_menu.clone(),
                         tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_download = on_download.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_remote_download_from_button(
-                                    entity.clone(),
-                                    side,
-                                    on_download.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-upload")),
-                        "icons/upload.svg",
-                        t!("sftp.upload").to_string(),
-                        on_upload.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let entity = entity.clone();
-                            let on_upload = on_upload.clone();
-                            let on_upload_batch = on_upload_batch.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                trigger_upload(
-                                    entity.clone(),
-                                    side,
-                                    on_upload.as_ref(),
-                                    on_upload_batch.as_ref(),
-                                    cwd.as_ref(),
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
-                    .child(render_action_button(
-                        SharedString::from(format!("{id_prefix}-refresh")),
-                        "icons/refresh-cw.svg",
-                        t!("sftp.refresh").to_string(),
-                        on_navigate.is_some(),
-                        tooltip_ctrl.clone(),
-                        {
-                            let on_navigate = on_navigate.clone();
-                            let cwd = cwd.clone();
-                            move |_w, cx| {
-                                let cb = on_navigate.as_ref();
-                                let cwd = cwd.as_ref();
-                                if let (Some(cb), Some(cwd)) = (cb, cwd) {
-                                    cb(cwd.as_str().to_string(), cx);
-                                }
-                            }
-                        },
+                        panel.show_hidden,
+                        true,
+                        on_download.clone(),
+                        on_upload.clone(),
+                        on_upload_batch.clone(),
+                        cwd.clone(),
                     )),
             )
             // Column header — outside the scroll container so the
             // scrollbar (absolute top_0..bottom_0 inside the container
             // below) only spans the file-list area, not the header.
             .child(render_column_header(id_prefix))
+            // Inline "new folder" input — shown above the list when the
+            // user has triggered "new folder" from the ellipsis menu.
+            // Press Enter to commit, click away / Esc to cancel.
+            .when(mkdir_pending, |el| {
+                el.when_some(mkdir_input.clone(), |el, input| {
+                    el.child(render_mkdir_input(
+                        SharedString::from(format!("{id_prefix}-mkdir")),
+                        input,
+                    ))
+                })
+            })
             .child(
                 div()
                     .relative()
@@ -1286,32 +969,14 @@ impl SftpTabView {
                             }
                         }
                     })
-                    .on_drag_move::<LocalFileDragValue>({
-                        let entity = entity_for_list.clone();
-                        move |e, _w, cx| {
-                            let _ = entity.update(cx, |view, cx| {
-                                let panel = view.panel_mut(side);
-                                let should = e.bounds.contains(&e.event.position);
-                                if panel.drag_over != should {
-                                    panel.drag_over = should;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
-                    .on_drag_move::<ExternalPaths>({
-                        let entity = entity_for_list.clone();
-                        move |e, _w, cx| {
-                            let _ = entity.update(cx, |view, cx| {
-                                let panel = view.panel_mut(side);
-                                let should = e.bounds.contains(&e.event.position);
-                                if panel.drag_over != should {
-                                    panel.drag_over = should;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
+                    .on_drag_move::<LocalFileDragValue>(panel_drag_over_tracker(
+                        &entity_for_list,
+                        side,
+                    ))
+                    .on_drag_move::<ExternalPaths>(panel_drag_over_tracker(
+                        &entity_for_list,
+                        side,
+                    ))
                     // Drop zone for remote→remote drag: download from
                     // source remote to temp, then upload to this remote.
                     .on_drop::<SftpDragValue>(move |drag, _w, cx| {
@@ -1349,19 +1014,10 @@ impl SftpTabView {
                             cx,
                         );
                     })
-                    .on_drag_move::<SftpDragValue>({
-                        let entity = entity_for_list.clone();
-                        move |e, _w, cx| {
-                            let _ = entity.update(cx, |view, cx| {
-                                let panel = view.panel_mut(side);
-                                let should = e.bounds.contains(&e.event.position);
-                                if panel.drag_over != should {
-                                    panel.drag_over = should;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
+                    .on_drag_move::<SftpDragValue>(panel_drag_over_tracker(
+                        &entity_for_list,
+                        side,
+                    ))
                     // Hidden terminal view (zero size, keeps frame pump alive)
                     .when_some(terminal_entity.clone(), |el, term| {
                         el.child(div().w_0().h_0().overflow_hidden().child(term))
@@ -1388,13 +1044,7 @@ impl SftpTabView {
                                         let entry_modified = entry.modified;
 
                                         let cwd_ref = this.panel(side).remote_cwd.as_ref().map(|s| s.as_str()).unwrap_or("/");
-                                        let target_path = if name == "." {
-                                            cwd_ref.to_string()
-                                        } else if name == ".." {
-                                            remote_parent(cwd_ref)
-                                        } else {
-                                            join_remote_path(cwd_ref, &name)
-                                        };
+                                        let target_path = remote_target_path(cwd_ref, &name);
 
                                         let on_navigate = this.panel(side).on_navigate.clone();
                                         let on_download = this.panel(side).on_download.clone();
@@ -1406,10 +1056,7 @@ impl SftpTabView {
                                         let remote_cwd_for_ctx = this.panel(side).remote_cwd.clone();
 
                                         // The "other" panel's state for cross-panel ops
-                                        let other_side = match side {
-                                            PanelSide::Left => PanelSide::Right,
-                                            PanelSide::Right => PanelSide::Left,
-                                        };
+                                        let other_side = super::pane::other_side(side);
                                         let other_is_remote = this.panel(other_side).host.is_remote();
                                         let other_local_entries = this.panel(other_side).local_entries.clone();
                                         let other_local_cwd = this.panel(other_side).local_cwd.clone();
@@ -1441,7 +1088,7 @@ impl SftpTabView {
                                         let drag_is_dir = is_dir;
                                         let drag_source_side = side;
 
-                                        div()
+                                        let row = div()
                                             .id(row_id.clone())
                                             .h(px(26.0))
                                             .w_full()
@@ -1667,7 +1314,7 @@ impl SftpTabView {
                                                             t!("sftp.rename").to_string(),
                                                             move |window, cx| {
                                                                 let _ = entity_for_rename.update(cx, |view, cx| {
-                                                                    view.start_remote_rename(side, entry_name.clone(), window, cx);
+                                                                    view.start_rename(side, entry_name.clone(), true, window, cx);
                                                                 });
                                                             },
                                                         ));
@@ -1741,116 +1388,31 @@ impl SftpTabView {
                                                         );
                                                     });
                                                 }
-                                            })
-                                            .with_transition(row_id_for_transition)
-                                            .on_hover({
-                                                let name = name.clone();
-                                                move |hovered, _w, cx| {
-                                                    let _ = entity.update(cx, |view, cx| {
-                                                        let panel = view.panel_mut(side);
-                                                        if *hovered {
-                                                            panel.hovered = Some(name.clone());
-                                                        } else if panel.hovered.as_deref()
-                                                            == Some(name.as_str())
-                                                        {
-                                                            panel.hovered = None;
-                                                        }
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            })
-                                            .transition_when_else(
-                                                is_highlighted,
-                                                DURATION_FAST,
-                                                EASE_STANDARD,
-                                                |el| el.bg(rgba((surface_hover() << 8) | 0xFF)),
-                                                |el| el.bg(rgba((surface_hover() << 8) | 0x00)),
-                                            )
-                                            .relative()
-                                            .child(
-                                                div()
-                                                    .id(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
-                                                    .absolute()
-                                                    .top(px(2.0))
-                                                    .bottom(px(2.0))
-                                                    .left_0()
-                                                    .w(px(2.0))
-                                                    .rounded(px(1.0))
-                                                    .bg(rgb(btn_primary_bg()))
-                                                    .opacity(0.0)
-                                                    .with_transition(ElementId::Name(format!("{id_prefix}-bar-{i}").into()))
-                                                    .transition_when_else(
-                                                        is_selected,
-                                                        DURATION_FAST,
-                                                        EASE_STANDARD,
-                                                        |el| el.opacity(1.0),
-                                                        |el| el.opacity(0.0),
-                                                    ),
-                                            )
-                                            .child(
-                                                svg()
-                                                    .path(icon_path)
-                                                    .size(px(14.0))
-                                                    .flex_shrink_0()
-                                                    .text_color(rgb(text_muted())),
-                                            )
-                                            .when_some(
-                                                if is_renaming { row_rename_input } else { None },
-                                                |el, input| {
-                                                    el.child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .child(
-                                                                StyledInput::new(
-                                                                    format!("{id_prefix}-rename-{i}"),
-                                                                    input,
-                                                                ).xsmall(),
-                                                            ),
-                                                    )
-                                                    .child(render_metadata_columns(
-                                                        entry_size,
-                                                        &entry_permissions,
-                                                        entry_modified,
-                                                    ))
-                                                },
-                                            )
-                                            .when(!is_renaming, |el| {
-                                                el
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .text_xs()
-                                                            .text_color(rgb(text_primary()))
-                                                            .whitespace_nowrap()
-                                                            .overflow_hidden()
-                                                            .child(name.clone()),
-                                                    )
-                                                    .child(render_metadata_columns(
-                                                        entry_size,
-                                                        &entry_permissions,
-                                                        entry_modified,
-                                                    ))
-                                            })
+                                            });
+                                        file_row_visuals(
+                                            row,
+                                            row_id_for_transition,
+                                            id_prefix,
+                                            i,
+                                            name,
+                                            entity,
+                                            side,
+                                            is_highlighted,
+                                            is_selected,
+                                            is_renaming,
+                                            row_rename_input,
+                                            icon_path,
+                                            entry_size,
+                                            entry_permissions,
+                                            entry_modified,
+                                        )
                                     })
                                     .collect::<Vec<_>>()
                             },
                         )
                         .track_scroll(&scroll_handle),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.0))
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
-                            ),
-                    )
+                    .child(render_scrollbar_overlay(&scroll_handle))
                     .child(
                         DropZoneOverlay::new(drag_over)
                             .hint(t!("sftp.drop_upload_hint").to_string())
@@ -1858,30 +1420,15 @@ impl SftpTabView {
                     )
                     .child({
                         let entity = entity_for_list.clone();
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |_bounds, _state, window, _cx| {
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |event: &FileDropEvent, phase, _window, cx| {
-                                        if phase != DispatchPhase::Capture {
-                                            return;
-                                        }
-                                        if matches!(event, FileDropEvent::Exited) {
-                                            let _ = entity.update(cx, |view, cx| {
-                                                let panel = view.panel_mut(side);
-                                                if panel.drag_over {
-                                                    panel.drag_over = false;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    }
-                                });
-                            },
-                        )
-                        .w_0()
-                        .h_0()
+                        render_drag_exit_canvas(move |cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                let panel = view.panel_mut(side);
+                                if panel.drag_over {
+                                    panel.drag_over = false;
+                                    cx.notify();
+                                }
+                            });
+                        })
                     })
                     // Connection overlay (loading spinner, host-key prompt,
                     // reconnect) — rendered per panel.
@@ -1920,8 +1467,17 @@ impl SftpTabView {
                                 current_status,
                                 &log_entries,
                                 // Encode side into the count so left/right
-                                // panels don't share transition IDs.
-                                connect_count * 2 + side as u64,
+                                // panels don't share transition IDs. The
+                                // `100_000` offset keeps SFTP panel overlay
+                                // IDs out of the SSH tab pane-id space
+                                // (pane IDs start at 1 and grow slowly);
+                                // without this, an SFTP panel's overlay
+                                // transition ID would collide with an SSH
+                                // tab's, and whichever rendered second
+                                // would inherit the other's cached
+                                // transition state (e.g. "already faded
+                                // out"), making the overlay invisible.
+                                100_000 + connect_count * 2 + side as u64,
                                 spinner_rot,
                                 on_reconnect,
                             ),

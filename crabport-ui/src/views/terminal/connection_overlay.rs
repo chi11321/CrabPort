@@ -14,7 +14,7 @@ use crabport_terminal::terminal::RemoteStatus;
 
 use crate::color::{term_bg, term_fg, term_green, term_red, term_yellow};
 use crate::components::button::Button;
-use crate::motion::{DURATION_SLOWER, EASE_STANDARD};
+use crate::motion::{EASE_STANDARD, duration_slower};
 
 /// A single log entry shown on the connection overlay.
 #[derive(Debug, Clone)]
@@ -116,6 +116,24 @@ impl ConnectionOverlayState {
         }
     }
 
+    /// Create an overlay that is permanently hidden — used by local
+    /// terminal tabs so the connection spinner (which repaints at
+    /// ~120 Hz while `status == Connecting`) never kicks in.
+    ///
+    /// On Windows, `PendingPtyBackend` constructs the real `PtyBackend`
+    /// on a worker thread (200–500 ms for `CreatePseudoConsole` +
+    /// spawning `pwsh.exe`). Driving the spinner at 120 Hz during that
+    /// window stalls the whole window's render loop — the user sees a
+    /// frozen UI instead of a brief blank terminal. The synchronous
+    /// (pre-async) version had the same UX: brief blank terminal, then
+    /// content appears. Local terminals don't need a connecting overlay
+    /// at all, so we start hidden and stay hidden.
+    pub fn new_hidden() -> Self {
+        let mut s = Self::new();
+        s.hidden = true;
+        s
+    }
+
     /// Push a log entry.
     pub fn log(&mut self, level: ConnectionLogLevel, message: impl Into<String>) {
         self.logs.push(ConnectionLogEntry {
@@ -158,7 +176,21 @@ impl ConnectionOverlayState {
                     format!("Disconnected from {}", host),
                 );
             }
-            RemoteStatus::Local => {}
+            // Local PTY finished starting up. Trigger the fade-out so the
+            // overlay (shown while `PendingPtyBackend` was constructing the
+            // real backend) disappears instead of lingering on top of a
+            // ready local shell. The log line is suppressed when `host`
+            // is empty (the common local-terminal case) so we don't push a
+            // useless "Connected to " row.
+            RemoteStatus::Local => {
+                if !host.is_empty() {
+                    self.log(
+                        ConnectionLogLevel::Success,
+                        format!("Connected to {}", host),
+                    );
+                }
+                self.fade_out_started = true;
+            }
         }
         self.status = new_status;
     }
@@ -294,7 +326,7 @@ pub(crate) fn render_connection_overlay(
         .bg(rgb(term_bg()))
         .opacity(1.0)
         .with_transition(("connection-overlay-opacity", count))
-        .transition_when(is_fading_out, DURATION_SLOWER, EASE_STANDARD, |el| {
+        .transition_when(is_fading_out, duration_slower(), EASE_STANDARD, |el| {
             el.opacity(0.0)
         })
         .child(
@@ -353,7 +385,7 @@ pub(crate) fn render_connection_overlay(
                                     .with_transition(row_id)
                                     .transition_when_else(
                                         true,
-                                        DURATION_SLOWER,
+                                        duration_slower(),
                                         EASE_STANDARD,
                                         |el| el.opacity(1.0).mt_0(),
                                         |el| el.opacity(0.0).mt(px(-4.0)),

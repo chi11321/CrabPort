@@ -168,6 +168,55 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo bundle --release --target ${{ matrix.target }} --format ${{ matrix.bundle_format }}
 
+      # cargo-bundle 0.11.0's `generate_dir_icon` only handles SVG icons —
+      # when the icon list is PNG/ICNS only (our case: `app-icon.icns` +
+      # `app-icon.png`), it silently skips and the AppDir root ends up with
+      # no `.DirIcon`, no `.png`, no `.svg`. Tools like `app-manager install`
+      # then reject the AppImage with:
+      #   "No icon file (.DirIcon, .png, or .svg) found in AppImage root"
+      #
+      # Fix: after `cargo bundle` leaves the AppDir behind (it isn't cleaned
+      # up — the `package_dir.exists()` removal runs at the *start* of the
+      # next invocation, not after this one), inject `app-icon.png` as
+      # `.DirIcon` and `CrabPort.png` at the AppDir root, then rebuild the
+      # squashfs + runtime into a fresh .AppImage.
+      #
+      # We re-download the type2 runtime (same URL cargo-bundle uses) because
+      # cargo-bundle doesn't expose the one it downloaded. `mksquashfs` is
+      # already installed via `squashfs-tools` in the apt step above.
+      - name: Inject .DirIcon into AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          arch="${{ matrix.arch }}"
+          bundle_root="target/${{ matrix.target }}/release/bundle/appimage"
+          appdir="$(find "$bundle_root" -maxdepth 2 -type d -name 'AppDir' | head -n1)"
+          if [ -z "$appdir" ]; then
+            echo "AppDir not found under $bundle_root — skipping .DirIcon injection"
+            exit 1
+          fi
+          echo "Injecting icon into $appdir"
+          cp app-icon.png "$appdir/.DirIcon"
+          cp app-icon.png "$appdir/CrabPort.png"
+
+          # Rebuild squashfs from the patched AppDir.
+          new_squashfs="$RUNNER_TEMP/CrabPort.squashfs"
+          rm -f "$new_squashfs"
+          mksquashfs "$appdir" "$new_squashfs" -root-owned -noappend -quiet
+
+          # Download the AppImage type2 runtime for this arch.
+          runtime_url="https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-${arch}"
+          runtime="$RUNNER_TEMP/runtime-${arch}"
+          curl -fsSL -o "$runtime" "$runtime_url"
+          chmod +x "$runtime"
+
+          # Concatenate runtime + squashfs → new .AppImage, overwriting the
+          # one cargo-bundle produced.
+          old_appimage="$(find "$bundle_root" -maxdepth 2 -type f -name '*.AppImage' | head -n1)"
+          cat "$runtime" "$new_squashfs" > "$old_appimage"
+          chmod +x "$old_appimage"
+          echo "Rebuilt $old_appimage with .DirIcon"
+
       - name: Build and package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

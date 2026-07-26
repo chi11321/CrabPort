@@ -15,7 +15,6 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
@@ -24,12 +23,13 @@ use crabport_core::credential::{GroupEntry, GroupKind, TunnelEntry, TunnelKind};
 use crate::app::CrabportApp;
 use crate::app_state::AppState;
 use crate::color::*;
-use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
-use crate::components::input::StyledInput;
+use crate::components::form::{
+    form_dialog, form_footer, form_title, group_dropdown, label_block, text_field,
+};
 use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{DURATION_BASE, EASE_STANDARD, RADIUS_LG, RADIUS_MD};
+use crate::motion::RADIUS_MD;
 use crate::views::sessions::ConnectionHost;
 
 // ---------------------------------------------------------------------------
@@ -121,12 +121,6 @@ pub struct TunnelFormState {
     pub bind_port_input: Entity<InputState>,
     pub target_host_input: Entity<InputState>,
     pub target_port_input: Entity<InputState>,
-    // Focus states (mirrors ConnectionFormState)
-    pub name_focused: bool,
-    pub bind_addr_focused: bool,
-    pub bind_port_focused: bool,
-    pub target_host_focused: bool,
-    pub target_port_focused: bool,
     // Host dropdown open state — owned here so the renderer is a pure
     // function of the state.
     pub host_dropdown_open: bool,
@@ -169,11 +163,6 @@ impl TunnelFormState {
             bind_port_input,
             target_host_input,
             target_port_input,
-            name_focused: false,
-            bind_addr_focused: false,
-            bind_port_focused: false,
-            target_host_focused: false,
-            target_port_focused: false,
             host_dropdown_open: false,
             group_dropdown_open: false,
             group_search_input,
@@ -377,11 +366,6 @@ pub struct TunnelFormView {
     group_dropdown_open: bool,
     group_search_input: Entity<InputState>,
     hosts: Vec<ConnectionHost>,
-    name_focused: bool,
-    bind_addr_focused: bool,
-    bind_port_focused: bool,
-    target_host_focused: bool,
-    target_port_focused: bool,
     errors: TunnelValidationErrors,
     app: Entity<CrabportApp>,
     /// FK into the `groups` table. `None` = ungrouped. Snapshot from
@@ -419,11 +403,6 @@ impl TunnelFormView {
             group_dropdown_open: state.group_dropdown_open,
             group_search_input: state.group_search_input.clone(),
             hosts,
-            name_focused: state.name_focused,
-            bind_addr_focused: state.bind_addr_focused,
-            bind_port_focused: state.bind_port_focused,
-            target_host_focused: state.target_host_focused,
-            target_port_focused: state.target_port_focused,
             errors: state.errors.clone(),
             app,
             group_id: state.group_id,
@@ -436,38 +415,11 @@ impl TunnelFormView {
 
 impl RenderOnce for TunnelFormView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let on_close_for_dialog = self.on_close.clone();
-
         render_overlay(
             ElementId::Name("tunnel-form-overlay".into()),
             self.open,
-            self.on_close,
-            render_dialog(
-                self.open,
-                self.editing,
-                self.tunnel_kind,
-                self.name_input,
-                self.bind_addr_input,
-                self.bind_port_input,
-                self.target_host_input,
-                self.target_port_input,
-                self.host_id,
-                self.host_dropdown_open,
-                self.group_dropdown_open,
-                self.group_search_input,
-                self.hosts,
-                self.name_focused,
-                self.bind_addr_focused,
-                self.bind_port_focused,
-                self.target_host_focused,
-                self.target_port_focused,
-                self.errors,
-                self.group_id,
-                self.groups,
-                self.app,
-                on_close_for_dialog,
-                self.on_save,
-            ),
+            self.on_close.clone(),
+            render_dialog(self),
         )
     }
 }
@@ -476,34 +428,28 @@ impl RenderOnce for TunnelFormView {
 // Render helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn render_dialog(
-    open: bool,
-    editing: bool,
-    tunnel_kind: TunnelKind,
-    name_input: Entity<InputState>,
-    bind_addr_input: Entity<InputState>,
-    bind_port_input: Entity<InputState>,
-    target_host_input: Entity<InputState>,
-    target_port_input: Entity<InputState>,
-    host_id: Option<i64>,
-    host_dropdown_open: bool,
-    group_dropdown_open: bool,
-    group_search_input: Entity<InputState>,
-    hosts: Vec<ConnectionHost>,
-    name_focused: bool,
-    bind_addr_focused: bool,
-    bind_port_focused: bool,
-    target_host_focused: bool,
-    target_port_focused: bool,
-    errors: TunnelValidationErrors,
-    group_id: Option<i64>,
-    groups: Vec<GroupEntry>,
-    app: Entity<CrabportApp>,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
-    on_save: Option<Rc<dyn Fn(TunnelFormOutput, &mut Window, &mut App) + 'static>>,
-) -> impl IntoElement {
-    let dialog_id = ElementId::Name("tunnel-form-dialog".into());
+fn render_dialog(view: TunnelFormView) -> impl IntoElement {
+    let TunnelFormView {
+        open,
+        editing,
+        tunnel_kind,
+        name_input,
+        bind_addr_input,
+        bind_port_input,
+        target_host_input,
+        target_port_input,
+        host_id,
+        host_dropdown_open,
+        group_dropdown_open,
+        group_search_input,
+        hosts,
+        errors,
+        app,
+        group_id,
+        groups,
+        on_close,
+        on_save,
+    } = view;
 
     let title = if editing {
         t!("tunnel_form.title_edit").to_string()
@@ -520,66 +466,26 @@ fn render_dialog(
         TunnelKind::Dynamic => t!("tunnel_form.hint_dynamic").to_string(),
     };
 
-    // Per-kind pane content height (used so the Tabs component can animate
-    // Per-kind pane content height (used so the Tabs component can animate
-    // max_height between kinds). Local/Remote show 4 fields; Dynamic hides
-    // target_host/target_port.
-    // StyledInput single-line: label(19) + gap_1(4) + shell(32) = 55px per
-    // field (text_xs line_height = 12*1.618 = 19px). Plus gap_4 (16) between
-    // fields. Bind row uses a 2-col layout so it occupies one field height.
-    // +1px per field for font metric rounding.
-    let kind_pane_height: f32 = match tunnel_kind {
-        TunnelKind::Local | TunnelKind::Remote => {
-            // bind row + gap_4 + target_host + gap_4 + target_port
-            56.0 + 16.0 + 56.0 + 16.0 + 56.0
-        }
-        TunnelKind::Dynamic => {
-            // bind row only
-            56.0
-        }
+    // The same entities + errors back every kind pane; only `TunnelKind`
+    // differs per `render_kind_pane` call.
+    let pane_fields = KindPaneFields {
+        bind_addr_input,
+        bind_port_input,
+        target_host_input,
+        target_port_input,
+        errors: errors.clone(),
     };
 
-    div()
-        .id(dialog_id.clone())
-        .w(px(440.0))
-        .bg(rgb(bg_base()))
-        .border_1()
-        .border_color(rgb(border()))
-        .rounded(RADIUS_LG)
-        .shadow_lg()
-        .flex()
-        .flex_col()
-        .p_6()
-        .gap_4()
-        .opacity(0.0)
-        .mt(px(-16.0))
-        .when(open, |el| {
-            el.on_click(|_, _, cx| {
-                cx.stop_propagation();
-            })
-        })
-        .with_transition(dialog_id)
-        .transition_when_else(
-            open,
-            DURATION_BASE,
-            EASE_STANDARD,
-            |el| el.opacity(1.0).mt_0(),
-            |el| el.opacity(0.0).mt(px(-16.0)),
-        )
+    form_dialog("tunnel-form-dialog", open, 440.0, |d| d.p_6())
         // Title
-        .child(
-            div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(text_primary()))
-                .child(title),
-        )
+        .child(form_title(title))
         // Name
-        .child(
-            StyledInput::new("tunnel-name", name_input)
-                .label(t!("tunnel_form.name").to_string())
-                .focused(name_focused),
-        )
+        .child(text_field(
+            "tunnel-name",
+            name_input,
+            t!("tunnel_form.name").to_string(),
+            None,
+        ))
         // Group selector (dropdown of tunnel groups, or "None" = ungrouped).
         .child(render_group_selector(
             group_id,
@@ -601,51 +507,9 @@ fn render_dialog(
         .child(
             Tabs::new("tunnel-kind-tabs")
                 .active(active_kind_index)
-                .pane(render_kind_pane(
-                    TunnelKind::Local,
-                    bind_addr_input.clone(),
-                    bind_port_input.clone(),
-                    target_host_input.clone(),
-                    target_port_input.clone(),
-                    bind_addr_focused,
-                    bind_port_focused,
-                    target_host_focused,
-                    target_port_focused,
-                    errors.bind_addr.clone(),
-                    errors.bind_port.clone(),
-                    errors.target_host.clone(),
-                    errors.target_port.clone(),
-                ))
-                .pane(render_kind_pane(
-                    TunnelKind::Remote,
-                    bind_addr_input.clone(),
-                    bind_port_input.clone(),
-                    target_host_input.clone(),
-                    target_port_input.clone(),
-                    bind_addr_focused,
-                    bind_port_focused,
-                    target_host_focused,
-                    target_port_focused,
-                    errors.bind_addr.clone(),
-                    errors.bind_port.clone(),
-                    errors.target_host.clone(),
-                    errors.target_port.clone(),
-                ))
-                .pane(render_kind_pane(
-                    TunnelKind::Dynamic,
-                    bind_addr_input.clone(),
-                    bind_port_input.clone(),
-                    target_host_input.clone(),
-                    target_port_input.clone(),
-                    bind_addr_focused,
-                    bind_port_focused,
-                    target_host_focused,
-                    target_port_focused,
-                    errors.bind_addr.clone(),
-                    errors.bind_port.clone(),
-                    errors.target_host.clone(),
-                    errors.target_port.clone(),
-                ))
+                .pane(render_kind_pane(TunnelKind::Local, &pane_fields))
+                .pane(render_kind_pane(TunnelKind::Remote, &pane_fields))
+                .pane(render_kind_pane(TunnelKind::Dynamic, &pane_fields))
                 .on_change({
                     let app = app.clone();
                     move |index, _w, cx| {
@@ -662,46 +526,39 @@ fn render_dialog(
         // Kind-specific hint
         .child(div().text_xs().text_color(rgb(text_muted())).child(hint))
         // Buttons
-        .child(render_buttons(
-            editing,
-            tunnel_kind,
-            kind_pane_height,
-            app,
-            on_close,
-            on_save,
-        ))
+        .child(render_buttons(app, on_close, on_save))
+}
+
+/// The shared field entities + validation errors rendered by every kind pane
+/// (Local / Remote / Dynamic) — only the `TunnelKind` differs per pane.
+struct KindPaneFields {
+    bind_addr_input: Entity<InputState>,
+    bind_port_input: Entity<InputState>,
+    target_host_input: Entity<InputState>,
+    target_port_input: Entity<InputState>,
+    errors: TunnelValidationErrors,
 }
 
 /// Build a `TabPane` for one TunnelKind. The pane content adapts to the kind:
 /// Local/Remote show bind + target fields; Dynamic shows only bind fields.
 /// The pane's `.height(...)` drives the Tabs component's animated max-height
 /// so switching kinds eases the dialog taller/shorter.
-fn render_kind_pane(
-    kind: TunnelKind,
-    bind_addr_input: Entity<InputState>,
-    bind_port_input: Entity<InputState>,
-    target_host_input: Entity<InputState>,
-    target_port_input: Entity<InputState>,
-    bind_addr_focused: bool,
-    bind_port_focused: bool,
-    target_host_focused: bool,
-    target_port_focused: bool,
-    bind_addr_error: Option<SharedString>,
-    bind_port_error: Option<SharedString>,
-    target_host_error: Option<SharedString>,
-    target_port_error: Option<SharedString>,
-) -> TabPane {
+fn render_kind_pane(kind: TunnelKind, fields: &KindPaneFields) -> TabPane {
     let label = match kind {
         TunnelKind::Local => t!("tunnel_form.kind_local").to_string(),
         TunnelKind::Remote => t!("tunnel_form.kind_remote").to_string(),
         TunnelKind::Dynamic => t!("tunnel_form.kind_dynamic").to_string(),
     };
 
+    let target_host_error = fields.errors.target_host.clone();
+    let target_port_error = fields.errors.target_port.clone();
+
     // Each error row adds ~24px below its input (gap_1 4px + error text
     // line_height 19px + 1px rounding). Add that to the pane height so the
     // layout doesn't clip the error message during the height anim.
     let err_extra = |e: &Option<SharedString>| if e.is_some() { 24.0_f32 } else { 0.0_f32 };
-    let bind_row_h = 56.0 + err_extra(&bind_addr_error).max(err_extra(&bind_port_error));
+    let bind_row_h =
+        56.0 + err_extra(&fields.errors.bind_addr).max(err_extra(&fields.errors.bind_port));
 
     // Bind addr + bind port share a row (mirrors the host:port row in the
     // connection form). Both columns are `flex_none` so the error rows
@@ -713,22 +570,18 @@ fn render_kind_pane(
         .flex_row()
         .items_start()
         .gap_3()
-        .child(
-            div().flex_1().min_w_0().child(
-                StyledInput::new("tunnel-bind-addr", bind_addr_input)
-                    .label(t!("tunnel_form.bind_addr").to_string())
-                    .focused(bind_addr_focused)
-                    .when_some(bind_addr_error, |el, e| el.error(e)),
-            ),
-        )
-        .child(
-            div().w(px(112.0)).flex_none().child(
-                StyledInput::new("tunnel-bind-port", bind_port_input)
-                    .label(t!("tunnel_form.bind_port").to_string())
-                    .focused(bind_port_focused)
-                    .when_some(bind_port_error, |el, e| el.error(e)),
-            ),
-        );
+        .child(div().flex_1().min_w_0().child(text_field(
+            "tunnel-bind-addr",
+            fields.bind_addr_input.clone(),
+            t!("tunnel_form.bind_addr").to_string(),
+            fields.errors.bind_addr.clone(),
+        )))
+        .child(div().w(px(112.0)).flex_none().child(text_field(
+            "tunnel-bind-port",
+            fields.bind_port_input.clone(),
+            t!("tunnel_form.bind_port").to_string(),
+            fields.errors.bind_port.clone(),
+        )));
 
     let (content, height) = match kind {
         TunnelKind::Local | TunnelKind::Remote => {
@@ -740,22 +593,18 @@ fn render_kind_pane(
                     .flex_col()
                     .gap_4()
                     .child(bind_row)
-                    .child(
-                        div().child(
-                            StyledInput::new("tunnel-target-host", target_host_input)
-                                .label(t!("tunnel_form.target_host").to_string())
-                                .focused(target_host_focused)
-                                .when_some(target_host_error.clone(), |el, e| el.error(e)),
-                        ),
-                    )
-                    .child(
-                        div().child(
-                            StyledInput::new("tunnel-target-port", target_port_input)
-                                .label(t!("tunnel_form.target_port").to_string())
-                                .focused(target_port_focused)
-                                .when_some(target_port_error.clone(), |el, e| el.error(e)),
-                        ),
-                    ),
+                    .child(div().child(text_field(
+                        "tunnel-target-host",
+                        fields.target_host_input.clone(),
+                        t!("tunnel_form.target_host").to_string(),
+                        target_host_error,
+                    )))
+                    .child(div().child(text_field(
+                        "tunnel-target-port",
+                        fields.target_port_input.clone(),
+                        t!("tunnel_form.target_port").to_string(),
+                        target_port_error,
+                    ))),
                 // bind row + gap + target_host + gap + target_port
                 px(bind_row_h + 16.0 + target_host_h + 16.0 + target_port_h),
             )
@@ -778,11 +627,7 @@ fn render_host_selector(
     host_error: Option<SharedString>,
     app: Entity<CrabportApp>,
 ) -> impl IntoElement {
-    let label_div = div()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(text_muted()))
-        .child(t!("tunnel_form.host").to_string());
+    let label_div = label_block(t!("tunnel_form.host").to_string());
 
     // Error row shown below the dropdown when no host is selected. Mirrors
     // the StyledInput error presentation (small icon + text).
@@ -884,87 +729,28 @@ fn render_group_selector(
     group_search_input: Entity<InputState>,
     app: Entity<CrabportApp>,
 ) -> impl IntoElement {
-    let label_div = div()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(text_muted()))
-        .child(t!("tunnel_form.group").to_string());
-
-    // Index 0 = "None" (ungrouped); groups start at index 1.
-    let selected_idx =
-        group_id.and_then(|id| groups.iter().position(|g| g.id == id).map(|i| i + 1));
-
-    let mut dropdown = Dropdown::new("tunnel-group-dropdown")
-        .placeholder(t!("tunnel_form.group_none").to_string())
-        .is_open(dropdown_open)
-        .searchable(group_search_input)
-        .on_create({
-            let app = app.clone();
-            move |name, _w, cx| {
-                app.update(cx, |app, cx| {
-                    // Create the group, then immediately select it.
-                    let kind = crabport_core::credential::GroupKind::Tunnel;
-                    if let Ok(gid) = crate::app_state::AppState::store(cx)
-                        .lock()
-                        .add_group(&name, kind, None)
-                    {
-                        if let Some(ref mut form) = app.tunnel_form {
-                            form.group_id = Some(gid);
-                            form.group_dropdown_open = false;
-                            cx.notify();
-                        }
-                    }
-                });
-            }
-        })
-        .on_toggle({
-            let app = app.clone();
-            move |_w, cx| {
-                app.update(cx, |app, cx| {
-                    if let Some(ref mut form) = app.tunnel_form {
-                        form.group_dropdown_open = !form.group_dropdown_open;
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .on_change({
-            let app = app.clone();
-            let groups = groups.clone();
-            move |index, _w, cx| {
-                let new_group = if index == 0 {
-                    None
-                } else {
-                    groups.get(index - 1).map(|g| g.id)
-                };
-                app.update(cx, |app, cx| {
-                    if let Some(ref mut form) = app.tunnel_form {
-                        form.group_id = new_group;
-                        form.group_dropdown_open = false;
-                        cx.notify();
-                    }
-                });
-            }
-        });
-
-    // Item 0: "None" (ungrouped).
-    dropdown =
-        dropdown.item_with_value(t!("tunnel_form.group_none").to_string(), "none".to_string());
-    for g in &groups {
-        dropdown = dropdown.item_with_value(g.name.clone(), g.id.to_string());
-    }
-    if let Some(idx) = selected_idx {
-        dropdown = dropdown.selected(idx);
-    }
-
-    label_div.child(dropdown).into_any_element()
+    label_block(t!("tunnel_form.group").to_string())
+        .child(group_dropdown(
+            "tunnel-group-dropdown",
+            t!("tunnel_form.group_none").to_string(),
+            t!("tunnel_form.group_none").to_string(),
+            "none",
+            GroupKind::Tunnel,
+            group_id,
+            dropdown_open,
+            group_search_input,
+            groups,
+            app,
+            |app| {
+                app.tunnel_form
+                    .as_mut()
+                    .map(|f| (&mut f.group_id, &mut f.group_dropdown_open))
+            },
+        ))
+        .into_any_element()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_buttons(
-    editing: bool,
-    _tunnel_kind: TunnelKind,
-    _kind_pane_height: f32,
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_save: Option<Rc<dyn Fn(TunnelFormOutput, &mut Window, &mut App) + 'static>>,
@@ -973,66 +759,49 @@ fn render_buttons(
     let dialog_id = ElementId::Name("tunnel-form-dialog".into());
     // Save label is the same for create/edit (unlike the connection form which
     // has Connect vs Save).
-    let _ = editing;
 
-    div()
-        .flex()
-        .flex_row()
-        .gap_3()
-        .justify_end()
-        .child(
-            Button::new("tunnel-cancel")
-                .centered(true)
-                .child(t!("tunnel_form.cancel").to_string())
-                .on_click(move |_e, w, cx| {
-                    if let Some(ref cb) = on_close {
-                        cb(w, cx);
-                    }
-                }),
-        )
-        .child(
-            Button::new("tunnel-save")
-                .primary()
-                .centered(true)
-                .child(t!("tunnel_form.save").to_string())
-                .on_click(move |_e, w, cx| {
-                    // Reset the overlay/dialog transitions so the next open
-                    // starts fresh (mirrors connection_form's connect button).
-                    gpui_animation::reset_transition(&overlay_id);
-                    gpui_animation::reset_transition(&dialog_id);
-                    // Validate required fields before building the output. If
-                    // invalid, per-field errors are shown and a toast is
-                    // surfaced; the save flow is aborted.
-                    let output: Option<TunnelFormOutput> = app.update(cx, |app, cx| {
-                        let valid = app
-                            .tunnel_form
-                            .as_mut()
-                            .map(|form| form.validate(cx))
-                            .unwrap_or(true);
-                        if !valid {
-                            app.app_ctx.notifications.update(cx, |c, cx| {
-                                c.show(
-                                    crate::components::notification::Notification::new(
-                                        t!("tunnel_form.validation_title").to_string(),
-                                    )
-                                    .level(
-                                        crate::components::notification::NotificationLevel::Warning,
-                                    )
-                                    .message(t!("tunnel_form.validation_message").to_string())
-                                    .duration(std::time::Duration::from_secs(4)),
-                                    cx,
-                                );
-                            });
-                            cx.notify();
-                            return None;
-                        }
-                        app.tunnel_form.as_ref().map(|form| form.output(cx))
+    form_footer(
+        "tunnel-cancel",
+        t!("tunnel_form.cancel").to_string(),
+        on_close,
+        "tunnel-save",
+        t!("tunnel_form.save").to_string(),
+        move |_e, w, cx| {
+            // Reset the overlay/dialog transitions so the next open
+            // starts fresh (mirrors connection_form's connect button).
+            gpui_animation::reset_transition(&overlay_id);
+            gpui_animation::reset_transition(&dialog_id);
+            // Validate required fields before building the output. If
+            // invalid, per-field errors are shown and a toast is
+            // surfaced; the save flow is aborted.
+            let output: Option<TunnelFormOutput> = app.update(cx, |app, cx| {
+                let valid = app
+                    .tunnel_form
+                    .as_mut()
+                    .map(|form| form.validate(cx))
+                    .unwrap_or(true);
+                if !valid {
+                    app.app_ctx.notifications.update(cx, |c, cx| {
+                        c.show(
+                            crate::components::notification::Notification::new(
+                                t!("tunnel_form.validation_title").to_string(),
+                            )
+                            .level(crate::components::notification::NotificationLevel::Warning)
+                            .message(t!("tunnel_form.validation_message").to_string())
+                            .duration(std::time::Duration::from_secs(4)),
+                            cx,
+                        );
                     });
-                    if let Some(out) = output {
-                        if let Some(ref cb) = on_save {
-                            cb(out, w, cx);
-                        }
-                    }
-                }),
-        )
+                    cx.notify();
+                    return None;
+                }
+                app.tunnel_form.as_ref().map(|form| form.output(cx))
+            });
+            if let Some(out) = output {
+                if let Some(ref cb) = on_save {
+                    cb(out, w, cx);
+                }
+            }
+        },
+    )
 }

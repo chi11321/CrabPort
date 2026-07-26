@@ -23,6 +23,7 @@ use crate::components::dialog::AlertController;
 use crate::components::notification::NotificationController;
 use crate::components::tooltip::TooltipController;
 use crate::layouts::command_palette::CommandView;
+use crate::views::history::HistoryView;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
@@ -74,6 +75,7 @@ pub struct AppCtx {
     pub sessions_view: Entity<SessionsView>,
     pub snippets_view: Entity<SnippetsView>,
     pub tunnels_view: Entity<TunnelsView>,
+    pub history_view: Entity<HistoryView>,
 }
 
 impl AppCtx {

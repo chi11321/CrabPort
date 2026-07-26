@@ -293,3 +293,37 @@ pub fn is_builtin(id: &str) -> bool {
         .iter()
         .any(|it| it.entry.id == id && it.entry.source == ThemeSource::Builtin)
 }
+
+/// Write `cfg` to `{data_dir}/crabport/themes/{cfg.name}.toml` and refresh
+/// the catalog so the new/updated theme is immediately selectable.
+///
+/// The caller is responsible for making `cfg.name` a filesystem-safe id (see
+/// the Theme Editor's slug sanitizer). Saving under a built-in id is allowed
+/// and overrides that built-in — same rule as hand-dropped files.
+pub fn save_custom_theme(cfg: &ThemeConfig) -> Result<PathBuf, String> {
+    let dir = themes_dir().ok_or_else(|| "no data directory available".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.toml", cfg.name));
+    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    refresh_catalog();
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every embedded theme must parse, and its `name` field must equal its
+    /// catalog id — the Settings dropdown and `config.toml` round-trip
+    /// depend on that equality.
+    #[test]
+    fn builtin_themes_parse_and_names_match_ids() {
+        for (id, label, toml_text) in BUILTIN_THEMES {
+            let cfg: ThemeConfig =
+                toml::from_str(toml_text).unwrap_or_else(|e| panic!("theme {id}: {e}"));
+            assert_eq!(cfg.name, *id, "theme file name must match its id");
+            assert!(!label.is_empty());
+        }
+    }
+}

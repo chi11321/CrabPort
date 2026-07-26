@@ -32,6 +32,8 @@
 //! `cmd.exe` (see `default_shell`). On Unix, `alacritty_terminal` resolves
 //! the login shell from `passwd`/`$SHELL`.
 
+use std::path::PathBuf;
+
 // Imports used only by the Unix implementation.
 #[cfg(unix)]
 use std::{
@@ -45,7 +47,7 @@ use std::{
 use std::{
     sync::Arc,
     sync::OnceLock,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     time::SystemTime,
 };
 
@@ -75,6 +77,57 @@ use crate::terminal::{
 // Platform-agnostic shell selection
 // ===========================================================================
 
+/// Ensure the PTY child shell runs in a UTF-8 capable locale.
+///
+/// See [`PtyBackend::new`] for why this is needed: GUI-launched processes
+/// on macOS don't inherit a usable `LANG` — the process starts with
+/// `LANG=""` and macOS's quirky `LC_CTYPE="UTF-8"` (which is not a valid
+/// POSIX locale name). The shell itself is lenient about this so input
+/// parsing works, but any child program that calls `setlocale(LC_ALL, "")`
+/// (`ls`, `echo`, …) rejects the bogus `LC_CTYPE`, silently falls back to
+/// the `C` locale, and emits `????` for any non-ASCII byte.
+///
+/// Fix: if `LANG` is missing or `C`/`POSIX`, force it to `en_US.UTF-8`
+/// (shipped by default on every macOS install, and a UTF-8 codeset is all
+/// that's needed to correctly round-trip CJK / emoji bytes — the language
+/// part of the locale doesn't restrict which characters can be displayed).
+/// Also set `LC_CTYPE` to a real locale name so it stops being the bogus
+/// `"UTF-8"` value. We don't try to derive a locale matching the user's
+/// UI language because macOS doesn't ship script-tagged locales (e.g.
+/// `zh_Hans_CN.UTF-8` doesn't exist — only `zh_CN.UTF-8`), so naive
+/// conversion from BCP 47 produces names `setlocale` rejects.
+///
+/// If the user has explicitly set `LANG` to something real (e.g.
+/// `zh_CN.UTF-8`), we respect it.
+#[cfg(unix)]
+fn ensure_utf8_locale() {
+    // A locale is "good" if it's non-empty and not the `C` / `POSIX`
+    // default (which is ASCII-only). We don't otherwise validate the name —
+    // if the user set `LANG=zh_CN.UTF-8` we trust them.
+    let lang_ok = std::env::var("LANG")
+        .ok()
+        .filter(|s| !s.is_empty() && s != "C" && s != "POSIX")
+        .is_some();
+
+    if lang_ok {
+        return;
+    }
+
+    // Default to `en_US.UTF-8` — always installed on macOS, and a UTF-8
+    // codeset is sufficient for correct CJK / emoji handling regardless of
+    // the language part.
+    // SAFETY: setting env vars is process-global but our PTY is the only
+    // child we spawn, and we do so immediately after this in
+    // [`PtyBackend::new`]. No other thread is reading env vars concurrently
+    // at this point.
+    unsafe {
+        std::env::set_var("LANG", "en_US.UTF-8");
+        // Overwrite the bogus `"UTF-8"` value macOS injects — a real locale
+        // name is required for `setlocale` in child programs.
+        std::env::set_var("LC_CTYPE", "en_US.UTF-8");
+    }
+}
+
 /// Pick the default local shell for this platform, mirroring alacritty's
 /// own `tty::windows::cmdline` default (which is `powershell`) plus a
 /// fallback cascade through modern PowerShell Core to the legacy
@@ -96,16 +149,36 @@ fn default_shell() -> Option<(String, Vec<String>)> {
         // Prefer PowerShell 7+ (`pwsh.exe`) when the user has installed
         // it — it's a noticeable upgrade over the inbox Windows
         // PowerShell (faster, cross-platform, better Unicode handling).
+        // `pwsh.exe` doesn't have a single canonical install path
+        // (`C:\Program Files\PowerShell\<7|6|7-preview>\pwsh.exe`),
+        // so we still rely on PATH lookup for it. Most users who install
+        // PowerShell 7 either let the installer add its dir to PATH, or
+        // run it via `winget`/`scoop` which also adds PATH.
         if which_executable("pwsh.exe").is_some() {
             return Some(("pwsh.exe".to_string(), vec![]));
         }
-        // Fall back to inbox Windows PowerShell — always present on
-        // Windows 10+. This matches alacritty's own `tty::windows::cmdline`
-        // default (`Shell::new("powershell".to_owned(), Vec::new())`).
-        if which_executable("powershell.exe").is_some() {
-            return Some(("powershell.exe".to_string(), vec![]));
+        // Inbox Windows PowerShell — present at a well-known path on
+        // every Windows 10+ install. Don't rely on PATH here: GUI apps
+        // (especially when launched from Explorer) sometimes inherit a
+        // PATH that's missing `System32\WindowsPowerShell\v1.0`, which
+        // would silently demote the user to `cmd.exe`. The absolute path
+        // is stable across installs and SKUs, so we check it directly
+        // and pass the absolute path to alacritty's `tty::Shell`.
+        const INBOX_PWSH: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        if std::path::Path::new(INBOX_PWSH).is_file() {
+            return Some((INBOX_PWSH.to_string(), vec![]));
         }
-        // Last resort: the legacy Windows command prompt. Always present.
+        // Last resort: the legacy Windows command prompt. Also at a
+        // well-known path; check it directly so we don't depend on PATH.
+        const INBOX_CMD: &str = r"C:\Windows\System32\cmd.exe";
+        if std::path::Path::new(INBOX_CMD).is_file() {
+            return Some((INBOX_CMD.to_string(), vec![]));
+        }
+        // Truly nothing found — let alacritty's own default kick in
+        // (it also tries to spawn `powershell` then `cmd` via PATH).
+        tracing::warn!(
+            "default_shell: neither pwsh.exe on PATH, inbox powershell.exe, nor cmd.exe found"
+        );
         Some(("cmd.exe".to_string(), vec![]))
     }
     #[cfg(not(target_os = "windows"))]
@@ -384,10 +457,174 @@ pub struct PtyBackend {
 // Unix implementation
 // ===========================================================================
 
+/// Snapshot of the foreground process running in a PTY.
+#[cfg(unix)]
+struct FgProcessSnapshot {
+    sys: sysinfo::System,
+    /// What we need from each process: cwd + command line + exe name.
+    refresh: sysinfo::ProcessRefreshKind,
+    /// Cached values from the last successful [`Self::probe`]. Used to
+    /// detect changes without broadcasting redundant events.
+    prev_cwd: Option<std::path::PathBuf>,
+    prev_cmd: Option<String>,
+    /// Master side of the PTY pair. `tcgetpgrp` on this fd returns the
+    /// foreground process group leader.
+    pty_fd: std::os::fd::RawFd,
+    /// PID of the direct child (the shell we spawned). Used as a
+    /// fallback when `tcgetpgrp` returns 0 (no fg pgid assigned yet).
+    shell_pid: u32,
+}
+
+#[cfg(unix)]
+impl FgProcessSnapshot {
+    fn new(pty_fd: std::os::fd::RawFd, shell_pid: u32) -> Self {
+        // Only ask sysinfo for the fields we actually read — cwd, cmd,
+        // and exe. Skipping everything else (cpu, memory, tasks, …)
+        // keeps each refresh cheap since we call it on every PTY data
+        // chunk.
+        let refresh = sysinfo::ProcessRefreshKind::nothing()
+            .with_cwd(sysinfo::UpdateKind::Always)
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_exe(sysinfo::UpdateKind::Always)
+            .without_tasks();
+        Self {
+            sys: sysinfo::System::new(),
+            refresh,
+            prev_cwd: None,
+            prev_cmd: None,
+            pty_fd,
+            shell_pid,
+        }
+    }
+
+    /// Probe the current foreground process. Returns `Some((cwd, cmdline))`
+    /// if the cwd or command string differs from the previous probe.
+    ///
+    /// Should be called whenever the PTY delivers data — that covers both
+    /// `cd` (the shell redraws its prompt) and foreground command
+    /// invocations (the program writes output), so no timer is needed.
+    fn probe(&mut self) -> Option<(std::path::PathBuf, String)> {
+        let pid = self.resolve_fg_pid()?;
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            self.refresh,
+        );
+        let info = self.sys.process(pid)?;
+
+        let cwd = info.cwd().map(std::path::PathBuf::from);
+        let cmdline = build_command_line(info);
+
+        let cwd_differs = cwd.as_deref() != self.prev_cwd.as_deref();
+        let cmd_differs = cmdline.as_deref() != self.prev_cmd.as_deref();
+
+        if !cwd_differs && !cmd_differs {
+            return None;
+        }
+
+        self.prev_cwd = cwd.clone();
+        self.prev_cmd = cmdline.clone();
+
+        // If sysinfo couldn't read the cwd (e.g. permission denied on
+        // `/proc/<pid>/cwd`), fall back to an empty path so the title
+        // still shows the command part.
+        let cwd = cwd.unwrap_or_default();
+        let cmdline = cmdline.unwrap_or_else(|| "sh".to_string());
+        Some((cwd, cmdline))
+    }
+
+    /// Determine which PID to inspect. Prefers the foreground process
+    /// group leader (via `tcgetpgrp`); falls back to the shell child
+    /// if no fg pgid is set yet (e.g. during early startup).
+    fn resolve_fg_pid(&self) -> Option<sysinfo::Pid> {
+        let fg = unsafe { libc::tcgetpgrp(self.pty_fd) };
+        if fg > 0 {
+            return Some(sysinfo::Pid::from_u32(fg as u32));
+        }
+        if self.shell_pid > 0 {
+            return Some(sysinfo::Pid::from_u32(self.shell_pid));
+        }
+        None
+    }
+}
+
+/// Turn a `sysinfo::Process` into a human-readable command string:
+/// the executable's basename followed by its arguments. For a shell
+/// at rest this yields just `zsh`; for `ssh root@1.2.3.4` it yields
+/// `ssh root@1.2.3.4`.
+#[cfg(unix)]
+fn build_command_line(proc_info: &sysinfo::Process) -> Option<String> {
+    let exe_name = proc_info.name().to_str()?;
+    // `cmd()` returns the full argv as `Vec<OsString>`-like. We skip
+    // argv[0] (the program path / name) since we already have a cleaner
+    // basename from `name()`.
+    let trailing_args: Vec<&str> = proc_info
+        .cmd()
+        .iter()
+        .skip(1)
+        .filter_map(|a| a.to_str())
+        .collect();
+    if trailing_args.is_empty() {
+        Some(exe_name.to_string())
+    } else {
+        Some(format!("{} {}", exe_name, trailing_args.join(" ")))
+    }
+}
+
 #[cfg(unix)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Spawn the local PTY with an optional working directory. `None` falls
+    /// back to the current process cwd (alacritty's default); `Some(p)` is
+    /// forwarded to `Options::working_directory`, which alacritty applies
+    /// via `chdir` in the child's `pre_exec` hook (see
+    /// `alacritty_terminal::tty::unix`). Used by the "Open in CrabPort"
+    /// macOS Finder / URL-scheme entry point so a folder right-clicked in
+    /// Finder opens a local terminal tab already cd'd into it.
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> std::io::Result<Self> {
+        let (event_tx, event_rx) = broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
+    }
+
+    /// Construct a `PtyBackend` that broadcasts on an externally-owned
+    /// channel. Used by [`PendingPtyBackend`] so subscribers attached
+    /// before the PTY exists still receive events once it's up.
+    pub(crate) fn new_with_event_tx(
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+    ) -> std::io::Result<Self> {
+        let _event_rx = event_tx.new_receiver().deactivate();
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
+    }
+
+    fn build(
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+        _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+    ) -> std::io::Result<Self> {
         tty::setup_env();
+        // alacritty's `setup_env` only sets `TERM` / `COLORTERM`. A shell
+        // spawned from a GUI app (e.g. launched from Finder / Spotlight on
+        // macOS) starts with `LANG=""` and macOS's bogus `LC_CTYPE="UTF-8"`
+        // (not a valid POSIX locale name). The shell itself is lenient so
+        // input parsing works, but any child program that calls
+        // `setlocale(LC_ALL, "")` (`ls`, `echo`, …) rejects the locale and
+        // falls back to `C`, emitting `????` for non-ASCII bytes.
+        //
+        // Force a real UTF-8 locale (`en_US.UTF-8`, shipped by default on
+        // every macOS install) when the user hasn't set one. A UTF-8 codeset
+        // is all that's needed to round-trip CJK / emoji — the language part
+        // doesn't restrict which characters display. We respect any `LANG`
+        // the user explicitly set.
+        ensure_utf8_locale();
 
         let window_size = WindowSize {
             num_lines: rows,
@@ -404,14 +641,22 @@ impl PtyBackend {
         if let Some((program, args)) = default_shell() {
             options.shell = Some(tty::Shell::new(program, args));
         }
+        // If a cwd was requested (e.g. "Open in CrabPort" from Finder),
+        // pass it to alacritty. The Unix tty path `chdir`s into it in the
+        // child's `pre_exec`; an invalid path is silently ignored by
+        // alacritty, which is the behaviour we want (fall back to the
+        // process cwd rather than failing the whole PTY).
+        options.working_directory = cwd;
 
         let pty = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
 
         let reader = pty.lock().file().try_clone()?;
         let mut writer = pty.lock().file().try_clone()?;
-
-        let (event_tx, event_rx) = broadcast(1024);
-        let _event_rx = event_rx.deactivate();
+        // Master fd + child pid for the foreground-process snapshot
+        // (Unix only). Grabbed here so the reader thread closure can
+        // construct a `FgProcessSnapshot` without holding the `pty` lock.
+        let master_fd = pty.lock().file().as_raw_fd();
+        let child_pid = pty.lock().child().id();
 
         let (command_tx, command_rx) = unbounded::<Command>();
 
@@ -421,6 +666,11 @@ impl PtyBackend {
             thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
+                // On every PTY data chunk, probe the foreground process
+                // (cwd + command line) via tcgetpgrp + sysinfo. A `cd` or
+                // any foreground command causes the shell to write bytes,
+                // so this fires naturally without a timer.
+                let mut snapshot = FgProcessSnapshot::new(master_fd, child_pid);
 
                 loop {
                     match reader.read(&mut buf) {
@@ -435,6 +685,15 @@ impl PtyBackend {
                             let _ = smol::block_on(
                                 event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())),
                             );
+                            if let Some((cwd, name)) = snapshot.probe() {
+                                tracing::debug!("process watcher: {} in {}", name, cwd.display());
+                                let _ = smol::block_on(event_tx.broadcast(
+                                    BackendEvent::ProcessChanged {
+                                        cwd,
+                                        process_name: name,
+                                    },
+                                ));
+                            }
                         }
 
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -482,6 +741,35 @@ impl PtyBackend {
                         }
 
                         Command::Close => {
+                            // Actively terminate the child shell so its
+                            // descendants (vim, top, …) get SIGHUP via
+                            // the kernel's session-leader semantics.
+                            // Just closing our writer fd isn't enough —
+                            // the reader thread still holds a clone of the
+                            // master fd, so the PTY never reaches EOF and
+                            // the child never sees HUP. Sending SIGTERM
+                            // (or SIGHUP) to the child's pid makes the
+                            // shell exit, which in turn tears down its
+                            // process group.
+                            #[cfg(unix)]
+                            {
+                                let pid = pty.lock().child().id();
+                                if pid > 0 {
+                                    // SIGHUP is the canonical "terminal
+                                    // hung up" signal; shells propagate
+                                    // it to their jobs.
+                                    unsafe {
+                                        libc::kill(pid as libc::pid_t, libc::SIGHUP);
+                                    }
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                // ConPTY doesn't expose the child pid via
+                                // `child()`; the pseudoconsole is torn down
+                                // when the `Pty` drops, which sends the
+                                // equivalent of a console close event.
+                            }
                             let _ = event_tx.broadcast(BackendEvent::Closed).await;
                             break;
                         }
@@ -550,6 +838,40 @@ impl PtyBackend {
 #[cfg(windows)]
 impl PtyBackend {
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Spawn the local PTY with an optional working directory. See the
+    /// Unix impl of [`PtyBackend::new_with_cwd`] for the rationale
+    /// (macOS Finder / URL-scheme entry point). On Windows, alacritty's
+    /// ConPTY path honours `Options::working_directory` via the child
+    /// process creation flags.
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> std::io::Result<Self> {
+        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
+    }
+
+    /// Construct a `PtyBackend` that broadcasts on an externally-owned
+    /// channel. Used by [`PendingPtyBackend`] so subscribers attached
+    /// before the PTY exists still receive events once it's up.
+    pub(crate) fn new_with_event_tx(
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+    ) -> std::io::Result<Self> {
+        let _event_rx = event_tx.new_receiver().deactivate();
+        Self::build(cols, rows, cwd, event_tx, _event_rx)
+    }
+
+    fn build(
+        cols: u16,
+        rows: u16,
+        cwd: Option<PathBuf>,
+        event_tx: async_broadcast::Sender<BackendEvent>,
+        _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+    ) -> std::io::Result<Self> {
         use alacritty_terminal::{
             event::WindowSize,
             tty::{self, Options, Pty},
@@ -563,6 +885,9 @@ impl PtyBackend {
             options.shell = Some(tty::Shell::new(program, args));
         }
         options.drain_on_exit = true;
+        // Pass through the requested cwd (alacritty's ConPTY path honours
+        // it when spawning the child).
+        options.working_directory = cwd;
 
         let window_size = WindowSize {
             num_lines: rows,
@@ -578,8 +903,7 @@ impl PtyBackend {
         let pty: Arc<Mutex<Pty>> = Arc::new(Mutex::new(tty::new(&options, window_size, 0)?));
 
         // Broadcast channel for backend events.
-        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
-        let _event_rx = event_rx.deactivate();
+        // (Reuses the caller-provided `event_tx` — see `new_with_event_tx`.)
 
         // --- Reader thread: lock `pty`, call `reader().read()`, broadcast `Data` ---
         //
@@ -834,6 +1158,243 @@ impl CrabPortMonitor for FailedPtyBackend {
     }
     fn metrics(&self) -> RemoteMetrics {
         RemoteMetrics::default()
+    }
+}
+
+// ===========================================================================
+// PendingPtyBackend — non-blocking local PTY launcher
+// ===========================================================================
+//
+// On Windows, `PtyBackend::new` is expensive: it calls `CreatePseudoConsole`
+// + `CreateProcessW` (which spawns `pwsh.exe` / `powershell.exe`), plus
+// `ChildExitWatcher::new` (which calls `RegisterWaitForSingleObject`).
+// PowerShell in particular can take 200–500 ms just to reach its first
+// prompt — all on the calling thread. When `TerminalView::new` is called
+// on the gpui foreground (which it is, from `add_tab` / split), that
+// stalls the render loop and produces a visible "hang" on the first
+// local terminal of the session.
+//
+// `PendingPtyBackend` fixes this by returning immediately and doing the
+// actual PTY construction on a background thread. It mirrors what the
+// SSH / Telnet backends already do — keep the heavy lifting off the UI
+// thread, broadcast status via `BackendEvent`, and let the connection
+// overlay show a spinner while the work is in flight.
+//
+// Lifecycle:
+//
+// 1. `new()` — creates a broadcast channel, spawns a worker thread, and
+//    returns immediately. Writes / resizes / closes issued before the
+//    PTY is ready are buffered into the same command channel the real
+//    `PtyBackend` will drain — they are replayed in order once the PTY
+//    is up, so the user's first keystrokes are not lost.
+// 2. The worker calls `PtyBackend::new_with_event_tx` (passing the
+//    already-created broadcast channel) so subscribers attached before
+//    the PTY existed still receive events. On success, it swaps the
+//    real backend into the `OnceLock` and the buffered command channel
+//    is seamlessly bridged (see `write` / `resize` / `close` below —
+//    they prefer the live backend and otherwise enqueue).
+// 3. On failure, the worker broadcasts `Error` + `Closed` (mirroring
+//    `FailedPtyBackend`) so the tab auto-closes with a visible message
+//    in the connection overlay.
+//
+// `as_monitor()` reports `RemoteStatus::Connecting` until the real
+// backend takes over, then `Local`. This drives the connection overlay
+// spinner and the "don't expand the side panel until ready" check in
+// `render_content`, so the layout doesn't shift mid-launch.
+
+/// State shared between `PendingPtyBackend` (UI thread) and the worker
+/// thread that actually constructs the `PtyBackend`.
+struct PendingState {
+    /// The real backend once it's ready. `None` while still constructing.
+    backend: OnceLock<Arc<PtyBackend>>,
+    /// Buffered commands issued before the PTY was ready. Drained by the
+    /// real backend's writer task once it takes over (the sender is
+    /// bridged in `PtyBackend::build` via the same `command_rx`).
+    command_tx: MpscSender<Command>,
+    /// Broadcast channel shared with the real backend (so subscribers
+    /// attached during construction receive events once it's up).
+    event_tx: async_broadcast::Sender<BackendEvent>,
+    /// Whether the worker has finished (success or failure). Used by
+    /// `status()` to distinguish "still starting" from "started".
+    done: AtomicBool,
+}
+
+pub struct PendingPtyBackend {
+    state: Arc<PendingState>,
+    _event_rx: async_broadcast::InactiveReceiver<BackendEvent>,
+}
+
+impl PendingPtyBackend {
+    /// Construct a non-blocking local PTY launcher. Returns immediately;
+    /// the real `PtyBackend` is built on a background thread.
+    pub fn new(cols: u16, rows: u16) -> Self {
+        Self::new_with_cwd(cols, rows, None)
+    }
+
+    /// Like [`new`](Self::new) but spawns the child shell in `cwd` when
+    /// given. Used by the "Open in CrabPort" macOS Finder / URL-scheme
+    /// entry point so the launched terminal starts in the right folder
+    /// instead of the app's process cwd (which, for a GUI-launched app on
+    /// macOS, is usually `/`).
+    pub fn new_with_cwd(cols: u16, rows: u16, cwd: Option<PathBuf>) -> Self {
+        let (event_tx, event_rx) = async_broadcast::broadcast(1024);
+        let _event_rx = event_rx.deactivate();
+        let (command_tx, command_rx) = unbounded::<Command>();
+
+        let state = Arc::new(PendingState {
+            backend: OnceLock::new(),
+            command_tx,
+            event_tx: event_tx.clone(),
+            done: AtomicBool::new(false),
+        });
+        let state_for_worker = state.clone();
+
+        std::thread::spawn(move || {
+            match PtyBackend::new_with_event_tx(cols, rows, cwd, state_for_worker.event_tx.clone())
+            {
+                Ok(backend) => {
+                    // Bridge the buffered command queue onto the real
+                    // backend's writer task by forwarding any pending
+                    // commands. `command_rx` is the receiver we created
+                    // above; the real backend created its own internal
+                    // `command_rx`, so we just drain ours into the live
+                    // sender. New commands after this point go straight
+                    // to the live backend via `state.command_tx` (which
+                    // is the same sender the real backend's writer is
+                    // NOT draining — see below).
+                    //
+                    // Actually, the real `PtyBackend` created its own
+                    // `command_rx` in `build()`, so our buffered
+                    // commands need to be re-sent to the real backend's
+                    // `command_tx`. We do that here.
+                    let live_tx = backend.command_tx.clone();
+                    while let Ok(cmd) = command_rx.try_recv() {
+                        let _ = live_tx.try_send(cmd);
+                    }
+                    // Install the live backend. After this point, all
+                    // `write`/`resize`/`close` calls hit the real backend
+                    // directly (see `PendingPtyBackend` impl).
+                    let _ = state_for_worker.backend.set(Arc::new(backend));
+                    state_for_worker.done.store(true, AtomicOrdering::SeqCst);
+                    // Signal readiness so the UI can stop the "Connecting"
+                    // spinner immediately. Without this, the spinner pump
+                    // would keep repainting at ~120 Hz until the first PTY
+                    // `Data` byte arrives — on Windows PowerShell that gap
+                    // can be a second or more, which makes the whole window
+                    // feel sluggish even though the backend itself is
+                    // already usable. The UI's wakeup listener re-reads
+                    // `monitor().status()` (now `Local`) and flips the
+                    // overlay to fade out.
+                    let _ = state_for_worker.event_tx.try_broadcast(BackendEvent::Ready);
+                    tracing::debug!("pending-pty: real backend installed");
+                }
+                Err(e) => {
+                    tracing::error!("pending-pty: construction failed: {e}");
+                    let msg = e.to_string();
+                    let _ = state_for_worker
+                        .event_tx
+                        .try_broadcast(BackendEvent::Error(msg));
+                    let _ = state_for_worker
+                        .event_tx
+                        .try_broadcast(BackendEvent::Closed);
+                    state_for_worker.done.store(true, AtomicOrdering::SeqCst);
+                }
+            }
+        });
+
+        Self { state, _event_rx }
+    }
+
+    /// Helper: route a command to the live backend if it's installed, else
+    /// buffer it in the pending queue. Keeps the public `write` / `resize` /
+    /// `close` methods DRY.
+    fn dispatch(&self, cmd: Command) {
+        if let Some(backend) = self.state.backend.get() {
+            // Live backend is up — send straight to its writer task.
+            let _ = backend.command_tx.try_send(cmd);
+        } else {
+            // Still constructing — buffer. Once the worker installs the
+            // real backend, it drains this queue and forwards the commands.
+            let _ = self.state.command_tx.try_send(cmd);
+        }
+    }
+}
+
+impl CrabPortTerminal for PendingPtyBackend {
+    fn write(&self, data: &[u8]) {
+        self.dispatch(Command::Write(data.to_vec()));
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        self.dispatch(Command::Resize(cols, rows));
+    }
+
+    fn close(&self) {
+        // If the real backend is up, tell it to close (which broadcasts
+        // `Closed` and tears down the child). Otherwise broadcast `Closed`
+        // ourselves so the session's reader loop terminates instead of
+        // waiting forever for the worker thread.
+        if let Some(backend) = self.state.backend.get() {
+            let _ = backend.command_tx.try_send(Command::Close);
+        } else {
+            let _ = self.state.event_tx.try_broadcast(BackendEvent::Closed);
+        }
+    }
+
+    fn subscribe(&self) -> BroadcastReceiver<BackendEvent> {
+        self.state.event_tx.new_receiver()
+    }
+
+    fn as_monitor(&self) -> Option<&dyn CrabPortMonitor> {
+        Some(self)
+    }
+
+    fn spawn_channel(&self, cols: u16, rows: u16) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
+        // Local PTY: each split pane gets its own independent shell. We
+        // spawn another `PendingPtyBackend` so split panes also don't
+        // stall the UI thread on Windows.
+        Some(std::sync::Arc::new(PendingPtyBackend::new(cols, rows)))
+    }
+
+    fn refresh_history(&self) {
+        // If the real backend is up, delegate to it so its event_tx is
+        // used. Otherwise queue the read to happen once it's ready —
+        // simplest is to spawn the read directly using our own event_tx
+        // (which is shared with the real backend once it takes over).
+        if let Some(backend) = self.state.backend.get() {
+            backend.refresh_history();
+        } else {
+            let event_tx = self.state.event_tx.clone();
+            std::thread::spawn(move || {
+                let cmds = read_local_shell_history();
+                let _ = event_tx.try_broadcast(BackendEvent::HistoryLoaded(cmds));
+            });
+        }
+    }
+}
+
+impl CrabPortMonitor for PendingPtyBackend {
+    fn status(&self) -> RemoteStatus {
+        if self.state.backend.get().is_some() {
+            RemoteStatus::Local
+        } else if self.state.done.load(AtomicOrdering::SeqCst) {
+            // Worker finished but no backend — construction failed.
+            RemoteStatus::Disconnected
+        } else {
+            // Still constructing.
+            RemoteStatus::Connecting
+        }
+    }
+
+    fn metrics(&self) -> RemoteMetrics {
+        // If the real backend is up, defer to its (cached) metrics. While
+        // pending, return defaults — the toolbar renders "—" for missing
+        // fields, which is fine for the short startup window.
+        if let Some(backend) = self.state.backend.get() {
+            backend.metrics()
+        } else {
+            RemoteMetrics::default()
+        }
     }
 }
 

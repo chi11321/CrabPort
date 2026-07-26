@@ -5,7 +5,7 @@ use rust_i18n::t;
 
 use crate::app::CrabportApp;
 use crate::color::*;
-use crate::components::input::{StyledInput, StyledPasswordInput};
+use crate::components::form::{password_field, text_field};
 use crate::motion::RADIUS_SM;
 
 #[derive(IntoElement)]
@@ -15,9 +15,6 @@ pub struct WithCertificateForm {
     /// Read-only file path filled by the "Browse…" button. Either this or
     /// `private_key_input` (pasted key content) must be set to pass validation.
     pub private_key_path_input: Entity<InputState>,
-    pub passphrase_focused: bool,
-    pub private_key_focused: bool,
-    pub private_key_path_focused: bool,
     /// Per-field validation error for the private key (passphrase is optional).
     /// Shown on the content textarea; the path field is read-only so the same
     /// error string is surfaced there too when applicable.
@@ -37,13 +34,12 @@ impl RenderOnce for WithCertificateForm {
             .flex_col()
             .gap_4()
             // Passphrase (optional)
-            .child(
-                div().child(
-                    StyledPasswordInput::new("passphrase", self.passphrase_input)
-                        .label(t!("connection_form.passphrase").to_string())
-                        .focused(self.passphrase_focused),
-                ),
-            )
+            .child(div().child(password_field(
+                "passphrase",
+                self.passphrase_input,
+                t!("connection_form.passphrase").to_string(),
+                None,
+            )))
             // Private Key file path (read-only input + Browse button).
             //
             // The input is disabled so the user cannot type a path manually —
@@ -53,64 +49,69 @@ impl RenderOnce for WithCertificateForm {
             // and the actual file on disk.
             .child(
                 div().child(
-                    StyledInput::new("conn-private-key-path", self.private_key_path_input)
-                        .label(t!("connection_form.private_key_file").to_string())
-                        .focused(self.private_key_path_focused)
-                        // Block keyboard editing but keep the shell visually
-                        // enabled so the inline Browse suffix button stays
-                        // bright and clickable.
-                        .input_disabled(true)
-                        .prefix(
-                            svg()
-                                .path("icons/file.svg")
-                                .size_3p5()
-                                .text_color(rgb(text_muted())),
-                        )
-                        .suffix(
-                            // Compact inline button (the full `Button` component
-                            // is `w_full` + `h_8`, which is too tall for a
-                            // suffix slot). We render a small padded clickable
-                            // div with a hover background instead.
-                            div()
-                                .id("conn-private-key-browse")
-                                .flex()
-                                .items_center()
-                                .h(px(22.0))
-                                .px_2()
-                                .rounded(RADIUS_SM)
-                                .text_xs()
-                                .text_color(rgb(text_primary()))
-                                .bg(rgb(surface_hover()))
-                                .hover(|s| s.bg(rgb(surface_active())))
-                                .child(browse_label)
-                                // The click handler drives the whole flow:
-                                //   1. open the native picker (GPUI's
-                                //      `prompt_for_paths`, same API the SFTP
-                                //      panel uses) and capture its result channel,
-                                //   2. capture the window handle so the
-                                //      write-back (which needs `&mut Window`
-                                //      for `InputState::set_value`) can re-enter
-                                //      this window,
-                                //   3. spawn a background task that awaits the
-                                //      picker and, on success, writes the path
-                                //      into the read-only field and clears any
-                                //      stale pasted key content.
-                                .on_click(move |_, w, cx| {
-                                    app_pick_private_key(&app, w, cx);
-                                }),
-                        )
-                        .when_some(private_key_error.clone(), |el, e| el.error(e)),
+                    text_field(
+                        "conn-private-key-path",
+                        self.private_key_path_input,
+                        t!("connection_form.private_key_file").to_string(),
+                        None,
+                    )
+                    // Block keyboard editing but keep the shell visually
+                    // enabled so the inline Browse suffix button stays
+                    // bright and clickable.
+                    .input_disabled(true)
+                    .prefix(
+                        svg()
+                            .path("icons/file.svg")
+                            .size_3p5()
+                            .text_color(rgb(text_muted())),
+                    )
+                    .suffix(
+                        // Compact inline button (the full `Button` component
+                        // is `w_full` + `h_8`, which is too tall for a
+                        // suffix slot). We render a small padded clickable
+                        // div with a hover background instead.
+                        div()
+                            .id("conn-private-key-browse")
+                            .flex()
+                            .items_center()
+                            .h(px(22.0))
+                            .px_2()
+                            .rounded(RADIUS_SM)
+                            .text_xs()
+                            .text_color(rgb(text_primary()))
+                            .bg(rgb(surface_hover()))
+                            .hover(|s| s.bg(rgb(surface_active())))
+                            .child(browse_label)
+                            // The click handler drives the whole flow:
+                            //   1. open the native picker (GPUI's
+                            //      `prompt_for_paths`, same API the SFTP
+                            //      panel uses) and capture its result channel,
+                            //   2. capture the window handle so the
+                            //      write-back (which needs `&mut Window`
+                            //      for `InputState::set_value`) can re-enter
+                            //      this window,
+                            //   3. spawn a background task that awaits the
+                            //      picker and, on success, writes the path
+                            //      into the read-only field and clears any
+                            //      stale pasted key content.
+                            .on_click(move |_, w, cx| {
+                                app_pick_private_key(&app, w, cx);
+                            }),
+                    )
+                    .when_some(private_key_error.clone(), |el, e| el.error(e)),
                 ),
             )
             // Private Key content (required — alternatively to the path above)
             .child(
                 div().child(
-                    StyledInput::new("conn-private-key", self.private_key_input)
-                        .label(t!("connection_form.private_key_content").to_string())
-                        .focused(self.private_key_focused)
-                        .multi_line(true)
-                        .rows(5)
-                        .when_some(private_key_error, |el, e| el.error(e)),
+                    text_field(
+                        "conn-private-key",
+                        self.private_key_input,
+                        t!("connection_form.private_key_content").to_string(),
+                        private_key_error,
+                    )
+                    .multi_line(true)
+                    .rows(5),
                 ),
             )
     }

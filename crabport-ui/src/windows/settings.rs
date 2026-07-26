@@ -14,7 +14,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
 use rust_i18n::t;
 
-use crabport_core::config::{self, StartupPage};
+use crabport_core::config::{self, AnimationSpeed, StartupPage};
 use crabport_core::credential::HostEntry;
 
 use crate::app_state::AppState;
@@ -80,6 +80,7 @@ pub struct SettingsWindow {
     theme_dropdown_open: bool,
     font_family_dropdown_open: bool,
     startup_dropdown_open: bool,
+    animation_speed_dropdown_open: bool,
     /// Search input backing the terminal font-family dropdown. Lets the
     /// user type to filter the (potentially long) list of installed fonts.
     font_search_input: Entity<InputState>,
@@ -109,31 +110,12 @@ impl SettingsWindow {
     /// should normally go through [`crate::windows::focus_or_open`] for the
     /// singleton check).
     pub fn open(cx: &mut App) -> WindowHandle<gpui_component::Root> {
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(720.0), px(820.0)), cx)),
-            // See `app::open_main_window` for the per-platform titlebar
-            // rationale. `appears_transparent: true` is required on Windows
-            // (not just macOS) to actually strip the system title bar;
-            // the GPUI default leaves it visible. The `title` is kept on
-            // every platform so the taskbar / window switcher / Expose all
-            // show "Settings" instead of a blank name.
-            titlebar: Some(TitlebarOptions {
-                title: Some(t!("window.settings.title").to_string().into()),
-                appears_transparent: true,
-                #[cfg(target_os = "macos")]
-                traffic_light_position: Some(point(px(12.0), px(14.0))),
-                ..Default::default()
-            }),
-            #[cfg(target_os = "macos")]
-            window_background: WindowBackgroundAppearance::Blurred,
-            #[cfg(target_os = "linux")]
-            window_decorations: Some(WindowDecorations::Client),
-            window_min_size: Some(Size {
-                width: px(560.0),
-                height: px(440.0),
-            }),
-            ..Default::default()
-        };
+        let options = crate::windows::aux_window_options(
+            t!("window.settings.title").to_string().into(),
+            size(px(720.0), px(820.0)),
+            size(px(560.0), px(440.0)),
+            cx,
+        );
 
         cx.open_window(options, |window, cx| {
             cx.new(|cx| {
@@ -191,6 +173,7 @@ impl SettingsWindow {
             theme_dropdown_open: false,
             font_family_dropdown_open: false,
             startup_dropdown_open: false,
+            animation_speed_dropdown_open: false,
             font_search_input,
             font_size_input,
             font_size_focused: false,
@@ -199,6 +182,37 @@ impl SettingsWindow {
             focus_handle: cx.focus_handle(),
             keybind_error: None,
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Dropdown open-state plumbing
+    // -------------------------------------------------------------------
+    //
+    // `Dropdown` is uncontrolled — the caller owns the open flag. Every
+    // settings dropdown wires the same toggle / close-on-change dance, so
+    // the two closures live here once, parameterized by a field accessor.
+
+    /// Build an `on_toggle` handler that flips the given open flag.
+    fn dropdown_toggle(
+        handle: &Entity<Self>,
+        slot: fn(&mut Self) -> &mut bool,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let handle = handle.clone();
+        move |_w, cx| {
+            handle.update(cx, |view, cx| {
+                let open = slot(view);
+                *open = !*open;
+                cx.notify();
+            });
+        }
+    }
+
+    /// Clear the given open flag (the close-on-change tail).
+    fn close_dropdown(handle: &Entity<Self>, slot: fn(&mut Self) -> &mut bool, cx: &mut App) {
+        handle.update(cx, |view, cx| {
+            *slot(view) = false;
+            cx.notify();
+        });
     }
 
     // -------------------------------------------------------------------
@@ -259,7 +273,6 @@ impl SettingsWindow {
             .unwrap_or(0);
 
         let startup_dropdown = {
-            let h_for_toggle = handle.clone();
             let h_for_change = handle.clone();
             let items_for_change = startup_items.clone();
             let mut dd = Dropdown::new("settings-startup-page")
@@ -268,12 +281,9 @@ impl SettingsWindow {
             for (label, value) in &startup_items {
                 dd = dd.item_with_value(label.clone(), value.clone());
             }
-            dd.on_toggle(move |_w, cx| {
-                h_for_toggle.update(cx, |view, cx| {
-                    view.startup_dropdown_open = !view.startup_dropdown_open;
-                    cx.notify();
-                });
-            })
+            dd.on_toggle(Self::dropdown_toggle(&handle, |v| {
+                &mut v.startup_dropdown_open
+            }))
             .on_change(move |idx, _w, cx| {
                 let page = items_for_change
                     .get(idx)
@@ -282,10 +292,7 @@ impl SettingsWindow {
                 let _ = config::update(|cfg| {
                     cfg.appearance.startup.page = page;
                 });
-                h_for_change.update(cx, |view, cx| {
-                    view.startup_dropdown_open = false;
-                    cx.notify();
-                });
+                Self::close_dropdown(&h_for_change, |v| &mut v.startup_dropdown_open, cx);
             })
         };
 
@@ -387,18 +394,14 @@ impl SettingsWindow {
 
         // --- Language dropdown ---
         let locale_dropdown = {
-            let h = handle.clone();
             Dropdown::new("settings-locale")
                 .item(t!("window.settings.appearance.language_en"))
                 .item(t!("window.settings.appearance.language_zh_cn"))
                 .selected(locale_idx)
                 .is_open(self.locale_dropdown_open)
-                .on_toggle(move |_w, cx| {
-                    h.update(cx, |view, cx| {
-                        view.locale_dropdown_open = !view.locale_dropdown_open;
-                        cx.notify();
-                    });
-                })
+                .on_toggle(Self::dropdown_toggle(&handle, |v| {
+                    &mut v.locale_dropdown_open
+                }))
                 .on_change(move |idx, _w, cx| {
                     let locale = if idx == 1 { "zh-CN" } else { "en" };
                     let _ = config::update(|cfg| {
@@ -411,7 +414,6 @@ impl SettingsWindow {
 
         // --- Theme dropdown ---
         let theme_dropdown = {
-            let h_for_toggle = handle.clone();
             let h_for_change = handle.clone();
             let mut dropdown = Dropdown::new("settings-theme");
             for t in &themes {
@@ -420,12 +422,9 @@ impl SettingsWindow {
             dropdown
                 .selected(theme_idx)
                 .is_open(self.theme_dropdown_open)
-                .on_toggle(move |_w, cx| {
-                    h_for_toggle.update(cx, |view, cx| {
-                        view.theme_dropdown_open = !view.theme_dropdown_open;
-                        cx.notify();
-                    });
-                })
+                .on_toggle(Self::dropdown_toggle(&handle, |v| {
+                    &mut v.theme_dropdown_open
+                }))
                 .on_change(move |idx, _w, cx| {
                     // `idx` is the position in the catalog snapshot captured
                     // above; resolve it back to an id via the same list, then
@@ -436,10 +435,7 @@ impl SettingsWindow {
                         .unwrap_or_else(|| "modern-dark".to_string());
                     crate::color::apply_theme(&id);
                     crate::refresh_theme_with(cx);
-                    h_for_change.update(cx, |view, cx| {
-                        view.theme_dropdown_open = false;
-                        cx.notify();
-                    });
+                    Self::close_dropdown(&h_for_change, |v| &mut v.theme_dropdown_open, cx);
                 })
         };
 
@@ -503,6 +499,88 @@ impl SettingsWindow {
                 .max(32)
                 .step(1);
 
+        // --- Animation speed dropdown ---
+        // Four tiers map to multipliers 1.25× / 1.0× / 0.75× / 0.5×. The
+        // selected index is resolved back to an `AnimationSpeed` variant
+        // via the parallel `animation_speed_items` list. On change we both
+        // persist to config and push the live multiplier into `motion.rs`
+        // so every open window picks up the new speed on its next frame —
+        // no restart needed.
+        let current_speed = config::snapshot().appearance.animation_speed;
+        let animation_speed_items: [(AnimationSpeed, &str); 4] = [
+            (
+                AnimationSpeed::Slow,
+                "window.settings.appearance.animation_speed_slow",
+            ),
+            (
+                AnimationSpeed::Standard,
+                "window.settings.appearance.animation_speed_standard",
+            ),
+            (
+                AnimationSpeed::Fast,
+                "window.settings.appearance.animation_speed_fast",
+            ),
+            (
+                AnimationSpeed::Fastest,
+                "window.settings.appearance.animation_speed_fastest",
+            ),
+        ];
+        let speed_idx = animation_speed_items
+            .iter()
+            .position(|(s, _)| *s == current_speed)
+            .unwrap_or(1);
+        let animation_speed_dropdown = {
+            let h_for_change = handle.clone();
+            let items_for_change = animation_speed_items.clone();
+            let mut dd = Dropdown::new("settings-animation-speed")
+                .is_open(self.animation_speed_dropdown_open)
+                .selected(speed_idx);
+            for (_, key) in &animation_speed_items {
+                dd = dd.item_with_value(t!(*key).to_string(), (*key).to_string());
+            }
+            dd.on_toggle(Self::dropdown_toggle(&handle, |v| {
+                &mut v.animation_speed_dropdown_open
+            }))
+            .on_change(move |idx, _w, cx| {
+                let speed = items_for_change
+                    .get(idx)
+                    .map(|(s, _)| *s)
+                    .unwrap_or(AnimationSpeed::Standard);
+                let _ = config::update(|cfg| {
+                    cfg.appearance.animation_speed = speed;
+                });
+                // Push the new multiplier into the global motion cache so
+                // every `duration_*()` call picks it up on the next render.
+                //
+                // We deliberately do NOT call `gpui_animation::reset_all_transitions()`
+                // here: clearing the `states` map forces the next render's
+                // `with_state_default` to rebuild every element's state from
+                // `Default::default()`, and `animated_handle` then sees a diff
+                // between the default and the live (e.g. hovered) style —
+                // launching a transition from the default to the current
+                // visual for EVERY element on screen, which looks far worse
+                // than the alternative.
+                //
+                // Instead, leave the registry alone. Active animations keep
+                // their old `duration` and finish within ≤320ms (the longest
+                // baseline token). New transitions started after this point
+                // pick up the new multiplier via the `duration_*()` calls.
+                // The handoff is imperceptible because the only visible
+                // effect of the speed change is on animations that START
+                // after the switch — and those use the new value.
+                //
+                // `refresh_windows` schedules a repaint of every live window
+                // so open views pick up the new multiplier on their next
+                // render. (Debug builds show transient stutter on speed
+                // change because `animation_tick`'s per-frame `refresh_windows`
+                // + DashMap lock contention is amplified without compiler
+                // optimizations; release builds don't exhibit this.)
+                crate::motion::set_speed_multiplier(speed.multiplier());
+                cx.refresh_windows();
+                Self::close_dropdown(&h_for_change, |v| &mut v.animation_speed_dropdown_open, cx);
+            })
+        };
+
         // Build the pane from declarative sections.
         div()
             .size_full()
@@ -521,7 +599,21 @@ impl SettingsWindow {
                 Section::new()
                     .header(t!("window.settings.appearance.section_theme"))
                     .desc(t!("window.settings.appearance.theme_desc"))
-                    .bare(div().w(px(240.0)).child(theme_dropdown)),
+                    .bare(div().w(px(240.0)).child(theme_dropdown))
+                    // Opens the Theme Editor window seeded from the theme
+                    // that's currently applied.
+                    .bare(
+                        Button::new("settings-edit-theme")
+                            .child(t!("window.settings.appearance.edit_theme").to_string())
+                            .w_auto()
+                            .centered(true)
+                            .on_click(|_e, _w, cx| {
+                                crate::windows::registry::focus_or_open(
+                                    crate::windows::AuxWindowKind::ThemeEditor,
+                                    cx,
+                                );
+                            }),
+                    ),
             )
             // --- Terminal font ---
             .child(
@@ -535,6 +627,36 @@ impl SettingsWindow {
                     .field(
                         t!("window.settings.appearance.terminal_font_size").to_string(),
                         div().w(px(180.0)).child(font_size_stepper),
+                    )
+                    .field(
+                        t!("window.settings.appearance.terminal_expand_panel").to_string(),
+                        div().w(px(180.0)).child(
+                            crate::components::switch::Switch::new("settings-term-expand-panel")
+                                .checked(term_cfg.expand_panel_on_connect)
+                                .on_change({
+                                    let h = handle.clone();
+                                    move |checked, _w, cx| {
+                                        let _ = config::update(|cfg| {
+                                            cfg.appearance.terminal.expand_panel_on_connect =
+                                                *checked;
+                                        });
+                                        // Repaint every window so open terminal
+                                        // tabs pick up the new default on
+                                        // their next render.
+                                        let _ = h.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
+                        ),
+                    ),
+            )
+            // --- Animation speed ---
+            .child(
+                Section::new()
+                    .header(t!("window.settings.appearance.section_animation"))
+                    .desc(t!("window.settings.appearance.animation_speed_desc"))
+                    .field(
+                        t!("window.settings.appearance.animation_speed_label").to_string(),
+                        div().w(px(180.0)).child(animation_speed_dropdown),
                     ),
             )
     }

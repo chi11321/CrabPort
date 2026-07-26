@@ -1,0 +1,102 @@
+<!--
+  Info.plist extension — merged into the generated Info.plist by
+  `cargo-bundle` (see `osx_info_plist_exts` in Cargo.toml).
+
+  Two things are declared here:
+
+  1. `CFBundleDocumentTypes` for `public.folder` — makes CrabPort
+     appear in Finder's "Open With" submenu for folders. Clicking it
+     delivers the folder as a `file://` URL via
+     `application:openURLs:`, which our `on_open_urls` handler in
+     `src/main.rs` resolves into a local-terminal tab cd'd into it.
+
+  2. `NSServices` — registers a real macOS Service so CrabPort
+     appears in the system-wide Services menu (Finder → right-click
+     a folder → Services → "Open Folder in CrabPort", or the app-menu
+     Services submenu in any app). The Service's `NSMessage` names
+     the `openInCrabPort:userData:error:` selector, which
+     `crabport-ui/src/macos_services.rs` attaches to GPUI's
+     `GPUIApplicationDelegate` class at runtime via `class_addMethod`.
+
+     This is the "proper Services menu" integration — unlike
+     `CFBundleDocumentTypes` (which only adds an "Open With" entry),
+     `NSServices` puts the item in the standard Services submenu that
+     power users already know. The trade-off is that we have to
+     dynamically inject the selector into GPUI's delegate because
+     GPUI 0.2.2 doesn't expose a way to add custom selectors to its
+     app delegate class at declaration time.
+
+  NOTE: This is a fragment, NOT a complete plist. `cargo-bundle`
+  writes the surrounding `<dict>…</dict>` and splices this file's
+  contents verbatim inside it.
+-->
+<!-- 1. Accept folders via "Open With". `public.folder` is the modern
+     UTI for directories; `LSHandlerRank = Alternate` means we're an
+     additional handler, not displacing Finder as the default. -->
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key>
+    <string>Folder</string>
+    <key>CFBundleTypeRole</key>
+    <string>Viewer</string>
+    <key>LSHandlerRank</key>
+    <string>Alternate</string>
+    <key>LSItemContentTypes</key>
+    <array>
+      <string>public.folder</string>
+    </array>
+  </dict>
+</array>
+
+<!-- 2. Register the "Open Folder in CrabPort" Service. -->
+<key>NSServices</key>
+<array>
+  <dict>
+    <!-- The menu item text shown in the Services submenu. -->
+    <key>NSMenuItem</key>
+    <dict>
+      <key>default</key>
+      <string>Open Folder in CrabPort</string>
+    </dict>
+    <!-- The selector invoked on the app delegate. Must match the
+         name we register via `class_addMethod` in
+         `macos_services.rs` AFTER AppKit appends the standard
+         `:userData:error:` suffix. So `NSMessage` is just the
+         method-name stem (no colons); AppKit composes the full
+         selector as `<NSMessage>:userData:error:`. Putting the
+         full selector here produces a doubled-up name like
+         `openInCrabPort:userData:error::userData:error:` which
+         AppKit can't dispatch (logged as "Cannot find service
+         provider for selector ...").
+         Signature we implement:
+           - (void)openInCrabPort:(NSPasteboard *)pboard
+                            userData:(NSString *)userData
+                              error:(NSError **)error -->
+    <key>NSMessage</key>
+    <string>openInCrabPort</string>
+    <!-- The port the host app should talk to. For a non-DO Services
+         app this is just the bundle name; macOS routes the call to
+         the running process (or launches it first). -->
+    <key>NSPortName</key>
+    <string>CrabPort</string>
+    <!-- Accept folders (directories) as input. `public.folder` is
+         the UTI for a directory; we also accept `public.item` so a
+         selected file in Finder passes its containing folder (we
+         resolve to the parent dir on the Rust side). -->
+    <key>NSSendFileTypes</key>
+    <array>
+      <string>public.folder</string>
+      <string>public.item</string>
+    </array>
+    <!-- Service only makes sense with a selection (not the empty
+         pasteboard). -->
+    <key>NSReturnTypes</key>
+    <array/>
+    <!-- Don't let the OS show an error dialog if the Service fails —
+         our Rust side already logs to `latest.log`. The `error`
+         pointer is set to nil on both success and failure. -->
+    <key>NSUserData</key>
+    <string></string>
+  </dict>
+</array>

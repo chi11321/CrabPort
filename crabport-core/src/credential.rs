@@ -498,6 +498,33 @@ pub struct HostEntry {
     /// Empty string means no startup command.
     #[serde(default)]
     pub startup_command: String,
+    /// Serial baud rate (e.g. 115200). Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_baud_rate: Option<u32>,
+    /// Serial data bits: 5, 6, 7, or 8. Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_data_bits: Option<u8>,
+    /// Serial parity: "none", "odd", or "even". Stored as TEXT; default
+    /// "none". Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_parity: Option<String>,
+    /// Serial stop bits: 1 or 2. Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_stop_bits: Option<u8>,
+    /// Serial flow control: "none", "software", or "hardware". Stored as
+    /// TEXT; default "none". Only meaningful for `HostKind::Serial`.
+    #[serde(default)]
+    pub serial_flow_control: Option<String>,
+    /// Optional jump host (bastion) to reach this host through. FK into the
+    /// `hosts` table (must point at an SSH host). At connect time the SSH
+    /// layer first connects + authenticates to the jump host, then opens a
+    /// `direct-tcpip` channel to this host and runs the SSH handshake over
+    /// it (like OpenSSH `ProxyJump`). Jump hosts chain: if the jump host
+    /// itself has a `jump_host_id`, the chain is followed recursively (with
+    /// cycle detection at resolve time). `None` means a direct connection.
+    /// Only meaningful for `HostKind::Ssh`.
+    #[serde(default)]
+    pub jump_host_id: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

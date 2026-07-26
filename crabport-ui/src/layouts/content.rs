@@ -10,9 +10,11 @@ use crate::app::AppCtx;
 use crate::app::{CrabportApp, SidebarItem, Tab, TabKind};
 use crate::color::*;
 use crate::components::dialog::{AlertSeverity, AlertState};
-use crate::layouts::panel::{PanelCaps, render_panel};
+use crate::layouts::panel::{
+    PanelCaps, render_panel, render_panel_divider, render_panel_drag_canvas,
+};
 use crate::layouts::tabbar::render_tab_bar;
-use crate::motion::{DURATION_FAST, EASE_STANDARD, RADIUS_SM};
+use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_fast};
 use crate::views::panel::PanelKind;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
@@ -36,6 +38,47 @@ fn terminal_entity(
         .cloned()
 }
 
+/// Wrap an app-method call into the `Rc<dyn Fn(&mut Window, &mut App)>`
+/// callback shape the sidebar views take.
+fn app_cb0(
+    handle: &Entity<CrabportApp>,
+    f: impl Fn(&mut CrabportApp, &mut Window, &mut Context<CrabportApp>) + 'static,
+) -> Rc<dyn Fn(&mut Window, &mut App)> {
+    let handle = handle.clone();
+    Rc::new(move |w, cx| {
+        handle.update(cx, |app, cx| f(app, w, cx));
+    })
+}
+
+/// Like [`app_cb0`] but for callbacks that receive an item id.
+fn app_cb1(
+    handle: &Entity<CrabportApp>,
+    f: impl Fn(&mut CrabportApp, i64, &mut Window, &mut Context<CrabportApp>) + 'static,
+) -> Rc<dyn Fn(i64, &mut Window, &mut App)> {
+    let handle = handle.clone();
+    Rc::new(move |id, w, cx| {
+        handle.update(cx, |app, cx| f(app, id, w, cx));
+    })
+}
+
+/// Build an optional panel callback that forwards to a method on the
+/// active terminal view: `term_cb!(term, (arg: Ty, ...), view => expr)`
+/// expands to `term.clone().map(|entity| Rc::new(move |arg..., cx| {
+/// entity.read_with(cx, |view, _cx| expr) }))` with the matching
+/// `Rc<dyn Fn(..., &mut App)>` coercion. `None` when there is no active
+/// terminal (the panels render disabled).
+macro_rules! term_cb {
+    ($term:expr, ($($arg:ident : $ty:ty),*), $view:ident => $body:expr) => {
+        $term.clone().map(|entity| {
+            Rc::new(move |$($arg: $ty,)* cx: &mut App| {
+                entity.read_with(cx, |$view, _cx| {
+                    $body;
+                });
+            }) as Rc<dyn Fn($($ty,)* &mut App)>
+        })
+    };
+}
+
 pub fn render_content(
     selected: SidebarItem,
     handle: &Entity<CrabportApp>,
@@ -52,6 +95,12 @@ pub fn render_content(
     // the `CrabportApp` borrow) and passed in to avoid a nested
     // `handle.read_with` during render.
     panel_active_tab: PanelKind,
+    // Whether the user has toggled the right-hand panel open for this tab.
+    // The toolbar's panel toggle button flips this; `render_panel`'s
+    // `with_transition` drives the slide animation. The caller (which owns
+    // the `CrabportApp` borrow) pre-reads it to avoid a nested
+    // `handle.read_with` during render.
+    panel_open: bool,
     // Pre-read by the caller (which owns the `CrabportApp` borrow) to avoid
     // a nested `handle.read_with` during render — same reason as
     // `panel_active_tab`.
@@ -98,58 +147,25 @@ pub fn render_content(
         });
     });
 
-    let app_handle = handle.clone();
-    let on_new = move |w: &mut Window, cx: &mut App| {
-        app_handle.update(cx, |app, cx| {
-            app.open_connection_form(w, cx);
-        });
-    };
-
     let view: AnyElement = match active_tab.map(|t| t.kind) {
         Some(TabKind::Home) => {
             match selected {
                 SidebarItem::Sessions => {
-                    let app_handle = handle.clone();
-                    let on_connect = move |host_id: i64, _w: &mut Window, cx: &mut App| {
-                        app_handle.update(cx, |app, cx| {
-                            app.connect_to_host(host_id, cx);
-                        });
-                    };
-                    let app_handle_sftp = handle.clone();
-                    let on_sftp_connect = move |host_id: i64, w: &mut Window, cx: &mut App| {
-                        app_handle_sftp.update(cx, |app, cx| {
-                            app.switch_sftp_panel_host(host_id, w, cx);
-                        });
-                    };
-                    let app_handle_edit = handle.clone();
-                    let on_edit = move |host_id: i64, w: &mut Window, cx: &mut App| {
-                        app_handle_edit.update(cx, |app, cx| {
-                            app.edit_host(host_id, w, cx);
-                        });
-                    };
-                    let app_handle_remove = handle.clone();
-                    let on_remove = move |host_id: i64, _w: &mut Window, cx: &mut App| {
-                        app_handle_remove.update(cx, |app, cx| {
-                            app.remove_host(host_id, cx);
-                        });
-                    };
-
-                    let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
-                    let on_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_connect);
-                    let on_sftp_connect_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> =
-                        Rc::new(on_sftp_connect);
-                    let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
-                    let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
-
                     sessions_view.update(cx, |view, cx| {
                         view.set_state(
                             hosts.to_vec(),
                             form_entity.cloned(),
-                            Some(on_new_rc),
-                            Some(on_connect_rc),
-                            Some(on_sftp_connect_rc),
-                            Some(on_edit_rc),
-                            Some(on_remove_rc),
+                            Some(app_cb0(handle, |app, w, cx| {
+                                app.open_connection_form(w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, _w, cx| {
+                                app.connect_to_host(id, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, w, cx| {
+                                app.switch_sftp_panel_host(id, w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, w, cx| app.edit_host(id, w, cx))),
+                            Some(app_cb1(handle, |app, id, _w, cx| app.remove_host(id, cx))),
                             context_menu.clone(),
                             alert_controller.clone(),
                             cx,
@@ -159,52 +175,21 @@ pub fn render_content(
                     sessions_view.clone().into_any_element()
                 }
                 SidebarItem::Tunnels => {
-                    let app_handle = handle.clone();
-                    let on_new = move |w: &mut Window, cx: &mut App| {
-                        app_handle.update(cx, |app, cx| {
-                            app.open_tunnel_form_for_create(w, cx);
-                        });
-                    };
-                    let app_handle_start = handle.clone();
-                    let on_start = move |id: i64, w: &mut Window, cx: &mut App| {
-                        app_handle_start.update(cx, |app, cx| {
-                            app.start_tunnel_owned(id, w, cx);
-                        });
-                    };
-                    let app_handle_stop = handle.clone();
-                    let on_stop = move |id: i64, _w: &mut Window, cx: &mut App| {
-                        app_handle_stop.update(cx, |app, cx| {
-                            app.stop_tunnel(id, cx);
-                        });
-                    };
-                    let app_handle_edit = handle.clone();
-                    let on_edit = move |id: i64, w: &mut Window, cx: &mut App| {
-                        app_handle_edit.update(cx, |app, cx| {
-                            app.open_tunnel_form_for_edit(id, w, cx);
-                        });
-                    };
-                    let app_handle_remove = handle.clone();
-                    let on_remove = move |id: i64, _w: &mut Window, cx: &mut App| {
-                        app_handle_remove.update(cx, |app, cx| {
-                            app.remove_tunnel(id, cx);
-                        });
-                    };
-
-                    let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
-                    let on_start_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_start);
-                    let on_stop_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_stop);
-                    let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
-                    let on_remove_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_remove);
-
                     tunnels_view.update(cx, |view, cx| {
                         view.set_state(
                             tunnel_list,
                             hosts.to_vec(),
-                            Some(on_new_rc),
-                            Some(on_start_rc),
-                            Some(on_stop_rc),
-                            Some(on_edit_rc),
-                            Some(on_remove_rc),
+                            Some(app_cb0(handle, |app, w, cx| {
+                                app.open_tunnel_form_for_create(w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, w, cx| {
+                                app.start_tunnel_owned(id, w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, _w, cx| app.stop_tunnel(id, cx))),
+                            Some(app_cb1(handle, |app, id, w, cx| {
+                                app.open_tunnel_form_for_edit(id, w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, _w, cx| app.remove_tunnel(id, cx))),
                             context_menu.clone(),
                             alert_controller.clone(),
                             tunnel_form_state,
@@ -231,46 +216,32 @@ pub fn render_content(
                     } else {
                         Vec::new()
                     };
-                    // Wire New / Edit callbacks to the app's snippet-form
-                    // methods (mirrors the Tunnels arm).
-                    let app_handle = handle.clone();
-                    let on_new = move |w: &mut Window, cx: &mut App| {
-                        app_handle.update(cx, |app, cx| {
-                            app.open_snippet_form_for_create(w, cx);
-                        });
-                    };
-                    let app_handle_edit = handle.clone();
-                    let on_edit = move |id: i64, w: &mut Window, cx: &mut App| {
-                        app_handle_edit.update(cx, |app, cx| {
-                            app.open_snippet_form_for_edit(id, w, cx);
-                        });
-                    };
-                    let on_new_rc: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(on_new);
-                    let on_edit_rc: Rc<dyn Fn(i64, &mut Window, &mut App)> = Rc::new(on_edit);
                     snippets_view.update(cx, |view, cx| {
                         view.set_state(
                             rows,
                             context_menu.clone(),
                             alert_controller.clone(),
-                            Some(on_new_rc),
-                            Some(on_edit_rc),
+                            Some(app_cb0(handle, |app, w, cx| {
+                                app.open_snippet_form_for_create(w, cx)
+                            })),
+                            Some(app_cb1(handle, |app, id, w, cx| {
+                                app.open_snippet_form_for_edit(id, w, cx)
+                            })),
                             snippet_form_state,
                             cx,
                         );
                     });
                     snippets_view.clone().into_any_element()
                 }
-                SidebarItem::History => div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_color(rgb(text_muted()))
-                            .child(selected.label().to_string()),
-                    )
-                    .into_any_element(),
+                SidebarItem::History => {
+                    // Push the shared overlay hosts into the view before
+                    // render (mirrors the Snippets / Tunnels arms).
+                    let history_view = &ctx.history_view;
+                    history_view.update(cx, |view, cx| {
+                        view.set_state(context_menu.clone(), alert_controller.clone(), cx);
+                    });
+                    history_view.clone().into_any_element()
+                }
             }
         }
         Some(TabKind::Terminal) => {
@@ -307,6 +278,7 @@ pub fn render_content(
                     terminal_views.get(&tab_id).is_some() || split_trees.get(&tab_id).is_some();
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
+                let handle_panel = handle.clone();
                 // Clone the download callback + terminal entity so the
                 // on_drop handler can trigger a download when the user
                 // drags an SFTP file row onto the terminal area.
@@ -364,7 +336,7 @@ pub fn render_content(
                                 .occlude()
                                 .child(render_split_button(
                                     "term-split-right",
-                                    "icons/panel-right.svg",
+                                    "icons/columns-2.svg",
                                     t!("terminal.split_right").to_string(),
                                     ctx.tooltip.clone(),
                                     {
@@ -381,7 +353,7 @@ pub fn render_content(
                                 ))
                                 .child(render_split_button(
                                     "term-split-down",
-                                    "icons/panel-bottom.svg",
+                                    "icons/rows-2.svg",
                                     t!("terminal.split_down").to_string(),
                                     ctx.tooltip.clone(),
                                     {
@@ -392,6 +364,20 @@ pub fn render_content(
                                                     crate::views::terminal::split::SplitDir::Horizontal,
                                                     cx,
                                                 );
+                                            });
+                                        }
+                                    },
+                                ))
+                                .child(render_split_button(
+                                    "term-toggle-panel",
+                                    "icons/panel-right.svg",
+                                    t!("terminal.toggle_panel").to_string(),
+                                    ctx.tooltip.clone(),
+                                    {
+                                        let handle = handle_panel.clone();
+                                        move |_w, cx| {
+                                            handle.update(cx, |app, cx| {
+                                                app.toggle_right_panel(active_tab_id, cx);
                                             });
                                         }
                                     },
@@ -482,7 +468,13 @@ pub fn render_content(
     // considered ready immediately; remote (SSH / Telnet) backends cycle
     // through `Connecting` -> `Connected` (or `Disconnected`), and the
     // panel stays collapsed until they actually reach `Connected`.
-    let panel_show = is_terminal && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
+    //
+    // The user can still toggle the panel closed via the toolbar button even
+    // when the session is ready — `panel_open` (defaulting to true) is
+    // AND-ed with the readiness check so the panel never appears mid-connect.
+    let panel_show = is_terminal
+        && panel_open
+        && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.
@@ -506,60 +498,19 @@ pub fn render_content(
     // the matching `view.sftp_*` method. The callbacks are `None` when the
     // active tab isn't a terminal or has no terminal entity.
 
-    let sftp_navigate: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
-        Rc::new(move |path: String, cx: &mut App| {
-            entity.read_with(cx, |view, _cx| {
-                view.sftp_navigate(&path);
-            });
-        }) as Rc<dyn Fn(String, &mut App)>
-    });
-
-    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> =
-        sftp_term.clone().map(|entity| {
-            Rc::new(
-                move |remote_path: String, local_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_download(&remote_path, &local_path);
-                    });
-                },
-            ) as Rc<dyn Fn(String, String, &mut App)>
-        });
-
-    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> =
-        sftp_term.clone().map(|entity| {
-            Rc::new(
-                move |local_path: String, remote_path: String, cx: &mut App| {
-                    entity.read_with(cx, |view, _cx| {
-                        view.sftp_upload(&local_path, &remote_path);
-                    });
-                },
-            ) as Rc<dyn Fn(String, String, &mut App)>
-        });
-
-    let sftp_delete: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
-        Rc::new(move |remote_path: String, cx: &mut App| {
-            entity.read_with(cx, |view, _cx| {
-                view.sftp_delete(&remote_path);
-            });
-        }) as Rc<dyn Fn(String, &mut App)>
-    });
-
-    let sftp_rename: Option<Rc<dyn Fn(String, String, &mut App)>> =
-        sftp_term.clone().map(|entity| {
-            Rc::new(move |old_path: String, new_path: String, cx: &mut App| {
-                entity.read_with(cx, |view, _cx| {
-                    view.sftp_rename(&old_path, &new_path);
-                });
-            }) as Rc<dyn Fn(String, String, &mut App)>
-        });
-
-    let sftp_edit: Option<Rc<dyn Fn(String, &mut App)>> = sftp_term.clone().map(|entity| {
-        Rc::new(move |remote_path: String, cx: &mut App| {
-            entity.read_with(cx, |view, _cx| {
-                view.sftp_open_in_editor(&remote_path);
-            });
-        }) as Rc<dyn Fn(String, &mut App)>
-    });
+    let sftp_navigate = term_cb!(sftp_term, (path: String), view => view.sftp_navigate(&path));
+    let sftp_download = term_cb!(sftp_term, (remote_path: String, local_path: String),
+        view => view.sftp_download(&remote_path, &local_path));
+    let sftp_upload = term_cb!(sftp_term, (local_path: String, remote_path: String),
+        view => view.sftp_upload(&local_path, &remote_path));
+    let sftp_delete =
+        term_cb!(sftp_term, (remote_path: String), view => view.sftp_delete(&remote_path));
+    let sftp_rename = term_cb!(sftp_term, (old_path: String, new_path: String),
+        view => view.sftp_rename(&old_path, &new_path));
+    let sftp_edit =
+        term_cb!(sftp_term, (remote_path: String), view => view.sftp_open_in_editor(&remote_path));
+    let sftp_mkdir =
+        term_cb!(sftp_term, (remote_path: String), view => view.sftp_mkdir(&remote_path));
 
     // ---- Panel capability flags ----
     //
@@ -597,6 +548,7 @@ pub fn render_content(
             sftp_delete,
             sftp_rename,
             sftp_edit,
+            sftp_mkdir,
             active_tab_id,
             context_menu.clone(),
             alert_controller.clone(),
@@ -658,41 +610,25 @@ pub fn render_content(
     // (~/.bash_history / ~/.zsh_history) and broadcast a
     // `HistoryLoaded` event, which the session forwards into
     // `command_history` and the panel picks up on the next render.
-    let (history_commands, history_on_paste, history_on_refresh): (
-        std::sync::Arc<Vec<crate::views::panel::history_command_panel::HistoryCommand>>,
-        Option<Rc<dyn Fn(String, &mut App)>>,
-        Option<Rc<dyn Fn(&mut App)>>,
-    ) = match &sftp_term {
-        Some(entity) => {
-            let cmds = entity.read_with(cx, |view, _cx| {
-                view.command_history()
-                    .into_iter()
-                    .map(
-                        |c| crate::views::panel::history_command_panel::HistoryCommand {
-                            command: c,
-                            timestamp: None,
-                        },
-                    )
-                    .collect::<Vec<_>>()
-            });
-            let cmds = std::sync::Arc::new(cmds);
-            let term_for_paste = entity.clone();
-            let on_paste: Rc<dyn Fn(String, &mut App)> =
-                Rc::new(move |cmd: String, cx: &mut App| {
-                    term_for_paste.read_with(cx, |view, _cx| {
-                        view.write_raw(cmd.as_bytes());
-                    });
-                });
-            let term_for_refresh = entity.clone();
-            let on_refresh: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
-                term_for_refresh.read_with(cx, |view, _cx| {
-                    view.refresh_history();
-                });
-            });
-            (cmds, Some(on_paste), Some(on_refresh))
-        }
-        None => (std::sync::Arc::new(Vec::new()), None, None),
+    let history_commands: std::sync::Arc<
+        Vec<crate::views::panel::history_command_panel::HistoryCommand>,
+    > = match &sftp_term {
+        Some(entity) => std::sync::Arc::new(entity.read_with(cx, |view, _cx| {
+            view.command_history()
+                .into_iter()
+                .map(
+                    |c| crate::views::panel::history_command_panel::HistoryCommand {
+                        command: c,
+                        timestamp: None,
+                    },
+                )
+                .collect::<Vec<_>>()
+        })),
+        None => std::sync::Arc::new(Vec::new()),
     };
+    let history_on_paste =
+        term_cb!(sftp_term, (cmd: String), view => view.write_raw(cmd.as_bytes()));
+    let history_on_refresh = term_cb!(sftp_term, (), view => view.refresh_history());
     history_panel.update(cx, |panel, cx| {
         panel.set_state(
             history_commands,
@@ -710,28 +646,10 @@ pub fn render_content(
     // Snippets are global (Store-backed), so we only need to wire the
     // run + paste callbacks to the active terminal. The panel reloads
     // its list from the Store inside `set_state`.
-    let (snippets_on_run, snippets_on_paste): (
-        Option<Rc<dyn Fn(String, &mut App)>>,
-        Option<Rc<dyn Fn(String, &mut App)>>,
-    ) = match &sftp_term {
-        Some(entity) => {
-            let term_for_run = entity.clone();
-            let on_run: Rc<dyn Fn(String, &mut App)> = Rc::new(move |cmd: String, cx: &mut App| {
-                term_for_run.read_with(cx, |view, _cx| {
-                    view.write_raw(format!("{}\r", cmd).as_bytes());
-                });
-            });
-            let term_for_paste = entity.clone();
-            let on_paste: Rc<dyn Fn(String, &mut App)> =
-                Rc::new(move |cmd: String, cx: &mut App| {
-                    term_for_paste.read_with(cx, |view, _cx| {
-                        view.write_raw(cmd.as_bytes());
-                    });
-                });
-            (Some(on_run), Some(on_paste))
-        }
-        None => (None, None),
-    };
+    let snippets_on_run =
+        term_cb!(sftp_term, (cmd: String), view => view.write_raw(format!("{}\r", cmd).as_bytes()));
+    let snippets_on_paste =
+        term_cb!(sftp_term, (cmd: String), view => view.write_raw(cmd.as_bytes()));
     snippets_panel.update(cx, |panel, cx| {
         panel.set_state(
             snippets_on_run,
@@ -831,38 +749,7 @@ pub fn render_content(
                 .child(view)
                 .when(
                     panel_show && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
-                    |el| {
-                        // Resize divider handle between terminal and panel.
-                        // A narrow strip with negative margins so it overlaps
-                        // the panel border while remaining grabbable.
-                        let handle_for_resize = handle.clone();
-                        el.child(
-                            div()
-                                .id("panel-resize-handle")
-                                .flex_shrink_0()
-                                .h_full()
-                                .w(px(crate::layouts::panel::PANEL_DIVIDER_HIT * 2.0))
-                                .ml(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
-                                .mr(px(-crate::layouts::panel::PANEL_DIVIDER_HIT))
-                                .cursor_col_resize()
-                                .occlude()
-                                .on_mouse_down(MouseButton::Left, {
-                                    let handle = handle_for_resize.clone();
-                                    let pw = panel_width;
-                                    move |event, _window, cx| {
-                                        handle.update(cx, |app, cx| {
-                                            app.panel_drag =
-                                                Some(crate::layouts::panel::PanelDrag {
-                                                    start_width: pw,
-                                                    start_x: f32::from(event.position.x),
-                                                    width: pw,
-                                                });
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        )
-                    },
+                    |el| el.child(render_panel_divider(handle, panel_width)),
                 )
                 .child({
                     let handle_for_panel = handle.clone();
@@ -917,71 +804,10 @@ pub fn render_content(
                         panel_dragging,
                     )
                 })
-                // Transparent canvas whose paint callback registers
-                // window-level mouse listeners for the panel resize drag.
-                // `window.on_mouse_event` can only be called during paint,
-                // so we need this canvas to hook into the paint phase. The
-                // listeners are registered every frame but no-op when
-                // `panel_drag` is `None`.
-                .child({
-                    let handle_for_canvas = handle.clone();
-                    canvas(
-                        |_bounds, _window, _cx| {},
-                        move |_bounds, _state, window, _cx| {
-                            let handle_for_move = handle_for_canvas.clone();
-                            window.on_mouse_event({
-                                let handle = handle_for_move.clone();
-                                move |event: &MouseMoveEvent, phase, window, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    let _ = handle.update(cx, |app, cx| {
-                                        if let Some(ref mut drag) = app.panel_drag {
-                                            let delta = drag.start_x - f32::from(event.position.x);
-                                            let eff_max =
-                                                crate::layouts::panel::effective_max_panel_width(
-                                                    f32::from(window.viewport_size().width),
-                                                );
-                                            let new_width = (drag.start_width + delta).clamp(
-                                                crate::layouts::panel::MIN_PANEL_WIDTH,
-                                                eff_max,
-                                            );
-                                            if (new_width - drag.width).abs() > 0.01 {
-                                                drag.width = new_width;
-                                                cx.notify();
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                            window.on_mouse_event({
-                                let handle = handle_for_move.clone();
-                                move |_event: &MouseUpEvent, phase, window, cx| {
-                                    if phase != DispatchPhase::Capture {
-                                        return;
-                                    }
-                                    let _ = handle.update(cx, |app, cx| {
-                                        if let Some(drag) = app.panel_drag.take() {
-                                            let eff_max =
-                                                crate::layouts::panel::effective_max_panel_width(
-                                                    f32::from(window.viewport_size().width),
-                                                );
-                                            let _ = crabport_core::config::update(|cfg| {
-                                                cfg.appearance.panel_width = drag.width.clamp(
-                                                    crate::layouts::panel::MIN_PANEL_WIDTH,
-                                                    eff_max,
-                                                );
-                                            });
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            });
-                        },
-                    )
-                    .w_0()
-                    .h_0()
-                }),
+                // Zero-size canvas that registers the window-level mouse
+                // listeners driving the panel resize drag (must hook the
+                // paint phase — see `render_panel_drag_canvas`).
+                .child(render_panel_drag_canvas(handle)),
         )
         .child(render_terminal_toolbar(
             TerminalToolbarInput::new(is_terminal, status, metrics, sftp_progress),
@@ -1182,7 +1008,7 @@ fn render_split_button(
             on_click(w, cx);
             cx.stop_propagation();
         })
-        .transition_on_hover(DURATION_FAST, EASE_STANDARD, move |hovered, el| {
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
             if *hovered {
                 el.bg(hover_bg)
             } else {
