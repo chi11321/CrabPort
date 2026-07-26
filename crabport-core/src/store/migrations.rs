@@ -170,10 +170,8 @@ mod tests {
     /// Also spot-checks that a late migration's column actually exists.
     #[test]
     fn fresh_db_migrates_to_latest_and_reopen_is_noop() {
-        let dir = std::env::temp_dir().join(format!(
-            "crabport-migrations-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("crabport-migrations-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         {

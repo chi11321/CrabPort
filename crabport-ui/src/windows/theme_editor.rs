@@ -503,3 +503,85 @@ impl Render for ThemeEditorWindow {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not `use super::*`: the file glob-imports `gpui::*`,
+    // whose `test` attribute macro would shadow the built-in `#[test]`.
+    use super::{ThemeEditorWindow, theme_fields, theme_groups};
+    use crabport_core::config::ThemeConfig;
+
+    #[test]
+    fn sanitize_id_slugs_and_rejects_empty() {
+        assert_eq!(
+            ThemeEditorWindow::sanitize_id("  My Theme!  ").as_deref(),
+            Some("My-Theme")
+        );
+        assert_eq!(
+            ThemeEditorWindow::sanitize_id("dark_v2").as_deref(),
+            Some("dark_v2")
+        );
+        // Path separators can't escape the themes dir.
+        assert_eq!(
+            ThemeEditorWindow::sanitize_id("../../etc/passwd").as_deref(),
+            Some("etc-passwd")
+        );
+        // CJK names are kept (alphanumeric per char::is_alphanumeric).
+        assert_eq!(
+            ThemeEditorWindow::sanitize_id("我的主题").as_deref(),
+            Some("我的主题")
+        );
+        assert_eq!(ThemeEditorWindow::sanitize_id(""), None);
+        assert_eq!(ThemeEditorWindow::sanitize_id("  "), None);
+        assert_eq!(ThemeEditorWindow::sanitize_id("!!!"), None);
+    }
+
+    /// The field registry must stay in lockstep with `ThemeConfig`: every
+    /// entry's `get`/`get_mut` must address the same field, and
+    /// (group, field) pairs must be unique. Guards against a copy-paste
+    /// slip in the `group!` macro invocations.
+    #[test]
+    fn field_registry_accessors_are_consistent_and_unique() {
+        let defs = theme_fields();
+        let mut cfg = ThemeConfig::modern_dark();
+        let mut seen = std::collections::HashSet::new();
+
+        for (i, def) in defs.iter().enumerate() {
+            assert!(
+                seen.insert((def.group, def.field)),
+                "duplicate registry entry {}.{}",
+                def.group,
+                def.field
+            );
+            let marker = format!("#{i:06x}");
+            *(def.get_mut)(&mut cfg) = marker.clone();
+            assert_eq!(
+                (def.get)(&cfg),
+                &marker,
+                "get/get_mut disagree for {}.{}",
+                def.group,
+                def.field
+            );
+        }
+
+        // Full coverage: after writing through every accessor, serializing
+        // the config must contain every marker (i.e. the registry reaches
+        // every color leaf it claims to).
+        let toml = toml::to_string(&cfg).unwrap();
+        for i in 0..defs.len() {
+            assert!(toml.contains(&format!("#{i:06x}")));
+        }
+    }
+
+    #[test]
+    fn groups_are_ordered_and_nonempty() {
+        let groups = theme_groups();
+        assert_eq!(groups.len(), 12);
+        assert_eq!(groups.first(), Some(&"base"));
+        assert_eq!(groups.last(), Some(&"selection"));
+        let defs = theme_fields();
+        for g in &groups {
+            assert!(defs.iter().any(|d| &d.group == g), "empty group {g}");
+        }
+    }
+}

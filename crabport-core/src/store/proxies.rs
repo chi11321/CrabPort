@@ -146,9 +146,20 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a proxy. Hosts referencing it via `proxy_id` will have their
-    /// `proxy_id` set to NULL (SQLite ON DELETE SET NULL).
+    /// Delete a proxy. Hosts referencing it via `proxy_id` fall back to a
+    /// direct connection (`proxy_id` NULL).
+    ///
+    /// The clearing is done explicitly: the `hosts.proxy_id` FK (migration 6)
+    /// has no `ON DELETE` clause, so with `foreign_keys=ON` deleting a
+    /// still-referenced proxy would otherwise be rejected with a constraint
+    /// error.
     pub fn remove_proxy(&self, id: i64) -> Result<(), StoreError> {
+        self.db
+            .execute(
+                "UPDATE hosts SET proxy_id = NULL WHERE proxy_id = ?1",
+                params![id],
+            )
+            .map_err(|e| StoreError::Db(e.to_string()))?;
         self.db
             .execute("DELETE FROM proxies WHERE id = ?1", params![id])
             .map_err(|e| StoreError::Db(e.to_string()))?;

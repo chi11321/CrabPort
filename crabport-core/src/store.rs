@@ -32,6 +32,9 @@ mod proxies;
 mod snippets;
 mod tunnels;
 
+#[cfg(test)]
+mod tests;
+
 use std::fs;
 use std::path::PathBuf;
 

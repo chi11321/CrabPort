@@ -53,3 +53,82 @@ pub(crate) fn validate_gzip(path: &std::path::Path) -> Result<()> {
     std::io::copy(&mut decoder, &mut sink)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "crabport-archive-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn tar_gz_roundtrip_preserves_layout_and_contents() {
+        let src = tmp_dir("src");
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
+
+        let out = local_tmp_path(".tar.gz");
+        build_tar_gz(src.to_str().unwrap(), "bundle", &out).unwrap();
+
+        // The produced stream is complete, valid gzip.
+        validate_gzip(&out).unwrap();
+
+        // Unpack and verify the top-level entry name + file contents.
+        let dst = tmp_dir("dst");
+        let file = std::fs::File::open(&out).unwrap();
+        let decoder = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(decoder).unpack(&dst).unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("bundle/a.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("bundle/sub/b.txt")).unwrap(),
+            b"world"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn validate_gzip_rejects_garbage_and_truncation() {
+        // Not gzip at all.
+        let garbage = local_tmp_path(".bin");
+        std::fs::write(&garbage, b"just some text, no gzip magic").unwrap();
+        assert!(validate_gzip(&garbage).is_err());
+        let _ = std::fs::remove_file(&garbage);
+
+        // Valid gzip cut short → CRC/size trailer check must fail.
+        let src = tmp_dir("trunc-src");
+        std::fs::write(src.join("f.txt"), vec![b'x'; 65536]).unwrap();
+        let full = local_tmp_path(".tar.gz");
+        build_tar_gz(src.to_str().unwrap(), "t", &full).unwrap();
+        let bytes = std::fs::read(&full).unwrap();
+        let truncated = local_tmp_path(".tar.gz");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(validate_gzip(&truncated).is_err());
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_file(&full);
+        let _ = std::fs::remove_file(&truncated);
+    }
+
+    #[test]
+    fn local_tmp_paths_are_unique_and_carry_suffix() {
+        let a = local_tmp_path(".tar.gz");
+        let b = local_tmp_path(".tar.gz");
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_str().unwrap().starts_with("crabport-"));
+        assert!(a.to_str().unwrap().ends_with(".tar.gz"));
+    }
+}
