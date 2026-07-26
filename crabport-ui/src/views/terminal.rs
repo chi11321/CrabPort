@@ -2005,18 +2005,45 @@ impl Render for TerminalView {
                         let needs_repaint = needs_repaint.clone();
                         let entity = entity.clone();
                         let line_height = line_height;
+                        let cell_width = cell_width;
+                        let last_bounds = last_bounds_c.clone();
+                        let display_offset_mouse = display_offset_mouse.clone();
                         move |event, _window, cx| {
                             let delta = event.delta.pixel_delta(line_height);
                             let dy = delta.y / line_height;
                             if dy.abs() < 0.001 {
                                 return;
                             }
+                            // Shift bypasses alt-screen / mouse-mode
+                            // forwarding so the user can reach the
+                            // scrollback buffer even inside vim / less.
+                            let shift = event.modifiers.shift;
+                            // Compute the pointer's grid cell for
+                            // mouse-mode wheel reports. Fall back to
+                            // (0, 0) if the bounds aren't known yet or
+                            // the pointer is outside the grid.
+                            let cell = if shift {
+                                (0, 0)
+                            } else if let Some(bounds) = *last_bounds.lock() {
+                                let offset = display_offset_mouse.load(Ordering::Relaxed);
+                                mouse_to_grid(
+                                    event.position,
+                                    bounds,
+                                    cell_width,
+                                    line_height,
+                                    offset,
+                                )
+                                .map(|(c, r)| (c, r.max(0) as usize))
+                                .unwrap_or((0, 0))
+                            } else {
+                                (0, 0)
+                            };
                             let _ = entity.update(cx, |this, _cx| {
                                 this.scroll_accumulator += dy;
                                 let lines = this.scroll_accumulator.trunc() as i32;
                                 if lines != 0 {
                                     this.scroll_accumulator -= lines as f32;
-                                    session.scroll(lines);
+                                    session.handle_wheel(lines, cell, shift);
                                 }
                             });
                             // Notify immediately for low-latency scroll feedback;
