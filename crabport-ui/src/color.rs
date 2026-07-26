@@ -387,6 +387,14 @@ pub fn opaque_base_bg() -> Rgba {
     rgb(bg_base())
 }
 
+/// Load `cfg` into the cached [`Theme`] **without** touching `config.toml`.
+/// Used by the Theme Editor for live preview: every window repaints with the
+/// in-progress palette, and a later [`refresh_theme`] (e.g. when the editor
+/// closes without saving) restores the persisted theme.
+pub fn preview_theme(cfg: &ThemeConfig) {
+    *THEME.write() = Theme::from_config(cfg);
+}
+
 /// Re-read the live `config.toml` theme into the cached [`Theme`]. Call this
 /// after mutating `config::update(|cfg| cfg.appearance.theme = ...)` so every
 /// subsequent `color::*()` accessor reflects the new values.

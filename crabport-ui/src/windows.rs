@@ -15,7 +15,9 @@
 pub mod about;
 pub mod registry;
 pub mod settings;
+pub mod theme_editor;
 
 pub use about::AboutWindow;
 pub use registry::{AuxWindowKind, WindowRegistry, focus_or_open};
 pub use settings::SettingsWindow;
+pub use theme_editor::ThemeEditorWindow;

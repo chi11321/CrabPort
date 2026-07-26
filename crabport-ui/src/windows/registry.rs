@@ -20,6 +20,7 @@ use gpui::*;
 pub enum AuxWindowKind {
     Settings,
     About,
+    ThemeEditor,
 }
 
 /// Tracks live auxiliary windows by kind so we can focus existing windows
@@ -85,6 +86,7 @@ pub fn focus_or_open(kind: AuxWindowKind, cx: &mut App) {
     let handle: AnyWindowHandle = match kind {
         AuxWindowKind::Settings => crate::windows::SettingsWindow::open(cx).into(),
         AuxWindowKind::About => crate::windows::AboutWindow::open(cx).into(),
+        AuxWindowKind::ThemeEditor => crate::windows::ThemeEditorWindow::open(cx).into(),
     };
 
     if cx.try_global::<WindowRegistry>().is_none() {
