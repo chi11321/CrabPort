@@ -470,6 +470,16 @@ saved_title = "已保存为代码片段"
 saved_msg = "已将「%{command}」保存到代码片段。"
 save_failed_title = "保存代码片段失败"
 
+[connection_history]
+empty = "暂无连接记录"
+clear = "清空"
+clear_title = "清空连接历史"
+clear_prompt = "确定删除所有连接记录吗？此操作无法撤销。"
+clear_confirm = "全部清空"
+delete = "删除"
+status_success = "成功"
+status_failed = "失败"
+
 [version_check.update_available]
 title = "有可用更新"
 message = "CrabPort 有新版本：%{current} → %{latest}。"

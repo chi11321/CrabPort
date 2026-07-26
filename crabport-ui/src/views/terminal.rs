@@ -146,6 +146,14 @@ pub struct TerminalView {
     telnet_info: Option<TelnetConnectionInfo>,
     serial_info: Option<SerialConnectionInfo>,
     on_backend_closed: Option<Rc<dyn Fn(&mut App)>>,
+    /// Invoked exactly once per connection attempt when the attempt
+    /// resolves: `(true, None)` on the first `Connected` status, or
+    /// `(false, error)` when the backend errors/closes before ever
+    /// connecting (`error` is `None` when the channel closed without an
+    /// error message). The app uses it to record the attempt in the
+    /// persistent connection history. Mirrors the `on_backend_closed`
+    /// callback pattern. Reconnects fire it again (one event per attempt).
+    on_connection_result: Option<Rc<dyn Fn(bool, Option<String>, &mut App)>>,
     /// Invoked when this pane receives keyboard focus, passing this pane's
     /// id. The app uses it to sync `split_trees[tab].active_pane` so splits
     /// and the toolbar follow keyboard focus, not just mouse clicks.
@@ -375,19 +383,39 @@ impl TerminalView {
         // a solid cursor when focused vs. a hollow outline when not focused.
         let is_focused = Arc::new(AtomicBool::new(false));
 
+        // Once-flag for this connection attempt's history event: flipped by
+        // whichever listener resolves the attempt first (wakeup loop on
+        // `Connected`, backend-event loop on error/close before that).
+        let conn_recorded = Arc::new(AtomicBool::new(false));
+
         // Backend error/close events.
         let mut event_rx = session.subscribe_backend();
         let overlay_c = overlay.clone();
         let entity = cx.entity().downgrade();
+        let conn_recorded_ev = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 match event {
                     crabport_terminal::terminal::BackendEvent::Error(err) => {
-                        overlay_c.lock().log(ConnectionLogLevel::Error, err);
-                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        overlay_c.lock().log(ConnectionLogLevel::Error, err.clone());
+                        let _ = entity.update(cx, |this, cx| {
+                            // An error before the first `Connected` means the
+                            // attempt failed — record it. Post-connect errors
+                            // are no-ops here (the flag is already set).
+                            this.fire_connection_result(
+                                &conn_recorded_ev,
+                                false,
+                                Some(err.clone()),
+                                cx,
+                            );
+                            cx.notify();
+                        });
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
                         let _ = entity.update(cx, |this, cx| {
+                            // A close before the first `Connected` (and with
+                            // no prior error) is a silent connect failure.
+                            this.fire_connection_result(&conn_recorded_ev, false, None, cx);
                             if let Some(ref cb) = this.on_backend_closed {
                                 let cb = cb.clone();
                                 cx.defer(move |cx| cb(cx));
@@ -527,14 +555,20 @@ impl TerminalView {
         let history_refreshed = Arc::new(AtomicBool::new(false));
         let history_refreshed_wk = history_refreshed.clone();
         let session_for_refresh = session.clone();
+        let conn_recorded_wk = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
-                let _ = status_entity.update(cx, |this, _cx| {
+                let _ = status_entity.update(cx, |this, cx| {
                     if let Some(m) = this.session.monitor() {
                         let new_status = m.status();
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            // First `Connected` resolves the attempt as a
+                            // success in the connection history.
+                            if new_status == RemoteStatus::Connected {
+                                this.fire_connection_result(&conn_recorded_wk, true, None, cx);
+                            }
                             // Trigger an initial TTY-history read when the
                             // connection first reaches a ready state.
                             if !history_refreshed_wk.swap(true, Ordering::AcqRel)
@@ -686,6 +720,7 @@ impl TerminalView {
             telnet_info,
             serial_info,
             on_backend_closed: None,
+            on_connection_result: None,
             on_focused: None,
             on_split_request: None,
             on_context_menu: None,
@@ -896,6 +931,32 @@ impl TerminalView {
 
     pub fn set_on_backend_closed(&mut self, f: impl Fn(&mut App) + 'static) {
         self.on_backend_closed = Some(Rc::new(f));
+    }
+
+    /// See [`Self::on_connection_result`]. `success` + optional error text.
+    pub fn set_on_connection_result(
+        &mut self,
+        f: impl Fn(bool, Option<String>, &mut App) + 'static,
+    ) {
+        self.on_connection_result = Some(Rc::new(f));
+    }
+
+    /// Fire `on_connection_result` for the current attempt if it hasn't
+    /// fired yet. `recorded` is the per-attempt once-flag shared by the
+    /// backend-event and wakeup listeners of that attempt.
+    fn fire_connection_result(
+        &self,
+        recorded: &Arc<AtomicBool>,
+        success: bool,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(cb) = self.on_connection_result.clone() {
+            cx.defer(move |cx| cb(success, error, cx));
+        }
     }
 
     /// The stable pane id this view was created with (passed as `count` to
@@ -1143,19 +1204,33 @@ impl TerminalView {
 
         self.render_cache.lock().clear_all();
 
+        // Once-flag for this reconnect attempt's history event — a fresh
+        // flag per attempt so each reconnect records its own outcome.
+        let conn_recorded = Arc::new(AtomicBool::new(false));
+
         // Backend events.
         let mut event_rx = session.subscribe_backend();
         let overlay_c = self.overlay.clone();
         let entity = cx.entity().downgrade();
+        let conn_recorded_ev = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 match event {
                     crabport_terminal::terminal::BackendEvent::Error(err) => {
-                        overlay_c.lock().log(ConnectionLogLevel::Error, err);
-                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        overlay_c.lock().log(ConnectionLogLevel::Error, err.clone());
+                        let _ = entity.update(cx, |this, cx| {
+                            this.fire_connection_result(
+                                &conn_recorded_ev,
+                                false,
+                                Some(err.clone()),
+                                cx,
+                            );
+                            cx.notify();
+                        });
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
                         let _ = entity.update(cx, |this, cx| {
+                            this.fire_connection_result(&conn_recorded_ev, false, None, cx);
                             if let Some(ref cb) = this.on_backend_closed {
                                 let cb = cb.clone();
                                 cx.defer(move |cx| cb(cx));
@@ -1270,14 +1345,18 @@ impl TerminalView {
         let history_refreshed = Arc::new(AtomicBool::new(false));
         let history_refreshed_wk = history_refreshed.clone();
         let session_for_refresh = session.clone();
+        let conn_recorded_wk = conn_recorded.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
-                let _ = status_entity.update(cx, |this, _cx| {
+                let _ = status_entity.update(cx, |this, cx| {
                     if let Some(m) = this.session.monitor() {
                         let new_status = m.status();
                         let mut ov = this.overlay.lock();
                         if new_status != ov.status {
                             ov.update_status(new_status, &this.remote_host);
+                            if new_status == RemoteStatus::Connected {
+                                this.fire_connection_result(&conn_recorded_wk, true, None, cx);
+                            }
                             if !history_refreshed_wk.swap(true, Ordering::AcqRel)
                                 && matches!(
                                     new_status,

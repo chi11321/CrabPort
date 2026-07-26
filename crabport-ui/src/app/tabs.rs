@@ -211,6 +211,54 @@ impl CrabportApp {
         id
     }
 
+    /// Wire the persistent connection-history recorder onto a freshly
+    /// created remote terminal view. The view fires the callback exactly
+    /// once per connection attempt (including reconnects), and each firing
+    /// inserts one row into the `connection_history` table with this
+    /// connection's metadata plus the attempt's outcome.
+    fn wire_connection_history(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        name: &str,
+        kind: crabport_core::credential::HostKind,
+        address: &str,
+        port: u16,
+        username: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use crabport_core::store::{ConnectionEvent, ConnectionStatus};
+
+        let store = crate::app_state::AppState::store(cx);
+        let app_handle = cx.entity().downgrade();
+        let history_view = self.app_ctx.history_view.clone();
+        let template = ConnectionEvent {
+            id: 0,
+            name: name.to_string(),
+            kind,
+            address: address.to_string(),
+            port,
+            username: username.to_string(),
+            status: ConnectionStatus::Success,
+            error: None,
+            created_at: 0,
+        };
+        terminal_view.update(cx, |view, _cx| {
+            view.set_on_connection_result(move |success, error, cx| {
+                let mut event = template.clone();
+                event.status = if success {
+                    ConnectionStatus::Success
+                } else {
+                    ConnectionStatus::Failed
+                };
+                event.error = error;
+                let _ = store.lock().add_connection_event(&event);
+                // Repaint so an open History page picks up the new row.
+                history_view.update(cx, |_, cx| cx.notify());
+                let _ = app_handle.update(cx, |_, cx| cx.notify());
+            });
+        });
+    }
+
     pub fn add_ssh_tab(
         &mut self,
         name: &str,
@@ -300,6 +348,18 @@ impl CrabportApp {
                 cx,
             )
         });
+        // Record this connection attempt (and future reconnects) in the
+        // persistent connection history.
+        self.wire_connection_history(
+            &terminal_view,
+            name,
+            crabport_core::credential::HostKind::Ssh,
+            host,
+            port,
+            username,
+            cx,
+        );
+
         // When the SSH session closes, automatically close the tab
         let app_handle = cx.entity().clone();
         terminal_view.update(cx, |view, _cx| {
@@ -513,6 +573,18 @@ impl CrabportApp {
                 cx,
             )
         });
+        // Record this connection attempt (and future reconnects) in the
+        // persistent connection history.
+        self.wire_connection_history(
+            &terminal_view,
+            name,
+            crabport_core::credential::HostKind::Telnet,
+            host,
+            port,
+            username,
+            cx,
+        );
+
         // Auto-close the tab when the telnet session ends.
         let app_handle = cx.entity().clone();
         terminal_view.update(cx, |view, _cx| {
@@ -609,6 +681,19 @@ impl CrabportApp {
                 cx,
             )
         });
+        // Record this connection attempt (and future reconnects) in the
+        // persistent connection history. Serial has no port/username —
+        // the device path is the address, port 0 renders as "—".
+        self.wire_connection_history(
+            &terminal_view,
+            name,
+            crabport_core::credential::HostKind::Serial,
+            device,
+            0,
+            "",
+            cx,
+        );
+
         // Auto-close the tab when the serial session ends.
         let app_handle = cx.entity().clone();
         terminal_view.update(cx, |view, _cx| {

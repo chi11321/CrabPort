@@ -17,6 +17,7 @@
 //! - [`snippets`] — global command-snippet library
 //! - [`tunnels`] — tunnel CRUD
 //! - [`groups`] — shared group CRUD for hosts/snippets/tunnels
+//! - [`history`] — connection-event history (size-capped)
 //!
 //! Schema migrations live in [`migrations`]: one `.sql` file per migration
 //! under `store/migrations/`, registered in an ordered list. See that
@@ -26,11 +27,14 @@
 mod commands;
 mod credentials;
 mod groups;
+mod history;
 mod hosts;
 mod migrations;
 mod proxies;
 mod snippets;
 mod tunnels;
+
+pub use history::{ConnectionEvent, ConnectionStatus};
 
 use std::fs;
 use std::path::PathBuf;
