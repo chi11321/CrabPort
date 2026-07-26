@@ -612,6 +612,15 @@ impl TerminalView {
         cx.spawn(async move |_this, cx| {
             while let Ok(()) = wakeup_rx.recv().await {
                 let _ = status_entity.update(cx, |this, cx| {
+                    // A reconnect swaps `this.session` for a fresh one; this
+                    // loop belongs to a single attempt. Once superseded, go
+                    // inert (the loop exits for good when its own wakeup
+                    // channel closes) so a stale attempt can't mirror status
+                    // into the shared overlay, re-resolve the connection
+                    // result, or refresh history on a dead session.
+                    if !Arc::ptr_eq(&session_for_refresh, &this.session) {
+                        return;
+                    }
                     if let Some(m) = this.session.monitor() {
                         let new_status = m.status();
                         let mut ov = this.overlay.lock();
@@ -1204,8 +1213,28 @@ impl TerminalView {
         let cols: usize = 80;
         let rows: usize = 24;
 
-        let session = Arc::new(TerminalSession::new(backend.clone(), cols, rows));
+        // Carry the command-history buffer over to the fresh session. Split
+        // panes share this `Arc` with their siblings, so the sharing must
+        // survive a reconnect; a standalone pane simply keeps the history it
+        // had before the drop.
+        let history = self.session.command_history_arc();
+        let session = Arc::new(TerminalSession::new_with_shared_history(
+            backend.clone(),
+            cols,
+            rows,
+            history,
+        ));
         session.start();
+
+        // Re-install command-history persistence: the callback lives on the
+        // session, so without this the fresh session would capture commands
+        // in memory but never write them to the Store again.
+        if let Some(hid) = self.host_id {
+            let store_for_cb = crate::app_state::AppState::store(cx);
+            session.set_on_command(Some(std::sync::Arc::new(move |cmd: &str| {
+                let _ = store_for_cb.lock().add_command(hid, cmd);
+            })));
+        }
 
         self.render_cache.lock().clear_all();
 
