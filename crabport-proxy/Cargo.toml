@@ -15,3 +15,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
 rustls-platform-verifier = "0.5"
+
+[dev-dependencies]
+# Async runtime for loopback proxy-handshake tests.
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }

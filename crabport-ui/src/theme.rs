@@ -309,3 +309,21 @@ pub fn save_custom_theme(cfg: &ThemeConfig) -> Result<PathBuf, String> {
     refresh_catalog();
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every embedded theme must parse, and its `name` field must equal its
+    /// catalog id — the Settings dropdown and `config.toml` round-trip
+    /// depend on that equality.
+    #[test]
+    fn builtin_themes_parse_and_names_match_ids() {
+        for (id, label, toml_text) in BUILTIN_THEMES {
+            let cfg: ThemeConfig =
+                toml::from_str(toml_text).unwrap_or_else(|e| panic!("theme {id}: {e}"));
+            assert_eq!(cfg.name, *id, "theme file name must match its id");
+            assert!(!label.is_empty());
+        }
+    }
+}

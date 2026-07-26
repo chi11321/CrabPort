@@ -296,7 +296,7 @@ fn io_err<E: std::fmt::Display>(e: E) -> std::io::Error {
 
 /// Minimal base64 encoder (avoids pulling in the `base64` crate for one
 /// tiny use). RFC 4648 standard alphabet with padding.
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
@@ -321,4 +321,279 @@ fn base64_encode(input: &[u8]) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure helpers + loopback fake-proxy handshakes (no real network)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crabport_core::credential::{ProxyConfig, ProxyKind};
+
+    // ---- base64 ----
+
+    /// RFC 4648 §10 test vectors.
+    #[test]
+    fn base64_rfc4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "input {input:?}");
+        }
+    }
+
+    // ---- PrefixedRead ----
+
+    /// The prefix is yielded before any inner-stream data, and writes pass
+    /// straight through to the inner stream.
+    #[tokio::test]
+    async fn prefixed_read_serves_prefix_then_inner() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut wrapped = PrefixedRead::new(client, b"EARLY".to_vec());
+
+        server.write_all(b"-LATE").await.unwrap();
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 16];
+        while out.len() < 10 {
+            let n = wrapped.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF after {:?}", out);
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, b"EARLY-LATE");
+
+        // Writes bypass the prefix and reach the peer.
+        wrapped.write_all(b"up").await.unwrap();
+        let mut got = [0u8; 2];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"up");
+    }
+
+    /// A read buffer smaller than the prefix drains it across multiple reads.
+    #[tokio::test]
+    async fn prefixed_read_partial_reads() {
+        let (client, _server) = tokio::io::duplex(64);
+        let mut wrapped = PrefixedRead::new(client, b"abcdef".to_vec());
+        let mut buf = [0u8; 4];
+        let n = wrapped.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcd");
+        let n = wrapped.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ef");
+    }
+
+    // ---- direct connect ----
+
+    /// `proxy = None` falls back to a plain TCP connection.
+    #[tokio::test]
+    async fn direct_connect_when_no_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"hello").await.unwrap();
+        });
+
+        let mut stream = connect(&None, "127.0.0.1", port).await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    /// A configured-but-disabled proxy (kind None / empty host) also goes
+    /// direct instead of failing.
+    #[tokio::test]
+    async fn disabled_proxy_goes_direct() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"ok").await.unwrap();
+        });
+
+        let disabled = ProxyConfig {
+            kind: ProxyKind::Socks5,
+            host: String::new(), // empty host → is_enabled() == false
+            port: 1,
+            username: None,
+            password: None,
+        };
+        let mut stream = connect(&Some(disabled), "127.0.0.1", port).await.unwrap();
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+    }
+
+    // ---- HTTP CONNECT ----
+
+    /// Read from `sock` until the header terminator, returning the request.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut req = Vec::new();
+        let mut buf = [0u8; 512];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "client closed before finishing request");
+            req.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(req).unwrap()
+    }
+
+    /// Happy path: CONNECT line + Basic auth header are sent, a 200 reply
+    /// opens the tunnel, and bytes that arrived in the same read as the
+    /// response are not lost.
+    #[tokio::test]
+    async fn http_connect_sends_auth_and_keeps_leftover_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = read_http_request(&mut sock).await;
+            // Tunnel bytes ride along in the same segment as the response.
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nEARLY")
+                .await
+                .unwrap();
+            sock.write_all(b"-DATA").await.unwrap();
+            req
+        });
+
+        let proxy = ProxyConfig {
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port,
+            username: Some("u".into()),
+            password: Some("p".into()),
+        };
+        let mut stream = connect(&Some(proxy), "target.example", 22).await.unwrap();
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 32];
+        while out.len() < 10 {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF after {:?}", out);
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, b"EARLY-DATA");
+
+        let req = server.await.unwrap();
+        assert!(
+            req.starts_with("CONNECT target.example:22 HTTP/1.1\r\n"),
+            "bad request line: {req}"
+        );
+        // base64("u:p") == "dTpw"
+        assert!(
+            req.contains("Proxy-Authorization: Basic dTpw"),
+            "missing auth header: {req}"
+        );
+    }
+
+    /// A non-200 response fails the connect with an error naming the status
+    /// line instead of handing back a dead stream.
+    #[tokio::test]
+    async fn http_connect_non_200_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut sock).await;
+            sock.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let proxy = ProxyConfig {
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port,
+            username: None,
+            password: None,
+        };
+        let err = match connect(&Some(proxy), "target.example", 22).await {
+            Ok(_) => panic!("407 must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("407"), "error was: {err}");
+    }
+
+    // ---- SOCKS5 ----
+
+    /// Minimal RFC 1928 server: no-auth greeting, accept any CONNECT,
+    /// then push `payload` through the tunnel. Returns the target the
+    /// client asked for.
+    async fn fake_socks5(listener: TcpListener, payload: &'static [u8]) -> (String, u16) {
+        let (mut sock, _) = listener.accept().await.unwrap();
+
+        // Greeting: VER NMETHODS METHODS...
+        let mut head = [0u8; 2];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], 0x05, "not SOCKS5");
+        let mut methods = vec![0u8; head[1] as usize];
+        sock.read_exact(&mut methods).await.unwrap();
+        // Select "no authentication required".
+        sock.write_all(&[0x05, 0x00]).await.unwrap();
+
+        // Request: VER CMD RSV ATYP ...
+        let mut req = [0u8; 4];
+        sock.read_exact(&mut req).await.unwrap();
+        assert_eq!(req[1], 0x01, "expected CONNECT");
+        let target = match req[3] {
+            0x01 => {
+                let mut ip = [0u8; 4];
+                sock.read_exact(&mut ip).await.unwrap();
+                format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                sock.read_exact(&mut len).await.unwrap();
+                let mut name = vec![0u8; len[0] as usize];
+                sock.read_exact(&mut name).await.unwrap();
+                String::from_utf8(name).unwrap()
+            }
+            other => panic!("unexpected ATYP {other}"),
+        };
+        let mut port = [0u8; 2];
+        sock.read_exact(&mut port).await.unwrap();
+
+        // Success reply, bound to 0.0.0.0:0.
+        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        sock.write_all(payload).await.unwrap();
+
+        (target, u16::from_be_bytes(port))
+    }
+
+    /// Anonymous SOCKS5 handshake reaches the requested target and the
+    /// returned stream carries tunnel data.
+    #[tokio::test]
+    async fn socks5_no_auth_tunnel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(fake_socks5(listener, b"SOCKS-OK"));
+
+        let proxy = ProxyConfig {
+            kind: ProxyKind::Socks5,
+            host: "127.0.0.1".into(),
+            port,
+            username: None,
+            password: None,
+        };
+        let mut stream = connect(&Some(proxy), "target.example", 2222).await.unwrap();
+        let mut buf = [0u8; 8];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"SOCKS-OK");
+
+        let (target, target_port) = server.await.unwrap();
+        assert_eq!(target, "target.example");
+        assert_eq!(target_port, 2222);
+    }
 }

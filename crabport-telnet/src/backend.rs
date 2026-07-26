@@ -791,4 +791,31 @@ mod tests {
         assert!(r.is_none());
         assert_eq!(al.phase, LoginPhase::Done);
     }
+
+    #[test]
+    fn naws_payload_encodes_big_endian_dimensions() {
+        // 80×24 fits in single bytes; 300 (0x012C) exercises the high byte.
+        assert_eq!(
+            naws_payload(80, 24),
+            [IAC, SB, opt::NAWS, 0, 80, 0, 24, IAC, SE]
+        );
+        assert_eq!(
+            naws_payload(300, 100),
+            [IAC, SB, opt::NAWS, 0x01, 0x2C, 0, 100, IAC, SE]
+        );
+    }
+
+    #[test]
+    fn prompt_scan_only_sees_trailing_window() {
+        // The prompt scanners only look at the last 64 bytes, so a prompt
+        // buried in old output followed by >64 bytes of banner is ignored
+        // (prevents re-triggering auto-login on scrollback).
+        let mut buf = b"login: ".to_vec();
+        buf.extend(std::iter::repeat(b'x').take(100));
+        assert!(!has_login_prompt(&buf));
+
+        // But a prompt within the trailing window is found.
+        buf.extend_from_slice(b"\r\nlogin: ");
+        assert!(has_login_prompt(&buf));
+    }
 }

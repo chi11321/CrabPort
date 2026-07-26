@@ -92,11 +92,12 @@ pub struct StartupConfig {
     pub page: StartupPage,
 }
 
-/// The launch target. Serialized as a single-tagged string
+/// The launch target. Serialized as a single tagged string
 /// (`"home"`, `"sftp"`, `"local_terminal"`, `"session:<id>"`)
-/// so hand-editing `config.toml` stays readable.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+/// so hand-editing `config.toml` stays readable — see the manual
+/// `Serialize`/`Deserialize` impls below, which route through
+/// [`StartupPage::to_id`] / [`StartupPage::from_id`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum StartupPage {
     /// Land on the Home (sessions) tab.
     #[default]
@@ -141,6 +142,44 @@ impl StartupPage {
             }
         }
         StartupPage::Home
+    }
+}
+
+impl Serialize for StartupPage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Single string form: `page = "session:7"` instead of the derive's
+        // `page = { session = 7 }` table — readable and grep-able.
+        s.serialize_str(&self.to_id())
+    }
+}
+
+impl<'de> Deserialize<'de> for StartupPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Accept both the documented string form and the legacy derive form
+        // (`{ session = 7 }`) that earlier builds wrote into config.toml, so
+        // upgrading never resets the user's startup page.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Id(String),
+            Legacy(LegacyStartupPage),
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyStartupPage {
+            Home,
+            Sftp,
+            LocalTerminal,
+            Session(i64),
+        }
+        Ok(match Raw::deserialize(d)? {
+            // Unknown / malformed ids fall back to Home inside from_id.
+            Raw::Id(s) => StartupPage::from_id(&s),
+            Raw::Legacy(LegacyStartupPage::Home) => StartupPage::Home,
+            Raw::Legacy(LegacyStartupPage::Sftp) => StartupPage::Sftp,
+            Raw::Legacy(LegacyStartupPage::LocalTerminal) => StartupPage::LocalTerminal,
+            Raw::Legacy(LegacyStartupPage::Session(id)) => StartupPage::Session(id),
+        })
     }
 }
 
@@ -929,9 +968,27 @@ bg = "#111111"
     /// keeping the file readable and round-tripping through `to_id`/`from_id`.
     #[test]
     fn startup_page_serializes_as_string() {
-        let toml = toml::to_string(&StartupPage::Session(7)).unwrap();
+        let toml = toml::to_string(&StartupConfig {
+            page: StartupPage::Session(7),
+        })
+        .unwrap();
         assert!(toml.contains("\"session:7\""));
-        let back: StartupPage = toml::from_str(&toml).unwrap();
-        assert_eq!(back, StartupPage::Session(7));
+        let back: StartupConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.page, StartupPage::Session(7));
+    }
+
+    /// Deserialization accepts both the string form and the legacy derive
+    /// form (`page = { session = 7 }`) written by earlier builds, and falls
+    /// back to `Home` on unknown ids instead of failing the whole config.
+    #[test]
+    fn startup_page_deserializes_legacy_and_fallback_forms() {
+        let back: StartupConfig = toml::from_str("page = { session = 7 }").unwrap();
+        assert_eq!(back.page, StartupPage::Session(7));
+
+        let back: StartupConfig = toml::from_str("page = \"local_terminal\"").unwrap();
+        assert_eq!(back.page, StartupPage::LocalTerminal);
+
+        let back: StartupConfig = toml::from_str("page = \"whatever\"").unwrap();
+        assert_eq!(back.page, StartupPage::Home);
     }
 }
