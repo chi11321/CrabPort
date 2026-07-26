@@ -126,6 +126,13 @@ pub(crate) async fn measure_latency(handle: &client::Handle<SshHandler>) -> Opti
 /// Collect remote memory stats via `cat /proc/meminfo`.
 async fn collect_memory(handle: &client::Handle<SshHandler>) -> Option<MemoryStats> {
     let output = exec_and_read(handle, "cat /proc/meminfo").await?;
+    parse_meminfo(&output)
+}
+
+/// Parse `/proc/meminfo` output into memory stats. Values are in kB;
+/// `used` is derived as `MemTotal - MemAvailable`. Returns `None` when
+/// `MemTotal` is missing/zero (not a Linux-style meminfo).
+fn parse_meminfo(output: &str) -> Option<MemoryStats> {
     let mut total: u64 = 0;
     let mut available: u64 = 0;
 
@@ -169,14 +176,21 @@ async fn collect_memory(handle: &client::Handle<SshHandler>) -> Option<MemorySta
 /// field — the toolbar only shows the percentage, so carrying the extra
 /// number through `RemoteMetrics` was dead weight.
 async fn collect_cpu(handle: &client::Handle<SshHandler>) -> Option<CpuStats> {
-    let output = exec_and_read(handle, "cat /proc/loadavg").await?;
-    let first = output.split_whitespace().next()?;
-    let load = first.parse::<f32>().ok()?;
-
+    let loadavg = exec_and_read(handle, "cat /proc/loadavg").await?;
     // Try to get CPU count. `nproc` is universally available on Linux;
     // `sysctl -n hw.ncpu` on macOS/BSD. We try both sequentially.
-    let ncpus: f32 = exec_and_read(handle, "nproc 2>/dev/null || sysctl -n hw.ncpu")
-        .await
+    let ncpus = exec_and_read(handle, "nproc 2>/dev/null || sysctl -n hw.ncpu").await;
+    parse_cpu(&loadavg, ncpus.as_deref())
+}
+
+/// Derive the usage percentage from `/proc/loadavg` output plus the raw
+/// CPU-count command output (`None` / unparseable → assume 1 core). See
+/// [`collect_cpu`] for the rationale behind the load-average proxy.
+fn parse_cpu(loadavg: &str, ncpus_raw: Option<&str>) -> Option<CpuStats> {
+    let first = loadavg.split_whitespace().next()?;
+    let load = first.parse::<f32>().ok()?;
+
+    let ncpus: f32 = ncpus_raw
         .and_then(|s| s.trim().parse::<f32>().ok())
         .map(|n| if n > 0.0 { n } else { 1.0 })
         .unwrap_or(1.0);
@@ -193,9 +207,15 @@ async fn collect_cpu(handle: &client::Handle<SshHandler>) -> Option<CpuStats> {
 /// remote server. If the root isn't present (unusual but possible on
 /// BSD/macOS), we fall back to the row with the largest total size.
 async fn collect_disk(handle: &client::Handle<SshHandler>) -> Option<DiskStats> {
+    let output = exec_and_read(handle, "df -kP 2>/dev/null || df -kP /").await?;
+    parse_df(&output)
+}
+
+/// Parse `df -kP` output. Picks the row mounted at `/` (or the largest
+/// filesystem as a fallback) and converts 1KB blocks to bytes.
+fn parse_df(output: &str) -> Option<DiskStats> {
     // `df -kP` headers:
     // Filesystem 1024-blocks Used Available Capacity Mounted on
-    let output = exec_and_read(handle, "df -kP 2>/dev/null || df -kP /").await?;
     // Parse every row into (mount_point, total_bytes, used_bytes).
     let mut rows: Vec<(&str, u64, u64)> = Vec::new();
     for line in output.lines().skip(1) {
@@ -231,6 +251,12 @@ async fn collect_disk(handle: &client::Handle<SshHandler>) -> Option<DiskStats> 
 /// Sums across all interfaces.
 async fn collect_network(handle: &client::Handle<SshHandler>) -> Option<NetworkStats> {
     let output = exec_and_read(handle, "cat /proc/net/dev").await?;
+    parse_net_dev(&output)
+}
+
+/// Parse `/proc/net/dev` output, summing receive/transmit byte counters
+/// across all interfaces.
+fn parse_net_dev(output: &str) -> Option<NetworkStats> {
     let mut bytes_recv: u64 = 0;
     let mut bytes_sent: u64 = 0;
 
@@ -338,4 +364,95 @@ pub(crate) async fn exec_with_status(
     }
 
     (exit_code, String::from_utf8_lossy(&output).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meminfo_parses_total_and_available() {
+        let out = "MemTotal:       16384000 kB\n\
+                   MemFree:         1024000 kB\n\
+                   MemAvailable:    8192000 kB\n\
+                   Buffers:          512000 kB\n";
+        let m = parse_meminfo(out).expect("parses");
+        assert_eq!(m.total, 16_384_000 * 1024);
+        assert_eq!(m.used, (16_384_000 - 8_192_000) * 1024);
+    }
+
+    #[test]
+    fn meminfo_without_total_is_none() {
+        // e.g. a BSD host without /proc — cat prints an error to stderr and
+        // nothing usable on stdout.
+        assert!(parse_meminfo("").is_none());
+        assert!(parse_meminfo("cat: /proc/meminfo: No such file\n").is_none());
+    }
+
+    #[test]
+    fn cpu_usage_is_load_over_cores_clamped() {
+        // load 2.0 on 4 cores → 50%.
+        let c = parse_cpu("2.00 1.50 1.00 2/345 6789\n", Some("4\n")).unwrap();
+        assert!((c.usage_pct - 50.0).abs() < 0.01);
+
+        // Unknown core count assumes 1 core; load 0.5 → 50%.
+        let c = parse_cpu("0.50 0.40 0.30 1/100 42\n", None).unwrap();
+        assert!((c.usage_pct - 50.0).abs() < 0.01);
+
+        // Overload clamps at 100%.
+        let c = parse_cpu("64.0 60.0 55.0 9/999 1\n", Some("2")).unwrap();
+        assert_eq!(c.usage_pct, 100.0);
+
+        // Garbage load → None.
+        assert!(parse_cpu("not-a-number", Some("4")).is_none());
+        assert!(parse_cpu("", Some("4")).is_none());
+    }
+
+    #[test]
+    fn df_prefers_root_mount() {
+        let out = "Filesystem     1024-blocks     Used Available Capacity Mounted on\n\
+                   /dev/sda1         102400      51200     51200      50% /\n\
+                   /dev/sdb1        1024000     102400    921600      10% /data\n";
+        let d = parse_df(out).expect("parses");
+        assert_eq!(d.total, 102_400 * 1024);
+        assert_eq!(d.used, 51_200 * 1024);
+    }
+
+    #[test]
+    fn df_without_root_falls_back_to_largest() {
+        let out = "Filesystem 1024-blocks Used Available Capacity Mounted-on\n\
+                   tank/a          1000  100       900      10% /a\n\
+                   tank/b          9000  900      8100      10% /b\n";
+        let d = parse_df(out).expect("parses");
+        assert_eq!(d.total, 9000 * 1024);
+        assert_eq!(d.used, 900 * 1024);
+    }
+
+    #[test]
+    fn df_with_no_rows_is_none() {
+        assert!(parse_df("Filesystem 1024-blocks Used Available Capacity Mounted on\n").is_none());
+        assert!(parse_df("").is_none());
+    }
+
+    #[test]
+    fn net_dev_sums_all_interfaces() {
+        let out = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:    1000      10    0    0    0     0          0         0     2000      20    0    0    0     0       0          0
+  eth0:    5000      50    0    0    0     0          0         0     7000      70    0    0    0     0       0          0
+";
+        let n = parse_net_dev(out).expect("parses");
+        assert_eq!(n.bytes_recv, 6000);
+        assert_eq!(n.bytes_sent, 9000);
+    }
+
+    #[test]
+    fn net_dev_headers_only_sums_to_zero() {
+        // Header lines carry a ':' inside "Inter-|" — the parser must not
+        // treat them as interface rows.
+        let n = parse_net_dev("Inter-|   Receive\n face |bytes packets\n").unwrap();
+        assert_eq!(n.bytes_recv, 0);
+        assert_eq!(n.bytes_sent, 0);
+    }
 }

@@ -529,3 +529,43 @@ accessors!(
     term_bright_white => term_bright_white,
     selection_bg => selection_bg,
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_accepts_6_and_8_digit_forms() {
+        assert_eq!(parse_hex("#14161c"), Some(0x0014161c));
+        assert_eq!(parse_hex("14161c"), Some(0x0014161c));
+        assert_eq!(parse_hex("  #FFAA00  "), Some(0x00ffaa00));
+        // 8-digit keeps the alpha byte in the low position (0xRRGGBBAA).
+        assert_eq!(parse_hex("#818cf833"), Some(0x818cf833));
+        assert_eq!(parse_hex("00000000"), Some(0x00000000));
+    }
+
+    #[test]
+    fn parse_hex_rejects_everything_else() {
+        for bad in ["", "#", "#fff", "#12345", "#1234567", "#123456789", "zzzzzz", "#gggggg"] {
+            assert_eq!(parse_hex(bad), None, "input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn from_config_falls_back_per_field_on_bad_values() {
+        let fallback = Theme::from_config(&ThemeConfig::modern_dark());
+
+        let mut cfg = ThemeConfig::modern_dark();
+        cfg.base.bg_base = "not-a-color".into(); // malformed
+        cfg.text.text_primary = String::new(); // empty (theme file omitted it)
+        cfg.terminal.red = "#ff0000".into(); // valid override
+
+        let theme = Theme::from_config(&cfg);
+        // Bad/missing fields inherit modern-dark…
+        assert_eq!(theme.bg_base, fallback.bg_base);
+        assert_eq!(theme.text_primary, fallback.text_primary);
+        // …while valid fields apply, and neighbors are unaffected.
+        assert_eq!(theme.term_red, 0x00ff0000);
+        assert_eq!(theme.border, fallback.border);
+    }
+}

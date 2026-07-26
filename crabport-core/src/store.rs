@@ -35,6 +35,8 @@ mod snippets;
 mod tunnels;
 
 pub use history::{ConnectionEvent, ConnectionStatus};
+#[cfg(test)]
+mod tests;
 
 use std::fs;
 use std::path::PathBuf;

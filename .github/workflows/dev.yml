@@ -1,8 +1,9 @@
 name: dev
 
 # Continuous-integration workflow that runs on every push to `dev` and on
-# pull requests. Compiles the `CrabPort` binary for all six platform × arch
-# combinations and uploads each artifact to the workflow run so it can be
+# pull requests. Runs the workspace test suite (see the `test` job) and, in
+# parallel, compiles the `CrabPort` binary for all six platform × arch
+# combinations, uploading each artifact to the workflow run so it can be
 # downloaded for smoke testing without cutting a release.
 #
 # Packaging strategy:
@@ -32,6 +33,58 @@ env:
   RUST_TOOLCHAIN: 1.91.1
 
 jobs:
+  # Runs the whole workspace test suite (store/SQLite, proxy loopback
+  # handshakes, telnet IAC, ssh known_hosts/monitor parsing, sftp archive,
+  # ui pure helpers). A single Linux runner is enough — the tests are
+  # platform-independent — and it runs in parallel with the build matrix so
+  # packaging isn't delayed; a red test still fails the workflow (and the
+  # README badge).
+  test:
+    name: Test (linux-x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # Compiling crabport-ui's tests links gpui, which needs the same
+      # native X11/Wayland/Vulkan/font/audio dev packages as the build job
+      # (minus squashfs-tools, which is only for AppImage packaging).
+      - name: Install Linux system dependencies
+        run: |
+          sudo add-apt-repository -y universe || true
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-randr0-dev \
+            libxcb-keysyms1-dev libxcb-icccm4-dev libxcb-image0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-cursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols \
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libssl-dev pkg-config
+
+      # Separate cache key from the build job: tests compile the debug
+      # profile, so sharing a key would just thrash the release cache.
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-x86_64-cargo-test-
+
+      - name: Run tests
+        run: cargo test --workspace
+
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}

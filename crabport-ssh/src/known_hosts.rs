@@ -192,3 +192,125 @@ fn default_data_dir() -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "data dir"))?;
     Ok(base.join("crabport"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "crabport-known-hosts-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    fn entry(host: &str, port: u16, algo: &str, fp: &str) -> KnownHost {
+        KnownHost {
+            host: host.into(),
+            port,
+            algo: algo.into(),
+            fingerprint: fp.into(),
+        }
+    }
+
+    #[test]
+    fn line_roundtrip_and_malformed_lines() {
+        let e = entry("example.com", 2222, "ssh-ed25519", "SHA256:abc/def+g=");
+        assert_eq!(KnownHost::from_line(&e.to_line()), Some(e));
+
+        // Malformed inputs are rejected, not mis-parsed.
+        assert_eq!(KnownHost::from_line(""), None);
+        assert_eq!(KnownHost::from_line("host-only"), None);
+        assert_eq!(KnownHost::from_line("host\tnot-a-port\talgo\tfp"), None);
+        assert_eq!(KnownHost::from_line("host\t22\talgo"), None); // missing fp
+        assert_eq!(KnownHost::from_line("\t22\talgo\tfp"), None); // empty host
+    }
+
+    #[test]
+    fn tofu_lookup_lifecycle() {
+        let path = tmp_path("lifecycle");
+        let kh = KnownHosts::open_at(path.clone());
+
+        // Unknown host:port → NotFound (ask the user).
+        assert_eq!(
+            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            LookupResult::NotFound
+        );
+
+        // Trust it, then the same key matches.
+        kh.add(&entry("example.com", 22, "ssh-ed25519", "SHA256:aaa"))
+            .unwrap();
+        assert_eq!(
+            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            LookupResult::Matched
+        );
+
+        // Same host, different key → Mismatched with the stored expectation.
+        match kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:EVIL").unwrap() {
+            LookupResult::Mismatched {
+                expected_algo,
+                expected_fingerprint,
+            } => {
+                assert_eq!(expected_algo, "ssh-ed25519");
+                assert_eq!(expected_fingerprint, "SHA256:aaa");
+            }
+            other => panic!("expected Mismatched, got {other:?}"),
+        }
+
+        // Same host on a different port is a separate TOFU decision.
+        assert_eq!(
+            kh.lookup("example.com", 2222, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            LookupResult::NotFound
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_dedups_and_persists_comments_ignored() {
+        let path = tmp_path("dedup");
+        let kh = KnownHosts::open_at(path.clone());
+        let e = entry("h", 22, "ssh-rsa", "SHA256:x");
+        kh.add(&e).unwrap();
+        kh.add(&e).unwrap(); // duplicate insert is a no-op
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents.lines().filter(|l| l.contains("SHA256:x")).count(),
+            1,
+            "duplicate entries must be deduped"
+        );
+        assert!(contents.starts_with('#'), "file keeps its header comment");
+
+        // A fresh handle re-reads the same store (persistence) and the
+        // header/comment lines don't break parsing.
+        let kh2 = KnownHosts::open_at(path.clone());
+        assert_eq!(
+            kh2.lookup("h", 22, "ssh-rsa", "SHA256:x").unwrap(),
+            LookupResult::Matched
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multiple_algorithms_per_host_can_all_match() {
+        let path = tmp_path("multi-algo");
+        let kh = KnownHosts::open_at(path.clone());
+        kh.add(&entry("h", 22, "ssh-ed25519", "SHA256:ed")).unwrap();
+        kh.add(&entry("h", 22, "rsa-sha2-512", "SHA256:rsa")).unwrap();
+
+        assert_eq!(
+            kh.lookup("h", 22, "ssh-ed25519", "SHA256:ed").unwrap(),
+            LookupResult::Matched
+        );
+        assert_eq!(
+            kh.lookup("h", 22, "rsa-sha2-512", "SHA256:rsa").unwrap(),
+            LookupResult::Matched
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+}
