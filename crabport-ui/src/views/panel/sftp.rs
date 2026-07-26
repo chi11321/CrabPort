@@ -5,7 +5,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 use gpui_component::input::InputState;
-use gpui_component::scroll::Scrollbar;
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use rust_i18n::t;
 use rustc_hash::FxHashSet;
@@ -16,6 +15,11 @@ use crate::components::dialog::{AlertController, AlertSeverity, AlertState};
 use crate::components::drop_zone_overlay::DropZoneOverlay;
 use crate::components::input::StyledInput;
 use crate::motion::{EASE_STANDARD, duration_fast};
+use crate::views::sftp::drag::render_drag_chip;
+use crate::views::sftp::pane::{
+    build_entry_rows, cmp_remote_listing, join_remote_path, remote_target_path,
+    render_drag_exit_canvas, render_scrollbar_overlay, render_selection_bar,
+};
 
 /// Drag payload for an SFTP row being dragged within the app.
 /// Dropped onto a terminal area to trigger a download.
@@ -29,34 +33,7 @@ pub struct SftpDragValue {
 impl Render for SftpDragValue {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // A small floating chip showing the file name + icon.
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(px(4.0))
-            .bg(rgb(bg_base()))
-            .border_1()
-            .border_color(rgb(border()))
-            .shadow_sm()
-            .child(
-                svg()
-                    .path(if self.is_dir {
-                        "icons/folder.svg"
-                    } else {
-                        "icons/file.svg"
-                    })
-                    .size_3()
-                    .text_color(rgb(text_muted())),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_primary()))
-                    .child(self.name.clone()),
-            )
+        render_drag_chip(self.is_dir, self.name.clone())
     }
 }
 
@@ -393,16 +370,8 @@ impl SftpPanel {
             .as_ref()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let old_path = if cwd_str.ends_with('/') {
-            format!("{}{}", cwd_str, entry_name)
-        } else {
-            format!("{}/{}", cwd_str, entry_name)
-        };
-        let new_path = if cwd_str.ends_with('/') {
-            format!("{}{}", cwd_str, new_name)
-        } else {
-            format!("{}/{}", cwd_str, new_name)
-        };
+        let old_path = join_remote_path(&cwd_str, &entry_name);
+        let new_path = join_remote_path(&cwd_str, &new_name);
         if let Some(ref cb) = self.on_rename {
             let cb = cb.clone();
             let old = old_path.clone();
@@ -499,25 +468,11 @@ impl SftpPanel {
 
 impl Render for SftpPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Sort entries alphabetically, directories first
-        let mut sorted: Vec<crabport_sftp::FileEntry> = self.entries.iter().cloned().collect();
-        sorted.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
-            (".", _) => std::cmp::Ordering::Less,
-            (_, ".") => std::cmp::Ordering::Greater,
-            ("..", _) => std::cmp::Ordering::Less,
-            (_, "..") => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
-
-        // Prepend .. entry
-        let mut all_entries: Vec<crabport_sftp::FileEntry> = vec![crabport_sftp::FileEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: None,
-            permissions: None,
-            modified: None,
-        }];
-        all_entries.extend(sorted);
+        // Sort entries alphabetically (`.`/`..` first), prepend the `..`
+        // parent row, and precompute the fixed 26px row sizes for the
+        // virtual list — the list never has to measure rows at runtime.
+        let (all_entries, item_sizes) =
+            build_entry_rows(self.entries.iter().cloned().collect(), cmp_remote_listing);
 
         let path_input = self.path_input.clone();
         let entity = _cx.entity().downgrade();
@@ -539,20 +494,6 @@ impl Render for SftpPanel {
             self.context_menu_entry = None;
         }
 
-        // Pre-compute item sizes for the virtual list. All rows share a
-        // fixed height (26px); width is left at 0 so VirtualList uses the
-        // container width. This satisfies the "precompute item sizes"
-        // best practice — the list never has to measure rows at runtime.
-        let item_sizes = Rc::new(
-            all_entries
-                .iter()
-                .map(|_| Size {
-                    width: px(0.0),
-                    height: px(26.0),
-                })
-                .collect::<Vec<_>>(),
-        );
-        let all_entries = Rc::new(all_entries);
         let scroll_handle = self.scroll_handle.clone();
 
         // Clone the action-button callbacks out of `self` so the button
@@ -654,11 +595,7 @@ impl Render for SftpPanel {
                                         .file_name()
                                         .map(|n| n.to_string_lossy().into_owned())
                                         .unwrap_or_else(|| local.to_string_lossy().into_owned());
-                                    let remote = if cwd_str.ends_with('/') {
-                                        format!("{}{}", cwd_str, name)
-                                    } else {
-                                        format!("{}/{}", cwd_str, name)
-                                    };
+                                    let remote = join_remote_path(&cwd_str, &name);
                                     if let Some(ref cb) = on_upload {
                                         cb(local.to_string_lossy().into_owned(), remote, cx);
                                     }
@@ -703,22 +640,7 @@ impl Render for SftpPanel {
 
                                         // Build target path for navigation
                                         let cwd_ref = this.cwd.as_ref().map(|s| s.as_str()).unwrap_or("/");
-                                        let target_path = if name == "." {
-                                            cwd_ref.to_string()
-                                        } else if name == ".." {
-                                            let mut parts: Vec<&str> =
-                                                cwd_ref.split('/').filter(|s| !s.is_empty()).collect();
-                                            parts.pop();
-                                            if parts.is_empty() {
-                                                "/".to_string()
-                                            } else {
-                                                format!("/{}", parts.join("/"))
-                                            }
-                                        } else if cwd_ref.ends_with('/') {
-                                            format!("{}{}", cwd_ref, name)
-                                        } else {
-                                            format!("{}/{}", cwd_ref, name)
-                                        };
+                                        let target_path = remote_target_path(cwd_ref, &name);
 
                                         let on_navigate = this.on_navigate.clone();
                                         let on_download = this.on_download.clone();
@@ -877,11 +799,7 @@ impl Render for SftpPanel {
                                                                         && view.selected.contains(e.name.as_str())
                                                                 })
                                                                 .map(|e| {
-                                                                    let p = if cwd_str.ends_with('/') {
-                                                                        format!("{}{}", cwd_str, e.name)
-                                                                    } else {
-                                                                        format!("{}/{}", cwd_str, e.name)
-                                                                    };
+                                                                    let p = join_remote_path(cwd_str, &e.name);
                                                                     (e.name.clone(), e.is_dir, p)
                                                                 })
                                                                 .collect()
@@ -1130,26 +1048,10 @@ impl Render for SftpPanel {
                                             // via a separate transition so selection
                                             // changes animate smoothly.
                                             .relative()
-                                            .child(
-                                                div()
-                                                    .id(ElementId::Name(format!("sftp-bar-{i}").into()))
-                                                    .absolute()
-                                                    .top(px(2.0))
-                                                    .bottom(px(2.0))
-                                                    .left_0()
-                                                    .w(px(2.0))
-                                                    .rounded(px(1.0))
-                                                    .bg(rgb(btn_primary_bg()))
-                                                    .opacity(0.0)
-                                                    .with_transition(ElementId::Name(format!("sftp-bar-{i}").into()))
-                                                    .transition_when_else(
-                                                        is_selected,
-                                                        duration_fast(),
-                                                        EASE_STANDARD,
-                                                        |el| el.opacity(1.0),
-                                                        |el| el.opacity(0.0),
-                                                    ),
-                                            )
+                                            .child(render_selection_bar(
+                                                format!("sftp-bar-{i}"),
+                                                is_selected,
+                                            ))
                                             .child(
                                                 svg()
                                                     .path(icon_path)
@@ -1196,18 +1098,7 @@ impl Render for SftpPanel {
                         )
                         .track_scroll(&scroll_handle),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.0))
-                            .child(
-                                Scrollbar::vertical(&scroll_handle)
-                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Hover),
-                            ),
-                    )
+                    .child(render_scrollbar_overlay(&scroll_handle))
                     // Drop-zone overlay: shows a translucent hint with icon
                     // when external files are dragged over the list. Fades
                     // in/out with an eased transition.
@@ -1224,29 +1115,14 @@ impl Render for SftpPanel {
                     // can’t catch this because `Exited` is not a `MouseMoveEvent`.
                     .child({
                         let entity = entity_for_list.clone();
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |_bounds, _state, window, _cx| {
-                                window.on_mouse_event({
-                                    let entity = entity.clone();
-                                    move |event: &FileDropEvent, phase, _window, cx| {
-                                        if phase != DispatchPhase::Capture {
-                                            return;
-                                        }
-                                        if matches!(event, FileDropEvent::Exited) {
-                                            let _ = entity.update(cx, |view, cx| {
-                                                if view.drag_over {
-                                                    view.drag_over = false;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    }
-                                });
-                            },
-                        )
-                        .w_0()
-                        .h_0()
+                        render_drag_exit_canvas(move |cx| {
+                            let _ = entity.update(cx, |view, cx| {
+                                if view.drag_over {
+                                    view.drag_over = false;
+                                    cx.notify();
+                                }
+                            });
+                        })
                     })
             )
     }
@@ -1592,11 +1468,7 @@ fn trigger_upload(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| local.to_string_lossy().into_owned());
-                let remote = if cwd.ends_with('/') {
-                    format!("{}{}", cwd, name)
-                } else {
-                    format!("{}/{}", cwd, name)
-                };
+                let remote = join_remote_path(&cwd, &name);
                 on_upload(local.to_string_lossy().into_owned(), remote, cx);
             }
         });
@@ -1624,11 +1496,7 @@ fn trigger_download_from_button(
             .iter()
             .filter(|e| e.name != "." && e.name != ".." && view.selected.contains(e.name.as_str()))
             .map(|e| {
-                let p = if cwd_str.ends_with('/') {
-                    format!("{}{}", cwd_str, e.name)
-                } else {
-                    format!("{}/{}", cwd_str, e.name)
-                };
+                let p = join_remote_path(cwd_str, &e.name);
                 (e.name.clone(), e.is_dir, p)
             })
             .collect::<Vec<_>>()

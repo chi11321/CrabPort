@@ -25,24 +25,26 @@ pub enum ConnectionType {
 }
 
 impl ConnectionType {
-    pub fn label(&self) -> SharedString {
+    /// i18n key stem under `new_connection.` — `label` uses it directly,
+    /// `description` appends `_desc`, so the two can't drift apart.
+    fn key(&self) -> &'static str {
         match self {
-            ConnectionType::LocalTerminal => t!("new_connection.local_terminal").into(),
-            ConnectionType::SSH => t!("new_connection.ssh").into(),
-            ConnectionType::SFTP => t!("new_connection.sftp").into(),
-            ConnectionType::Telnet => t!("new_connection.telnet").into(),
-            ConnectionType::Serial => t!("new_connection.serial").into(),
+            ConnectionType::LocalTerminal => "local_terminal",
+            ConnectionType::SSH => "ssh",
+            ConnectionType::SFTP => "sftp",
+            ConnectionType::Telnet => "telnet",
+            ConnectionType::Serial => "serial",
         }
     }
 
+    pub fn label(&self) -> SharedString {
+        let key = format!("new_connection.{}", self.key());
+        t!(&key).to_string().into()
+    }
+
     pub fn description(&self) -> SharedString {
-        match self {
-            ConnectionType::LocalTerminal => t!("new_connection.local_terminal_desc").into(),
-            ConnectionType::SSH => t!("new_connection.ssh_desc").into(),
-            ConnectionType::SFTP => t!("new_connection.sftp_desc").into(),
-            ConnectionType::Telnet => t!("new_connection.telnet_desc").into(),
-            ConnectionType::Serial => t!("new_connection.serial_desc").into(),
-        }
+        let key = format!("new_connection.{}_desc", self.key());
+        t!(&key).to_string().into()
     }
 
     pub fn icon(&self) -> &'static str {

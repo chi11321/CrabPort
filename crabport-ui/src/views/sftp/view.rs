@@ -21,6 +21,8 @@ use crate::components::host_selector::{HostSelectorOverlay, PanelSide};
 use crate::views::sessions::ConnectionHost;
 use crate::views::terminal::{SftpProgress, TerminalView};
 
+use super::pane::{cmp_dirs_first, join_remote_path};
+
 use crabport_core::credential::{CredentialKind as CoreCredentialKind, HostKind as CoreHostKind};
 use crabport_ssh::backend::SshBackend;
 use crabport_ssh::session::SshConnectionInfo;
@@ -107,39 +109,9 @@ pub(super) struct PanelState {
 }
 
 impl PanelState {
-    fn new_local() -> Self {
+    fn new(host: PanelHost) -> Self {
         Self {
-            host: PanelHost::Local,
-            local_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
-            local_entries: Vec::new(),
-            remote_cwd: None,
-            remote_entries: Arc::new(Vec::new()),
-            path_input: None,
-            last_synced_path: None,
-            show_hidden: false,
-            hovered: None,
-            selected: FxHashSet::default(),
-            context_menu_entry: None,
-            drag_over: false,
-            scroll: VirtualListScrollHandle::new(),
-            renaming: None,
-            rename_input: None,
-            mkdir_pending: None,
-            mkdir_input: None,
-            connect_count: 0,
-            on_navigate: None,
-            on_download: None,
-            on_upload: None,
-            on_upload_batch: None,
-            on_delete: None,
-            on_rename: None,
-            on_edit: None,
-        }
-    }
-
-    fn new_disconnected() -> Self {
-        Self {
-            host: PanelHost::Disconnected,
+            host,
             local_cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
             local_entries: Vec::new(),
             remote_cwd: None,
@@ -202,8 +174,8 @@ pub struct SftpTabView {
 impl SftpTabView {
     pub fn new() -> Self {
         Self {
-            left: PanelState::new_local(),
-            right: PanelState::new_disconnected(),
+            left: PanelState::new(PanelHost::Local),
+            right: PanelState::new(PanelHost::Disconnected),
             context_menu: None,
             alert_controller: None,
             tooltip: None,
@@ -264,11 +236,7 @@ impl SftpTabView {
                 });
             }
         }
-        out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
+        out.sort_by(cmp_dirs_first);
         out
     }
 
@@ -585,12 +553,17 @@ impl SftpTabView {
         panel.last_synced_path = Some(actual);
     }
 
-    // --- Rename helpers (remote) ---
+    // --- Rename helpers (shared by local + remote panels) ---
 
-    pub(super) fn start_remote_rename(
+    /// Begin renaming `entry_name` on a panel. `remote` selects which
+    /// commit path Enter triggers; it is baked into the rename input's
+    /// subscription when the input is first created (mirroring the
+    /// original per-kind start functions).
+    pub(super) fn start_rename(
         &mut self,
         side: PanelSide,
         entry_name: String,
+        remote: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -606,7 +579,11 @@ impl SftpTabView {
                 &entity,
                 move |this, _input, event: &gpui_component::input::InputEvent, cx| {
                     if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_remote_rename(side, cx);
+                        if remote {
+                            this.commit_remote_rename(side, cx);
+                        } else {
+                            this.commit_local_rename(side, cx);
+                        }
                     }
                 },
             )
@@ -614,7 +591,7 @@ impl SftpTabView {
             let blur_handle = entity.read(cx).focus_handle(cx);
             cx.on_blur(&blur_handle, window, move |this, _window, cx| {
                 if this.panel(side).renaming.is_some() {
-                    this.cancel_remote_rename(side, cx);
+                    this.cancel_rename(side, cx);
                 }
             })
             .detach();
@@ -630,12 +607,19 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn commit_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        let new_name = self.panel(side).rename_input.as_ref().and_then(|input| {
+    /// Read the pending rename input's value, or `None` if it's empty
+    /// or the input doesn't exist.
+    fn rename_input_value(&self, side: PanelSide, cx: &App) -> Option<String> {
+        self.panel(side).rename_input.as_ref().and_then(|input| {
             let v = input.read(cx).value().to_string();
             if v.is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else { return };
+        })
+    }
+
+    pub(super) fn commit_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        let Some(new_name) = self.rename_input_value(side, cx) else {
+            return;
+        };
         let panel = self.panel_mut(side);
         let Some(entry_name) = panel.renaming.take() else {
             return;
@@ -664,62 +648,10 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn cancel_remote_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        self.panel_mut(side).renaming = None;
-        cx.notify();
-    }
-
-    // --- Rename helpers (local) ---
-
-    pub(super) fn start_local_rename(
-        &mut self,
-        side: PanelSide,
-        entry_name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = self.panel_mut(side);
-        panel.renaming = Some(entry_name.clone());
-        if panel.rename_input.is_none() {
-            let entity = cx.new(|cx| {
-                let state = InputState::new(window, cx).placeholder("new name");
-                state.focus(window, cx);
-                state
-            });
-            cx.subscribe(
-                &entity,
-                move |this, _input, event: &gpui_component::input::InputEvent, cx| {
-                    if let gpui_component::input::InputEvent::PressEnter { .. } = event {
-                        this.commit_local_rename(side, cx);
-                    }
-                },
-            )
-            .detach();
-            let blur_handle = entity.read(cx).focus_handle(cx);
-            cx.on_blur(&blur_handle, window, move |this, _window, cx| {
-                if this.panel(side).renaming.is_some() {
-                    this.cancel_local_rename(side, cx);
-                }
-            })
-            .detach();
-            panel.rename_input = Some(entity);
-        }
-        let panel = self.panel_mut(side);
-        if let Some(ref input) = panel.rename_input {
-            input.update(cx, |state, cx| {
-                state.set_value(entry_name, window, cx);
-                state.focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
     pub(super) fn commit_local_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
-        let new_name = self.panel(side).rename_input.as_ref().and_then(|input| {
-            let v = input.read(cx).value().to_string();
-            if v.is_empty() { None } else { Some(v) }
-        });
-        let Some(new_name) = new_name else { return };
+        let Some(new_name) = self.rename_input_value(side, cx) else {
+            return;
+        };
         let panel = self.panel_mut(side);
         let Some(entry_name) = panel.renaming.take() else {
             return;
@@ -740,7 +672,9 @@ impl SftpTabView {
         cx.notify();
     }
 
-    pub(super) fn cancel_local_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+    /// Abort an in-progress rename (local or remote) without invoking
+    /// any callback.
+    pub(super) fn cancel_rename(&mut self, side: PanelSide, cx: &mut Context<Self>) {
         self.panel_mut(side).renaming = None;
         cx.notify();
     }
@@ -764,12 +698,7 @@ impl SftpTabView {
         let host = store.lock().find_host(host_id).ok().flatten()?;
 
         // Only SSH hosts support SFTP.
-        let host_kind = match host.kind {
-            CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-            CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-            CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-        };
-        if host_kind != crate::views::sessions::ConnectionKind::SSH {
+        if host.kind != CoreHostKind::Ssh {
             return None;
         }
 
@@ -782,32 +711,7 @@ impl SftpTabView {
                 let app = app.clone();
                 cx.defer(move |cx| {
                     app.update(cx, |a, _cx| {
-                        a.hosts = all
-                            .into_iter()
-                            .map(|h| ConnectionHost {
-                                id: h.id,
-                                name: h.name,
-                                host: h.host,
-                                port: h.port,
-                                username: h.username,
-                                kind: match h.kind {
-                                    CoreHostKind::Ssh => {
-                                        crate::views::sessions::ConnectionKind::SSH
-                                    }
-                                    CoreHostKind::Telnet => {
-                                        crate::views::sessions::ConnectionKind::Telnet
-                                    }
-                                    CoreHostKind::Serial => {
-                                        crate::views::sessions::ConnectionKind::Serial
-                                    }
-                                },
-                                credential_id: h.credential_id,
-                                last_login: h.last_login,
-                                favorite: h.favorite,
-                                proxy_id: h.proxy_id,
-                                group_id: h.group_id,
-                            })
-                            .collect();
+                        a.hosts = all.into_iter().map(ConnectionHost::from).collect();
                     });
                 });
             }
@@ -1441,31 +1345,6 @@ impl CrabPortTab for SftpTabView {
     fn close(&mut self) {
         // Remote terminals are closed when switching hosts or dropping
         // the entity. Nothing extra to do here for the persistent tab.
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Path join helpers (shared with panel.rs / helpers.rs)
-// ---------------------------------------------------------------------------
-
-/// Join a remote path component onto a remote cwd string, handling the
-/// trailing-slash cases. POSIX-style (forward slash).
-pub(super) fn join_remote_path(cwd: &str, name: &str) -> String {
-    if cwd.ends_with('/') {
-        format!("{}{}", cwd, name)
-    } else {
-        format!("{}/{}", cwd, name)
-    }
-}
-
-/// Compute the parent path of a remote cwd string. Returns "/" for root.
-pub(super) fn remote_parent(cwd: &str) -> String {
-    let mut parts: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
-    parts.pop();
-    if parts.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", parts.join("/"))
     }
 }
 

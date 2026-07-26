@@ -1,3 +1,4 @@
+pub mod collection;
 pub mod group_rename;
 pub mod groups;
 pub mod history;

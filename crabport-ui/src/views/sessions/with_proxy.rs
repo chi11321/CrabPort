@@ -1,9 +1,8 @@
-use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::InputState;
 use rust_i18n::t;
 
-use crate::components::input::StyledInput;
+use crate::components::form::text_field;
 use crate::components::tabs::{TabPane, Tabs};
 
 /// Which proxy mode the user picked in the proxy sub-tabs.
@@ -39,7 +38,6 @@ impl ProxyKind {
 #[derive(IntoElement)]
 pub struct WithProxyForm {
     pub proxy_url_input: Entity<InputState>,
-    pub proxy_url_focused: bool,
     pub proxy_kind: ProxyKind,
     /// Per-field validation error for the proxy URL (only relevant when
     /// `proxy_kind == Custom`).
@@ -78,12 +76,12 @@ impl RenderOnce for WithProxyForm {
                     .pane(
                         TabPane::new(
                             t!("connection_form.proxy_custom").to_string(),
-                            div().flex().flex_col().gap_4().child(
-                                StyledInput::new("proxy-url", self.proxy_url_input)
-                                    .label(t!("connection_form.proxy_url").to_string())
-                                    .focused(self.proxy_url_focused)
-                                    .when_some(proxy_url_error, |el, e| el.error(e)),
-                            ),
+                            div().flex().flex_col().gap_4().child(text_field(
+                                "proxy-url",
+                                self.proxy_url_input,
+                                t!("connection_form.proxy_url").to_string(),
+                                proxy_url_error,
+                            )),
                         )
                         .height(px(if has_error { 80.0 } else { 57.0 })),
                     )

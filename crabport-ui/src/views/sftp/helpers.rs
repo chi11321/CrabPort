@@ -14,7 +14,8 @@ use crate::color::*;
 use crate::components::context_menu::{ContextMenuItem, ContextMenuState};
 use crate::motion::{EASE_STANDARD, duration_fast};
 
-use super::view::{SftpTabView, join_remote_path};
+use super::pane::join_remote_path;
+use super::view::SftpTabView;
 use crate::components::host_selector::PanelSide;
 
 // ---------------------------------------------------------------------------
@@ -52,10 +53,7 @@ pub(super) fn render_panel_ellipsis_button(
     on_upload_batch: Option<Rc<dyn Fn(Vec<(String, String)>, &mut App)>>,
     cwd: Option<Arc<String>>,
 ) -> impl IntoElement {
-    let id_prefix = match side {
-        PanelSide::Left => "sftp-tab-left",
-        PanelSide::Right => "sftp-tab-right",
-    };
+    let id_prefix = super::pane::tab_id_prefix(side);
     let btn_id = ElementId::Name(format!("{id_prefix}-ellipsis-btn").into());
     // Resting background is a faint surface tint (alpha ~30%) rather than
     // fully transparent — the panel reads better with a visible button.

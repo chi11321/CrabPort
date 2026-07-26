@@ -74,11 +74,10 @@ impl AlertSeverity {
         }
     }
 
-    /// Icon path for the leading icon.
+    /// Icon path for the leading icon (same alert glyph for every severity;
+    /// the accent color does the differentiating).
     fn icon(self) -> &'static str {
-        match self {
-            Self::Info | Self::Warning | Self::Danger => "icons/circle-alert.svg",
-        }
+        "icons/circle-alert.svg"
     }
 }
 
