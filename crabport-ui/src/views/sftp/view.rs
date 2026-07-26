@@ -764,12 +764,7 @@ impl SftpTabView {
         let host = store.lock().find_host(host_id).ok().flatten()?;
 
         // Only SSH hosts support SFTP.
-        let host_kind = match host.kind {
-            CoreHostKind::Ssh => crate::views::sessions::ConnectionKind::SSH,
-            CoreHostKind::Telnet => crate::views::sessions::ConnectionKind::Telnet,
-            CoreHostKind::Serial => crate::views::sessions::ConnectionKind::Serial,
-        };
-        if host_kind != crate::views::sessions::ConnectionKind::SSH {
+        if host.kind != CoreHostKind::Ssh {
             return None;
         }
 
@@ -782,32 +777,7 @@ impl SftpTabView {
                 let app = app.clone();
                 cx.defer(move |cx| {
                     app.update(cx, |a, _cx| {
-                        a.hosts = all
-                            .into_iter()
-                            .map(|h| ConnectionHost {
-                                id: h.id,
-                                name: h.name,
-                                host: h.host,
-                                port: h.port,
-                                username: h.username,
-                                kind: match h.kind {
-                                    CoreHostKind::Ssh => {
-                                        crate::views::sessions::ConnectionKind::SSH
-                                    }
-                                    CoreHostKind::Telnet => {
-                                        crate::views::sessions::ConnectionKind::Telnet
-                                    }
-                                    CoreHostKind::Serial => {
-                                        crate::views::sessions::ConnectionKind::Serial
-                                    }
-                                },
-                                credential_id: h.credential_id,
-                                last_login: h.last_login,
-                                favorite: h.favorite,
-                                proxy_id: h.proxy_id,
-                                group_id: h.group_id,
-                            })
-                            .collect();
+                        a.hosts = all.into_iter().map(ConnectionHost::from).collect();
                     });
                 });
             }
