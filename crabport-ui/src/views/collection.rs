@@ -378,10 +378,23 @@ pub fn render_grouped_list<V: GroupedListView>(
                 .pb_2()
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(text_primary()))
-                        .child(t!(V::TITLE_KEY).to_string()),
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(text_primary()))
+                                .child(t!(V::TITLE_KEY).to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_muted()))
+                                .child(format!("· {}", items.len())),
+                        ),
                 )
                 .child(
                     Button::new(V::NEW_BUTTON_ID)
@@ -411,9 +424,23 @@ pub fn render_grouped_list<V: GroupedListView>(
                     |el| {
                         el.flex().items_center().justify_center().child(
                             div()
-                                .text_color(rgb(text_muted()))
-                                .text_sm()
-                                .child(t!(V::EMPTY_KEY).to_string()),
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    svg()
+                                        .path("icons/folder.svg")
+                                        .size_8()
+                                        .text_color(rgb(text_muted()))
+                                        .opacity(0.5),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(text_muted()))
+                                        .child(t!(V::EMPTY_KEY).to_string()),
+                                ),
                         )
                     },
                     |el| {

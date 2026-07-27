@@ -14,6 +14,7 @@ use crate::components::context_menu::{
 };
 use crate::components::dialog::AlertController;
 use crate::components::list_row::{favorite_star, interactive_row};
+use crate::motion::RADIUS_SM;
 use crate::views::collection::{GroupedListView, render_grouped_list};
 use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
@@ -30,6 +31,20 @@ pub mod with_certificate;
 pub mod with_proxy;
 
 pub use form::{AuthKind, ConnectionFormState, ConnectionFormView, ConnectionKind};
+
+/// Color accents for the kind badge (subtle tint, not the full primary
+/// blue). Read live from the theme so a preset switch recolors the badges
+/// too. Mirrors `views::tunnels` so the three grouped-list views share the
+/// same row visual language.
+fn kind_ssh_color() -> u32 {
+    term_blue()
+}
+fn kind_telnet_color() -> u32 {
+    term_magenta()
+}
+fn kind_serial_color() -> u32 {
+    term_yellow()
+}
 
 /// A saved connection host entry.
 #[derive(Clone)]
@@ -309,23 +324,54 @@ fn host_row(
 
     let on_connect_for_dblclick = on_connect.clone();
 
-    // Host info (name + address)
+    // Kind badge label + accent color. Serial uses "R" (serial port)
+    // rather than "S" so it doesn't collide with SSH at a single glance.
+    let (kind_letter, kind_color) = match host.kind {
+        ConnectionKind::SSH => ("S", kind_ssh_color()),
+        ConnectionKind::Telnet => ("T", kind_telnet_color()),
+        ConnectionKind::Serial => ("R", kind_serial_color()),
+    };
+
+    // Host info (kind badge + name + address)
     let info = div()
         .flex()
-        .flex_col()
+        .flex_row()
+        .items_start()
+        .gap_2()
         .min_w_0()
         .flex_1()
+        // Kind badge (single letter, color-coded)
         .child(
             div()
-                .text_sm()
-                .text_color(rgb(text_primary()))
-                .child(host.name.clone()),
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_5()
+                .rounded(RADIUS_SM)
+                .bg(rgba((kind_color << 8) | 0x22))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(kind_color))
+                .child(kind_letter.to_string()),
         )
         .child(
             div()
-                .text_xs()
-                .text_color(rgb(text_muted()))
-                .child(format!("{}@{}:{}", host.username, host.host, host.port)),
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(host.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .child(format!("{}@{}:{}", host.username, host.host, host.port)),
+                ),
         )
         .into_any_element();
 

@@ -34,6 +34,7 @@ use crate::components::context_menu::{
 };
 use crate::components::dialog::AlertController;
 use crate::components::list_row::{favorite_star, interactive_row};
+use crate::motion::RADIUS_SM;
 use crate::views::collection::{GroupedListView, render_grouped_list};
 use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
@@ -43,6 +44,14 @@ use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
 pub mod form;
 pub use form::{SnippetFormOutput, SnippetFormState, SnippetFormView};
+
+/// Color accent for the snippet kind badge. Uses `term_cyan()` so the
+/// Snippets view reads visually distinct from Sessions (blue/magenta/
+/// yellow) and Tunnels (blue/magenta/yellow) — all three grouped-list
+/// views share the same badge shape but a different palette slot.
+fn snippet_badge_color() -> u32 {
+    term_cyan()
+}
 
 /// A snippet row shown in the management list.
 #[derive(Clone)]
@@ -270,30 +279,55 @@ fn snippet_row(
     let is_favorite = snippet.favorite;
     let is_highlighted = is_hovered || force_highlight;
 
-    // Snippet info (name + command)
-    let info =
-        div()
-            .flex()
-            .flex_col()
-            .min_w_0()
-            .flex_1()
-            .child(div().text_sm().text_color(rgb(text_primary())).child(
-                if snippet.name.is_empty() {
-                    snippet_command.clone()
-                } else {
-                    snippet.name.clone()
-                },
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(text_muted()))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(snippet_command.clone()),
-            )
-            .into_any_element();
+    // Snippet info (kind badge + name + command). Snippets don't have a
+    // "kind" enum, so the badge uses a single consistent "#" glyph
+    // (evokes snippet/command) tinted with `term_cyan()`.
+    let badge_color = snippet_badge_color();
+    let info = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap_2()
+        .min_w_0()
+        .flex_1()
+        // Kind badge (single glyph, color-coded)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_5()
+                .rounded(RADIUS_SM)
+                .bg(rgba((badge_color << 8) | 0x22))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(badge_color))
+                .child("#".to_string()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .flex_1()
+                .child(div().text_sm().text_color(rgb(text_primary())).child(
+                    if snippet.name.is_empty() {
+                        snippet_command.clone()
+                    } else {
+                        snippet.name.clone()
+                    },
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(snippet_command.clone()),
+                ),
+        )
+        .into_any_element();
 
     let star = favorite_star(
         "snippet",
