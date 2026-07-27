@@ -403,7 +403,6 @@ impl RenderOnce for Button {
             move |this| {
                 this.bg(to_color(bg_disabled))
                     .text_color(to_color(text_disabled))
-                    .cursor_not_allowed()
             },
             move |this| {
                 this.text_color(rgb(text_primary()))

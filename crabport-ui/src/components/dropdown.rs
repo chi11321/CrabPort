@@ -279,7 +279,7 @@ impl RenderOnce for Dropdown {
             }))
             .border_1()
             .border_color(rgb(border()))
-            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
+            .when(disabled, |el| el.opacity(0.5))
             .child(
                 div()
                     .text_sm()

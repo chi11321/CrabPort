@@ -502,7 +502,6 @@ fn render_menu_item(idx: usize, item: ContextMenuItem) -> impl IntoElement {
                 })
             })
         })
-        .when(disabled, |el| el.cursor_not_allowed())
         .when_some(icon, |el, path| {
             el.child(
                 svg()
