@@ -74,24 +74,45 @@ pub fn render_sidebar(
 
 /// Compact app wordmark header at the top of the sidebar.
 ///
-/// A small terminal-prompt mark + `CRABPORT` wordmark in a ~32px row, with a
-/// hairline divider below. Sits below the macOS traffic-light padding on
-/// macOS (so it isn't hidden under the native buttons) and at the very top
-/// on Windows/Linux to fix the otherwise-empty sidebar top. Purely visual —
-/// no `on_click`.
+/// A crab emoji + `CRABPORT` wordmark in a 44px row (matching the tab bar
+/// / title bar height), with a hairline divider below. Only rendered on
+/// Windows/Linux, where it fills the otherwise-empty sidebar top and
+/// doubles as a window-drag region (mirrors the tab bar's drag behavior).
 fn wordmark_header() -> impl IntoElement {
     div()
         .flex()
         .flex_col()
         .gap_2()
         .child(
-            // Wordmark row — height matches the nav buttons' visual weight.
+            // Wordmark row — matches the tab bar height (h_11 = 44px) so the
+            // sidebar top reads as a continuation of the title bar.
+            //
+            // On Windows/Linux this row doubles as a window-drag region so
+            // the user can grab it to move the window, and double-click to
+            // maximize — mirroring `render_tab_bar`. Two mechanisms work
+            // together: `window_control_area(Drag)` lets Windows'
+            // `WM_NCHITTEST` return `HTCAPTION` (native drag + double-click);
+            // `start_window_move` handles Linux (`_NET_WM_MOVERESIZE` /
+            // `xdg_toplevel._move`). macOS is excluded because it uses the
+            // native transparent title bar instead.
             div()
-                .h_8()
+                .id("sidebar-wordmark")
+                .h_11()
                 .px_2()
                 .flex()
                 .items_center()
                 .gap_2()
+                .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, _cx| {
+                    crate::components::window_controls::start_window_move(window);
+                })
+                .on_mouse_up(MouseButton::Left, |event: &MouseUpEvent, window, _| {
+                    if event.click_count == 2 {
+                        crate::components::window_controls::toggle_maximize(window);
+                    }
+                })
+                .when(cfg!(not(target_os = "macos")), |el| {
+                    el.window_control_area(WindowControlArea::Drag).occlude()
+                })
                 .child(
                     // Crab emoji as the brand mark — Crabport = Crab + port.
                     // No `.text_color` override so the emoji keeps its native

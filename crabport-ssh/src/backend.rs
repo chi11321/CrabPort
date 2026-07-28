@@ -9,6 +9,7 @@ use russh::{
     client::{self, Msg},
 };
 use tokio::task::AbortHandle;
+use tokio::time::interval;
 use tokio::{select, sync::Mutex as TokioMutex};
 
 use crabport_core::credential::{ProxyConfig, build_startup_command_bytes};
@@ -456,6 +457,16 @@ impl SshBackend {
                 monitor_loop(handle_for_monitor, info, monitor_for_task).await;
             });
 
+            // ---- Keepalive (heartbeat) ----
+            // Read the interval once per connection: changing the setting
+            // applies to the NEXT connection, not this one. `None` disables
+            // probing entirely (the select! arm stays pending forever).
+            let keepalive = crabport_core::config::snapshot()
+                .appearance
+                .terminal
+                .effective_keepalive();
+            let mut ticker = keepalive.map(|d| interval(d));
+
             // ---- Event loop (read + cmd via tokio::select!) ----
             loop {
                 select! {
@@ -537,6 +548,33 @@ impl SshBackend {
                                 let _ = event_tx2.broadcast(BackendEvent::Closed).await;
                                 return;
                             }
+                        }
+                    }
+                    // Keepalive probe — fires on the configured interval.
+                    // When keepalive is disabled (`ticker == None`) the arm
+                    // awaits `pending()` forever, so it adds no overhead.
+                    _ = async {
+                        match &mut ticker {
+                            Some(t) => {
+                                t.tick().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        // A no-op window-change request exercises the
+                        // channel's send path: if the underlying transport
+                        // is dead, `send_msg` fails locally and we treat
+                        // the connection as disconnected.
+                        if let Err(_e) = channel.window_change(0, 0, 0, 0).await {
+                            tracing::warn!(
+                                "SSH: keepalive probe failed: {_e} — treating as disconnected"
+                            );
+                            {
+                                let mut m = monitor2.write();
+                                m.status = RemoteStatus::Disconnected;
+                            }
+                            let _ = event_tx2.broadcast(BackendEvent::Closed).await;
+                            return;
                         }
                     }
                 }

@@ -365,6 +365,16 @@ impl TelnetBackend {
             let mut data_out: Vec<u8> = Vec::with_capacity(8192);
             let mut neg_out: Vec<u8> = Vec::with_capacity(256);
 
+            // ---- Keepalive (heartbeat) ----
+            // Read the interval ONCE per connection. None => disabled, in
+            // which case the keepalive branch below never fires (it parks on
+            // `pending`).
+            let keepalive = crabport_core::config::snapshot()
+                .appearance
+                .terminal
+                .effective_keepalive();
+            let mut ticker = keepalive.map(tokio::time::interval);
+
             loop {
                 select! {
                     // ---- Socket read ----
@@ -464,6 +474,35 @@ impl TelnetBackend {
                                 return;
                             }
                         }
+                    }
+
+                    // ---- Keepalive probe (IAC NOP) ----
+                    // Fires every `keepalive` interval. When disabled (None),
+                    // the branch parks on `pending` so it never wakes.
+                    _ = async {
+                        match &mut ticker {
+                            Some(t) => {
+                                t.tick().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        // Send IAC NOP (No-Operation) as a keepalive probe.
+                        // A write failure means the TCP connection is dead.
+                        const NOP: [u8; 2] = [0xFF, 0xF1]; // IAC + NOP
+                        if let Err(_e) = stream.write_all(&NOP).await {
+                            tracing::warn!(
+                                "telnet: keepalive probe failed: {_e} — treating as disconnected"
+                            );
+                            flush_data(&event_tx2, &mut data_out).await;
+                            {
+                                let mut m = monitor2.write();
+                                m.status = RemoteStatus::Disconnected;
+                            }
+                            let _ = event_tx2.broadcast(BackendEvent::Closed).await;
+                            return;
+                        }
+                        let _ = stream.flush().await;
                     }
                 }
             }
