@@ -165,6 +165,7 @@ pub fn render_content(
                                 app.switch_sftp_panel_host(id, w, cx)
                             })),
                             Some(app_cb1(handle, |app, id, w, cx| app.edit_host(id, w, cx))),
+                            Some(app_cb1(handle, |app, id, w, cx| app.clone_host(id, w, cx))),
                             Some(app_cb1(handle, |app, id, _w, cx| app.remove_host(id, cx))),
                             context_menu.clone(),
                             alert_controller.clone(),

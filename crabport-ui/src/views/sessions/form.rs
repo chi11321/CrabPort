@@ -8,9 +8,10 @@ use super::with_certificate::WithCertificateForm;
 use super::with_proxy::{ProxyKind, WithProxyForm};
 use crate::app::CrabportApp;
 use crate::color::*;
+use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::form::{
-    form_dialog, form_footer, form_title, group_dropdown, label_column, password_field, text_field,
+    form_dialog, form_title, group_dropdown, label_column, password_field, text_field,
 };
 use crate::components::overlay::render_overlay;
 use crate::components::tabs::{TabPane, Tabs};
@@ -159,6 +160,12 @@ pub struct ConnectionFormState {
     pub errors: ValidationErrors,
     pub on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     pub on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+    /// Save-only callback (no connect). Wired for the New / Clone flows so
+    /// the form can offer a `Save` button alongside `Connect`. When invoked
+    /// the host is persisted but no terminal tab is opened. `None` for the
+    /// Edit flow, which already persists on submit and has no separate
+    /// connect action.
+    pub on_save: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 }
 
 impl ConnectionFormState {
@@ -228,6 +235,7 @@ impl ConnectionFormState {
             errors: ValidationErrors::default(),
             on_close: None,
             on_connect: None,
+            on_save: None,
         }
     }
 
@@ -513,6 +521,7 @@ pub struct ConnectionFormView {
     app: Entity<CrabportApp>,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+    on_save: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
 }
 
 impl ConnectionFormView {
@@ -553,6 +562,7 @@ impl ConnectionFormView {
             app,
             on_close: state.on_close.clone(),
             on_connect: state.on_connect.clone(),
+            on_save: state.on_save.clone(),
         }
     }
 }
@@ -609,6 +619,7 @@ fn render_dialog(view: ConnectionFormView, cx: &App) -> impl IntoElement {
         app,
         on_close,
         on_connect,
+        on_save,
     } = view;
 
     let auth_active_index = match auth_kind {
@@ -1069,7 +1080,7 @@ fn render_dialog(view: ConnectionFormView, cx: &App) -> impl IntoElement {
         div()
             .p_6()
             .pt_2()
-            .child(render_buttons(editing, kind, on_close, on_connect)),
+            .child(render_buttons(editing, kind, on_close, on_connect, on_save)),
     )
 }
 
@@ -1421,28 +1432,55 @@ fn render_buttons(
     kind: ConnectionKind,
     on_close: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
     on_connect: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
-) -> impl IntoElement {
+    on_save: Option<Rc<dyn Fn(ConnectionKind, &mut Window, &mut App) + 'static>>,
+) -> Div {
     let overlay_id = ElementId::Name("conn-form-overlay".into());
     let dialog_id = ElementId::Name("conn-form-dialog".into());
+    // New / Clone flow offers Save (persist without connecting) alongside
+    // Connect (persist + open a terminal tab). Edit flow only has Save
+    // (persist updates to the existing host).
     let confirm_label = if editing {
         t!("connection_form.save").to_string()
     } else {
         t!("connection_form.connect").to_string()
     };
-    form_footer(
-        "conn-cancel",
-        t!("connection_form.cancel").to_string(),
-        on_close,
-        "conn-connect",
-        confirm_label,
-        move |_e, w, cx| {
-            if !editing {
-                gpui_animation::reset_transition(&overlay_id);
-                gpui_animation::reset_transition(&dialog_id);
-            }
-            if let Some(ref cb) = on_connect {
-                cb(kind, w, cx);
-            }
-        },
+    let mut footer = div().flex().flex_row().gap_3().justify_end().child(
+        Button::new("conn-cancel")
+            .centered(true)
+            .child(t!("connection_form.cancel").to_string())
+            .on_click(move |_e, w, cx| {
+                if let Some(ref cb) = on_close {
+                    cb(w, cx);
+                }
+            }),
+    );
+    // Save (persist-only) button: shown for the New / Clone flow, hidden
+    // for Edit (Edit's primary button already saves).
+    if !editing {
+        footer = footer.child(
+            Button::new("conn-save")
+                .centered(true)
+                .child(t!("connection_form.save").to_string())
+                .on_click(move |_e, w, cx| {
+                    if let Some(ref cb) = on_save {
+                        cb(kind, w, cx);
+                    }
+                }),
+        );
+    }
+    footer.child(
+        Button::new("conn-connect")
+            .primary()
+            .centered(true)
+            .child(confirm_label)
+            .on_click(move |_e, w, cx| {
+                if !editing {
+                    gpui_animation::reset_transition(&overlay_id);
+                    gpui_animation::reset_transition(&dialog_id);
+                }
+                if let Some(ref cb) = on_connect {
+                    cb(kind, w, cx);
+                }
+            }),
     )
 }

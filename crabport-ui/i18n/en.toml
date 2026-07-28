@@ -271,6 +271,7 @@ local_entry_desc = "Browse local filesystem"
 
 [hosts]
 edit = "Edit"
+clone = "Clone"
 delete = "Delete"
 connect = "Connect"
 connect_sftp = "Open in SFTP"

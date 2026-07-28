@@ -112,6 +112,9 @@ pub struct SessionsView {
     /// Only called for SSH hosts.
     on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    /// Clone a host: open the form pre-filled from the source host, in create
+    /// mode (a new row will be inserted on save).
+    on_clone: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Per-group collapse state for the grouped list.
     collapsed_groups: HashSet<i64>,
@@ -133,6 +136,7 @@ impl SessionsView {
             on_connect: None,
             on_sftp_connect: None,
             on_edit: None,
+            on_clone: None,
             on_remove: None,
             collapsed_groups: HashSet::new(),
             group_rename: GroupRenameState::new(),
@@ -149,6 +153,7 @@ impl SessionsView {
         on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+        on_clone: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         context_menu: Entity<ContextMenuController>,
         alert_controller: Entity<AlertController>,
@@ -166,6 +171,7 @@ impl SessionsView {
         self.on_connect = on_connect;
         self.on_sftp_connect = on_sftp_connect;
         self.on_edit = on_edit;
+        self.on_clone = on_clone;
         self.on_remove = on_remove;
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
@@ -244,6 +250,7 @@ impl GroupedListView for SessionsView {
     ) -> AnyElement {
         let host_id = host.id;
         let on_edit = self.on_edit.clone();
+        let on_clone = self.on_clone.clone();
         let on_remove = self.on_remove.clone();
         host_row(
             host,
@@ -258,6 +265,11 @@ impl GroupedListView for SessionsView {
             self.on_sftp_connect.clone(),
             move |w, cx| {
                 if let Some(ref cb) = on_edit {
+                    cb(host_id, w, cx);
+                }
+            },
+            move |w, cx| {
+                if let Some(ref cb) = on_clone {
                     cb(host_id, w, cx);
                 }
             },
@@ -300,6 +312,7 @@ fn host_row(
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    on_clone: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     // The favorites bucket renders the same host a second time (the item
@@ -409,6 +422,7 @@ fn host_row(
             // triggered the menu so it stays highlighted while it's open.
             .on_mouse_down(MouseButton::Right, {
                 let on_edit = Rc::new(on_edit);
+                let on_clone = Rc::new(on_clone);
                 let on_remove = Rc::new(on_remove);
                 move |event, _w, cx| {
                     let Some(ref cm) = context_menu else {
@@ -422,6 +436,7 @@ fn host_row(
                     });
                     let pos = event.position;
                     let on_edit = on_edit.clone();
+                    let on_clone = on_clone.clone();
                     let on_remove = on_remove.clone();
                     let on_connect = on_connect.clone();
                     let on_sftp_connect = on_sftp_connect.clone();
@@ -482,6 +497,15 @@ fn host_row(
                             let on_edit = on_edit.clone();
                             move |w, cx| {
                                 on_edit(w, cx);
+                            }
+                        }));
+
+                        // Clone (open the form pre-filled from this host,
+                        // in create mode so a new row is inserted on save).
+                        items.push(ContextMenuItem::new(t!("hosts.clone").to_string(), {
+                            let on_clone = on_clone.clone();
+                            move |w, cx| {
+                                on_clone(w, cx);
                             }
                         }));
 

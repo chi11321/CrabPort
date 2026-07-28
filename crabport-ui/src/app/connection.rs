@@ -56,215 +56,23 @@ impl CrabportApp {
             }
         }));
 
+        // Save (persist without connecting). The New / Clone flow offers
+        // this as a secondary button so users can stockpile host configs
+        // without immediately opening a terminal.
+        form.on_save = Some(Rc::new({
+            let a = app.clone();
+            move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    app.save_new_host_from_form(kind, false, cx);
+                });
+            }
+        }));
+
         form.on_connect = Some(Rc::new({
             let a = app.clone();
             move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
                 a.update(cx, |app, cx| {
-                    // Validate required fields before doing anything. If the
-                    // form is invalid, per-field errors are shown and a toast
-                    // is surfaced; the save/connect flow is aborted.
-                    if !app.validate_connection_form(cx) {
-                        return;
-                    }
-                    // Read form values directly from state
-                    let (
-                        name,
-                        host,
-                        port_num,
-                        username,
-                        password,
-                        passphrase,
-                        auth_kind,
-                        private_key,
-                        private_key_kind,
-                        proxy_config,
-                        startup_command,
-                        jump_host_id,
-                    ) = {
-                        let f = app.connection_form.as_ref().unwrap();
-                        let n = f.name_text(cx);
-                        let h = f.host_text(cx);
-                        let p: u16 = f.port_text(cx).parse().unwrap_or(22);
-                        let u = f.user_text(cx);
-                        let pw = f.pass_text(cx);
-                        let pp = f.passphrase_text(cx);
-                        let ak = f.auth_kind;
-                        let (pk, pk_kind) = f.private_key_value(cx);
-                        let pc = f.proxy_config(cx);
-                        let sc = f.startup_command_text(cx);
-                        // Jump hosts only apply to SSH connections.
-                        let jh = if kind == ConnectionKind::SSH {
-                            f.jump_host_id
-                        } else {
-                            None
-                        };
-                        (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc, jh)
-                    };
-                    app.close_connection_form(cx);
-
-                    // Persist credential for this host
-                    let (cred_kind, secret, pk, pk_kind) = match auth_kind {
-                        AuthKind::Password => (
-                            CoreCredentialKind::Password,
-                            password.clone(),
-                            String::new(),
-                            PrivateKeyKind::Content,
-                        ),
-                        AuthKind::Certificate => (
-                            CoreCredentialKind::Certificate,
-                            passphrase.clone(),
-                            private_key.clone(),
-                            private_key_kind,
-                        ),
-                    };
-                    let cred = CredentialEntry {
-                        id: 0,
-                        name: name.clone(),
-                        kind: cred_kind,
-                        anonymous: true,
-                        secret,
-                        private_key: pk,
-                        private_key_kind: pk_kind,
-                        public_key: String::new(),
-                        certificate: String::new(),
-                    };
-                    let cred_id = AppState::store(cx)
-                        .lock()
-                        .add_credential(&cred)
-                        .unwrap_or(0);
-
-                    // Persist host with linked credential
-                    let proxy_id = upsert_proxy_for_host(&proxy_config, None, cx);
-                    let entry = HostEntry {
-                        id: 0,
-                        name: name.clone(),
-                        host: host.clone(),
-                        port: port_num,
-                        username: username.clone(),
-                        credential_id: Some(cred_id),
-                        kind: kind.into(),
-                        last_login: None,
-                        favorite: false,
-                        proxy_id,
-                        group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
-                        startup_command: startup_command.clone(),
-                        serial_baud_rate: app
-                            .connection_form
-                            .as_ref()
-                            .and_then(|f| f.serial_baud_rate(cx)),
-                        serial_data_bits: app
-                            .connection_form
-                            .as_ref()
-                            .and_then(|f| f.serial_data_bits(cx)),
-                        serial_parity: app
-                            .connection_form
-                            .as_ref()
-                            .and_then(|f| f.serial_parity(cx)),
-                        serial_stop_bits: app
-                            .connection_form
-                            .as_ref()
-                            .and_then(|f| f.serial_stop_bits(cx)),
-                        serial_flow_control: app
-                            .connection_form
-                            .as_ref()
-                            .and_then(|f| f.serial_flow_control(cx)),
-                        jump_host_id,
-                    };
-                    let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
-
-                    app.hosts.push(ConnectionHost {
-                        id: row_id,
-                        name: name.clone(),
-                        host: host.to_string(),
-                        port: port_num,
-                        username: username.to_string(),
-                        kind,
-                        credential_id: Some(cred_id),
-                        last_login: None,
-                        favorite: false,
-                        proxy_id,
-                        group_id: app.connection_form.as_ref().and_then(|f| f.group_id),
-                    });
-                    let (private_key_arg, passphrase_arg) = match auth_kind {
-                        AuthKind::Password => (None, None),
-                        AuthKind::Certificate => (
-                            if private_key.is_empty() {
-                                None
-                            } else {
-                                Some(private_key.as_str())
-                            },
-                            if passphrase.is_empty() {
-                                None
-                            } else {
-                                Some(passphrase.as_str())
-                            },
-                        ),
-                    };
-                    // Dispatch to the matching backend by connection kind.
-                    // Telnet uses password-only auth; SSH keeps its full
-                    // password / private-key / passphrase flow.
-                    match kind {
-                        ConnectionKind::Telnet => {
-                            app.add_telnet_tab(
-                                &name,
-                                Some(row_id),
-                                &host,
-                                port_num,
-                                &username,
-                                &password,
-                                proxy_config,
-                                Some(&startup_command),
-                                cx,
-                            );
-                        }
-                        ConnectionKind::Serial => {
-                            let f = app.connection_form.as_ref().unwrap();
-                            // Device path is entered in the host field.
-                            let device = f.host_text(cx);
-                            let baud = f.serial_baud_rate(cx).unwrap_or(115200);
-                            let data_bits = f.serial_data_bits(cx).unwrap_or(8);
-                            let parity = f.serial_parity(cx).unwrap_or_else(|| "none".to_string());
-                            let stop_bits = f.serial_stop_bits(cx).unwrap_or(1);
-                            let flow_control = f
-                                .serial_flow_control(cx)
-                                .unwrap_or_else(|| "none".to_string());
-                            app.add_serial_tab(
-                                &name,
-                                Some(row_id),
-                                &device,
-                                baud,
-                                data_bits,
-                                &parity,
-                                stop_bits,
-                                &flow_control,
-                                Some(&startup_command),
-                                cx,
-                            );
-                        }
-                        _ => {
-                            // Resolve the jump-host (bastion) chain, if one
-                            // was selected in the form.
-                            let jump_hosts = resolve_jump_chain(cx, jump_host_id);
-                            app.add_ssh_tab(
-                                &name,
-                                Some(row_id),
-                                &host,
-                                port_num,
-                                &username,
-                                match auth_kind {
-                                    AuthKind::Password => &password,
-                                    AuthKind::Certificate => "",
-                                },
-                                private_key_arg,
-                                passphrase_arg,
-                                proxy_config,
-                                Some(&startup_command),
-                                jump_hosts,
-                                cx,
-                            );
-                        }
-                    }
-                    cx.notify();
+                    app.save_new_host_from_form(kind, true, cx);
                 });
             }
         }));
@@ -333,6 +141,242 @@ impl CrabportApp {
             cx.notify();
         }
         valid
+    }
+
+    /// Persist a brand-new host from the current connection form, optionally
+    /// connecting to it. Shared by the form's Save and Connect buttons (and
+    /// by the Clone flow, which reuses the same form in create mode).
+    ///
+    /// `connect = true` dispatches to the matching backend (SSH / Telnet /
+    /// Serial) and opens a terminal tab; `connect = false` just persists
+    /// the host + credential + proxy rows and shows a success toast.
+    pub fn save_new_host_from_form(
+        &mut self,
+        kind: ConnectionKind,
+        connect: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // Validate required fields before doing anything. If the form is
+        // invalid, per-field errors are shown and a toast is surfaced; the
+        // save/connect flow is aborted.
+        if !self.validate_connection_form(cx) {
+            return;
+        }
+        // Read form values directly from state
+        let (
+            name,
+            host,
+            port_num,
+            username,
+            password,
+            passphrase,
+            auth_kind,
+            private_key,
+            private_key_kind,
+            proxy_config,
+            startup_command,
+            jump_host_id,
+        ) = {
+            let f = self.connection_form.as_ref().unwrap();
+            let n = f.name_text(cx);
+            let h = f.host_text(cx);
+            let p: u16 = f.port_text(cx).parse().unwrap_or(22);
+            let u = f.user_text(cx);
+            let pw = f.pass_text(cx);
+            let pp = f.passphrase_text(cx);
+            let ak = f.auth_kind;
+            let (pk, pk_kind) = f.private_key_value(cx);
+            let pc = f.proxy_config(cx);
+            let sc = f.startup_command_text(cx);
+            // Jump hosts only apply to SSH connections.
+            let jh = if kind == ConnectionKind::SSH {
+                f.jump_host_id
+            } else {
+                None
+            };
+            (n, h, p, u, pw, pp, ak, pk, pk_kind, pc, sc, jh)
+        };
+        self.close_connection_form(cx);
+
+        // Persist credential for this host
+        let (cred_kind, secret, pk, pk_kind) = match auth_kind {
+            AuthKind::Password => (
+                CoreCredentialKind::Password,
+                password.clone(),
+                String::new(),
+                PrivateKeyKind::Content,
+            ),
+            AuthKind::Certificate => (
+                CoreCredentialKind::Certificate,
+                passphrase.clone(),
+                private_key.clone(),
+                private_key_kind,
+            ),
+        };
+        let cred = CredentialEntry {
+            id: 0,
+            name: name.clone(),
+            kind: cred_kind,
+            anonymous: true,
+            secret,
+            private_key: pk,
+            private_key_kind: pk_kind,
+            public_key: String::new(),
+            certificate: String::new(),
+        };
+        let cred_id = AppState::store(cx)
+            .lock()
+            .add_credential(&cred)
+            .unwrap_or(0);
+
+        // Persist host with linked credential
+        let proxy_id = upsert_proxy_for_host(&proxy_config, None, cx);
+        let entry = HostEntry {
+            id: 0,
+            name: name.clone(),
+            host: host.clone(),
+            port: port_num,
+            username: username.clone(),
+            credential_id: Some(cred_id),
+            kind: kind.into(),
+            last_login: None,
+            favorite: false,
+            proxy_id,
+            group_id: self.connection_form.as_ref().and_then(|f| f.group_id),
+            startup_command: startup_command.clone(),
+            serial_baud_rate: self
+                .connection_form
+                .as_ref()
+                .and_then(|f| f.serial_baud_rate(cx)),
+            serial_data_bits: self
+                .connection_form
+                .as_ref()
+                .and_then(|f| f.serial_data_bits(cx)),
+            serial_parity: self
+                .connection_form
+                .as_ref()
+                .and_then(|f| f.serial_parity(cx)),
+            serial_stop_bits: self
+                .connection_form
+                .as_ref()
+                .and_then(|f| f.serial_stop_bits(cx)),
+            serial_flow_control: self
+                .connection_form
+                .as_ref()
+                .and_then(|f| f.serial_flow_control(cx)),
+            jump_host_id,
+        };
+        let row_id = AppState::store(cx).lock().add_host(&entry).unwrap_or(0);
+
+        self.hosts.push(ConnectionHost {
+            id: row_id,
+            name: name.clone(),
+            host: host.to_string(),
+            port: port_num,
+            username: username.to_string(),
+            kind,
+            credential_id: Some(cred_id),
+            last_login: None,
+            favorite: false,
+            proxy_id,
+            group_id: self.connection_form.as_ref().and_then(|f| f.group_id),
+        });
+
+        // Save-only path: surface a toast and stop here.
+        if !connect {
+            self.app_ctx.notifications.update(cx, |c, cx| {
+                c.show(
+                    Notification::new(t!("hosts.notif_saved_title").to_string())
+                        .level(NotificationLevel::Success)
+                        .message(t!("hosts.notif_saved_msg", name = name.as_str()).to_string())
+                        .duration(std::time::Duration::from_secs(3)),
+                    cx,
+                );
+            });
+            cx.notify();
+            return;
+        }
+
+        let (private_key_arg, passphrase_arg) = match auth_kind {
+            AuthKind::Password => (None, None),
+            AuthKind::Certificate => (
+                if private_key.is_empty() {
+                    None
+                } else {
+                    Some(private_key.as_str())
+                },
+                if passphrase.is_empty() {
+                    None
+                } else {
+                    Some(passphrase.as_str())
+                },
+            ),
+        };
+        // Dispatch to the matching backend by connection kind.
+        // Telnet uses password-only auth; SSH keeps its full
+        // password / private-key / passphrase flow.
+        match kind {
+            ConnectionKind::Telnet => {
+                self.add_telnet_tab(
+                    &name,
+                    Some(row_id),
+                    &host,
+                    port_num,
+                    &username,
+                    &password,
+                    proxy_config,
+                    Some(&startup_command),
+                    cx,
+                );
+            }
+            ConnectionKind::Serial => {
+                let f = self.connection_form.as_ref().unwrap();
+                // Device path is entered in the host field.
+                let device = f.host_text(cx);
+                let baud = f.serial_baud_rate(cx).unwrap_or(115200);
+                let data_bits = f.serial_data_bits(cx).unwrap_or(8);
+                let parity = f.serial_parity(cx).unwrap_or_else(|| "none".to_string());
+                let stop_bits = f.serial_stop_bits(cx).unwrap_or(1);
+                let flow_control = f
+                    .serial_flow_control(cx)
+                    .unwrap_or_else(|| "none".to_string());
+                self.add_serial_tab(
+                    &name,
+                    Some(row_id),
+                    &device,
+                    baud,
+                    data_bits,
+                    &parity,
+                    stop_bits,
+                    &flow_control,
+                    Some(&startup_command),
+                    cx,
+                );
+            }
+            _ => {
+                // Resolve the jump-host (bastion) chain, if one
+                // was selected in the form.
+                let jump_hosts = resolve_jump_chain(cx, jump_host_id);
+                self.add_ssh_tab(
+                    &name,
+                    Some(row_id),
+                    &host,
+                    port_num,
+                    &username,
+                    match auth_kind {
+                        AuthKind::Password => &password,
+                        AuthKind::Certificate => "",
+                    },
+                    private_key_arg,
+                    passphrase_arg,
+                    proxy_config,
+                    Some(&startup_command),
+                    jump_hosts,
+                    cx,
+                );
+            }
+        }
+        cx.notify();
     }
 }
 

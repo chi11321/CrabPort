@@ -270,6 +270,7 @@ local_entry_desc = "浏览本地文件系统"
 
 [hosts]
 edit = "编辑"
+clone = "克隆"
 delete = "删除"
 connect = "连接"
 connect_sftp = "在 SFTP 中打开"

@@ -199,6 +199,167 @@ impl CrabportApp {
         cx.notify();
     }
 
+    /// Open the connection form pre-filled from an existing host, but in
+    /// *create* mode (no `editing_host_id`, a fresh row will be inserted on
+    /// save). Wired to the row's right-click "Clone" action. The user can
+    /// tweak any field (typically the name) and then either Save (persist
+    /// without connecting) or Connect (persist + open a terminal tab).
+    pub fn clone_host(&mut self, host_id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_connection_form(cx);
+
+        let host = self.hosts.iter().find(|h| h.id == host_id).cloned();
+        if host.is_none() {
+            return;
+        }
+        let h = host.unwrap();
+
+        let cred = h.credential_id.and_then(|cid| {
+            AppState::store(cx)
+                .lock()
+                .find_credential(cid)
+                .ok()
+                .flatten()
+        });
+
+        // Fetch the full stored host entry (includes startup_command, which
+        // the in-memory ConnectionHost doesn't carry).
+        let stored_host = AppState::store(cx).lock().find_host(host_id).ok().flatten();
+        let startup_command = stored_host
+            .as_ref()
+            .map(|h| h.startup_command.clone())
+            .unwrap_or_default();
+
+        let mut form = ConnectionFormState::new(window, cx);
+
+        // Restore the connection type so the form opens on the correct tab.
+        form.kind = h.kind;
+
+        form.name_input.update(cx, |state, cx| {
+            // Pre-fill with a " (copy)" suffix so the user can tell at a
+            // glance this is a clone, and the name doesn't collide.
+            state.set_value(format!("{} (copy)", h.name), window, cx);
+        });
+        form.host_input.update(cx, |state, cx| {
+            state.set_value(&h.host, window, cx);
+        });
+        form.port_input.update(cx, |state, cx| {
+            state.set_value(&h.port.to_string(), window, cx);
+        });
+        form.user_input.update(cx, |state, cx| {
+            state.set_value(&h.username, window, cx);
+        });
+
+        if let Some(c) = cred.as_ref() {
+            match c.kind {
+                CoreCredentialKind::Password => {
+                    form.pass_input.update(cx, |state, cx| {
+                        state.set_value(&c.secret, window, cx);
+                    });
+                }
+                CoreCredentialKind::Certificate => {
+                    form.auth_kind = AuthKind::Certificate;
+                    form.passphrase_input.update(cx, |state, cx| {
+                        state.set_value(&c.secret, window, cx);
+                    });
+                    match c.private_key_kind {
+                        PrivateKeyKind::Path => {
+                            form.private_key_path_input.update(cx, |state, cx| {
+                                state.set_value(&c.private_key, window, cx);
+                            });
+                        }
+                        PrivateKeyKind::Content => {
+                            form.private_key_input.update(cx, |state, cx| {
+                                state.set_value(&c.private_key, window, cx);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load the saved proxy (if any) so the user can edit / clear it.
+        let saved_proxy = h.proxy_id.and_then(|pid| {
+            AppState::store(cx)
+                .lock()
+                .find_proxy_config(pid)
+                .ok()
+                .flatten()
+                .map(|cfg| (pid, cfg))
+        });
+        match saved_proxy {
+            Some((pid, cfg)) => form.load_proxy(Some(pid), Some(&cfg), window, cx),
+            None => form.load_proxy(None, None, window, cx),
+        }
+
+        // Restore the startup command (if any) so the user can edit it.
+        if !startup_command.is_empty() {
+            form.startup_command_input.update(cx, |state, cx| {
+                state.set_value(&startup_command, window, cx);
+            });
+        }
+
+        // Restore the jump-host selection (if any). Unlike Edit, there's no
+        // `editing_host_id` to exclude — the clone is a brand-new host, so
+        // the original host is a valid jump candidate.
+        form.jump_host_id = stored_host
+            .as_ref()
+            .and_then(|h| h.jump_host_id)
+            .filter(|&jid| jid != host_id);
+
+        // Restore the serial config (if any) so the user can edit it.
+        if let Some(ref h) = stored_host {
+            if let Some(baud) = h.serial_baud_rate {
+                form.serial_baud_rate_input.update(cx, |state, cx| {
+                    state.set_value(&baud.to_string(), window, cx);
+                });
+            }
+            form.serial_data_bits = h.serial_data_bits.unwrap_or(8);
+            form.serial_parity = h
+                .serial_parity
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+            form.serial_stop_bits = h.serial_stop_bits.unwrap_or(1);
+            form.serial_flow_control = h
+                .serial_flow_control
+                .clone()
+                .unwrap_or_else(|| "none".to_string());
+        }
+
+        let app = cx.entity().clone();
+        // Clone inherits the source host's group so it lands next to its
+        // sibling in the sidebar.
+        form.group_id = h.group_id;
+
+        form.on_save = Some(Rc::new({
+            let a = app.clone();
+            move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    app.save_new_host_from_form(kind, false, cx);
+                });
+            }
+        }));
+        form.on_connect = Some(Rc::new({
+            let a = app.clone();
+            move |kind: ConnectionKind, _w: &mut Window, cx: &mut App| {
+                a.update(cx, |app, cx| {
+                    app.save_new_host_from_form(kind, true, cx);
+                });
+            }
+        }));
+        form.on_close = Some(Rc::new({
+            let a = app.clone();
+            move |_w, cx| {
+                a.update(cx, |app, cx| {
+                    app.close_connection_form(cx);
+                });
+            }
+        }));
+
+        form.open(window, cx);
+        self.connection_form = Some(form);
+        cx.notify();
+    }
+
     pub fn edit_host(&mut self, host_id: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.close_connection_form(cx);
 
