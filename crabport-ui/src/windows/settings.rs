@@ -90,6 +90,10 @@ pub struct SettingsWindow {
     font_size_input: Entity<InputState>,
     /// Focus flag for the font-size input (drives the accent border).
     font_size_focused: bool,
+    /// `InputState` backing the terminal keepalive-interval stepper. Pre-filled
+    /// with the persisted value on open and re-clamped to `[0, 3600]` on every
+    /// edit via [`subscribe_number_filter`] (`0` disables keepalive).
+    keepalive_input: Entity<InputState>,
     /// Cached list of *all* system-installed font family names shown in the
     /// Terminal section's font dropdown. Built lazily on first render of the
     /// Appearance pane.
@@ -162,6 +166,25 @@ impl SettingsWindow {
             },
         )
         .detach();
+        // Keepalive-interval stepper — same shape as font-size above but
+        // clamped to `[0, 3600]` seconds. `0` disables keepalive entirely
+        // (see `TerminalConfig::effective_keepalive`).
+        let current_keepalive = config::snapshot()
+            .appearance
+            .terminal
+            .keepalive_interval_secs as i64;
+        let keepalive_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(current_keepalive.to_string(), window, cx);
+            state
+        });
+        subscribe_number_filter(&keepalive_input, 0, 3600, window, cx, |_this, value, cx| {
+            let _ = config::update(|cfg| {
+                cfg.appearance.terminal.keepalive_interval_secs = value as u32;
+            });
+            cx.refresh_windows();
+        })
+        .detach();
         // Search box for the font-family dropdown — filters the list of
         // installed fonts by case-insensitive substring.
         let font_search_input = cx.new(|cx| {
@@ -177,6 +200,7 @@ impl SettingsWindow {
             font_search_input,
             font_size_input,
             font_size_focused: false,
+            keepalive_input,
             mono_font_names: Vec::new(),
             recording_action: None,
             focus_handle: cx.focus_handle(),
@@ -296,70 +320,74 @@ impl SettingsWindow {
             })
         };
 
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_6()
-            .gap_6()
-            // --- Startup page section ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.general.section_startup"))
-                    .desc(t!("window.settings.general.startup_page_desc"))
-                    .field(
-                        t!("window.settings.general.startup_page_label").to_string(),
-                        div().w(px(280.0)).child(startup_dropdown),
-                    ),
-            )
-            // --- Data directory section ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.general.section_data"))
-                    .desc(t!("window.settings.general.open_data_dir_desc"))
-                    .bare(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(text_muted()))
-                            .child(Label::new(store_path)),
-                    )
-                    .bare(
-                        Button::new("settings-open-data-dir")
-                            .child(t!("window.settings.general.open_data_dir").to_string())
-                            .w_auto()
-                            .centered(true)
-                            .on_click(move |_e, _w, cx| {
-                                let _ = crabport_core::store::default_data_dir().map(|p| {
-                                    let _ = open_path(&p, cx);
-                                });
-                            }),
-                    ),
-            )
-            // --- Reset config section ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.general.reset_config"))
-                    .desc(t!("window.settings.general.reset_config_desc"))
-                    .bare({
-                        let h = handle.clone();
-                        Button::new("settings-reset-config")
-                            .child(t!("window.settings.general.reset_config").to_string())
-                            .w_auto()
-                            .centered(true)
-                            .on_click(move |_e, _w, cx| {
-                                let _ = config::update(|cfg| {
-                                    cfg.appearance = Default::default();
-                                });
-                                // Resetting appearance also resets the theme,
-                                // so repaint every window with the default
-                                // palette.
-                                crate::refresh_theme_with(cx);
-                                h.update(cx, |_, cx| {
-                                    cx.notify();
-                                });
-                            })
-                    }),
-            )
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-general-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                // --- Startup page section ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.general.section_startup"))
+                        .desc(t!("window.settings.general.startup_page_desc"))
+                        .field(
+                            t!("window.settings.general.startup_page_label").to_string(),
+                            div().w(px(280.0)).child(startup_dropdown),
+                        ),
+                )
+                // --- Data directory section ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.general.section_data"))
+                        .desc(t!("window.settings.general.open_data_dir_desc"))
+                        .bare(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_muted()))
+                                .child(Label::new(store_path)),
+                        )
+                        .bare(
+                            Button::new("settings-open-data-dir")
+                                .child(t!("window.settings.general.open_data_dir").to_string())
+                                .w_auto()
+                                .centered(true)
+                                .on_click(move |_e, _w, cx| {
+                                    let _ = crabport_core::store::default_data_dir().map(|p| {
+                                        let _ = open_path(&p, cx);
+                                    });
+                                }),
+                        ),
+                )
+                // --- Reset config section ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.general.reset_config"))
+                        .desc(t!("window.settings.general.reset_config_desc"))
+                        .bare({
+                            let h = handle.clone();
+                            Button::new("settings-reset-config")
+                                .child(t!("window.settings.general.reset_config").to_string())
+                                .w_auto()
+                                .centered(true)
+                                .on_click(move |_e, _w, cx| {
+                                    let _ = config::update(|cfg| {
+                                        cfg.appearance = Default::default();
+                                    });
+                                    // Resetting appearance also resets the theme,
+                                    // so repaint every window with the default
+                                    // palette.
+                                    crate::refresh_theme_with(cx);
+                                    h.update(cx, |_, cx| {
+                                        cx.notify();
+                                    });
+                                })
+                        }),
+                ),
+        )
     }
 
     // -------------------------------------------------------------------
@@ -499,6 +527,15 @@ impl SettingsWindow {
                 .max(32)
                 .step(1);
 
+        // --- Keepalive interval stepper ---
+        // Mirrors font-size: `min 0` lets the user disable keepalive by
+        // clearing the field down to 0 (matches `effective_keepalive`).
+        let keepalive_stepper =
+            StyledNumberInput::new("settings-term-keepalive", self.keepalive_input.clone())
+                .min(0)
+                .max(3600)
+                .step(1);
+
         // --- Animation speed dropdown ---
         // Four tiers map to multipliers 1.25× / 1.0× / 0.75× / 0.5×. The
         // selected index is resolved back to an `AnimationSpeed` variant
@@ -582,56 +619,66 @@ impl SettingsWindow {
         };
 
         // Build the pane from declarative sections.
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_6()
-            .gap_6()
-            // --- Language ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.appearance.section_language"))
-                    .bare(div().w(px(240.0)).child(locale_dropdown)),
-            )
-            // --- Theme ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.appearance.section_theme"))
-                    .desc(t!("window.settings.appearance.theme_desc"))
-                    .bare(div().w(px(240.0)).child(theme_dropdown))
-                    // Opens the Theme Editor window seeded from the theme
-                    // that's currently applied.
-                    .bare(
-                        Button::new("settings-edit-theme")
-                            .child(t!("window.settings.appearance.edit_theme").to_string())
-                            .w_auto()
-                            .centered(true)
-                            .on_click(|_e, _w, cx| {
-                                crate::windows::registry::focus_or_open(
-                                    crate::windows::AuxWindowKind::ThemeEditor,
-                                    cx,
-                                );
-                            }),
-                    ),
-            )
-            // --- Terminal font ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.appearance.section_terminal"))
-                    .desc(t!("window.settings.appearance.terminal_desc"))
-                    .field(
-                        t!("window.settings.appearance.terminal_font_family").to_string(),
-                        div().w(px(240.0)).child(font_family_dropdown),
-                    )
-                    .field(
-                        t!("window.settings.appearance.terminal_font_size").to_string(),
-                        div().w(px(180.0)).child(font_size_stepper),
-                    )
-                    .field(
-                        t!("window.settings.appearance.terminal_expand_panel").to_string(),
-                        div().w(px(180.0)).child(
-                            crate::components::switch::Switch::new("settings-term-expand-panel")
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-appearance-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                // --- Language ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.appearance.section_language"))
+                        .bare(div().w(px(240.0)).child(locale_dropdown)),
+                )
+                // --- Theme ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.appearance.section_theme"))
+                        .desc(t!("window.settings.appearance.theme_desc"))
+                        .bare(div().w(px(240.0)).child(theme_dropdown))
+                        // Opens the Theme Editor window seeded from the theme
+                        // that's currently applied.
+                        .bare(
+                            Button::new("settings-edit-theme")
+                                .child(t!("window.settings.appearance.edit_theme").to_string())
+                                .w_auto()
+                                .centered(true)
+                                .on_click(|_e, _w, cx| {
+                                    crate::windows::registry::focus_or_open(
+                                        crate::windows::AuxWindowKind::ThemeEditor,
+                                        cx,
+                                    );
+                                }),
+                        ),
+                )
+                // --- Terminal font ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.appearance.section_terminal"))
+                        .desc(t!("window.settings.appearance.terminal_desc"))
+                        .field(
+                            t!("window.settings.appearance.terminal_font_family").to_string(),
+                            div().w(px(240.0)).child(font_family_dropdown),
+                        )
+                        .field(
+                            t!("window.settings.appearance.terminal_font_size").to_string(),
+                            div().w(px(180.0)).child(font_size_stepper),
+                        )
+                        .field(
+                            t!("window.settings.appearance.terminal_keepalive_interval")
+                                .to_string(),
+                            div().w(px(180.0)).child(keepalive_stepper),
+                        )
+                        .field(
+                            t!("window.settings.appearance.terminal_expand_panel").to_string(),
+                            div().w(px(180.0)).child(
+                                crate::components::switch::Switch::new(
+                                    "settings-term-expand-panel",
+                                )
                                 .checked(term_cfg.expand_panel_on_connect)
                                 .on_change({
                                     let h = handle.clone();
@@ -646,19 +693,38 @@ impl SettingsWindow {
                                         let _ = h.update(cx, |_, cx| cx.notify());
                                     }
                                 }),
+                            ),
+                        )
+                        .field(
+                            t!("window.settings.appearance.terminal_auto_reconnect").to_string(),
+                            div().w(px(180.0)).child(
+                                crate::components::switch::Switch::new(
+                                    "settings-term-auto-reconnect",
+                                )
+                                .checked(term_cfg.auto_reconnect)
+                                .on_change({
+                                    let h = handle.clone();
+                                    move |checked, _w, cx| {
+                                        let _ = config::update(|cfg| {
+                                            cfg.appearance.terminal.auto_reconnect = *checked;
+                                        });
+                                        let _ = h.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
+                            ),
                         ),
-                    ),
-            )
-            // --- Animation speed ---
-            .child(
-                Section::new()
-                    .header(t!("window.settings.appearance.section_animation"))
-                    .desc(t!("window.settings.appearance.animation_speed_desc"))
-                    .field(
-                        t!("window.settings.appearance.animation_speed_label").to_string(),
-                        div().w(px(180.0)).child(animation_speed_dropdown),
-                    ),
-            )
+                )
+                // --- Animation speed ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.appearance.section_animation"))
+                        .desc(t!("window.settings.appearance.animation_speed_desc"))
+                        .field(
+                            t!("window.settings.appearance.animation_speed_label").to_string(),
+                            div().w(px(180.0)).child(animation_speed_dropdown),
+                        ),
+                ),
+        )
     }
 
     // -------------------------------------------------------------------
