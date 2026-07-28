@@ -335,6 +335,32 @@ pub struct TerminalConfig {
     /// versions.
     #[serde(default)]
     pub toolbar: ToolbarVisibilityConfig,
+
+    /// SSH / Telnet keepalive interval, in seconds.
+    ///
+    /// When greater than zero, the backend periodically sends a no-op probe
+    /// (SSH `channel.env` with an empty value; Telnet `IAC NOP`) on this
+    /// cadence. A failed probe is treated as a dead connection and surfaces
+    /// `BackendEvent::Closed`, which lets auto-reconnect kick in.
+    ///
+    /// `0` disables keepalive entirely (the backend never probes). Defaults
+    /// to 60 seconds — a conservative cadence that keeps NAT/firewall idle
+    /// timeouts at bay without spamming the server.
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u32,
+
+    /// Whether the UI should automatically reconnect after an unexpected
+    /// disconnect (i.e. a `BackendEvent::Closed` that wasn't triggered by the
+    /// user closing the tab).
+    ///
+    /// Off by default so a server that kicks the session (bad credentials,
+    /// `MaxSessions`, host-key mismatch, etc.) doesn't loop reconnects and
+    /// spam the connection history. The user can opt in from Settings if
+    /// they want resilience against transient network drops.
+    ///
+    /// The reconnect uses exponential backoff (1 → 2 → 4 → … → 30 s cap).
+    #[serde(default)]
+    pub auto_reconnect: bool,
 }
 
 fn default_terminal_font_size() -> f32 {
@@ -348,6 +374,12 @@ fn default_expand_panel_on_connect() -> bool {
     true
 }
 
+/// Default keepalive interval — 60 s. Conservative; keeps NAT/firewall
+/// idle timeouts at bay without spamming the server.
+fn default_keepalive_interval_secs() -> u32 {
+    60
+}
+
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
@@ -355,6 +387,8 @@ impl Default for TerminalConfig {
             font_size: default_terminal_font_size(),
             expand_panel_on_connect: default_expand_panel_on_connect(),
             toolbar: ToolbarVisibilityConfig::default(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+            auto_reconnect: false,
         }
     }
 }
@@ -374,6 +408,18 @@ impl TerminalConfig {
     /// hand-edited `config.toml` values from bricking the terminal.
     pub fn effective_font_size(&self) -> f32 {
         self.font_size.clamp(8.0, 32.0)
+    }
+
+    /// Effective keepalive interval as a `Duration`. Returns `None` when
+    /// keepalive is disabled (`0` or an absurdly large value clamped to a
+    /// sane upper bound of 1 hour).
+    pub fn effective_keepalive(&self) -> Option<std::time::Duration> {
+        let secs = self.keepalive_interval_secs.min(3600);
+        if secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(u64::from(secs)))
+        }
     }
 }
 

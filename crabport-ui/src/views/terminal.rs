@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use alacritty_terminal::{
@@ -193,6 +193,11 @@ pub struct TerminalView {
     /// reuse this tab's SSH connection instead of opening a dedicated owned
     /// session. `None` for local PTY backends.
     tunnel_source: Option<Arc<dyn crabport_ssh::CrabPortTunnel>>,
+    /// Reconnect attempt counter for exponential backoff. Reset to 0 on a
+    /// successful `Connected` status. Incremented each time an auto-reconnect
+    /// fires, so the delay grows (1 → 2 → 4 → … → 30s cap) across repeated
+    /// failures.
+    reconnect_attempts: Arc<AtomicU32>,
 }
 
 impl TerminalView {
@@ -411,6 +416,7 @@ impl TerminalView {
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
             on_cwd_changed: None,
+            reconnect_attempts: Arc::new(AtomicU32::new(0)),
             tunnel_source: None,
         }
     }
@@ -446,6 +452,12 @@ impl TerminalView {
         let overlay_c = overlay.clone();
         let entity = cx.entity().downgrade();
         let conn_recorded_ev = conn_recorded.clone();
+        // Captured for the auto-reconnect stale-session guard inside the
+        // `Closed` arm — this is the session this listener set belongs to, so
+        // a later `Arc::ptr_eq` against `view.session` detects manual
+        // reconnects (which swap in a fresh session) and aborts the pending
+        // auto-reconnect.
+        let session_for_reconnect = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 match event {
@@ -465,6 +477,7 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
+                        let entity_for_reconnect = entity.clone();
                         let _ = entity.update(cx, |this, cx| {
                             // A close before the first `Connected` (and with
                             // no prior error) is a silent connect failure.
@@ -478,6 +491,56 @@ impl TerminalView {
                                     .log(ConnectionLogLevel::Warning, "Connection closed");
                             }
                             cx.notify();
+
+                            // Auto-reconnect on an unexpected mid-session
+                            // drop (config-gated). We only fire when the
+                            // overlay status was still `Connected` at close
+                            // time — a close while `Connecting` is a connect
+                            // failure (don't loop), and a user-initiated tab
+                            // close is caught by the `WeakEntity` going stale
+                            // during the backoff window. The `Arc::ptr_eq`
+                            // guard inside the spawned task also aborts if the
+                            // user manually reconnected (replacing
+                            // `this.session`) while we were waiting.
+                            if crabport_core::config::snapshot()
+                                .appearance
+                                .terminal
+                                .auto_reconnect
+                            {
+                                let was_connected =
+                                    this.overlay.lock().status == RemoteStatus::Connected;
+                                if was_connected {
+                                    let attempts = this.reconnect_attempts.clone();
+                                    let overlay_for_reconnect = this.overlay.clone();
+                                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                                    // Exponential backoff: 1, 2, 4, 8, 16, 30,
+                                    // 30, … (cap at 30s). `n.min(5)` avoids a
+                                    // shift overflow panic on pathological
+                                    // consecutive-failure counts.
+                                    let delay_secs = (1u64 << n.min(5)).min(30);
+                                    let session_ref = session_for_reconnect.clone();
+                                    cx.spawn(async move |_this, cx| {
+                                        overlay_for_reconnect.lock().log(
+                                            ConnectionLogLevel::Info,
+                                            format!("Reconnecting in {delay_secs}s..."),
+                                        );
+                                        smol::Timer::after(std::time::Duration::from_secs(
+                                            delay_secs,
+                                        ))
+                                        .await;
+                                        let _ = entity_for_reconnect.update(cx, |view, cx| {
+                                            // Guard: don't reconnect if the
+                                            // session was replaced (manual
+                                            // reconnect) or the view is gone.
+                                            if !Arc::ptr_eq(&session_ref, &view.session) {
+                                                return;
+                                            }
+                                            view.reconnect(cx);
+                                        });
+                                    })
+                                    .detach();
+                                }
+                            }
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::SftpTransferFinished {
@@ -629,6 +692,7 @@ impl TerminalView {
                             // First `Connected` resolves the attempt as a
                             // success in the connection history.
                             if new_status == RemoteStatus::Connected {
+                                this.reconnect_attempts.store(0, Ordering::SeqCst);
                                 this.fire_connection_result(&conn_recorded_wk, true, None, cx);
                             }
                             // Trigger an initial TTY-history read when the
