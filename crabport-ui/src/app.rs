@@ -73,6 +73,7 @@ actions!(
         TerminalIncreaseFont,
         TerminalDecreaseFont,
         TerminalResetFont,
+        TerminalSearch,
         SplitVertical,
         SplitHorizontal,
     ]

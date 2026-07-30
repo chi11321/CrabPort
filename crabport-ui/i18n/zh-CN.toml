@@ -181,6 +181,10 @@ split_down = "向下分屏"
 toggle_panel = "开启/关闭右侧面板"
 close_pane = "关闭窗格"
 
+[terminal.search]
+placeholder = "搜索"
+no_matches = "0 个结果"
+
 [toolbar]
 gear_header = "工具栏组件"
 latency = "延迟"

@@ -182,6 +182,10 @@ split_down = "Split Down"
 toggle_panel = "Toggle Right Panel"
 close_pane = "Close Pane"
 
+[terminal.search]
+placeholder = "Search"
+no_matches = "0 results"
+
 [toolbar]
 gear_header = "Toolbar slots"
 latency = "Latency"

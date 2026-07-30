@@ -53,7 +53,11 @@ pub struct ResolvedBinding {
 /// Pick the macOS or non-macOS default keystroke at compile time. An empty
 /// string means "no default binding" ([`apply_bindings`] skips empties).
 fn plat(mac: &'static str, other: &'static str) -> &'static str {
-    if cfg!(target_os = "macos") { mac } else { other }
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        other
+    }
 }
 
 /// Expands one line per keybind into a full [`CatalogEntry`]:
@@ -101,6 +105,7 @@ pub fn catalog() -> Vec<CatalogEntry> {
         "terminal_increase_font" => crate::app::TerminalIncreaseFont, TERM, plat("cmd-=", "ctrl-="), true;
         "terminal_decrease_font" => crate::app::TerminalDecreaseFont, TERM, plat("cmd--", "ctrl--"), true;
         "terminal_reset_font" => crate::app::TerminalResetFont, TERM, plat("cmd-0", "ctrl-0"), true;
+        "terminal_search" => crate::app::TerminalSearch, TERM, plat("cmd-f", "ctrl-f"), true;
         "split_vertical" => crate::app::SplitVertical, TERM, plat("cmd-d", "ctrl-d"), true;
         "split_horizontal" => crate::app::SplitHorizontal, TERM, plat("cmd-shift-d", "ctrl-shift-d"), true;
     )

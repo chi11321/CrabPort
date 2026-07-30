@@ -28,6 +28,7 @@ use crabport_terminal::terminal::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
+use rust_i18n::t;
 
 use crate::app::{
     CrabPortTab, TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab,
@@ -44,6 +45,7 @@ use crate::views::terminal::runs::build_runs;
 use crate::views::terminal::selection::*;
 
 pub mod connection_overlay;
+pub mod search;
 pub mod split;
 pub mod toolbar;
 
@@ -198,6 +200,19 @@ pub struct TerminalView {
     /// fires, so the delay grows (1 → 2 → 4 → … → 30s cap) across repeated
     /// failures.
     reconnect_attempts: Arc<AtomicU32>,
+    /// Terminal search overlay state.
+    search_state: Option<Entity<gpui_component::input::InputState>>,
+    /// Whether the search overlay is currently visible.
+    search_visible: bool,
+    /// Current search query (kept in sync with the InputState).
+    search_query: String,
+    /// Cached list of matches for `search_query`. Recomputed when the query
+    /// changes or the terminal grid is invalidated (resize, new output
+    /// that changes line count, …).
+    search_matches: Vec<crabport_terminal::terminal::SearchMatch>,
+    /// Index into `search_matches` of the currently-active (highlighted)
+    /// match, or `None` if none is active.
+    search_active: Option<usize>,
 }
 
 impl TerminalView {
@@ -418,6 +433,11 @@ impl TerminalView {
             on_cwd_changed: None,
             reconnect_attempts: Arc::new(AtomicU32::new(0)),
             tunnel_source: None,
+            search_state: None,
+            search_visible: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_active: None,
         }
     }
 
@@ -1414,6 +1434,175 @@ impl TerminalView {
         }
         cx.notify();
     }
+
+    // -----------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------
+
+    /// Toggle the search overlay open/closed. When opening, lazily creates
+    /// the `InputState` entity (bound to the current window) and focuses
+    /// it so the user can start typing immediately.
+    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_visible {
+            self.close_search(window, cx);
+        } else {
+            self.open_search(window, cx);
+        }
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_state.is_none() {
+            let state = cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .placeholder(t!("terminal.search.placeholder"))
+            });
+            // Subscribe to query changes + Enter key so we recompute matches
+            // and navigate on Enter / Shift+Enter.
+            cx.subscribe(
+                &state,
+                |this, input, event: &gpui_component::input::InputEvent, cx| match event {
+                    gpui_component::input::InputEvent::Change { .. } => {
+                        let new_query = input.read(cx).value().to_string();
+                        this.on_search_query_changed(&new_query, cx);
+                    }
+                    gpui_component::input::InputEvent::PressEnter { secondary } => {
+                        let dir = if *secondary {
+                            search::SearchDirection::Prev
+                        } else {
+                            search::SearchDirection::Next
+                        };
+                        this.advance_match(dir, cx);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            self.search_state = Some(state);
+        }
+        self.search_visible = true;
+        // Clear any selection so the search highlights are the only overlay.
+        *self.selection.lock() = None;
+        if let Some(state) = &self.search_state {
+            // Focus the search input so typing goes straight into the query.
+            state.focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_visible = false;
+        // Clear matches so highlights disappear.
+        self.search_matches.clear();
+        self.search_active = None;
+        self.search_query.clear();
+        // Return keyboard focus to the terminal pane so the user can
+        // resume typing immediately after closing the search.
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Recompute matches for a new query, then select the first match
+    /// closest to the current cursor position.
+    fn on_search_query_changed(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search_query = query.to_string();
+        self.recompute_matches();
+        self.search_active = self.compute_initial_active();
+        if let Some(idx) = self.search_active {
+            self.activate_match(idx, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Re-run the search against the current terminal grid. Called when
+    /// the query changes or when the grid is invalidated (resize, new
+    /// output). Safe to call even when the search overlay is closed.
+    fn recompute_matches(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.search_active = None;
+            return;
+        }
+        // Escape regex metacharacters so the query is treated as a literal
+        // substring. We don't expose a regex toggle in the UI yet; this keeps
+        // it simple and matches the common Ctrl+F expectation.
+        let escaped = escape_regex(&self.search_query);
+        self.search_matches = self.session.search_matches(&escaped);
+        // Clamp the active index.
+        if let Some(idx) = self.search_active {
+            if idx >= self.search_matches.len() {
+                self.search_active = if self.search_matches.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+            }
+        }
+    }
+
+    /// Pick the initial active match: the first match whose start line is at
+    /// or after the cursor line (searching forward), or 0 if none qualify.
+    fn compute_initial_active(&self) -> Option<usize> {
+        if self.search_matches.is_empty() {
+            return None;
+        }
+        let (cursor_line, _) = self.session.cursor_point();
+        // Find the first match at or after the cursor.
+        let idx = self
+            .search_matches
+            .iter()
+            .position(|m| m.start_line >= cursor_line)
+            .unwrap_or(0);
+        Some(idx)
+    }
+
+    /// Advance the active match in the given direction, wrapping around.
+    pub fn advance_match(&mut self, dir: search::SearchDirection, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let len = self.search_matches.len();
+        let new_idx = match (self.search_active, dir) {
+            (Some(i), search::SearchDirection::Next) => Some((i + 1) % len),
+            (Some(i), search::SearchDirection::Prev) => Some((i + len - 1) % len),
+            (None, _) => Some(0),
+        };
+        if let Some(idx) = new_idx {
+            self.search_active = Some(idx);
+            self.activate_match(idx, cx);
+        }
+    }
+
+    /// Scroll the terminal to the match at `index` and request a repaint.
+    fn activate_match(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.search_matches.get(index) {
+            self.session.scroll_to_match(m);
+            self.needs_repaint
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Search accessors (read by `render_content` to render the search bar
+    // as a layout-level row that pushes the toolbar down)
+    // -----------------------------------------------------------------
+
+    pub fn search_visible(&self) -> bool {
+        self.search_visible
+    }
+
+    pub fn search_state(&self) -> Option<&Entity<gpui_component::input::InputState>> {
+        self.search_state.as_ref()
+    }
+
+    pub fn search_active(&self) -> Option<usize> {
+        self.search_active
+    }
+
+    pub fn search_match_count(&self) -> usize {
+        self.search_matches.len()
+    }
 }
 // ---- GPUI Render ----
 
@@ -1541,6 +1730,11 @@ impl Render for TerminalView {
         // global `ContextMenuController`.
         let on_context_menu = self.on_context_menu.clone();
         let pane_id_for_ctx = self.count;
+        // Search matches snapshot for the paint callback. Cloned by value so
+        // the paint closure has an immutable copy that doesn't fight the
+        // render thread for the Vec.
+        let search_matches_paint = self.search_matches.clone();
+        let search_active_paint = self.search_active;
 
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
@@ -1612,6 +1806,11 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::app::TerminalSearch, window, cx| {
+                    this.toggle_search(window, cx);
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
@@ -1621,6 +1820,9 @@ impl Render for TerminalView {
                     Some(KeyAction::Action(TerminalAction::Paste)) => {
                         this.pending_paste = true;
                         cx.notify();
+                    }
+                    Some(KeyAction::Action(TerminalAction::Search)) => {
+                        this.toggle_search(_window, cx);
                     }
                     Some(KeyAction::Bytes(bytes)) => {
                         // While the IME is actively composing (preedit text
@@ -1881,6 +2083,59 @@ impl Render for TerminalView {
                                     }
                                 }
                                 for (col, n, color) in rects {
+                                    let cell_x = bounds.origin.x + col as f32 * cell_width;
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(cell_x, y),
+                                            size(cell_width * n as f32, line_height),
+                                        ),
+                                        color,
+                                    ));
+                                }
+                            }
+
+                            // Search match highlights. Drawn after the cell
+                            // background layer but before the text so the text
+                            // remains visible on top of the match highlight.
+                            // Each match is converted from grid line to
+                            // viewport row via `display_offset`, the same as
+                            // selection highlighting.
+                            //
+                            // The active match gets a brighter highlight so
+                            // the user can see which one they're on.
+                            if !search_matches_paint.is_empty() {
+                                let vp_row = row_idx as i32 - display_offset;
+                                let mut search_rects: Vec<(usize, usize, Hsla)> = Vec::new();
+                                for (mi, m) in search_matches_paint.iter().enumerate() {
+                                    let is_active = Some(mi) == search_active_paint;
+                                    if m.start_line == m.end_line {
+                                        // Single-row match.
+                                        if vp_row == m.start_line {
+                                            let lo = m.start_col.min(num_cols);
+                                            let hi = (m.end_col + 1).min(num_cols).max(lo + 1);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((lo, hi - lo, color));
+                                        }
+                                    } else {
+                                        // Multi-row match.
+                                        if vp_row == m.start_line {
+                                            let lo = m.start_col.min(num_cols);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((lo, num_cols - lo, color));
+                                        } else if vp_row > m.start_line && vp_row < m.end_line {
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((0, num_cols, color));
+                                        } else if vp_row == m.end_line {
+                                            let hi = (m.end_col + 1).min(num_cols);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((0, hi, color));
+                                        }
+                                    }
+                                }
+                                for (col, n, color) in search_rects {
+                                    if n == 0 {
+                                        continue;
+                                    }
                                     let cell_x = bounds.origin.x + col as f32 * cell_width;
                                     window.paint_quad(fill(
                                         Bounds::new(
@@ -2529,5 +2784,36 @@ fn paint_cursor(
             ));
         }
         CursorShape::Hidden => {}
+    }
+}
+
+/// Escape regex metacharacters in `s` so the resulting string is treated as
+/// a literal substring by [`alacritty_terminal::term::search::RegexSearch`].
+/// Mirrors `regex::escape` without pulling the `regex` crate as a direct dep.
+fn escape_regex(s: &str) -> String {
+    const METACHARS: &[char] = &[
+        '\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '$', '^', '|',
+    ];
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if METACHARS.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Background color for a search-match highlight. The active match gets a
+/// brighter accent-tinted color; non-active matches use a muted version.
+fn search_match_color(active: bool) -> Hsla {
+    // Reuse the accent-ish colors: active = a semi-transparent yellow/orange
+    // that pops over the dark terminal bg; inactive = a dimmer variant.
+    if active {
+        let c: Hsla = rgb(0xFFD668FF).into();
+        c.opacity(0.35)
+    } else {
+        let c: Hsla = rgb(0xFFD668FF).into();
+        c.opacity(0.18)
     }
 }

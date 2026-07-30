@@ -280,6 +280,20 @@ pub fn render_content(
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
                 let handle_panel = handle.clone();
+                // Read the active terminal view's search state so the search
+                // bar can float above the split/panel buttons.
+                let term_view = terminal_views.get(&tab_id).cloned();
+                let (search_visible, search_state, search_active, search_total) = match &term_view {
+                    Some(entity) => entity.read_with(cx, |view, _cx| {
+                        (
+                            view.search_visible(),
+                            view.search_state().cloned(),
+                            view.search_active(),
+                            view.search_match_count(),
+                        )
+                    }),
+                    None => (false, None, None, 0),
+                };
                 // Clone the download callback + terminal entity so the
                 // on_drop handler can trigger a download when the user
                 // drags an SFTP file row onto the terminal area.
@@ -327,7 +341,8 @@ pub fn render_content(
                                 .top_2()
                                 .right_2()
                                 .flex()
-                                .flex_row()
+                                .flex_col()
+                                .items_end()
                                 .gap_1()
                                 // Occlude so mouse-down on the split buttons
                                 // doesn't fall through to the terminal pane
@@ -335,54 +350,97 @@ pub fn render_content(
                                 // and make `split_active_pane` target the
                                 // wrong pane).
                                 .occlude()
-                                .child(render_split_button(
-                                    "term-split-right",
-                                    "icons/columns-2.svg",
-                                    t!("terminal.split_right").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_split_r.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.split_active_pane(
-                                                    crate::views::terminal::split::SplitDir::Vertical,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    },
-                                ))
-                                .child(render_split_button(
-                                    "term-split-down",
-                                    "icons/rows-2.svg",
-                                    t!("terminal.split_down").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_split_d.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.split_active_pane(
-                                                    crate::views::terminal::split::SplitDir::Horizontal,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    },
-                                ))
-                                .child(render_split_button(
-                                    "term-toggle-panel",
-                                    "icons/panel-right.svg",
-                                    t!("terminal.toggle_panel").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_panel.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.toggle_right_panel(active_tab_id, cx);
-                                            });
-                                        }
-                                    },
-                                )),
+                                // Search bar — right-aligned, slides down
+                                // from the top-right corner with a height
+                                // animation. Only the split/panel buttons
+                                // below are displaced.
+                                .when_some(search_state, |el, state| {
+                                    let handle = handle.clone();
+                                    el.child(crate::views::terminal::search::render_search_bar(
+                                        &state,
+                                        search_visible,
+                                        search_active,
+                                        search_total,
+                                        {
+                                            let handle = handle.clone();
+                                            move |dir, _w, cx| {
+                                                handle.update(cx, |app, cx| {
+                                                    if let Some(view) = app.terminal_views.get(&tab_id) {
+                                                        view.update(cx, |v, cx| {
+                                                            v.advance_match(*dir, cx);
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        {
+                                            let handle = handle.clone();
+                                            move |_w, cx| {
+                                                handle.update(cx, |app, cx| {
+                                                    if let Some(view) = app.terminal_views.get(&tab_id) {
+                                                        view.update(cx, |v, cx| {
+                                                            v.close_search(_w, cx);
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1()
+                                        .child(render_split_button(
+                                            "term-split-right",
+                                            "icons/columns-2.svg",
+                                            t!("terminal.split_right").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_split_r.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.split_active_pane(
+                                                            crate::views::terminal::split::SplitDir::Vertical,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                        ))
+                                        .child(render_split_button(
+                                            "term-split-down",
+                                            "icons/rows-2.svg",
+                                            t!("terminal.split_down").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_split_d.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.split_active_pane(
+                                                            crate::views::terminal::split::SplitDir::Horizontal,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                        ))
+                                        .child(render_split_button(
+                                            "term-toggle-panel",
+                                            "icons/panel-right.svg",
+                                            t!("terminal.toggle_panel").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_panel.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.toggle_right_panel(active_tab_id, cx);
+                                                    });
+                                                }
+                                            },
+                                        )),
+                                ),
                         )
                     })
                     .into_any_element()
