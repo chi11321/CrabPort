@@ -182,6 +182,10 @@ split_down = "Split Down"
 toggle_panel = "Toggle Right Panel"
 close_pane = "Close Pane"
 
+[terminal.search]
+placeholder = "Search"
+no_matches = "0 results"
+
 [toolbar]
 gear_header = "Toolbar slots"
 latency = "Latency"
@@ -445,6 +449,7 @@ action_terminal_shift_tab = "Terminal: Shift+Tab"
 action_terminal_increase_font = "Terminal: Increase Font Size"
 action_terminal_decrease_font = "Terminal: Decrease Font Size"
 action_terminal_reset_font = "Terminal: Reset Font Size"
+action_terminal_search = "Terminal: Search"
 action_split_vertical = "Terminal: Split Pane Vertically"
 action_split_horizontal = "Terminal: Split Pane Horizontally"
 

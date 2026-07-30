@@ -181,6 +181,10 @@ split_down = "向下分屏"
 toggle_panel = "开启/关闭右侧面板"
 close_pane = "关闭窗格"
 
+[terminal.search]
+placeholder = "搜索"
+no_matches = "0 个结果"
+
 [toolbar]
 gear_header = "工具栏组件"
 latency = "延迟"
@@ -444,6 +448,7 @@ action_terminal_shift_tab = "终端：Shift+Tab"
 action_terminal_increase_font = "终端：放大字体"
 action_terminal_decrease_font = "终端：缩小字体"
 action_terminal_reset_font = "终端：重置字体"
+action_terminal_search = "终端：搜索"
 action_split_vertical = "终端：垂直分割面板"
 action_split_horizontal = "终端：水平分割面板"
 

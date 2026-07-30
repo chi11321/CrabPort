@@ -6,6 +6,8 @@ use std::sync::{
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
+    grid::Dimensions,
+    index::{Column, Line, Point as AlacPoint},
     sync::FairMutex,
     term::{Config, test::TermSize},
     vte::ansi::{Processor, StdSyncHandler},
@@ -15,6 +17,33 @@ use async_broadcast::{
 };
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+
+use alacritty_terminal::index::Direction as AlacDirection;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
+
+/// A single search match in the terminal grid, expressed as grid absolute
+/// coordinates. A match spans from `(start_line, start_col)` to
+/// `(end_line, end_col)` inclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start_line: i32,
+    pub start_col: usize,
+    pub end_line: i32,
+    pub end_col: usize,
+}
+
+impl SearchMatch {
+    fn from_alacritty(range: std::ops::RangeInclusive<AlacPoint>) -> Self {
+        let start = range.start();
+        let end = range.end();
+        Self {
+            start_line: start.line.0,
+            start_col: start.column.0,
+            end_line: end.line.0,
+            end_col: end.column.0,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
@@ -948,5 +977,48 @@ impl TerminalSession {
 
         // (3) Default: scroll the scrollback buffer.
         self.scroll(lines);
+    }
+
+    // -----------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------
+
+    /// Find all matches of `query` in the terminal grid (scrollback +
+    /// visible area). Returns an empty vec if the query is empty or the
+    /// regex fails to compile.
+    ///
+    /// The query is treated as a regex; callers that want literal matching
+    /// should pre-escape it with `regex::escape`.
+    pub fn search_matches(&self, query: &str) -> Vec<SearchMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut regex = match RegexSearch::new(query) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let term = self.term.lock();
+        let start = AlacPoint::new(term.grid().topmost_line(), Column(0));
+        let end = AlacPoint::new(term.grid().bottommost_line(), term.grid().last_column());
+        RegexIter::new(start, end, AlacDirection::Right, &*term, &mut regex)
+            .map(SearchMatch::from_alacritty)
+            .collect()
+    }
+
+    /// Scroll the terminal viewport so that `m` is visible, and return the
+    /// grid line of the match start (for selection highlighting).
+    pub fn scroll_to_match(&self, m: &SearchMatch) {
+        let mut term = self.term.lock();
+        let point = AlacPoint::new(Line(m.start_line), Column(m.start_col));
+        term.scroll_to_point(point);
+        let _ = self.wakeup_tx.try_broadcast(());
+    }
+
+    /// Returns the cursor's grid line + column, used by the search UI to
+    /// determine which match is "active" (closest to the cursor).
+    pub fn cursor_point(&self) -> (i32, usize) {
+        let term = self.term.lock();
+        let p = term.grid().cursor.point;
+        (p.line.0, p.column.0)
     }
 }
