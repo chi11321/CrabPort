@@ -1623,6 +1623,28 @@ impl Render for TerminalView {
                         cx.notify();
                     }
                     Some(KeyAction::Bytes(bytes)) => {
+                        // While the IME is actively composing (preedit text
+                        // is non-empty), editing keys — Backspace / Delete —
+                        // must reach the platform's input context so it can
+                        // edit the in-progress composition (e.g. delete a
+                        // pinyin letter in the candidate window). If we wrote
+                        // the raw control byte to the PTY and called
+                        // `stop_propagation`, the IME would never see the
+                        // key and the Backspace would silently leak into the
+                        // terminal as a DEL (#58). So: when preedit is active
+                        // AND the matched byte is an editing key, fall through
+                        // to the platform instead of writing.
+                        let is_editing_key =
+                            matches!(bytes.as_slice(), [0x08] | [0x7f] | [0x1b, b'[', b'3', b'~']);
+                        let composing = this
+                            .marked_text
+                            .lock()
+                            .as_ref()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if composing && is_editing_key {
+                            return;
+                        }
                         this.session.write(&bytes);
                         this.session.scroll_to_bottom();
                         cx.notify();
