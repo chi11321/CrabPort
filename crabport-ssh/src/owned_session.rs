@@ -30,6 +30,7 @@ use crate::keys::decode_private_key;
 use crate::known_hosts::KnownHosts;
 use crate::session::SshConnectionInfo;
 use ::crabport_tunnel::ReverseForwardRegistry;
+use secrecy::ExposeSecret;
 
 /// A standalone SSH connection owned by the tunnel layer.
 ///
@@ -130,8 +131,15 @@ impl OwnedSession {
 
             // Authenticate — key auth if a private key is set, else password.
             if info.uses_key_auth() {
-                let key_str = info.private_key.as_deref().unwrap_or("");
-                let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
+                let key_str = info
+                    .private_key
+                    .as_ref()
+                    .map(|s| s.expose_secret())
+                    .unwrap_or("");
+                let key_pair = match decode_private_key(
+                    key_str,
+                    info.passphrase.as_ref().map(|s| s.expose_secret()),
+                ) {
                     Ok(kp) => kp,
                     Err(e) => {
                         tracing::error!("SSH: owned session — failed to decode private key: {e}");
@@ -159,7 +167,7 @@ impl OwnedSession {
                 }
             } else {
                 match sh
-                    .authenticate_password(&info.username, &info.password)
+                    .authenticate_password(&info.username, info.password.expose_secret())
                     .await
                 {
                     Ok(true) => {}

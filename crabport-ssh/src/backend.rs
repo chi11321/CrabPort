@@ -26,6 +26,7 @@ use crate::monitor::monitor_loop;
 use crate::session::SshConnectionInfo;
 use crate::transfer::SftpTransferHandle;
 use ::crabport_tunnel::ReverseForwardRegistry;
+use secrecy::ExposeSecret;
 
 /// Connect a russh session over a (possibly proxied) stream.
 ///
@@ -248,9 +249,16 @@ impl SshBackend {
             if info.uses_key_auth() {
                 on_status2("Authenticating with public key...".into());
 
-                let key_str = info.private_key.as_deref().unwrap_or("");
+                let key_str = info
+                    .private_key
+                    .as_ref()
+                    .map(|s| s.expose_secret())
+                    .unwrap_or("");
                 tracing::info!("SSH: private key length={}, starts_with_BEGIN={}", key_str.len(), key_str.contains("BEGIN"));
-                let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
+                let key_pair = match decode_private_key(
+                    key_str,
+                    info.passphrase.as_ref().map(|s| s.expose_secret()),
+                ) {
                     Ok(kp) => kp,
                     Err(e) => {
                         tracing::error!("SSH: failed to decode private key: {e}");
@@ -307,7 +315,7 @@ impl SshBackend {
                 tracing::info!("SSH: using password auth (private_key is None)");
                 on_status2("Authenticating with password...".into());
                 match sh
-                    .authenticate_password(&info.username, &info.password)
+                    .authenticate_password(&info.username, info.password.expose_secret())
                     .await
                 {
                     Ok(true) => {

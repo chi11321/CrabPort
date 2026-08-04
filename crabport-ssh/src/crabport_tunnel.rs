@@ -193,28 +193,18 @@ impl TunnelManager {
         // The actually-bound port (in case bind_port was 0).
         let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
-        let id = self.alloc_id();
-        {
-            let mut t = self.tunnels.lock();
-            t.insert(
-                id,
-                TunnelEntry {
-                    kind: TunnelKind::Local,
-                    name: name.clone(),
-                    status: TunnelStatus::Active,
-                    bind_addr: bind_addr.clone(),
-                    bind_port: local_port,
-                    target_host: target_host.clone(),
-                    target_port,
-                    bytes: 0,
-                    accept_task: None,
-                    reverse_key: None,
-                },
-            );
-        }
-        self.notify();
-
+        // Spawn the accept loop *before* inserting the entry so we can
+        // store the abort handle atomically in the same critical section.
+        // Previously the entry was inserted with `accept_task: None` and the
+        // abort handle was stored in a second lock pass — a concurrent
+        // `stop_all` could remove the entry in that window, orphaning the
+        // accept loop (its abort handle never got stored), so the listener
+        // kept forwarding to the *old* target port even after the tunnel was
+        // "stopped" and restarted with new config.
         let source = self.source.clone();
+        // Clone the values the accept loop needs so the entry insert below
+        // can still move the originals.
+        let target_host_for_loop = target_host.clone();
 
         let join = crate::TOKIO.spawn(async move {
             loop {
@@ -243,7 +233,7 @@ impl TunnelManager {
                     }
                 };
 
-                let th = target_host.clone();
+                let th = target_host_for_loop.clone();
                 let tp = target_port;
 
                 // Open the direct-tcpip channel and bridge. Each connection
@@ -276,12 +266,26 @@ impl TunnelManager {
         });
 
         let abort = join.abort_handle();
+        let id = self.alloc_id();
         {
             let mut t = self.tunnels.lock();
-            if let Some(e) = t.get_mut(&id) {
-                e.accept_task = Some(abort);
-            }
+            t.insert(
+                id,
+                TunnelEntry {
+                    kind: TunnelKind::Local,
+                    name,
+                    status: TunnelStatus::Active,
+                    bind_addr,
+                    bind_port: local_port,
+                    target_host,
+                    target_port,
+                    bytes: 0,
+                    accept_task: Some(abort),
+                    reverse_key: None,
+                },
+            );
         }
+        self.notify();
 
         Ok(id)
     }
@@ -390,27 +394,9 @@ impl TunnelManager {
             .map_err(|e| format!("bind {bind_addr}:{bind_port} failed: {e}"))?;
         let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
-        let id = self.alloc_id();
-        {
-            let mut t = self.tunnels.lock();
-            t.insert(
-                id,
-                TunnelEntry {
-                    kind: TunnelKind::Dynamic,
-                    name,
-                    status: TunnelStatus::Active,
-                    bind_addr: bind_addr.clone(),
-                    bind_port: local_port,
-                    target_host: String::new(),
-                    target_port: 0,
-                    bytes: 0,
-                    accept_task: None,
-                    reverse_key: None,
-                },
-            );
-        }
-        self.notify();
-
+        // Spawn the accept loop first, then insert the entry with the
+        // abort handle set atomically — see `start_local` for why the old
+        // two-pass insert caused orphaned listeners.
         let source = self.source.clone();
 
         let join = crate::TOKIO.spawn(async move {
@@ -477,12 +463,26 @@ impl TunnelManager {
         });
 
         let abort = join.abort_handle();
+        let id = self.alloc_id();
         {
             let mut t = self.tunnels.lock();
-            if let Some(e) = t.get_mut(&id) {
-                e.accept_task = Some(abort);
-            }
+            t.insert(
+                id,
+                TunnelEntry {
+                    kind: TunnelKind::Dynamic,
+                    name,
+                    status: TunnelStatus::Active,
+                    bind_addr,
+                    bind_port: local_port,
+                    target_host: String::new(),
+                    target_port: 0,
+                    bytes: 0,
+                    accept_task: Some(abort),
+                    reverse_key: None,
+                },
+            );
         }
+        self.notify();
 
         Ok(id)
     }
