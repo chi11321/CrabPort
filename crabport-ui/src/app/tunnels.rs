@@ -514,17 +514,21 @@ impl CrabportApp {
         // start/stop completion handlers, and the `TunnelManager`'s
         // `on_change` is `Send + Sync` which doesn't compose with GPUI's
         // thread-local entity handles.
+        //
+        // Unlike the previous implementation, the borrowed runtime is NOT
+        // registered up front. Registering before the async start completed
+        // created a race: a stop arriving before `start_local` finished its
+        // atomic insert would find an empty manager, clear the runtime, then
+        // `start_local` would insert a tunnel entry that nothing in the
+        // registry pointed at — orphaning the listener (it kept forwarding to
+        // the *old* target port). Mirroring `start_tunnel_owned`, we register
+        // only after the start succeeds.
         let manager = Arc::new(TunnelManager::new(source, Arc::new(|| {})));
-
-        // Register the borrowed runtime up front so the panel immediately
-        // reflects the "running" state and `stop_tunnel` can find the manager.
-        // The manager is `Arc`-backed, so the clone held by the registry keeps
-        // the tunnels alive even after the spawn task below drops its clone.
-        self.app_ctx
-            .tunnels
-            .set_borrowed(tunnel_id, tab_id, manager.clone());
+        // Keep a clone for the registry — registered only on success (below).
+        let manager_for_registry = manager.clone();
 
         let tunnel_id_for_set = tunnel_id;
+        let tab_id_for_set = tab_id;
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         crabport_ssh::TOKIO.spawn(async move {
             let start_result = match entry.kind {
@@ -561,7 +565,7 @@ impl CrabportApp {
                 e.to_string()
             }));
             // `manager` (the spawn's clone) drops here — the registry's clone
-            // keeps the live tunnels alive.
+            // (registered on success below) keeps the live tunnels alive.
         });
 
         cx.spawn(async move |this, cx| {
@@ -569,6 +573,15 @@ impl CrabportApp {
             match rx.await {
                 Ok(Ok(())) => {
                     let _ = this.update(cx, |app, cx| {
+                        // Register the borrowed runtime now that the start
+                        // succeeded. The spawn's manager clone keeps the
+                        // tunnels alive while it runs; this registry clone
+                        // keeps them alive after the spawn drops.
+                        app.app_ctx.tunnels.set_borrowed(
+                            tunnel_id_for_set,
+                            tab_id_for_set,
+                            manager_for_registry,
+                        );
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(
                                 Notification::new(t!("tunnels.notif_start_title").to_string())
@@ -586,8 +599,10 @@ impl CrabportApp {
                 }
                 Ok(Err(e)) => {
                     let _ = this.update(cx, |app, cx| {
-                        // Start failed — tear down the borrowed runtime we
-                        // optimistically registered above.
+                        // Start failed — no runtime was registered (we only
+                        // register on success), so there's nothing to clear.
+                        // Keep the clear as a defensive no-op in case a
+                        // future code path registers eagerly.
                         app.app_ctx.tunnels.clear_runtime(tunnel_id_for_set);
                         app.app_ctx.notifications.update(cx, |c, cx| {
                             c.show(

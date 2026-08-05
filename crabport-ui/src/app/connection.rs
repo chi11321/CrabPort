@@ -395,6 +395,7 @@ pub fn resolve_jump_chain(
     first_jump_id: Option<i64>,
 ) -> Vec<crabport_ssh::session::JumpHostInfo> {
     use crabport_ssh::session::JumpHostInfo;
+    use crabport_ssh::session::SecretString;
 
     let store = AppState::store(cx);
     let mut chain: Vec<JumpHostInfo> = Vec::new();
@@ -422,12 +423,12 @@ pub fn resolve_jump_chain(
             .and_then(|cid| store.lock().find_credential(cid).ok().flatten());
         let (password, private_key, passphrase) = match cred {
             Some(c) if c.kind == CoreCredentialKind::Certificate => (
-                String::new(),
-                (!c.private_key.is_empty()).then(|| c.private_key.clone()),
-                (!c.secret.is_empty()).then(|| c.secret.clone()),
+                SecretString::from(""),
+                (!c.private_key.is_empty()).then(|| SecretString::from(c.private_key.as_str())),
+                (!c.secret.is_empty()).then(|| SecretString::from(c.secret.as_str())),
             ),
-            Some(c) => (c.secret.clone(), None, None),
-            None => (String::new(), None, None),
+            Some(c) => (SecretString::from(c.secret.as_str()), None, None),
+            None => (SecretString::from(""), None, None),
         };
         let proxy = host
             .proxy_id

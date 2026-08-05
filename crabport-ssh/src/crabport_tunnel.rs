@@ -108,6 +108,13 @@ struct TunnelEntry {
     /// For Local/Dynamic tunnels: the abort handle of the accept-loop task.
     /// `None` for Remote tunnels (no accept loop — the handler dispatches).
     accept_task: Option<AbortHandle>,
+    /// Per-connection abort handles for in-flight bridge tasks spawned by the
+    /// accept loop. On `stop`, every handle is aborted so existing
+    /// connections are torn down immediately (not just new ones refused).
+    /// Handles for naturally-completed bridges linger here until the entry
+    /// is removed on stop — `AbortHandle::abort` is a no-op on finished
+    /// tasks, and the vec is bounded by the number of live connections.
+    conn_tasks: Vec<AbortHandle>,
     /// For Remote tunnels: the `(bind_addr, bind_port)` registered with the
     /// server via `tcpip_forward`, so `stop` can call `cancel_tcpip_forward`
     /// and remove the registry entry. `None` for Local/Dynamic.
@@ -193,28 +200,15 @@ impl TunnelManager {
         // The actually-bound port (in case bind_port was 0).
         let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
+        // Allocate the id up front so the accept loop can register
+        // per-connection abort handles into the entry (inserted below).
         let id = self.alloc_id();
-        {
-            let mut t = self.tunnels.lock();
-            t.insert(
-                id,
-                TunnelEntry {
-                    kind: TunnelKind::Local,
-                    name: name.clone(),
-                    status: TunnelStatus::Active,
-                    bind_addr: bind_addr.clone(),
-                    bind_port: local_port,
-                    target_host: target_host.clone(),
-                    target_port,
-                    bytes: 0,
-                    accept_task: None,
-                    reverse_key: None,
-                },
-            );
-        }
-        self.notify();
-
         let source = self.source.clone();
+        let tunnels_for_conn = self.tunnels.clone();
+        let id_for_conn = id;
+        // Clone the values the accept loop needs so the entry insert below
+        // can still move the originals.
+        let target_host_for_loop = target_host.clone();
 
         let join = crate::TOKIO.spawn(async move {
             loop {
@@ -243,12 +237,17 @@ impl TunnelManager {
                     }
                 };
 
-                let th = target_host.clone();
+                let th = target_host_for_loop.clone();
                 let tp = target_port;
+                let tunnels_c = tunnels_for_conn.clone();
+                let id_c = id_for_conn;
 
                 // Open the direct-tcpip channel and bridge. Each connection
-                // gets its own task so the accept loop stays responsive.
-                crate::TOKIO.spawn(async move {
+                // gets its own task so the accept loop stays responsive. The
+                // abort handle is registered into the entry's `conn_tasks` so
+                // `stop` can tear down in-flight connections, not just refuse
+                // new ones.
+                let conn = crate::TOKIO.spawn(async move {
                     let channel = {
                         let h = handle.lock().await;
                         match h
@@ -272,16 +271,36 @@ impl TunnelManager {
                     // `bridge` runs until either side EOFs.
                     bridge(channel, tcp).await;
                 });
+                // Register the connection task's abort handle. If the entry
+                // was already removed (stop raced ahead), the handle is
+                // simply dropped — the task will end on its own.
+                if let Some(e) = tunnels_c.lock().get_mut(&id_c) {
+                    e.conn_tasks.push(conn.abort_handle());
+                }
             }
         });
 
         let abort = join.abort_handle();
         {
             let mut t = self.tunnels.lock();
-            if let Some(e) = t.get_mut(&id) {
-                e.accept_task = Some(abort);
-            }
+            t.insert(
+                id,
+                TunnelEntry {
+                    kind: TunnelKind::Local,
+                    name,
+                    status: TunnelStatus::Active,
+                    bind_addr,
+                    bind_port: local_port,
+                    target_host,
+                    target_port,
+                    bytes: 0,
+                    accept_task: Some(abort),
+                    conn_tasks: Vec::new(),
+                    reverse_key: None,
+                },
+            );
         }
+        self.notify();
 
         Ok(id)
     }
@@ -365,6 +384,7 @@ impl TunnelManager {
                     target_port,
                     bytes: 0,
                     accept_task: None,
+                    conn_tasks: Vec::new(),
                     reverse_key: Some((bind_addr, bound_port as u32)),
                 },
             );
@@ -390,28 +410,12 @@ impl TunnelManager {
             .map_err(|e| format!("bind {bind_addr}:{bind_port} failed: {e}"))?;
         let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
 
+        // Allocate the id up front so the accept loop can register
+        // per-connection abort handles into the entry (inserted below).
         let id = self.alloc_id();
-        {
-            let mut t = self.tunnels.lock();
-            t.insert(
-                id,
-                TunnelEntry {
-                    kind: TunnelKind::Dynamic,
-                    name,
-                    status: TunnelStatus::Active,
-                    bind_addr: bind_addr.clone(),
-                    bind_port: local_port,
-                    target_host: String::new(),
-                    target_port: 0,
-                    bytes: 0,
-                    accept_task: None,
-                    reverse_key: None,
-                },
-            );
-        }
-        self.notify();
-
         let source = self.source.clone();
+        let tunnels_for_conn = self.tunnels.clone();
+        let id_for_conn = id;
 
         let join = crate::TOKIO.spawn(async move {
             loop {
@@ -434,9 +438,12 @@ impl TunnelManager {
                     }
                 };
 
+                let tunnels_c = tunnels_for_conn.clone();
+                let id_c = id_for_conn;
+
                 // Each SOCKS connection is handled in its own task: parse the
                 // handshake, open the channel, bridge.
-                crate::TOKIO.spawn(async move {
+                let conn = crate::TOKIO.spawn(async move {
                     let (tcp, target_host, target_port) =
                         match socks5_handshake(tcp).await {
                             Ok(t) => t,
@@ -473,16 +480,36 @@ impl TunnelManager {
                     };
                     bridge(channel, tcp).await;
                 });
+                // Register the connection task's abort handle. If the entry
+                // was already removed (stop raced ahead), the handle is
+                // simply dropped.
+                if let Some(e) = tunnels_c.lock().get_mut(&id_c) {
+                    e.conn_tasks.push(conn.abort_handle());
+                }
             }
         });
 
         let abort = join.abort_handle();
         {
             let mut t = self.tunnels.lock();
-            if let Some(e) = t.get_mut(&id) {
-                e.accept_task = Some(abort);
-            }
+            t.insert(
+                id,
+                TunnelEntry {
+                    kind: TunnelKind::Dynamic,
+                    name,
+                    status: TunnelStatus::Active,
+                    bind_addr,
+                    bind_port: local_port,
+                    target_host: String::new(),
+                    target_port: 0,
+                    bytes: 0,
+                    accept_task: Some(abort),
+                    conn_tasks: Vec::new(),
+                    reverse_key: None,
+                },
+            );
         }
+        self.notify();
 
         Ok(id)
     }
@@ -497,7 +524,16 @@ impl TunnelManager {
 
         match entry.kind {
             TunnelKind::Local | TunnelKind::Dynamic => {
+                // Abort the accept loop (stops accepting new connections +
+                // drops the listener, closing the bound port).
                 if let Some(abort) = entry.accept_task {
+                    abort.abort();
+                }
+                // Abort in-flight bridge tasks so existing connections are
+                // torn down immediately — not just new ones refused. Without
+                // this, `stop` would leave live tunnels forwarding data until
+                // each connection naturally EOFs.
+                for abort in &entry.conn_tasks {
                     abort.abort();
                 }
             }

@@ -28,6 +28,7 @@ use crate::keys::decode_private_key;
 use crate::known_hosts::KnownHosts;
 use crate::session::JumpHostInfo;
 use ::crabport_tunnel::ReverseForwardRegistry;
+use secrecy::ExposeSecret;
 
 /// Keeps the intermediate jump-host sessions alive for the lifetime of the
 /// target connection. Dropping the guard drops the hop `Handle`s, letting
@@ -75,8 +76,13 @@ async fn authenticate_hop(
     hop: &JumpHostInfo,
 ) -> Result<(), String> {
     let label = format!("{}@{}:{}", hop.username, hop.host, hop.port);
-    if let Some(key) = hop.private_key.as_deref().filter(|k| !k.is_empty()) {
-        let key_pair = decode_private_key(key, hop.passphrase.as_deref())
+    if let Some(key) = hop
+        .private_key
+        .as_ref()
+        .map(|s| s.expose_secret())
+        .filter(|k| !k.is_empty())
+    {
+        let key_pair = decode_private_key(key, hop.passphrase.as_ref().map(|s| s.expose_secret()))
             .map_err(|e| format!("jump host {label}: private key decode failed: {e}"))?;
         match sh
             .authenticate_publickey(&hop.username, Arc::new(key_pair))
@@ -91,7 +97,10 @@ async fn authenticate_hop(
             )),
         }
     } else {
-        match sh.authenticate_password(&hop.username, &hop.password).await {
+        match sh
+            .authenticate_password(&hop.username, hop.password.expose_secret())
+            .await
+        {
             Ok(true) => Ok(()),
             Ok(false) => Err(format!("jump host {label}: password authentication failed")),
             Err(e) => Err(format!(

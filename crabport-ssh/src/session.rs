@@ -1,5 +1,12 @@
 use crabport_core::credential::ProxyConfig;
 
+/// Re-export so callers (e.g. the UI's jump-host resolver) can construct
+/// secret fields without adding `secrecy` as a direct dependency. Wraps a
+/// heap-allocated `str` that is volatile-zeroed on drop; access requires
+/// `ExposeSecret::expose_secret` (returns `&str`), so secrets never appear
+/// in `Debug` output or stray log lines by accident.
+pub use secrecy::SecretString;
+
 /// One hop of a jump-host (bastion) chain.
 ///
 /// Carries everything needed to connect + authenticate to a single jump
@@ -15,12 +22,12 @@ pub struct JumpHostInfo {
     /// Login username on the jump host.
     pub username: String,
     /// Password for password authentication.
-    pub password: String,
+    pub password: SecretString,
     /// Private key for key-based authentication (PEM content or file path;
     /// resolved by [`crate::keys::decode_private_key`]).
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Passphrase for the private key (if encrypted).
-    pub passphrase: Option<String>,
+    pub passphrase: Option<SecretString>,
     /// Optional proxy for this hop's own TCP connection. Only meaningful
     /// for the FIRST hop in a chain — later hops ride a `direct-tcpip`
     /// channel of the previous hop, so no raw TCP connection is made.
@@ -37,11 +44,11 @@ pub struct SshConnectionInfo {
     /// Login username.
     pub username: String,
     /// Password for password authentication.
-    pub password: String,
+    pub password: SecretString,
     /// Private key for certificate/key-based authentication.
-    pub private_key: Option<String>,
+    pub private_key: Option<SecretString>,
     /// Passphrase for the private key (if encrypted).
-    pub passphrase: Option<String>,
+    pub passphrase: Option<SecretString>,
     /// Optional proxy to tunnel the TCP connection through. When set, the
     /// SSH client connects to the proxy first, then the proxy establishes
     /// a tunnel to `host:port`, and the SSH handshake runs over that
@@ -73,7 +80,7 @@ impl SshConnectionInfo {
             host: host.into(),
             port: 22,
             username: username.into(),
-            password: password.into(),
+            password: password.into().into(),
             private_key: None,
             passphrase: None,
             proxy: None,
@@ -94,8 +101,8 @@ impl SshConnectionInfo {
         private_key: impl Into<String>,
         passphrase: Option<String>,
     ) -> Self {
-        self.private_key = Some(private_key.into());
-        self.passphrase = passphrase;
+        self.private_key = Some(private_key.into().into());
+        self.passphrase = passphrase.map(Into::into);
         self
     }
 
