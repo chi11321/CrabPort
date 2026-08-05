@@ -632,6 +632,13 @@ impl PtyBackend {
         // negotiated independently via escape sequences, so they keep working
         // regardless of TERM. This only affects the child shell environment;
         // the GUI itself doesn't read `TERM`.
+        //
+        // `tty::setup_env()` (called above) already sets TERM when it is unset;
+        // this extra guard only covers the degenerate `TERM=""` case so child
+        // shells never see an empty TERM. Keep this block adjacent to the
+        // other env setup here — mutating the process env is not thread-safe
+        // while other threads may read it, so it should stay confined to the
+        // one-shot backend construction path.
         if std::env::var("TERM").map(|v| v.is_empty()).unwrap_or(true) {
             unsafe {
                 std::env::set_var("TERM", "xterm-256color");

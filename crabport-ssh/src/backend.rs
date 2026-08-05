@@ -487,6 +487,19 @@ impl SshBackend {
             // Read the interval once per connection: changing the setting
             // applies to the NEXT connection, not this one. `None` disables
             // probing entirely (the select! arm stays pending forever).
+            //
+            // Two complementary keepalive layers are deliberately active:
+            //   1. `config.keepalive_interval` (set in the Config above)
+            //      makes russh emit `keepalive@openssh.com` GLOBAL_REQUESTs —
+            //      transport-level liveness that never touches the PTY. Not
+            //      every server implements that extension, though.
+            //   2. The ticker below re-sends the last known window size over
+            //      the channel. Sending identical dimensions is a genuine
+            //      no-op for the remote PTY (Linux only raises SIGWINCH when
+            //      TIOCSWINSZ actually changes) while still exercising the
+            //      channel's send path, which fails locally if the transport
+            //      is dead. This covers servers without keepalive support and
+            //      sessions without a PTY (tunnels).
             let keepalive = crabport_core::config::snapshot()
                 .appearance
                 .terminal

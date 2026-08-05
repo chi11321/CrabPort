@@ -297,6 +297,79 @@ fn encode_kitty_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
     Some(seq.into_bytes())
 }
 
+/// Resize the PTY grid to match the *current* canvas bounds, issuing the
+/// resize only when the computed grid actually changed.
+///
+/// Shared by the prepaint and paint callbacks of the terminal canvas. The
+/// frame pump drives repaints through `cx.notify()` without re-running
+/// layout, so a bounds change that happens without a relayout would
+/// otherwise leave the PTY grid stale — the prepaint-time resize alone is
+/// not enough, hence the same check also runs on every painted frame.
+///
+/// Resizing eagerly (no debounce) is deliberate: during split-drag or panel
+/// animations the bounds shrink transiently to an intermediate size, and a
+/// debounce can lock the PTY grid onto that small size. Once locked, even
+/// after the bounds grow back the grid stays small and text collapses to
+/// the top-left corner while the surrounding (stale) frame buffer is never
+/// repainted. Following bounds every frame keeps the grid in sync with what
+/// is actually on screen.
+///
+/// Returns `true` when a resize was issued (callers use this to invalidate
+/// derived caches).
+fn sync_pty_grid(
+    bounds: Bounds<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    last_grid: &Mutex<Option<(usize, usize)>>,
+    session: &TerminalSession,
+    selection: &Mutex<Option<Selection>>,
+    window: &mut Window,
+    view_id: u64,
+) -> bool {
+    // `Pixels / Pixels` yields an f32 column/row count.
+    let cols = (bounds.size.width / cell_width).floor().max(2.0) as usize;
+    let rows = (bounds.size.height / line_height).floor().max(1.0) as usize;
+
+    // Guard against degenerate sizes: a 0/very small grid would shrink the
+    // PTY (and a multiplexer such as tmux) to almost nothing, which looks
+    // like the terminal "collapsing". This can happen if the size is
+    // computed from a not-yet-laid-out view or an overlay bounds.
+    if cols < 10 || rows < 4 {
+        tracing::debug!(
+            "[grid-sync #{}] SKIP tiny bounds {:?} (cell {}x{}, prev {:?})",
+            view_id, bounds.size, cell_width, line_height, *last_grid.lock()
+        );
+        return false;
+    }
+
+    let prev_grid = *last_grid.lock();
+    let grid_changed = match prev_grid {
+        Some((lc, lr)) => lc != cols || lr != rows,
+        None => true,
+    };
+    if !grid_changed {
+        return false;
+    }
+
+    session.resize(cols as u16, rows as u16);
+    *selection.lock() = None;
+    *last_grid.lock() = Some((cols, rows));
+
+    // Force the whole window to repaint on the next frame. Without this,
+    // when the canvas bounds shrink (e.g. opencode exits its TUI and the
+    // grid collapses) GPUI only repaints the new, smaller dirty rectangle —
+    // the pixels that used to sit in the now-vacated region are never
+    // cleared and stay as stale residue until the user manually resizes the
+    // window. Refreshing the window marks it fully dirty so the surrounding
+    // area repaints and the ghost is gone.
+    window.refresh();
+    tracing::debug!(
+        "[grid-sync #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
+        view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
+    );
+    true
+}
+
 impl TerminalView {
     pub fn new(count: u64, cx: &mut Context<Self>) -> Self {
         Self::new_with_cwd(count, None, cx)
@@ -2020,59 +2093,18 @@ impl Render for TerminalView {
                     // ---- prepaint: resize + try-lock incremental snapshot ----
                     move |bounds, window, _cx| {
                         let mut last = last_bounds.lock();
-                        let (cols, rows) = {
-                            let c = (bounds.size.width / cell_width).floor() as usize;
-                            let r = (bounds.size.height / line_height).floor() as usize;
-                            (c.max(2), r.max(1))
-                        };
-
-                        let mut resized = false;
-
-                        // Debounced resize: only forward a new grid size to
-                        // the PTY once it has remained stable for a short
-                        // delay.  This prevents layout oscillations where the
-                        // bounds flip between two sizes every frame.
-                        if cols >= 10 && rows >= 4 {
-                            let prev_grid = *last_resized_grid.lock();
-                            let grid_changed = match prev_grid {
-                                Some((lc, lr)) => lc != cols || lr != rows,
-                                None => true,
-                            };
-
-                            // Resize immediately to the *current* bounds. A
-                            // debounce here is dangerous: during split-drag or
-                            // panel animations the bounds shrinks transiently to
-                            // an intermediate size, and the debounce can lock the
-                            // PTY grid onto that small size. Once locked, even
-                            // after the bounds grow back the grid stays small and
-                            // the text collapses to the top-left corner while the
-                            // surrounding (stale) frame buffer is never repainted.
-                            // Following bounds every frame keeps the grid in sync
-                            // with what is actually on screen, so there is no
-                            // stale-residue artifact.
-                            if grid_changed {
-                                session.resize(cols as u16, rows as u16);
-                                resized = true;
-                                *selection_prepaint.lock() = None;
-                                *last_resized_grid.lock() = Some((cols, rows));
-                                // Force the whole window to repaint on the next
-                                // frame. Without this, when the canvas bounds
-                                // shrink (e.g. opencode exits its TUI and the
-                                // grid collapses) GPUI only repaints the new,
-                                // smaller dirty rectangle — the pixels that used
-                                // to sit in the now-vacated region are never
-                                // cleared and stay as stale residue until the
-                                // user manually resizes the window. Refreshing
-                                // the window marks it fully dirty so the
-                                // surrounding area repaints and the ghost is
-                                // gone.
-                                window.refresh();
-                                tracing::debug!(
-                                    "[prepaint-resize #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
-                                    view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
-                                );
-                            }
-                        }
+                        // Keep the PTY grid in sync with the current bounds
+                        // (see `sync_pty_grid` for why we resize eagerly).
+                        let resized = sync_pty_grid(
+                            bounds,
+                            cell_width,
+                            line_height,
+                            &last_resized_grid,
+                            &session,
+                            &selection_prepaint,
+                            window,
+                            view_id,
+                        );
 
                         *last = Some(bounds);
 
@@ -2177,50 +2209,23 @@ impl Render for TerminalView {
                         // cursor is Option<(Point, CursorShape)>
 
                         // Keep the PTY grid in sync with the *current* paint
-                        // bounds on every frame.  The frame pump drives repaints
+                        // bounds on every frame. The frame pump drives repaints
                         // through `cx.notify()` without re-running layout, so the
                         // prepaint-time resize alone would miss any size change
                         // that happened without a relayout — e.g. the canvas
                         // bounds spontaneously shrinking (or a detached/split
-                        // layout) would lock the grid at the wrong size.  By
+                        // layout) would lock the grid at the wrong size. By
                         // resizing here we self-correct every painted frame.
-                        {
-                            let cols = (bounds.size.width / cell_width).floor() as usize;
-                            let rows = (bounds.size.height / line_height).floor() as usize;
-                            if cols >= 10 && rows >= 4 {
-                                let prev_grid =
-                                    *last_resized_grid_paint.lock();
-                                let grid_changed = match prev_grid {
-                                    Some((lc, lr)) => lc != cols || lr != rows,
-                                    None => true,
-                                };
-                                if grid_changed {
-                                    session_paint.resize(cols as u16, rows as u16);
-                                    *selection_paint_resize.lock() = None;
-                                    *last_resized_grid_paint.lock() =
-                                        Some((cols, rows));
-                                    // Same stale-residue guard as in prepaint: a
-                                    // shrinking canvas only repaints its new
-                                    // (smaller) dirty rect unless we refresh the
-                                    // whole window, leaving the vacated region as a
-                                    // ghost until a manual resize.
-                                    window.refresh();
-                                    tracing::debug!(
-                                        "[paint-resize #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
-                                        view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
-                                    );
-                                }
-                            } else {
-                                // Bounds collapsed to an unexpectedly small size
-                                // while still being painted — this is the
-                                // "shrinks to top-left, stale residue" symptom.
-                                tracing::debug!(
-                                    "[paint-resize] SKIP tiny bounds {:?} (cell {}x{}, prev {:?})",
-                                    bounds.size, cell_width, line_height,
-                                    *last_resized_grid_paint.lock()
-                                );
-                            }
-                        }
+                        sync_pty_grid(
+                            bounds,
+                            cell_width,
+                            line_height,
+                            &last_resized_grid_paint,
+                            &session_paint,
+                            &selection_paint_resize,
+                            window,
+                            view_id,
+                        );
 
                         let text_system = window.text_system().clone();
 

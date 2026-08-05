@@ -725,6 +725,12 @@ impl TerminalSession {
     /// - `\e[>u`  enable request      → enable our CSI u output
     /// - `\e[=u`  enable request (alias) → enable our CSI u output
     /// - `\e[<u`  disable request     → disable
+    ///
+    /// NOTE: this scan is stateless per chunk, so a request split across a
+    /// chunk boundary (e.g. `\e[?u` arriving as `\e[?` + `u`) is missed.
+    /// Programs typically retry their capability query after a timeout, so
+    /// this only delays enablement in practice. Do not "fix" it by scanning
+    /// to an arbitrary `u` byte — that would false-positive on normal text.
     fn scan_kitty_negotiation(
         data: &[u8],
         _backend: &Arc<dyn CrabPortTerminal>,
