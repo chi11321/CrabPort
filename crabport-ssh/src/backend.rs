@@ -198,7 +198,19 @@ impl SshBackend {
                 reverse_registry: reverse_registry_for_handler,
             };
 
-            let config = Arc::new(client::Config::default());
+            let mut config = client::Config::default();
+            // Enable russh's protocol-level keepalive
+            // (`keepalive@openssh.com` GLOBAL_REQUEST). It exercises the
+            // transport without touching the remote PTY window size —
+            // unlike a `window_change(0,0,0,0)` probe, which sets the
+            // remote winsize to 0x0 and makes TUI apps (opencode/tmux)
+            // redraw to a degenerate size ("auto-zoom" symptom). `None`
+            // keeps the existing "keepalive disabled" semantics.
+            config.keepalive_interval = crabport_core::config::snapshot()
+                .appearance
+                .terminal
+                .effective_keepalive();
+            let config = Arc::new(config);
             // Direct: plain (possibly proxied) TCP + handshake. With jump
             // hosts: connect + authenticate each hop, then run the target
             // handshake over a `direct-tcpip` channel of the last hop. The
@@ -373,7 +385,14 @@ impl SshBackend {
 
             // ---- Request PTY ----
             on_status2(format!("Requesting PTY ({}x{})...", cols, rows));
-            let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+            // Use the broadly compatible `xterm-256color` terminal type. We do
+            // NOT declare `xterm-kitty`: many remote tools (older tmux/screen,
+            // ncurses apps without the kitty terminfo) reject an unknown TERM
+            // and fail outright (e.g. `tmux attach` → "missing or unsuitable
+            // terminal"). The kitty keyboard protocol and SGR mouse reporting
+            // are negotiated independently via escape sequences, so they keep
+            // working without changing TERM.
+            let term = "xterm-256color".to_string();
             if let Err(e) = channel
                 .request_pty(false, &term, cols as u32, rows as u32, 0, 0, &[])
                 .await
@@ -404,6 +423,13 @@ impl SshBackend {
                 return;
             }
             on_status2("Shell started".into());
+
+            // NOTE: We deliberately do NOT proactively send a kitty-keyboard
+            // enable sequence here.  The protocol should be negotiated by the
+            // application running inside the terminal (e.g. opencode) via the
+            // standard query/enable sequences.  Pre-emptively injecting CSI u
+            // garbage on connection causes literal `5u` characters to appear in
+            // plain shell prompts.
 
             // ---- Send startup command (if any) ----
             // Each line is sent followed by `\r` so the remote shell executes
@@ -469,11 +495,31 @@ impl SshBackend {
             // Read the interval once per connection: changing the setting
             // applies to the NEXT connection, not this one. `None` disables
             // probing entirely (the select! arm stays pending forever).
+            //
+            // Two complementary keepalive layers are deliberately active:
+            //   1. `config.keepalive_interval` (set in the Config above)
+            //      makes russh emit `keepalive@openssh.com` GLOBAL_REQUESTs —
+            //      transport-level liveness that never touches the PTY. Not
+            //      every server implements that extension, though.
+            //   2. The ticker below re-sends the last known window size over
+            //      the channel. Sending identical dimensions is a genuine
+            //      no-op for the remote PTY (Linux only raises SIGWINCH when
+            //      TIOCSWINSZ actually changes) while still exercising the
+            //      channel's send path, which fails locally if the transport
+            //      is dead. This covers servers without keepalive support and
+            //      sessions without a PTY (tunnels).
             let keepalive = crabport_core::config::snapshot()
                 .appearance
                 .terminal
                 .effective_keepalive();
             let mut ticker = keepalive.map(|d| interval(d));
+
+            // Track the last window size we told the remote PTY about. The
+            // keepalive probe re-sends this exact size so it stays a true
+            // no-op — Linux only raises SIGWINCH when TIOCSWINSZ actually
+            // changes the size — while still exercising the channel's send
+            // path to detect a dead transport.
+            let mut last_window: Option<(u32, u32)> = Some((cols as u32, rows as u32));
 
             // ---- Event loop (read + cmd via tokio::select!) ----
             loop {
@@ -505,6 +551,7 @@ impl SshBackend {
                                 }
                             }
                             Ok(Command::Resize(cols, rows)) => {
+                                last_window = Some((cols as u32, rows as u32));
                                 if let Err(_e) = channel
                                     .window_change(cols as u32, rows as u32, 0, 0)
                                     .await
@@ -569,20 +616,29 @@ impl SshBackend {
                             None => std::future::pending::<()>().await,
                         }
                     } => {
-                        // A no-op window-change request exercises the
-                        // channel's send path: if the underlying transport
-                        // is dead, `send_msg` fails locally and we treat
-                        // the connection as disconnected.
-                        if let Err(_e) = channel.window_change(0, 0, 0, 0).await {
-                            tracing::warn!(
-                                "SSH: keepalive probe failed: {_e} — treating as disconnected"
-                            );
-                            {
-                                let mut m = monitor2.write();
-                                m.status = RemoteStatus::Disconnected;
+                        // No-op window-change probe: re-send the CURRENT
+                        // window size. Sending identical dimensions
+                        // exercises the channel's send path (detecting a
+                        // dead transport locally via `send_msg`) but leaves
+                        // the remote PTY untouched — Linux only raises
+                        // SIGWINCH when the size actually changes. This is
+                        // critical for TUI apps like opencode or tmux: a
+                        // `window_change(0,0,0,0)` probe would set the
+                        // remote winsize to 0x0 and make them redraw to a
+                        // degenerate viewport ("auto-zoom"). If we never
+                        // resized, skip the probe entirely.
+                        if let Some((cw, ch)) = last_window {
+                            if let Err(_e) = channel.window_change(cw, ch, 0, 0).await {
+                                tracing::warn!(
+                                    "SSH: keepalive probe failed: {_e} — treating as disconnected"
+                                );
+                                {
+                                    let mut m = monitor2.write();
+                                    m.status = RemoteStatus::Disconnected;
+                                }
+                                let _ = event_tx2.broadcast(BackendEvent::Closed).await;
+                                return;
                             }
-                            let _ = event_tx2.broadcast(BackendEvent::Closed).await;
-                            return;
                         }
                     }
                 }
@@ -629,8 +685,11 @@ impl SshBackend {
             .await
             .map_err(|e| anyhow::anyhow!("channel_open_session failed: {e}"))?;
 
-        // Request PTY.
-        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        // Request PTY. Use the broadly compatible `xterm-256color` terminal
+        // type (see the comment at the other `request_pty` call for why we
+        // avoid `xterm-kitty`). Kitty keyboard + SGR mouse are negotiated via
+        // escape sequences, independent of TERM.
+        let term = "xterm-256color".to_string();
         channel
             .request_pty(false, &term, cols as u32, rows as u32, 0, 0, &[])
             .await
@@ -641,6 +700,13 @@ impl SshBackend {
             .request_shell(true)
             .await
             .map_err(|e| anyhow::anyhow!("request_shell failed: {e}"))?;
+
+        // NOTE: we deliberately do NOT inject a kitty-keyboard enable
+        // sequence (`\e[>Nu`) here, matching the main connection path in
+        // `SshBackend::new`. Pre-emptively sending it makes plain shells
+        // echo literal garbage (e.g. `5u`) in their prompts. The protocol is
+        // negotiated on demand by the program inside the terminal via
+        // `TerminalSession::scan_kitty_negotiation`.
 
         drop(sh);
         drop(handle_guard);

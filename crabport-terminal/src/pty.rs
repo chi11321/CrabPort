@@ -625,6 +625,25 @@ impl PtyBackend {
         // doesn't restrict which characters display. We respect any `LANG`
         // the user explicitly set.
         ensure_utf8_locale();
+        // Use the broadly compatible `xterm-256color` terminal type. We do NOT
+        // set `xterm-kitty`: remote/child tools without the kitty terminfo (and
+        // tools that validate TERM, e.g. `tmux attach`) reject an unknown value
+        // and fail. The kitty keyboard protocol and SGR mouse reporting are
+        // negotiated independently via escape sequences, so they keep working
+        // regardless of TERM. This only affects the child shell environment;
+        // the GUI itself doesn't read `TERM`.
+        //
+        // `tty::setup_env()` (called above) already sets TERM when it is unset;
+        // this extra guard only covers the degenerate `TERM=""` case so child
+        // shells never see an empty TERM. Keep this block adjacent to the
+        // other env setup here — mutating the process env is not thread-safe
+        // while other threads may read it, so it should stay confined to the
+        // one-shot backend construction path.
+        if std::env::var("TERM").map(|v| v.is_empty()).unwrap_or(true) {
+            unsafe {
+                std::env::set_var("TERM", "xterm-256color");
+            }
+        }
 
         let window_size = WindowSize {
             num_lines: rows,
