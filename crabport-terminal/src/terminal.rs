@@ -501,7 +501,6 @@ impl TerminalSession {
         let term = self.term.clone();
         let wakeup_tx = self.wakeup_tx.clone();
         let command_history = self.command_history.clone();
-        let backend = self.backend.clone();
         let kitty_state = self.kitty_keyboard.clone();
 
         smol::spawn(async move {
@@ -520,7 +519,7 @@ impl TerminalSession {
                             // key bytes and we never inject reply bytes into the
                             // stream (which a multiplexer like tmux would forward
                             // to the pane and print as garbage).
-                            Self::scan_kitty_negotiation(&data, &backend, &kitty_state);
+                            Self::scan_kitty_negotiation(&data, &kitty_state);
                             // Batch-drain: hold the term lock once and advance all
                             // currently-queued chunks. Cuts lock churn and wakeup
                             // storms when the PTY floods (cat / top / build logs).
@@ -676,27 +675,6 @@ impl TerminalSession {
         self.backend.write(data);
     }
 
-    /// Enable the kitty keyboard protocol at the progressive level `flags`.
-    ///
-    /// Sends the `\e[>Nu` request to the program so TUI tools (e.g. opencode,
-    /// which builds on the Ink framework) know the terminal understands
-    /// `CSI u` key encoding, focus events and disambiguated keys — then records
-    /// the negotiated level locally so the UI can switch key encoding.
-    ///
-    /// `flags` should be a kitty keyboard progressive level (1 = disable
-    /// disambiguation, 2 = + report alternate keys, 4 = + report all keys as
-    /// CSI u, …). We default to level 1 (disambiguate) on the UI side, which is
-    /// enough for `CSI u` of the common control/function keys.
-    pub fn enable_kitty_keyboard(&self, flags: u8) {
-        // Request progressive kitty keyboard support from the program. The
-        // program then emits `CSI u` frames for keys; we meanwhile encode
-        // *input* as `CSI u` because we now know the program can parse it.
-        self.backend
-            .write(format!("\x1b[>{}u", flags).as_bytes());
-        self.kitty_keyboard.store(flags, Ordering::SeqCst);
-        tracing::debug!("kitty keyboard protocol enabled at level {}", flags);
-    }
-
     /// Whether the kitty keyboard protocol is currently active for this
     /// session. When true, the UI encodes key events as `CSI u` and emits
     /// focus in/out events.
@@ -731,11 +709,7 @@ impl TerminalSession {
     /// Programs typically retry their capability query after a timeout, so
     /// this only delays enablement in practice. Do not "fix" it by scanning
     /// to an arbitrary `u` byte — that would false-positive on normal text.
-    fn scan_kitty_negotiation(
-        data: &[u8],
-        _backend: &Arc<dyn CrabPortTerminal>,
-        state: &Arc<AtomicU8>,
-    ) {
+    fn scan_kitty_negotiation(data: &[u8], state: &Arc<AtomicU8>) {
         // Only recognise the exact Kitty keyboard protocol CSI sequences:
         //   ESC [ ? u        query
         //   ESC [ > u        enable (progressive enhancement)

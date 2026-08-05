@@ -2032,12 +2032,20 @@ impl Render for TerminalView {
                 // such as opencode bind unambiguous keys and react to focus
                 // changes. Falls back to the legacy path when the protocol is off.
                 if this.session.kitty_keyboard_enabled() {
-                    if let Some(bytes) = encode_kitty_key(&event.keystroke) {
-                        this.session.write(&bytes);
-                        this.session.scroll_to_bottom();
-                        cx.notify();
-                        cx.stop_propagation();
-                        return;
+                    // macOS convention: leave ⌘ (platform) shortcuts to the
+                    // app layer (copy/paste, scroll, search…). Only keys
+                    // without ⌘ are encoded as `CSI u` — TUI tools bind
+                    // ctrl/alt/shift combinations, not ⌘. This also keeps the
+                    // app's copy/paste working while a kitty-aware TUI (e.g.
+                    // opencode) is active.
+                    if !event.keystroke.modifiers.platform {
+                        if let Some(bytes) = encode_kitty_key(&event.keystroke) {
+                            this.session.write(&bytes);
+                            this.session.scroll_to_bottom();
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
                     }
                 }
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
