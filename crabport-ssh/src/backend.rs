@@ -680,10 +680,12 @@ impl SshBackend {
             .await
             .map_err(|e| anyhow::anyhow!("request_shell failed: {e}"))?;
 
-        // Request kitty keyboard protocol (harmless if unsupported).
-        if let Err(e) = channel.data(Cursor::new(b"\x1b[>5u".to_vec())).await {
-            tracing::debug!("SSH: kitty keyboard request write error: {e}");
-        }
+        // NOTE: we deliberately do NOT inject a kitty-keyboard enable
+        // sequence (`\e[>Nu`) here, matching the main connection path in
+        // `SshBackend::new`. Pre-emptively sending it makes plain shells
+        // echo literal garbage (e.g. `5u`) in their prompts. The protocol is
+        // negotiated on demand by the program inside the terminal via
+        // `TerminalSession::scan_kitty_negotiation`.
 
         drop(sh);
         drop(handle_guard);

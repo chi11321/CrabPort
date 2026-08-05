@@ -751,8 +751,14 @@ impl TerminalSession {
                 }
                 if k < data.len() && matches!(data[k], b'?' | b'>' | b'=' | b'<') {
                     let intermediate = data[k];
-                    let param_start = i + 2;
                     k += 1;
+                    // `param_start` must point at the first parameter digit
+                    // (or the sequence's final letter when there are none).
+                    // Pointing it at the intermediate byte (`?`/`>`/`=`/`<`)
+                    // made the alt-screen-exit check below parse e.g.
+                    // `?1049` — which fails to parse as a number and
+                    // silently disabled that whole branch.
+                    let param_start = k;
                     // Optional trailing parameter digits.
                     while k < data.len() && data[k].is_ascii_digit() {
                         k += 1;
@@ -785,7 +791,11 @@ impl TerminalSession {
                     // protocol, so we treat alt-screen exit as an implicit
                     // disable to avoid sending `CSI u` keystrokes to the plain
                     // shell that follows (which would render as garbage).
-                    if data[k] == b'l' {
+                    // Bounds-checked: `k` can equal `data.len()` when the
+                    // chunk ends right after the parameter digits (e.g. a
+                    // split `\x1b[?1049l`), and indexing past the end would
+                    // panic the parsing task.
+                    if k < data.len() && data[k] == b'l' {
                         let param = std::str::from_utf8(&data[param_start..k])
                             .unwrap_or("")
                             .parse::<u32>()
@@ -1190,8 +1200,6 @@ impl TerminalSession {
         pressed: bool,
         dragging: bool,
     ) -> bool {
-        use alacritty_terminal::term::TermMode;
-
         let mode = *self.term.lock().mode();
 
         if !mode.intersects(TermMode::MOUSE_MODE) {
@@ -1200,19 +1208,14 @@ impl TerminalSession {
 
         // Build the xterm button code.
         //   base button: 0=left, 1=middle, 2=right
-        //   +0x20: button is pressed (release omits this bit)
-        //   +0x40: motion while a button is held (drag)
+        //   +0x20: motion while a button is held (drag)
+        // SGR (1006) distinguishes press/release via the final byte
+        // ('M' for press, 'm' for release); legacy CSI M encodes
+        // release as `button + 3` instead.
         let mut code = button;
-        if pressed {
+        if dragging {
             code |= 0x20;
         }
-        if dragging {
-            code |= 0x40;
-        }
-
-        // Shift / Meta force the report into the "modify" mask so programs
-        // that only listen for plain clicks still react; keep it simple and
-        // let the UI pass already-combined codes (we don't add 0x1/0x8 here).
 
         let (col, row) = cell;
         let mut buf = Vec::with_capacity(16);
@@ -1224,6 +1227,9 @@ impl TerminalSession {
             );
         } else {
             // Legacy CSI M format: \e[M <32+code> <32+1+col> <32+1+row>.
+            if !pressed {
+                code = button + 3;
+            }
             if col < 222 && row < 222 {
                 buf.push(0x1b);
                 buf.push(b'[');
@@ -1235,8 +1241,11 @@ impl TerminalSession {
         }
         if !buf.is_empty() {
             self.backend.write(&buf);
+            return true;
         }
-        true
+        // Nothing was emitted (e.g. legacy format coordinate overflow) —
+        // report `false` so the caller falls back to its local handling.
+        false
     }
 
     // -----------------------------------------------------------------
