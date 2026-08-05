@@ -97,7 +97,15 @@ impl OwnedSession {
                 reverse_registry: reverse_registry_for_handler,
             };
 
-            let config = Arc::new(client::Config::default());
+            let mut config = client::Config::default();
+            // Enable protocol-level keepalive so long-idle tunnel
+            // connections stay alive. This session has no PTY, so the
+            // `keepalive@openssh.com` GLOBAL_REQUEST is side-effect free.
+            config.keepalive_interval = crabport_core::config::snapshot()
+                .appearance
+                .terminal
+                .effective_keepalive();
+            let config = Arc::new(config);
             // Direct or through the jump-host chain (mirrors
             // `SshBackend::new`). The returned guard keeps the intermediate
             // hop sessions alive; it's parked on this task below.

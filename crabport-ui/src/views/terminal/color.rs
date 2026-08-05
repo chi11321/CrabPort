@@ -2,6 +2,18 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use crate::color::theme;
 
+/// Dim (a.k.a. faint) intensity multiplier.  A value of 0.6 approximates the
+/// brightness reduction applied by most terminals for SGR 2.
+const DIM_FACTOR: f32 = 0.6;
+
+pub(crate) fn dim_color(rgb: u32) -> u32 {
+    let r = ((rgb >> 16) & 0xFF) as f32;
+    let g = ((rgb >> 8) & 0xFF) as f32;
+    let b = (rgb & 0xFF) as f32;
+    let dim = |c: f32| (c * DIM_FACTOR) as u32;
+    (dim(r) << 16) | (dim(g) << 8) | dim(b)
+}
+
 pub(crate) fn ansi_color_to_rgb(
     color: &Color,
     term_colors: &alacritty_terminal::term::color::Colors,

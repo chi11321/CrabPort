@@ -709,12 +709,12 @@ impl ThemeConfig {
                 overlay: "#00000050", bg: "#14161c", border: "#23262f",
                 item_hover: "#1c1f27", item_active: "#262a34", group_label: "#6b7080"),
             terminal: tc!(ThemeTerminal;
-                fg: "#e6e9ef", bg: "#14161c", cursor: "#c8cce4",
-                black: "#2e333f", red: "#f87171", green: "#4ade80", yellow: "#facc15",
-                blue: "#818cf8", magenta: "#e879f9", cyan: "#22d3ee", white: "#c1c5d0",
-                bright_black: "#6b7080", bright_red: "#f87171", bright_green: "#4ade80",
-                bright_yellow: "#facc15", bright_blue: "#818cf8", bright_magenta: "#e879f9",
-                bright_cyan: "#22d3ee", bright_white: "#e6e9ef"),
+                fg: "#e8ebf2", bg: "#1b1e26", cursor: "#ccd2e8",
+                black: "#3a4150", red: "#e5726f", green: "#7cc38a", yellow: "#e4c46a",
+                blue: "#8ba2e8", magenta: "#d597e6", cyan: "#5bc8d8", white: "#cdd2de",
+                bright_black: "#7b8294", bright_red: "#f08e8b", bright_green: "#98d6a4",
+                bright_yellow: "#efd98c", bright_blue: "#a6b8f0", bright_magenta: "#e2a9ef",
+                bright_cyan: "#7ad6e4", bright_white: "#e8ebf2"),
             selection: tc!(ThemeSelection; bg: "#6b7080"),
         }
     }
@@ -751,12 +751,12 @@ impl ThemeConfig {
                 overlay: "#00000050", bg: "#1e1e2e", border: "#313244",
                 item_hover: "#24273a", item_active: "#313244", group_label: "#585b70"),
             terminal: tc!(ThemeTerminal;
-                fg: "#cdd6f4", bg: "#1e1e2e", cursor: "#f5e0dc",
-                black: "#45475a", red: "#f38ba8", green: "#a6e3a1", yellow: "#f9e2af",
-                blue: "#89b4fa", magenta: "#f5c2e7", cyan: "#94e2d5", white: "#bac2de",
-                bright_black: "#585b70", bright_red: "#f38ba8", bright_green: "#a6e3a1",
-                bright_yellow: "#f9e2af", bright_blue: "#89b4fa", bright_magenta: "#f5c2e7",
-                bright_cyan: "#94e2d5", bright_white: "#a6adc8"),
+                fg: "#d6dcf5", bg: "#242436", cursor: "#f5e0dc",
+                black: "#414559", red: "#e57384", green: "#a8d2a6", yellow: "#e7d488",
+                blue: "#8fb2f7", magenta: "#e3b3d9", cyan: "#a3ded3", white: "#c2cadf",
+                bright_black: "#62667a", bright_red: "#ef9aae", bright_green: "#bce0b8",
+                bright_yellow: "#f1e0a6", bright_blue: "#a6c2fa", bright_magenta: "#efc8e7",
+                bright_cyan: "#b6e7de", bright_white: "#c3c8e0"),
             selection: tc!(ThemeSelection; bg: "#585b70"),
         }
     }
@@ -793,12 +793,12 @@ impl ThemeConfig {
                 overlay: "#00000050", bg: "#1a1b26", border: "#2a2b3d",
                 item_hover: "#1f2335", item_active: "#292e42", group_label: "#565f89"),
             terminal: tc!(ThemeTerminal;
-                fg: "#c0caf5", bg: "#1a1b26", cursor: "#c0caf5",
-                black: "#414868", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
-                blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
-                bright_black: "#565f89", bright_red: "#f7768e", bright_green: "#9ece6a",
-                bright_yellow: "#e0af68", bright_blue: "#7aa2f7", bright_magenta: "#bb9af7",
-                bright_cyan: "#7dcfff", bright_white: "#c0caf5"),
+                fg: "#b4bce0", bg: "#20223a", cursor: "#c0caf5",
+                black: "#3d3f58", red: "#e98097", green: "#9fd08a", yellow: "#e6cf8f",
+                blue: "#8fb0f8", magenta: "#c2a6f8", cyan: "#88d3ff", white: "#a6b0d6",
+                bright_black: "#4e5275", bright_red: "#f0a4b3", bright_green: "#b4dcab",
+                bright_yellow: "#f0dcae", bright_blue: "#9cb8f9", bright_magenta: "#cfb8fa",
+                bright_cyan: "#9bd9ff", bright_white: "#c0caf5"),
             selection: tc!(ThemeSelection; bg: "#33467c"),
         }
     }

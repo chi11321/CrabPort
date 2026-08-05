@@ -79,6 +79,9 @@ pub struct SftpProgress {
 }
 
 pub struct TerminalView {
+    /// Stable per-instance id, used only for debug logging to tell apart
+    /// multiple terminal panels in the same window.
+    id: u64,
     session: Arc<TerminalSession>,
     /// Cloned `Arc` to the underlying backend, kept so this view can call
     /// trait methods (`sftp_rename`, `sftp_open_in_editor`, …) that
@@ -96,6 +99,10 @@ pub struct TerminalView {
     /// `None` until the first render finishes setup.
     applied_font_signature: Option<(String, f32)>,
     last_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// Last grid size (cols, rows) we actually told the PTY about.
+    /// Used to throttle / debounce resizes so a layout feedback loop
+    /// (e.g. opencode inside tmux) cannot oscillate the terminal size.
+    last_resized_grid: Arc<Mutex<Option<(usize, usize)>>>,
     selection: Arc<Mutex<Option<Selection>>>,
     render_cache: SharedRenderCache,
     /// Set by data/status; consumed by the ~120Hz frame pump.
@@ -213,6 +220,81 @@ pub struct TerminalView {
     /// Index into `search_matches` of the currently-active (highlighted)
     /// match, or `None` if none is active.
     search_active: Option<usize>,
+}
+
+/// Encode a key event into the kitty keyboard protocol's `CSI u` form, or one
+/// of its fixed-function-key escape sequences when the key has no Unicode
+/// scalar (arrows, F-keys, …). Returns `None` for keys we cannot encode (in
+/// which case the caller should fall back to the legacy IME/byte path).
+///
+/// `CSI u` layout: `\e[<unicode>;<mods>u`, where `mods` is the kitty modifier
+/// mask (shift=1, alt=2, ctrl=4, super/cmd=8) **plus 1** — the +1 is part of
+/// the protocol so that "no modifiers" is reported as `1`, not `0`.
+///
+/// NOTE: when the kitty keyboard protocol is active we route *every* key
+/// through this encoder and bypass the IME text path. That trades away CJK
+/// input-method composition under kitty-enabled TUIs (e.g. opencode), which is
+/// an acceptable trade-off: those TUIs are English-first and need unambiguous
+/// key reporting far more than they need an IME.
+fn encode_kitty_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let modifiers = &keystroke.modifiers;
+    let mut mods = 0u8;
+    if modifiers.shift {
+        mods |= 1;
+    }
+    if modifiers.alt {
+        mods |= 2;
+    }
+    if modifiers.control {
+        mods |= 4;
+    }
+    // On macOS the `platform` modifier is ⌘ (Command); kitty maps it to super.
+    if modifiers.platform {
+        mods |= 8;
+    }
+    let reported = mods + 1;
+
+    // Function / non-character keys get dedicated escape sequences.
+    // `keystroke.key` uses gpui's naming ("up", "down", "enter", "f1", …).
+    let seq = match keystroke.key.as_str() {
+        "up" => format!("\x1b[1;{}A", reported),
+        "down" => format!("\x1b[1;{}B", reported),
+        "right" => format!("\x1b[1;{}C", reported),
+        "left" => format!("\x1b[1;{}D", reported),
+        "home" => format!("\x1b[1;{}H", reported),
+        "end" => format!("\x1b[1;{}F", reported),
+        "pageup" => format!("\x1b[5;{}~", reported),
+        "pagedown" => format!("\x1b[6;{}~", reported),
+        "insert" => format!("\x1b[2;{}~", reported),
+        "delete" => format!("\x1b[3;{}~", reported),
+        "f1" => format!("\x1b[1;{}P", reported),
+        "f2" => format!("\x1b[1;{}Q", reported),
+        "f3" => format!("\x1b[1;{}R", reported),
+        "f4" => format!("\x1b[1;{}S", reported),
+        "f5" => format!("\x1b[15;{}~", reported),
+        "f6" => format!("\x1b[17;{}~", reported),
+        "f7" => format!("\x1b[18;{}~", reported),
+        "f8" => format!("\x1b[19;{}~", reported),
+        "f9" => format!("\x1b[20;{}~", reported),
+        "f10" => format!("\x1b[21;{}~", reported),
+        "f11" => format!("\x1b[23;{}~", reported),
+        "f12" => format!("\x1b[24;{}~", reported),
+        _ => {
+            // Character keys and the "named" control keys (enter/tab/…).
+            let cp: u32 = match keystroke.key.as_str() {
+                "enter" => 13,
+                "tab" => 9,
+                "backspace" => 127,
+                "escape" => 27,
+                "space" => 32,
+                // Regular character: take its first Unicode scalar value.
+                s if !s.is_empty() => s.chars().next()? as u32,
+                _ => return None,
+            };
+            format!("\x1b[{};{}u", cp, reported)
+        }
+    };
+    Some(seq.into_bytes())
 }
 
 impl TerminalView {
@@ -334,6 +416,13 @@ impl TerminalView {
         };
         session.start();
 
+        // NOTE: kitty keyboard protocol is *not* enabled unconditionally here.
+        // Doing so makes plain shells (bash/zsh) mis-parse `CSI u` sequences as
+        // garbage. Instead, `TerminalSession` negotiates on demand: when the
+        // program (e.g. a TUI like opencode/Ink) sends a kitty keyboard request
+        // (`\e[>u` / `\e[?u`), the session enables `CSI u` input encoding and
+        // focus events for that session only.
+
         // Wire command-history persistence: when the session captures a new
         // command, persist it to the Store for this host (if any). Local
         // terminals (host_id = None) keep history in-memory only.
@@ -389,6 +478,7 @@ impl TerminalView {
         );
 
         Self {
+            id: count,
             session,
             backend,
             focus_handle,
@@ -397,6 +487,7 @@ impl TerminalView {
             cell_width,
             applied_font_signature: None,
             last_bounds: Arc::new(Mutex::new(None)),
+            last_resized_grid: Arc::new(Mutex::new(None)),
             selection: Arc::new(Mutex::new(None)),
             render_cache: Arc::new(Mutex::new(RenderCache::default())),
             needs_repaint,
@@ -714,6 +805,35 @@ impl TerminalView {
                             if new_status == RemoteStatus::Connected {
                                 this.reconnect_attempts.store(0, Ordering::SeqCst);
                                 this.fire_connection_result(&conn_recorded_wk, true, None, cx);
+                                // Force a window-size sync right after the PTY is
+                                // up. The initial PTY was allocated at a default
+                                // size (80x24) before the grid was measured, so a
+                                // program like tmux that lays out its panes from
+                                // the PTY size would otherwise render truncated
+                                // and never refresh.
+                                //
+                                // IMPORTANT: do NOT snap the grid to
+                                // `last_bounds` here. This callback runs on a
+                                // spawned async task, and for an SSH connection
+                                // the round-trip delay means the window may not
+                                // have been laid out (or `last_bounds` may still
+                                // hold a stale/transitional value) by the time we
+                                // get here. Snapping to that value would lock the
+                                // PTY grid at the wrong size, and since the layout
+                                // would then never change again the terminal would
+                                // stay shrunk in the top-left corner until the user
+                                // manually resizes the window.
+                                //
+                                // Instead we just invalidate the recorded grid
+                                // size. The per-frame resize sync in `paint` (and
+                                // `prepaint`) will then re-measure the *current*
+                                // real bounds on the next painted frame and resize
+                                // to that — self-correcting once layout is stable.
+                                *this.last_resized_grid.lock() = None;
+                                tracing::debug!(
+                                    "post-connect #{}: invalidated last_resized_grid, will re-sync to real bounds next frame (last_bounds was {:?})",
+                                    this.id, *this.last_bounds.lock()
+                                );
                             }
                             // Trigger an initial TTY-history read when the
                             // connection first reaches a ready state.
@@ -1310,6 +1430,9 @@ impl TerminalView {
         ));
         session.start();
 
+        // Kitty keyboard protocol is negotiated on demand by `TerminalSession`
+        // when the program requests it (see note in `new_with_cwd`).
+
         // Re-install command-history persistence: the callback lives on the
         // session, so without this the fresh session would capture commands
         // in memory but never write them to the Store again.
@@ -1429,6 +1552,7 @@ impl TerminalView {
             // Invalidate last_bounds so the prepaint step re-runs the
             // cols/rows resize with the new cell metrics.
             *self.last_bounds.lock() = None;
+            *self.last_resized_grid.lock() = None;
             self.needs_repaint
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -1671,16 +1795,22 @@ impl Render for TerminalView {
             let focused_cb = self.on_focused.clone();
             let pane_id = self.count;
             let fh = self.focus_handle.clone();
+            let session_focus = self.session.clone();
             let sub_f = cx.on_focus(&fh, _window, move |_this, _window, cx| {
                 is_focused.store(true, Ordering::Release);
+                // Kitty keyboard protocol: notify the program it gained focus.
+                session_focus.report_focus(true);
                 if let Some(cb) = &focused_cb {
                     let cb = cb.clone();
                     cx.defer(move |cx| cb(pane_id, cx));
                 }
             });
             let is_focused_b = self.is_focused.clone();
+            let session_blur = self.session.clone();
             let sub_b = cx.on_blur(&fh, _window, move |_this, _window, _cx| {
                 is_focused_b.store(false, Ordering::Release);
+                // Kitty keyboard protocol: notify the program it lost focus.
+                session_blur.report_focus(false);
             });
             // Re-fetch focus state immediately so the first frame after a
             // focus change (e.g. switching tabs via the app's
@@ -1692,15 +1822,26 @@ impl Render for TerminalView {
 
         let session_c = self.session.clone();
         let session = session_c.clone();
+        let view_id = self.id;
         let font_size = self.font_size;
         let line_height = self.line_height;
         let cell_width = self.cell_width;
         let focus_handle = self.focus_handle.clone();
         let last_bounds_c = self.last_bounds.clone();
         let last_bounds = last_bounds_c.clone();
+        let last_resized_grid = self.last_resized_grid.clone();
         let selection = self.selection.clone();
         let selection_prepaint = selection.clone();
         let selection_c = selection.clone();
+        // Paint-closure clones: the resize sync below must run on *every*
+        // painted frame (not just on layout), because the frame pump only
+        // triggers repaints via `cx.notify()`, which does not re-run layout.
+        // Without this, a bounds that shrank without a subsequent relayout
+        // would leave the PTY grid locked at the small size forever (text
+        // collapses to the top-left corner) until the user resizes the window.
+        let session_paint = session_c.clone();
+        let last_resized_grid_paint = self.last_resized_grid.clone();
+        let selection_paint_resize = selection.clone();
         let render_cache = self.render_cache.clone();
         let render_cache_paint = render_cache.clone();
         let needs_repaint = self.needs_repaint.clone();
@@ -1812,6 +1953,20 @@ impl Render for TerminalView {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                // Kitty keyboard protocol: when active, every key is encoded as
+                // `CSI u` (or its function-key escape) and routed straight to the
+                // PTY, bypassing the IME text path. This is what lets TUI tools
+                // such as opencode bind unambiguous keys and react to focus
+                // changes. Falls back to the legacy path when the protocol is off.
+                if this.session.kitty_keyboard_enabled() {
+                    if let Some(bytes) = encode_kitty_key(&event.keystroke) {
+                        this.session.write(&bytes);
+                        this.session.scroll_to_bottom();
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
                         this.pending_copy = true;
@@ -1863,7 +2018,7 @@ impl Render for TerminalView {
             .child(
                 canvas(
                     // ---- prepaint: resize + try-lock incremental snapshot ----
-                    move |bounds, _window, _cx| {
+                    move |bounds, window, _cx| {
                         let mut last = last_bounds.lock();
                         let (cols, rows) = {
                             let c = (bounds.size.width / cell_width).floor() as usize;
@@ -1872,22 +2027,53 @@ impl Render for TerminalView {
                         };
 
                         let mut resized = false;
-                        if let Some(ref lb) = *last {
-                            let (lc, lr) = {
-                                let c = (lb.size.width / cell_width).floor() as usize;
-                                let r = (lb.size.height / line_height).floor() as usize;
-                                (c.max(2), r.max(1))
+
+                        // Debounced resize: only forward a new grid size to
+                        // the PTY once it has remained stable for a short
+                        // delay.  This prevents layout oscillations where the
+                        // bounds flip between two sizes every frame.
+                        if cols >= 10 && rows >= 4 {
+                            let prev_grid = *last_resized_grid.lock();
+                            let grid_changed = match prev_grid {
+                                Some((lc, lr)) => lc != cols || lr != rows,
+                                None => true,
                             };
-                            if lc != cols || lr != rows {
+
+                            // Resize immediately to the *current* bounds. A
+                            // debounce here is dangerous: during split-drag or
+                            // panel animations the bounds shrinks transiently to
+                            // an intermediate size, and the debounce can lock the
+                            // PTY grid onto that small size. Once locked, even
+                            // after the bounds grow back the grid stays small and
+                            // the text collapses to the top-left corner while the
+                            // surrounding (stale) frame buffer is never repainted.
+                            // Following bounds every frame keeps the grid in sync
+                            // with what is actually on screen, so there is no
+                            // stale-residue artifact.
+                            if grid_changed {
                                 session.resize(cols as u16, rows as u16);
                                 resized = true;
                                 *selection_prepaint.lock() = None;
+                                *last_resized_grid.lock() = Some((cols, rows));
+                                // Force the whole window to repaint on the next
+                                // frame. Without this, when the canvas bounds
+                                // shrink (e.g. opencode exits its TUI and the
+                                // grid collapses) GPUI only repaints the new,
+                                // smaller dirty rectangle — the pixels that used
+                                // to sit in the now-vacated region are never
+                                // cleared and stay as stale residue until the
+                                // user manually resizes the window. Refreshing
+                                // the window marks it fully dirty so the
+                                // surrounding area repaints and the ghost is
+                                // gone.
+                                window.refresh();
+                                tracing::debug!(
+                                    "[prepaint-resize #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
+                                    view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
+                                );
                             }
-                        } else {
-                            session.resize(cols as u16, rows as u16);
-                            resized = true;
-                            *selection_prepaint.lock() = None;
                         }
+
                         *last = Some(bounds);
 
                         let pal = palette();
@@ -1989,6 +2175,53 @@ impl Render for TerminalView {
                     move |bounds, lines, window, cx| {
                         let (cursor, num_cols, _num_lines, display_offset, _history_size) = lines;
                         // cursor is Option<(Point, CursorShape)>
+
+                        // Keep the PTY grid in sync with the *current* paint
+                        // bounds on every frame.  The frame pump drives repaints
+                        // through `cx.notify()` without re-running layout, so the
+                        // prepaint-time resize alone would miss any size change
+                        // that happened without a relayout — e.g. the canvas
+                        // bounds spontaneously shrinking (or a detached/split
+                        // layout) would lock the grid at the wrong size.  By
+                        // resizing here we self-correct every painted frame.
+                        {
+                            let cols = (bounds.size.width / cell_width).floor() as usize;
+                            let rows = (bounds.size.height / line_height).floor() as usize;
+                            if cols >= 10 && rows >= 4 {
+                                let prev_grid =
+                                    *last_resized_grid_paint.lock();
+                                let grid_changed = match prev_grid {
+                                    Some((lc, lr)) => lc != cols || lr != rows,
+                                    None => true,
+                                };
+                                if grid_changed {
+                                    session_paint.resize(cols as u16, rows as u16);
+                                    *selection_paint_resize.lock() = None;
+                                    *last_resized_grid_paint.lock() =
+                                        Some((cols, rows));
+                                    // Same stale-residue guard as in prepaint: a
+                                    // shrinking canvas only repaints its new
+                                    // (smaller) dirty rect unless we refresh the
+                                    // whole window, leaving the vacated region as a
+                                    // ghost until a manual resize.
+                                    window.refresh();
+                                    tracing::debug!(
+                                        "[paint-resize #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
+                                        view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
+                                    );
+                                }
+                            } else {
+                                // Bounds collapsed to an unexpectedly small size
+                                // while still being painted — this is the
+                                // "shrinks to top-left, stale residue" symptom.
+                                tracing::debug!(
+                                    "[paint-resize] SKIP tiny bounds {:?} (cell {}x{}, prev {:?})",
+                                    bounds.size, cell_width, line_height,
+                                    *last_resized_grid_paint.lock()
+                                );
+                            }
+                        }
+
                         let text_system = window.text_system().clone();
 
                         let sel_guard = selection.lock();
@@ -2061,10 +2294,11 @@ impl Render for TerminalView {
                                     let is_inv = cell.flags.contains(Flags::INVERSE);
                                     let wide = cell.flags.contains(Flags::WIDE_CHAR);
 
+                                    let is_dim = cell.flags.contains(Flags::DIM);
                                     let bg_color: Option<Hsla> = if is_sel {
                                         Some(rgb(selection_bg()).into())
                                     } else if is_inv {
-                                        Some(rgb(cell.fg).into())
+                                        Some(rgb(if is_dim { dim_color(cell.fg) } else { cell.fg }).into())
                                     } else if cell.custom_bg {
                                         Some(rgb(cell.bg).into())
                                     } else {
@@ -2337,7 +2571,26 @@ impl Render for TerminalView {
                         let line_height = line_height;
                         let display_offset_mouse = display_offset_mouse.clone();
                         let session_for_dblclick = session_c.clone();
+                        let session_for_mouse = session_c.clone();
                         move |event, _window, _cx| {
+                            // If the program is in mouse-reporting mode and
+                            // Shift is NOT held, forward the click to the PTY
+                            // instead of doing a local text selection. This is
+                            // what lets TUI tools (e.g. opencode) handle clicks.
+                            if !event.modifiers.shift {
+                                if let Some(bounds) = *last_bounds.lock() {
+                                    let offset = display_offset_mouse.load(Ordering::Relaxed);
+                                    if let Some((col, row)) =
+                                        mouse_to_grid(event.position, bounds, cell_width, line_height, offset)
+                                    {
+                                        if session_for_mouse
+                                            .report_mouse_button(0, (col as usize, row as usize), true, false)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(bounds) = *last_bounds.lock() {
                                 // Skip if click is in the scrollbar region
                                 // (rightmost WIDTH px). The `Scrollbar`
@@ -2394,8 +2647,30 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse_move = display_offset_mouse_move.clone();
+                        let session_for_mouse_move = session_c.clone();
                         move |event, _window, _cx| {
                             if event.dragging() {
+                                // Forward drag motions to the PTY in mouse mode
+                                // (Shift bypasses to allow local selection).
+                                if !event.modifiers.shift {
+                                    if let Some(bounds) = *last_bounds.lock() {
+                                        let offset =
+                                            display_offset_mouse_move.load(Ordering::Relaxed);
+                                        if let Some((col, row)) = mouse_to_grid(
+                                            event.position,
+                                            bounds,
+                                            cell_width,
+                                            line_height,
+                                            offset,
+                                        ) {
+                                            if session_for_mouse_move
+                                                .report_mouse_button(0, (col as usize, row as usize), true, true)
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(bounds) = *last_bounds.lock() {
                                     let offset = display_offset_mouse_move.load(Ordering::Relaxed);
                                     if let Some((col, row)) = mouse_to_grid(
@@ -2432,7 +2707,28 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse_up = display_offset_mouse_up.clone();
+                        let session_for_mouse_up = session_c.clone();
                         move |event, _window, _cx| {
+                            // If the press started a mouse-mode drag, just send
+                            // the release to the PTY; skip local selection logic.
+                            if !event.modifiers.shift {
+                                if let Some(bounds) = *last_bounds.lock() {
+                                    let offset = display_offset_mouse_up.load(Ordering::Relaxed);
+                                    if let Some((up_col, up_row)) = mouse_to_grid(
+                                        event.position,
+                                        bounds,
+                                        cell_width,
+                                        line_height,
+                                        offset,
+                                    ) {
+                                        if session_for_mouse_up
+                                            .report_mouse_button(0, (up_col as usize, up_row as usize), false, false)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(bounds) = *last_bounds.lock() {
                                 let offset = display_offset_mouse_up.load(Ordering::Relaxed);
                                 if let Some((up_col, up_row)) = mouse_to_grid(

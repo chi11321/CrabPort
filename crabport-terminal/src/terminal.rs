@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use alacritty_terminal::{
@@ -9,7 +9,7 @@ use alacritty_terminal::{
     grid::Dimensions,
     index::{Column, Line, Point as AlacPoint},
     sync::FairMutex,
-    term::{Config, test::TermSize},
+    term::{Config, TermMode, test::TermSize},
     vte::ansi::{Processor, StdSyncHandler},
 };
 use async_broadcast::{
@@ -427,6 +427,10 @@ pub struct TerminalSession {
     /// — TerminalSession itself stays free of any storage dependency.
     /// Receives the captured command text.
     on_command: Arc<Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
+    /// Kitty keyboard protocol flags negotiated with the program. 0 means
+    /// disabled (plain byte input via the IME path). Non-zero bits track
+    /// which progressive feature levels are active.
+    kitty_keyboard: Arc<AtomicU8>,
 }
 
 impl TerminalSession {
@@ -449,6 +453,7 @@ impl TerminalSession {
             command_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_COMMAND_HISTORY))),
             line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
+            kitty_keyboard: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -483,6 +488,7 @@ impl TerminalSession {
             command_history,
             line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
+            kitty_keyboard: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -495,6 +501,8 @@ impl TerminalSession {
         let term = self.term.clone();
         let wakeup_tx = self.wakeup_tx.clone();
         let command_history = self.command_history.clone();
+        let backend = self.backend.clone();
+        let kitty_state = self.kitty_keyboard.clone();
 
         smol::spawn(async move {
             let mut parser = Processor::<StdSyncHandler>::new();
@@ -504,15 +512,49 @@ impl TerminalSession {
                     Ok(event) => match event {
                         BackendEvent::Data(data) => {
                             tracing::debug!("session: received {} bytes", data.len());
+                            // Kitty keyboard protocol *negotiation*: the program
+                            // (e.g. a TUI like opencode) asks the terminal to
+                            // switch to `CSI u` key reporting. We only enable our
+                            // CSI u *output* encoding after the program explicitly
+                            // requests it, so plain shells keep receiving ordinary
+                            // key bytes and we never inject reply bytes into the
+                            // stream (which a multiplexer like tmux would forward
+                            // to the pane and print as garbage).
+                            Self::scan_kitty_negotiation(&data, &backend, &kitty_state);
                             // Batch-drain: hold the term lock once and advance all
                             // currently-queued chunks. Cuts lock churn and wakeup
                             // storms when the PTY floods (cat / top / build logs).
                             let mut terminal = term.lock();
                             parser.advance(&mut *terminal, &data);
+                            // Implicit kitty-keyboard disable: if kitty is active
+                            // but the program has left the alternate screen (e.g.
+                            // opencode exiting its TUI without sending `ESC[<u`),
+                            // stop encoding keys as `CSI u` so the plain shell that
+                            // follows does not receive garbage. Querying the real
+                            // alt-screen mode is far more reliable than guessing at
+                            // the `?1049l` byte sequence in the stream.
+                            if kitty_state.load(Ordering::SeqCst) != 0
+                                && !terminal.mode().contains(TermMode::ALT_SCREEN)
+                            {
+                                kitty_state.store(0, Ordering::SeqCst);
+                                tracing::debug!(
+                                    "kitty keyboard: disabled because alt-screen exited (mode {:?})",
+                                    terminal.mode()
+                                );
+                            }
                             loop {
                                 match rx.try_recv() {
                                     Ok(BackendEvent::Data(more)) => {
                                         parser.advance(&mut *terminal, &more);
+                                        if kitty_state.load(Ordering::SeqCst) != 0
+                                            && !terminal.mode().contains(TermMode::ALT_SCREEN)
+                                        {
+                                            kitty_state.store(0, Ordering::SeqCst);
+                                            tracing::debug!(
+                                                "kitty keyboard: disabled because alt-screen exited (mode {:?})",
+                                                terminal.mode()
+                                            );
+                                        }
                                     }
                                     Ok(BackendEvent::Closed) => {
                                         drop(terminal);
@@ -632,6 +674,147 @@ impl TerminalSession {
     pub fn write(&self, data: &[u8]) {
         self.capture_command(data);
         self.backend.write(data);
+    }
+
+    /// Enable the kitty keyboard protocol at the progressive level `flags`.
+    ///
+    /// Sends the `\e[>Nu` request to the program so TUI tools (e.g. opencode,
+    /// which builds on the Ink framework) know the terminal understands
+    /// `CSI u` key encoding, focus events and disambiguated keys — then records
+    /// the negotiated level locally so the UI can switch key encoding.
+    ///
+    /// `flags` should be a kitty keyboard progressive level (1 = disable
+    /// disambiguation, 2 = + report alternate keys, 4 = + report all keys as
+    /// CSI u, …). We default to level 1 (disambiguate) on the UI side, which is
+    /// enough for `CSI u` of the common control/function keys.
+    pub fn enable_kitty_keyboard(&self, flags: u8) {
+        // Request progressive kitty keyboard support from the program. The
+        // program then emits `CSI u` frames for keys; we meanwhile encode
+        // *input* as `CSI u` because we now know the program can parse it.
+        self.backend
+            .write(format!("\x1b[>{}u", flags).as_bytes());
+        self.kitty_keyboard.store(flags, Ordering::SeqCst);
+        tracing::debug!("kitty keyboard protocol enabled at level {}", flags);
+    }
+
+    /// Whether the kitty keyboard protocol is currently active for this
+    /// session. When true, the UI encodes key events as `CSI u` and emits
+    /// focus in/out events.
+    pub fn kitty_keyboard_enabled(&self) -> bool {
+        self.kitty_keyboard.load(Ordering::SeqCst) != 0
+    }
+
+    /// Scan a chunk of *program output* for kitty-keyboard negotiation
+    /// requests and react accordingly.
+    ///
+    /// The kitty keyboard protocol is opt-in: a program must explicitly ask
+    /// the terminal to switch key reporting to `CSI u`. We only flip
+    /// [`Self::kitty_keyboard`] on after the program sends a request, so plain
+    /// shells keep receiving ordinary key bytes.
+    ///
+    /// IMPORTANT: we intentionally do **NOT** write any response bytes back to
+    /// the PTY. Writing a kitty reply (`\e[?u` / `\e[>1u`) would be forwarded by
+    /// a multiplexer such as tmux to the pane's program, which (e.g. a plain
+    /// shell) would echo it as literal garbage like `?u` / `>1u`. Instead we
+    /// only track the local state: when the program requests `CSI u` we enable
+    /// our own `CSI u` *output* encoding so the program still receives properly
+    /// encoded keys, without injecting any bytes into the stream.
+    ///
+    /// Recognized requests (program → terminal):
+    /// - `\e[?u`  capability query   → enable our CSI u output
+    /// - `\e[>u`  enable request      → enable our CSI u output
+    /// - `\e[=u`  enable request (alias) → enable our CSI u output
+    /// - `\e[<u`  disable request     → disable
+    fn scan_kitty_negotiation(
+        data: &[u8],
+        _backend: &Arc<dyn CrabPortTerminal>,
+        state: &Arc<AtomicU8>,
+    ) {
+        // Only recognise the exact Kitty keyboard protocol CSI sequences:
+        //   ESC [ ? u        query
+        //   ESC [ > u        enable (progressive enhancement)
+        //   ESC [ > Ps u     enable with flags
+        //   ESC [ = u        enable
+        //   ESC [ = Ps u     enable with flags
+        //   ESC [ < u        disable
+        // We deliberately do NOT scan to the next arbitrary 'u' byte: CSI
+        // colour sequences (e.g. \e[01;32m) and ordinary text containing the
+        // letter 'u' occur all the time, and matching them would flip kitty
+        // keyboard state on and off spuriously.
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i] == 0x1b && data[i + 1] == b'[' {
+                let mut k = i + 2;
+                // Optional leading parameter digits.
+                while k < data.len() && data[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if k < data.len() && matches!(data[k], b'?' | b'>' | b'=' | b'<') {
+                    let intermediate = data[k];
+                    let param_start = i + 2;
+                    k += 1;
+                    // Optional trailing parameter digits.
+                    while k < data.len() && data[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k < data.len() && data[k] == b'u' {
+                        match intermediate {
+                            b'?' | b'>' | b'=' => {
+                                state.store(1, Ordering::SeqCst);
+                                tracing::debug!(
+                                    "kitty keyboard: enabled by program request {:?}",
+                                    std::str::from_utf8(&data[i..=k])
+                                );
+                            }
+                            b'<' => {
+                                state.store(0, Ordering::SeqCst);
+                                tracing::debug!(
+                                    "kitty keyboard: disabled by program request {:?}",
+                                    std::str::from_utf8(&data[i..=k])
+                                );
+                            }
+                            _ => {}
+                        }
+                        i = k + 1;
+                        continue;
+                    }
+                    // Not a kitty `u` sequence. If it is an alternate-screen
+                    // *exit* (`?1049l`, `?1047l`, `?47l`), the TUI program is
+                    // leaving its full-screen UI. Many programs (e.g. opencode)
+                    // forget to send `ESC [ < u` to disable the kitty keyboard
+                    // protocol, so we treat alt-screen exit as an implicit
+                    // disable to avoid sending `CSI u` keystrokes to the plain
+                    // shell that follows (which would render as garbage).
+                    if data[k] == b'l' {
+                        let param = std::str::from_utf8(&data[param_start..k])
+                            .unwrap_or("")
+                            .parse::<u32>()
+                            .unwrap_or(0);
+                        if matches!(param, 1049 | 1047 | 47) {
+                            if state.load(Ordering::SeqCst) != 0 {
+                                state.store(0, Ordering::SeqCst);
+                                tracing::debug!(
+                                    "kitty keyboard: disabled on alt-screen exit {:?}",
+                                    std::str::from_utf8(&data[i..=k])
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Report a focus change to the program (kitty keyboard protocol).
+    /// `focused == true` → `\e[I`, `false` → `\e[O`. No-op when kitty keyboard
+    /// is disabled, since legacy terminals do not understand these sequences.
+    pub fn report_focus(&self, focused: bool) {
+        if !self.kitty_keyboard_enabled() {
+            return;
+        }
+        let seq = if focused { b"\x1b[I" } else { b"\x1b[O" };
+        self.backend.write(seq);
     }
 
     /// Write raw bytes to the backend **without** capturing them into the
@@ -777,6 +960,15 @@ impl TerminalSession {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        // Guard against nonsensical / tiny sizes. A 0 or very small size would
+        // make the underlying PTY (and a multiplexer such as tmux) shrink the
+        // usable area to almost nothing, which looks like the terminal
+        // "collapsing". This can happen if a resize is computed from a not-yet
+        // laid-out view or an overlay bounds. Ignore those.
+        if cols < 2 || rows < 1 {
+            tracing::warn!("ignoring invalid resize request: {}x{}", cols, rows);
+            return;
+        }
         {
             let mut term = self.term.lock();
             term.resize(TermSize::new(cols as usize, rows as usize));
@@ -977,6 +1169,74 @@ impl TerminalSession {
 
         // (3) Default: scroll the scrollback buffer.
         self.scroll(lines);
+    }
+
+    /// Report a mouse button press / release / drag to the program when mouse
+    /// reporting is active, mirroring `handle_wheel`'s encoding.
+    ///
+    /// `button` is the xterm button number: `0` = left, `1` = middle,
+    /// `2` = right. `pressed` is true for a press (or a drag move) and false
+    /// for a release. `dragging` is true while a button is held and the
+    /// pointer moves. `cell` is the 0-based `(col, row)` of the pointer inside
+    /// the terminal grid.
+    ///
+    /// Returns `true` if a mouse report was emitted (caller should then skip
+    /// its local selection logic), or `false` if the program isn't in mouse
+    /// mode (so the caller may handle the event as a plain selection).
+    pub fn report_mouse_button(
+        &self,
+        button: u8,
+        cell: (usize, usize),
+        pressed: bool,
+        dragging: bool,
+    ) -> bool {
+        use alacritty_terminal::term::TermMode;
+
+        let mode = *self.term.lock().mode();
+
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return false;
+        }
+
+        // Build the xterm button code.
+        //   base button: 0=left, 1=middle, 2=right
+        //   +0x20: button is pressed (release omits this bit)
+        //   +0x40: motion while a button is held (drag)
+        let mut code = button;
+        if pressed {
+            code |= 0x20;
+        }
+        if dragging {
+            code |= 0x40;
+        }
+
+        // Shift / Meta force the report into the "modify" mask so programs
+        // that only listen for plain clicks still react; keep it simple and
+        // let the UI pass already-combined codes (we don't add 0x1/0x8 here).
+
+        let (col, row) = cell;
+        let mut buf = Vec::with_capacity(16);
+        if mode.contains(TermMode::SGR_MOUSE) {
+            // SGR mouse: \e[<code;col;rowM (press/drag) / m (release).
+            let suffix = if pressed { b'M' } else { b'm' };
+            buf.extend_from_slice(
+                format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix as char).as_bytes(),
+            );
+        } else {
+            // Legacy CSI M format: \e[M <32+code> <32+1+col> <32+1+row>.
+            if col < 222 && row < 222 {
+                buf.push(0x1b);
+                buf.push(b'[');
+                buf.push(b'M');
+                buf.push(32 + code);
+                buf.push(32 + 1 + col as u8);
+                buf.push(32 + 1 + row as u8);
+            }
+        }
+        if !buf.is_empty() {
+            self.backend.write(&buf);
+        }
+        true
     }
 
     // -----------------------------------------------------------------
