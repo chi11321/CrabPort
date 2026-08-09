@@ -9,6 +9,7 @@ use crabport_core::credential::GroupKind;
 
 use crate::app::CrabportApp;
 use crate::color::*;
+use crate::components::button::Button;
 use crate::components::context_menu::{
     ContextMenuController, ContextMenuItem, ContextMenuState, confirm_delete_item,
 };
@@ -27,6 +28,7 @@ use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 // the proxy / certificate sub-form components used by the SSH pane.
 
 pub mod form;
+pub mod import;
 pub mod with_certificate;
 pub mod with_proxy;
 
@@ -107,6 +109,8 @@ pub struct SessionsView {
     alert_controller: Option<Entity<AlertController>>,
     // Callbacks
     on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    /// Open the system OpenSSH configuration import preview.
+    on_import: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Connect to a host in SFTP-only mode (right-click → "Connect via SFTP").
     /// Only called for SSH hosts.
@@ -133,6 +137,7 @@ impl SessionsView {
             context_menu: None,
             alert_controller: None,
             on_new: None,
+            on_import: None,
             on_connect: None,
             on_sftp_connect: None,
             on_edit: None,
@@ -150,6 +155,7 @@ impl SessionsView {
         hosts: Vec<ConnectionHost>,
         form_state: Option<ConnectionFormState>,
         on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+        on_import: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
         on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
@@ -168,6 +174,7 @@ impl SessionsView {
         self.hosts = hosts;
         self.form_state = form_state;
         self.on_new = on_new;
+        self.on_import = on_import;
         self.on_connect = on_connect;
         self.on_sftp_connect = on_sftp_connect;
         self.on_edit = on_edit;
@@ -228,6 +235,23 @@ impl GroupedListView for SessionsView {
     }
     fn on_new_cb(&self) -> Option<Rc<dyn Fn(&mut Window, &mut App)>> {
         self.on_new.clone()
+    }
+
+    fn render_header_actions(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let on_import = self.on_import.clone();
+        vec![
+            Button::new("hosts-import-ssh-btn")
+                .icon("icons/download.svg")
+                .w_auto()
+                .px_2()
+                .child(t!("sessions.import_ssh").to_string())
+                .on_click(move |_event, window, cx| {
+                    if let Some(callback) = on_import.as_ref() {
+                        callback(window, cx);
+                    }
+                })
+                .into_any_element(),
+        ]
     }
 
     fn hover_state(&self) -> Option<(i64, bool)> {

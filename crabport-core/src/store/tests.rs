@@ -10,6 +10,7 @@ use crate::credential::{
     CredentialEntry, CredentialKind, GroupKind, HostEntry, HostKind, PrivateKeyKind, ProxyEntry,
     ProxyKind, TunnelEntry, TunnelKind,
 };
+use crate::ssh_import::SshImportRecord;
 
 use super::Store;
 
@@ -193,6 +194,138 @@ fn deleting_jump_host_degrades_dependents_to_direct() {
     s.remove_host(bastion).unwrap();
     let inner = s.find_host(inner_id).unwrap().expect("dependent survives");
     assert_eq!(inner.jump_host_id, None);
+}
+
+impl std::ops::DerefMut for TempStore {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
+#[test]
+fn ssh_import_creates_jump_chain_and_encrypts_key_fields() {
+    let mut s = TempStore::new("ssh-import-create");
+    let records = vec![
+        imported_record("outer", None, None),
+        imported_record("inner", None, Some("outer")),
+        imported_record("target", None, Some("inner")),
+    ];
+
+    let summary = s.import_ssh_hosts(&records).unwrap();
+    assert_eq!(summary.created, 3);
+    assert_eq!(summary.updated, 0);
+    let hosts = s.hosts().unwrap();
+    let outer = hosts.iter().find(|host| host.name == "outer").unwrap();
+    let inner = hosts.iter().find(|host| host.name == "inner").unwrap();
+    let target = hosts.iter().find(|host| host.name == "target").unwrap();
+    assert_eq!(inner.jump_host_id, Some(outer.id));
+    assert_eq!(target.jump_host_id, Some(inner.id));
+
+    let credential = s
+        .find_credential(target.credential_id.unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        credential.private_key,
+        records[2].identity_file.to_string_lossy()
+    );
+    assert_eq!(credential.secret, "key-passphrase");
+    let raw: Vec<u8> =
+        s.db.query_row(
+            "SELECT private_key FROM credentials WHERE id = ?1",
+            [target.credential_id.unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !raw.windows(b"target-key".len())
+            .any(|part| part == b"target-key")
+    );
+}
+
+#[test]
+fn ssh_import_update_preserves_crabport_fields() {
+    let mut s = TempStore::new("ssh-import-update");
+    let group_id = s.add_group("Production", GroupKind::Host, None).unwrap();
+    let proxy_id = s
+        .add_proxy(&ProxyEntry {
+            id: 0,
+            name: "proxy".into(),
+            kind: ProxyKind::Http,
+            host: "proxy.example.com".into(),
+            port: 8080,
+            username: None,
+            password: None,
+            created_at: 0,
+        })
+        .unwrap();
+    let old_credential = s.add_credential(&credential("old", "old-secret")).unwrap();
+    let mut existing = host("Prod");
+    existing.credential_id = Some(old_credential);
+    existing.favorite = true;
+    existing.group_id = Some(group_id);
+    existing.proxy_id = Some(proxy_id);
+    existing.last_login = Some(42);
+    existing.startup_command = "tmux attach".into();
+    let host_id = s.add_host(&existing).unwrap();
+
+    let record = imported_record("prod", Some(host_id), None);
+    let summary = s.import_ssh_hosts(&[record]).unwrap();
+    assert_eq!(summary.updated, 1);
+    let updated = s.find_host(host_id).unwrap().unwrap();
+    assert!(updated.favorite);
+    assert_eq!(updated.group_id, Some(group_id));
+    assert_eq!(updated.proxy_id, Some(proxy_id));
+    assert_eq!(updated.last_login, Some(42));
+    assert_eq!(updated.startup_command, "tmux attach");
+    assert!(s.find_credential(old_credential).unwrap().is_none());
+}
+
+#[test]
+fn ssh_import_rolls_back_every_row_when_a_late_update_fails() {
+    let mut s = TempStore::new("ssh-import-rollback");
+    let records = vec![
+        imported_record("created-first", None, None),
+        imported_record("missing-update", Some(999_999), None),
+    ];
+
+    assert!(s.import_ssh_hosts(&records).is_err());
+    assert!(s.hosts().unwrap().is_empty());
+    assert!(s.credentials().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_import_rejects_cycle_completed_through_existing_host() {
+    let mut s = TempStore::new("ssh-import-cycle");
+    let first_id = s.add_host(&host("first")).unwrap();
+    let mut second = host("second");
+    second.jump_host_id = Some(first_id);
+    let second_id = s.add_host(&second).unwrap();
+
+    let record = imported_record("first", Some(first_id), Some("second"));
+    assert!(s.import_ssh_hosts(&[record]).is_err());
+    let first = s.find_host(first_id).unwrap().unwrap();
+    let second = s.find_host(second_id).unwrap().unwrap();
+    assert_eq!(first.jump_host_id, None);
+    assert_eq!(second.jump_host_id, Some(first_id));
+}
+
+/// Build one valid transaction input with a deterministic test key path.
+fn imported_record(
+    name: &str,
+    existing_host_id: Option<i64>,
+    jump_host_name: Option<&str>,
+) -> SshImportRecord {
+    SshImportRecord {
+        name: name.into(),
+        host: format!("{name}.example.com"),
+        port: 22,
+        username: "deploy".into(),
+        identity_file: PathBuf::from(format!("C:/keys/{name}-key")),
+        passphrase: "key-passphrase".into(),
+        existing_host_id,
+        jump_host_name: jump_host_name.map(str::to_string),
+    }
 }
 
 // ---------------------------------------------------------------------------

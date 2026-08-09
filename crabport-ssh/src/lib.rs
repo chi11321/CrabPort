@@ -24,6 +24,9 @@ pub use backend::SshBackend;
 pub use crabport_terminal::runtime::TOKIO;
 pub use crabport_tunnel::{CrabPortTunnel, TunnelManager};
 pub use handler::{HostKeyInfo, HostKeyVerifier, HostKeyVerifyFuture, SshHandler};
+pub use keys::{
+    PrivateKeyFileError, PrivateKeyFileStatus, inspect_private_key_file, validate_private_key_file,
+};
 pub use owned_session::OwnedSession;
 
 // Re-export the transport-agnostic tunnel types from `crabport-tunnel` so

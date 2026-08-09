@@ -16,3 +16,4 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 getrandom = "0.3"
 dirs = "6"
 sys-locale = "0.3"
+ssh2-config = "0.7.2"
