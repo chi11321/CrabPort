@@ -337,7 +337,11 @@ fn sync_pty_grid(
     if cols < 10 || rows < 4 {
         tracing::debug!(
             "[grid-sync #{}] SKIP tiny bounds {:?} (cell {}x{}, prev {:?})",
-            view_id, bounds.size, cell_width, line_height, *last_grid.lock()
+            view_id,
+            bounds.size,
+            cell_width,
+            line_height,
+            *last_grid.lock()
         );
         return false;
     }
@@ -365,7 +369,13 @@ fn sync_pty_grid(
     window.refresh();
     tracing::debug!(
         "[grid-sync #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
-        view_id, cols, rows, bounds.size, cell_width, line_height, prev_grid
+        view_id,
+        cols,
+        rows,
+        bounds.size,
+        cell_width,
+        line_height,
+        prev_grid
     );
     true
 }
@@ -496,9 +506,16 @@ impl TerminalView {
         // (`\e[>u` / `\e[?u`), the session enables `CSI u` input encoding and
         // focus events for that session only.
 
-        // Wire command-history persistence: when the session captures a new
-        // command, persist it to the Store for this host (if any). Local
-        // terminals (host_id = None) keep history in-memory only.
+        // Pre-seed the in-memory command-history buffer from the Store so
+        // the History panel has something to show before the first TTY
+        // history-file read lands. We still install a command-capture
+        // callback, but the capture path is now the Enter-byte-triggered
+        // *grid read-back* in [`TerminalSession::snapshot_command_from_grid`]
+        // — it reads the rendered prompt line from the alacritty grid
+        // instead of byte-streaming the user's keystrokes, so prompts like
+        // `sudo -i` never leak the typed password into the command list
+        // (issue #69). Local terminals (host_id = None) keep history
+        // in-memory only.
         //
         // When sharing history (split panes), skip the Store pre-seed — the
         // source pane already populated the shared buffer, and re-seeding
@@ -1508,7 +1525,10 @@ impl TerminalView {
 
         // Re-install command-history persistence: the callback lives on the
         // session, so without this the fresh session would capture commands
-        // in memory but never write them to the Store again.
+        // in memory but never write them to the Store again. The capture
+        // path is the Enter-byte-triggered grid read-back (see
+        // `with_backend_and_host_and_overlay_and_history`), which is
+        // password-safe.
         if let Some(hid) = self.host_id {
             let store_for_cb = crate::app_state::AppState::store(cx);
             session.set_on_command(Some(std::sync::Arc::new(move |cmd: &str| {
@@ -2311,7 +2331,10 @@ impl Render for TerminalView {
                                     let bg_color: Option<Hsla> = if is_sel {
                                         Some(rgb(selection_bg()).into())
                                     } else if is_inv {
-                                        Some(rgb(if is_dim { dim_color(cell.fg) } else { cell.fg }).into())
+                                        Some(
+                                            rgb(if is_dim { dim_color(cell.fg) } else { cell.fg })
+                                                .into(),
+                                        )
                                     } else if cell.custom_bg {
                                         Some(rgb(cell.bg).into())
                                     } else {
@@ -2586,6 +2609,29 @@ impl Render for TerminalView {
                         let session_for_dblclick = session_c.clone();
                         let session_for_mouse = session_c.clone();
                         move |event, _window, _cx| {
+                            // Scrollbar strip guard — runs BEFORE the
+                            // mouse-mode report so a click on the scrollbar
+                            // neither starts a local selection nor gets
+                            // forwarded to the PTY as a grid-located press.
+                            // Without this, a TUI in mouse-reporting mode
+                            // (vim / less / htop) would receive a phantom
+                            // "press at column 50" when the user just meant
+                            // to drag the scrollbar, and the press would
+                            // never be paired with a release (we also early
+                            // return on `on_mouse_up` for the same strip).
+                            // Scrollbar::WIDTH is private, so we hardcode the
+                            // gpui-component value
+                            // (THUMB_ACTIVE_INSET*2 + THUMB_ACTIVE_WIDTH).
+                            let in_scrollbar = match *last_bounds.lock() {
+                                Some(bounds) => {
+                                    event.position.x
+                                        > bounds.origin.x + bounds.size.width - px(16.0)
+                                }
+                                None => false,
+                            };
+                            if in_scrollbar {
+                                return;
+                            }
                             // If the program is in mouse-reporting mode and
                             // Shift is NOT held, forward the click to the PTY
                             // instead of doing a local text selection. This is
@@ -2593,33 +2639,25 @@ impl Render for TerminalView {
                             if !event.modifiers.shift {
                                 if let Some(bounds) = *last_bounds.lock() {
                                     let offset = display_offset_mouse.load(Ordering::Relaxed);
-                                    if let Some((col, row)) =
-                                        mouse_to_grid(event.position, bounds, cell_width, line_height, offset)
-                                    {
-                                        if session_for_mouse
-                                            .report_mouse_button(0, (col as usize, row as usize), true, false)
-                                        {
+                                    if let Some((col, row)) = mouse_to_grid(
+                                        event.position,
+                                        bounds,
+                                        cell_width,
+                                        line_height,
+                                        offset,
+                                    ) {
+                                        if session_for_mouse.report_mouse_button(
+                                            0,
+                                            (col as usize, row as usize),
+                                            true,
+                                            false,
+                                        ) {
                                             return;
                                         }
                                     }
                                 }
                             }
                             if let Some(bounds) = *last_bounds.lock() {
-                                // Skip if click is in the scrollbar region
-                                // (rightmost WIDTH px). The `Scrollbar`
-                                // widget overlays that strip and calls
-                                // `cx.stop_propagation()` on its own click
-                                // handler, but we also guard here in case the
-                                // scrollbar is hidden (no history) — in which
-                                // case the strip is empty and we want normal
-                                // selection. Scrollbar::WIDTH is private, so we
-                                // hardcode the gpui-component value
-                                // (THUMB_ACTIVE_INSET*2 + THUMB_ACTIVE_WIDTH).
-                                let in_scrollbar = event.position.x
-                                    > bounds.origin.x + bounds.size.width - px(16.0);
-                                if in_scrollbar {
-                                    return;
-                                }
                                 let offset = display_offset_mouse.load(Ordering::Relaxed);
                                 if let Some((col, row)) = mouse_to_grid(
                                     event.position,
@@ -2676,9 +2714,12 @@ impl Render for TerminalView {
                                             line_height,
                                             offset,
                                         ) {
-                                            if session_for_mouse_move
-                                                .report_mouse_button(0, (col as usize, row as usize), true, true)
-                                            {
+                                            if session_for_mouse_move.report_mouse_button(
+                                                0,
+                                                (col as usize, row as usize),
+                                                true,
+                                                true,
+                                            ) {
                                                 return;
                                             }
                                         }
@@ -2721,7 +2762,26 @@ impl Render for TerminalView {
                         let line_height = line_height;
                         let display_offset_mouse_up = display_offset_mouse_up.clone();
                         let session_for_mouse_up = session_c.clone();
-                        move |event, _window, _cx| {
+                        move |event, _window, cx| {
+                            // Scrollbar strip guard — symmetric with the
+                            // `on_mouse_down` guard above. A release on the
+                            // scrollbar strip must NOT be forwarded to the
+                            // PTY as a grid-located release (a stray release
+                            // without a matching in-grid press confuses TUIs
+                            // in mouse mode), must NOT finalize a selection
+                            // whose end column would be `mouse_to_grid`'s
+                            // 999-clamp nonsense, and must NOT auto-copy that
+                            // nonsense span into the clipboard. We just bail.
+                            let in_scrollbar = match *last_bounds.lock() {
+                                Some(bounds) => {
+                                    event.position.x
+                                        > bounds.origin.x + bounds.size.width - px(16.0)
+                                }
+                                None => false,
+                            };
+                            if in_scrollbar {
+                                return;
+                            }
                             // If the press started a mouse-mode drag, just send
                             // the release to the PTY; skip local selection logic.
                             if !event.modifiers.shift {
@@ -2734,9 +2794,12 @@ impl Render for TerminalView {
                                         line_height,
                                         offset,
                                     ) {
-                                        if session_for_mouse_up
-                                            .report_mouse_button(0, (up_col as usize, up_row as usize), false, false)
-                                        {
+                                        if session_for_mouse_up.report_mouse_button(
+                                            0,
+                                            (up_col as usize, up_row as usize),
+                                            false,
+                                            false,
+                                        ) {
                                             return;
                                         }
                                     }
@@ -2774,6 +2837,33 @@ impl Render for TerminalView {
                                     }
                                 }
                             }
+
+                            // Auto-copy on select: once the user finishes a
+                            // drag / double / triple click that yields a real
+                            // selection, copy the selected text to the
+                            // clipboard (no explicit Copy action needed).
+                            // Single clicks clear the selection above, so the
+                            // re-lock below sees `None` and leaves the
+                            // clipboard untouched. We deliberately do *not*
+                            // fall back to the whole visible grid (unlike the
+                            // explicit Copy shortcut) — auto-copy is strictly
+                            // "what was highlighted." The brief selection
+                            // clone is dropped before we touch the term lock
+                            // or the system clipboard so we never hold the
+                            // two locks at once.
+                            let sel_to_copy = {
+                                let sel_guard = selection.lock();
+                                match *sel_guard {
+                                    Some(ref sel) if !sel.is_empty() => Some(sel.clone()),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(sel) = sel_to_copy {
+                                let text =
+                                    TerminalView::copy_selected_text(&session_for_mouse_up, &sel);
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+
                             needs_repaint.store(true, Ordering::Release);
                         }
                     })

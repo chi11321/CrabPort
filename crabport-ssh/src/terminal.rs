@@ -60,10 +60,16 @@ impl CrabPortTerminal for SshBackend {
             //
             // We keep the command small and POSIX-portable: `for f in ...`
             // loops aren't universally available in non-interactive sh,
-            // so we use explicit `[ -r ] && cat` fallbacks.
+            // so we use explicit `[ -r ] && tail` fallbacks.
+            //
+            // `tail -n 500` keeps the transfer bounded to the *recent*
+            // history (the panel caps at `MAX_COMMAND_HISTORY` anyway) and
+            // avoids pulling a multi-megabyte `~/.zsh_history` over the
+            // wire on every Enter-triggered resync. `tail -n` is supported
+            // by GNU coreutils, BSD and busybox.
             let cmd = "f=$HOME/.zsh_history; [ -r \"$f\" ] || f=$HOME/.bash_history; \
                  [ -r \"$f\" ] || f=$HOME/.history; \
-                 [ -r \"$f\" ] && cat \"$f\"";
+                 [ -r \"$f\" ] && tail -n 500 \"$f\"";
             let Some(raw) = crate::monitor::exec_and_read(&h, cmd).await else {
                 return;
             };

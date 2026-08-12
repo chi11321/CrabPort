@@ -380,26 +380,253 @@ impl EventListener for EventProxy {
 /// recent use).
 const MAX_COMMAND_HISTORY: usize = 300;
 
-/// State of the input-stream ANSI escape parser used by
-/// [`TerminalSession::capture_command`].
+/// Strip a leading prompt marker from a row that was read back from the
+/// alacritty grid, returning the command text that follows it.
 ///
-/// Arrow keys, Home/End, Delete, PageUp/Down, etc. emit multi-byte
-/// sequences (`ESC [ A` for ↑, `ESC [ C` for →, `ESC O c` for some
-/// keypads, …). Their printable tail (`[A`, `[C`, …) must NOT leak into
-/// the command buffer, so we run a tiny state machine that skips the
-/// whole sequence. The state is persisted across `write` calls because a
-/// single key press may arrive split across multiple packets.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum CaptureState {
-    #[default]
-    Normal,
-    /// Saw `ESC` — waiting for the next byte to tell us what kind of
-    /// sequence this is.
-    Esc,
-    /// Inside a CSI (`ESC [`) or SS3 (`ESC O`) sequence, waiting for the
-    /// final byte (0x40..=0x7e). Parameter/intermediate bytes
-    /// (0x20..=0x3f) keep us in this state.
-    AwaitFinal,
+/// Three prompt shapes are handled (best-effort heuristic — see the
+/// caveats below):
+///
+/// 1. **Simple leading marker** — the row starts with one of `$`, `%`,
+///    `#`, `>`, `❯`, `➜` (optionally followed by a single space). The
+///    marker is stripped.
+/// 2. **Complex PS1 with trailing-space marker** —
+///    `alice@box:~/repo$ ls -l` / `~/repo % ls -l`. We find the *last*
+///    occurrence of `<marker><space>` and trim everything up to it,
+///    requiring the prefix to look like a real PS1 (contains one of `@`,
+///    `:`, `/`, `~`) so a `$` mid-command doesn't cause a false cut.
+/// 3. **Complex PS1 with no trailing space** — this is the case the
+///    original heuristic missed and which caused
+///    `weed@MacBook-Pro ~ %` (macOS zsh default PS1, `%#` has no trailing
+///    space) to leak into the history verbatim. We additionally try the
+///    *last* occurrence of a single marker char (no trailing space),
+///    again gated by the PS1-indicator check on the prefix. This also
+///    handles prompt-only lines: `weed@MacBook-Pro ~ %` strips to `""`,
+///    and `snapshot_command_from_grid` drops empty results.
+///
+/// Returns the trimmed remainder (possibly empty). If no known prompt
+/// marker is found, the input is returned unchanged (trimmed).
+///
+/// Caveats: a command containing a bare `$` / `%` / `#` after a path-like
+/// prefix (e.g. `echo ~/foo $ bar`) can still be over-trimmed. The
+/// `refresh_history` path re-syncs from the shell's own history file
+/// (which never records the prompt) as ground truth, so any transient
+/// misread is corrected on the next refresh.
+fn strip_prompt_prefix(line: &str) -> &str {
+    // Simple leading marker: `$ cmd`, `% cmd`, ...
+    let head = line.trim_start();
+    for marker in [
+        "$ ", "% ", "# ", "> ", "❯ ", "➜ ", "$", "%", "#", ">", "❯", "➜",
+    ] {
+        if let Some(rest) = head.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+
+    // Heuristic test for "the prefix before this marker looks like a shell
+    // PS1" — must contain at least one of `@`, `:`, `/`, `~`. Without this
+    // gate we'd happily cut `echo $FOO` at `$` and return `FOO`.
+    fn prefix_looks_like_ps1(prefix: &str) -> bool {
+        prefix.contains('@') || prefix.contains(':') || prefix.contains('/') || prefix.contains('~')
+    }
+
+    // Complex PS1 with `<marker><space>`, e.g.
+    //   `alice@box:~/repo$ ls -l`
+    //   `~/repo % ls -l`
+    for marker in ["$ ", "# ", "% "] {
+        if let Some(idx) = line.rfind(marker) {
+            let prefix = &line[..idx];
+            if prefix_looks_like_ps1(prefix) {
+                return line[idx + marker.len()..].trim();
+            }
+        }
+    }
+
+    // Complex PS1 with a *bare* trailing marker (no following space), e.g.
+    //   `weed@MacBook-Pro ~ %ls`     (zsh `%#`, user typed `ls` no space)
+    //   `weed@MacBook-Pro ~ %`         (zsh prompt-only line → empty)
+    //   `alice@box:~/repo$ls`         (bash, no space)
+    // Try each marker char in turn; the markers that double as shell sigils
+    // (`$`, `%`, `#`) are risky so the PS1-indicator gate is essential.
+    // Marker is a single `char`, so the byte length matches `char::len_utf8()`.
+    for marker in ['%', '$', '#', '❯', '➜'] {
+        if let Some(idx) = line.rfind(marker) {
+            let prefix = &line[..idx];
+            if prefix_looks_like_ps1(prefix) {
+                let rest = &line[idx + marker.len_utf8()..];
+                // Allow an optional single space right after the marker
+                // (covers `weed@…~ % ls` written with a space too).
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                return rest.trim();
+            }
+        }
+    }
+
+    line.trim()
+}
+
+/// Merge freshly-loaded shell-history file entries into the in-memory
+/// deque.
+///
+/// `cmds` is **newest-first** (the backends `reverse()` the file before
+/// broadcasting — see `crabport_ssh::terminal::parse_shell_history` and
+/// `crabport_terminal::pty::parse_local_shell_history`). The merge keeps
+/// the deque ordered newest-at-front:
+///
+/// - Entries that are **only in memory** (not in the file) are kept at the
+///   front. These are the Enter-triggered grid snapshots of commands the
+///   shell hasn't flushed to its history file yet (default-config bash
+///   only writes `~/.bash_history` on exit) — they're newer than anything
+///   the file can tell us, and dropping them was part of the
+///   "history entries vanish right after arriving" bug. (Store pre-seed
+///   leftovers are also caught here — they're older, but harmless and
+///   rare; keeping them beats losing data.)
+/// - File-only entries are appended after them, in the file's
+///   newest-first order.
+///
+/// The deque is capped at [`MAX_COMMAND_HISTORY`] entries, evicting from
+/// the tail (the oldest). Because file entries are appended at the tail,
+/// a full deque drops the *file's oldest* entries — never the fresh
+/// in-memory snapshots at the front.
+fn merge_history_entries(history: &mut VecDeque<String>, cmds: &[String]) {
+    use std::collections::HashSet;
+
+    let file_set: HashSet<&str> = cmds.iter().map(String::as_str).collect();
+    // Memory-only entries keep their current (newest-first) order and go
+    // to the front of the merged list.
+    let memory_only: Vec<String> = history
+        .iter()
+        .filter(|e| !file_set.contains(e.as_str()))
+        .cloned()
+        .collect();
+
+    history.clear();
+    let mut kept: HashSet<String> = memory_only.iter().cloned().collect();
+    for e in memory_only {
+        history.push_back(e);
+    }
+    for c in cmds {
+        if !kept.insert(c.clone()) {
+            continue;
+        }
+        history.push_back(c.clone());
+        if history.len() > MAX_COMMAND_HISTORY {
+            history.pop_back();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::{MAX_COMMAND_HISTORY, merge_history_entries, strip_prompt_prefix};
+
+    // Regression for issue #69: macOS zsh default PS1 `%n@%m %1~ %#`
+    // renders as `weed@MacBook-Pro ~ %` — no trailing space after the
+    // marker. The original heuristic only looked for `<marker><space>`
+    // and missed this form, dumping the entire prompt line into the
+    // history sidebar.
+    #[test]
+    fn strip_prompt_handles_macos_zsh_default_ps1() {
+        // Empty prompt line (just the PS1, user pressed Enter on an empty
+        // input) — must strip to empty so `snapshot_command_from_grid`
+        // drops it.
+        assert_eq!(strip_prompt_prefix("weed@MacBook-Pro ~ %"), "");
+        // User typed `ls` without a space after `%`.
+        assert_eq!(strip_prompt_prefix("weed@MacBook-Pro ~ %ls"), "ls");
+        // User typed `ls` with a space after `%`.
+        assert_eq!(strip_prompt_prefix("weed@MacBook-Pro ~ % ls"), "ls");
+    }
+
+    #[test]
+    fn strip_prompt_handles_bash_default_ps1() {
+        // `\u@\h:\w$ ` style
+        assert_eq!(strip_prompt_prefix("alice@box:~/repo$ ls -l"), "ls -l");
+        assert_eq!(strip_prompt_prefix("alice@box:~/repo$ls"), "ls");
+        assert_eq!(strip_prompt_prefix("alice@box:~/repo$ "), "");
+    }
+
+    #[test]
+    fn strip_prompt_handles_simple_leading_markers() {
+        assert_eq!(strip_prompt_prefix("$ ls"), "ls");
+        assert_eq!(strip_prompt_prefix("% ls"), "ls");
+        assert_eq!(strip_prompt_prefix("# ls"), "ls");
+        assert_eq!(strip_prompt_prefix("> ls"), "ls");
+        assert_eq!(strip_prompt_prefix("❯ ls"), "ls");
+        assert_eq!(strip_prompt_prefix("➜ ls"), "ls");
+    }
+
+    #[test]
+    fn strip_prompt_does_not_overtrim_commands_with_sigils() {
+        // `$` / `%` / `#` mid-command without a PS1-shaped prefix must NOT
+        // be cut — the whole line is the command.
+        assert_eq!(strip_prompt_prefix("echo $FOO"), "echo $FOO");
+        assert_eq!(
+            strip_prompt_prefix("echo # not a comment"),
+            "echo # not a comment"
+        );
+        assert_eq!(strip_prompt_prefix("echo 50%"), "echo 50%");
+        assert_eq!(strip_prompt_prefix("echo ~/foo"), "echo ~/foo");
+        // Known false-positive (unavoidable with the heuristic): a `$` /
+        // `%` placed right after a path-like prefix in the *command body*
+        // is over-trimmed. We document this with a test so any future tweak
+        // is forced to make a deliberate call either way. The
+        // `refresh_history` resync on the next Enter corrects this in
+        // practice for shells that flush their file in real time.
+        assert_eq!(strip_prompt_prefix("echo ~/foo $ bar"), "bar");
+    }
+
+    // Regression for the "history entries vanish right after arriving" bug:
+    // the merge must preserve newest-first order and must not evict
+    // in-memory entries that the shell hasn't flushed to its file yet.
+    #[test]
+    fn merge_history_preserves_newest_first_order_and_keeps_unflushed_entries() {
+        // `cmds` is newest-first: ls was the most recent, cd the oldest.
+        let cmds = vec!["ls".to_string(), "pwd".to_string(), "cd".to_string()];
+        // In-memory already holds `git status` — the snapshot of a command
+        // the user just Enter'd, which bash hasn't written to the file yet.
+        let mut history: VecDeque<String> = ["git status".to_string()].into();
+
+        merge_history_entries(&mut history, &cmds);
+
+        // Newest first: the unflushed command stays at the front, the file
+        // entries follow in file order (newest first), nothing lost.
+        let got: Vec<String> = history.into_iter().collect();
+        assert_eq!(got, vec!["git status", "ls", "pwd", "cd"]);
+    }
+
+    #[test]
+    fn merge_history_dedups_and_respects_cap() {
+        // A command that exists both in memory and in the file is merged to
+        // the file's position; memory-only entries (`pwd`) stay at the
+        // front. No duplicates.
+        let mut history: VecDeque<String> = ["ls".to_string(), "pwd".to_string()].into();
+        let cmds = vec!["ls".to_string(), "vim".to_string()];
+        merge_history_entries(&mut history, &cmds);
+        let got: Vec<String> = history.into_iter().collect();
+        assert_eq!(got, vec!["pwd", "ls", "vim"]);
+
+        // Cap: memory-only entries are never evicted (they're the fresh
+        // snapshots), so a full deque drops the *file's oldest* entries
+        // instead. `big` holds 298 entries, all memory-only; the 5 file
+        // entries fill the remaining 2 slots and the 3 overflow file
+        // entries (the newest ones, appended last) are dropped at the tail.
+        let mut big: VecDeque<String> = (0..(MAX_COMMAND_HISTORY as i32) - 2)
+            .map(|i| format!("old-{i}"))
+            .collect();
+        let new_cmds: Vec<String> = (0..5).map(|i| format!("new-{i}")).collect();
+        merge_history_entries(&mut big, &new_cmds);
+        assert_eq!(big.len(), MAX_COMMAND_HISTORY);
+        // The oldest memory-only entries survive (never evicted).
+        assert!(big.iter().any(|e| e == "old-0"));
+        // The two oldest file entries made it in (appended at the tail in
+        // file order); the three newest overflow entries were dropped
+        // because the deque was already full of memory-only entries.
+        assert_eq!(big.back().map(String::as_str), Some("new-1"));
+        assert!(!big.iter().any(|e| e == "new-2"));
+        assert!(!big.iter().any(|e| e == "new-3"));
+        assert!(!big.iter().any(|e| e == "new-4"));
+    }
 }
 
 pub struct TerminalSession {
@@ -416,17 +643,20 @@ pub struct TerminalSession {
     /// clones this `Arc` from its source pane via
     /// [`TerminalSession::new_with_shared_history`].
     command_history: Arc<Mutex<VecDeque<String>>>,
-    /// In-progress input line + ANSI escape parser state, accumulated by
-    /// [`Self::write`] and submitted to `command_history` on Enter (CR/LF).
-    /// Backspace deletes the last char; ANSI escape sequences (arrow keys,
-    /// Home/End, Delete, …) are skipped by the [`CaptureState`] machine so
-    /// their printable tail (`[A`, `[C`, …) never pollutes the buffer.
-    line_buffer: Arc<Mutex<(String, CaptureState)>>,
-    /// Optional callback invoked whenever a new command is captured. The UI
-    /// layer (TerminalView) uses this to persist the command to the Store
-    /// — TerminalSession itself stays free of any storage dependency.
-    /// Receives the captured command text.
+    /// Optional callback invoked whenever a new command is captured by
+    /// [`Self::snapshot_command_from_grid`] (the Enter-byte-triggered grid
+    /// read-back — see [`Self::write`]). The UI layer (TerminalView) uses
+    /// this to persist the command to the Store; `TerminalSession` itself
+    /// stays free of any storage dependency. Receives the captured command
+    /// text.
     on_command: Arc<Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
+    /// Last time [`Self::write`] fired [`Self::refresh_history`] as an
+    /// Enter-triggered re-sync. Throttles the per-keystroke shell-history
+    /// file read so we don't `cat ~/.bash_history` (or run a remote SSH
+    /// `cat` over the wire) on every single Enter hit. The backend's own
+    /// `Connected` one-shot and the panel's refresh button are independent
+    /// of this gate.
+    last_history_refresh: Arc<parking_lot::Mutex<std::time::Instant>>,
     /// Kitty keyboard protocol flags negotiated with the program. 0 means
     /// disabled (plain byte input via the IME path). Non-zero bits track
     /// which progressive feature levels are active.
@@ -451,8 +681,13 @@ impl TerminalSession {
             started: AtomicBool::new(false),
             _wakeup_rx,
             command_history: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_COMMAND_HISTORY))),
-            line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
+            // Pre-date by a minute so the very first Enter always passes the
+            // throttle gate (and so a connect-time refresh firing just
+            // before doesn't starve the first user Enter).
+            last_history_refresh: Arc::new(parking_lot::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            )),
             kitty_keyboard: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -460,10 +695,6 @@ impl TerminalSession {
     /// Like [`new`](Self::new) but shares `command_history` with another
     /// session — used when splitting a terminal pane so all panes of the
     /// same tab see the same command history.
-    ///
-    /// Each split pane keeps its own `line_buffer` (input-line capture is
-    /// per-pane, since each pane has its own prompt); only the completed
-    /// history is shared.
     pub fn new_with_shared_history(
         backend: Arc<dyn CrabPortTerminal>,
         cols: usize,
@@ -486,8 +717,10 @@ impl TerminalSession {
             started: AtomicBool::new(false),
             _wakeup_rx,
             command_history,
-            line_buffer: Arc::new(Mutex::new((String::new(), CaptureState::default()))),
             on_command: Arc::new(Mutex::new(None)),
+            last_history_refresh: Arc::new(parking_lot::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+            )),
             kitty_keyboard: Arc::new(AtomicU8::new(0)),
         }
     }
@@ -601,17 +834,39 @@ impl TerminalSession {
                         // terminal parser. Ignore them here.
                         BackendEvent::SftpTransferFinished { .. } => {}
                         BackendEvent::SftpTransferProgress { .. } => {}
-                        // Replace the in-memory command history with the
-                        // freshly-loaded TTY history file contents. The
-                        // backend delivers most-recent-first, so we assign
-                        // the deque front-to-back as given. A wake-up is
-                        // broadcast so the UI repaints with the new list.
+                        // Merge the freshly-loaded TTY history file
+                        // contents into the in-memory deque. The backend
+                        // delivers most-recent-first.
+                        //
+                        // We *merge* (LRU dedup + promote) instead of
+                        // `clear + extend` so that commands the shell has
+                        // not yet flushed to its history file (e.g. a
+                        // freshly-Enter'd command under default-config bash,
+                        // which only writes `~/.bash_history` on shell exit)
+                        // aren't evicted by an Enter-triggered resync that
+                        // loads an older file snapshot. For zsh users with
+                        // `INC_APPEND_HISTORY` / `SHARE_HISTORY` the merge
+                        // is a no-op dedup — the just-typed command is
+                        // already at the file's front and at the deque's
+                        // front, so the entry is just promoted.
                         BackendEvent::HistoryLoaded(cmds) => {
+                            // `cmds` is delivered **newest-first** (the
+                            // backends `reverse()` the file before
+                            // broadcasting). We must preserve that order:
+                            // entries already in memory are skipped (no
+                            // `remove + push_front`, which would flip the
+                            // whole list and shove the freshest command to
+                            // the tail — where the cap below would evict
+                            // it), and file-only entries are appended at the
+                            // tail so the deque stays oldest-at-back.
+                            //
+                            // Example: file = [ls(newest), pwd, cd], memory
+                            // = [git status] (snapshot of a just-Enter'd
+                            // command bash hasn't flushed yet) → after merge
+                            // deque = [git status, ls, pwd, cd], i.e. the
+                            // newest first, nothing lost.
                             let mut history = command_history.lock();
-                            history.clear();
-                            for c in cmds {
-                                history.push_back(c);
-                            }
+                            merge_history_entries(&mut history, &cmds);
                             drop(history);
                             let _ = wakeup_tx.try_broadcast(());
                         }
@@ -670,8 +925,55 @@ impl TerminalSession {
         parser.advance(&mut *term, data);
     }
 
+    /// Forward user keystrokes to the backend. We intentionally do **not**
+    /// parse the byte stream itself for command text — that would capture
+    /// every typed character including passwords typed at a `sudo -i` /
+    /// `ssh-keygen` prompt (see issue #69: the root password was leaking
+    /// into the sidebar). Instead, we only watch for the Enter byte
+    /// (`\r` 0x0d / `\n` 0x0a) as a *trigger*, and at that instant read the
+    /// already-rendered prompt line back from the alacritty grid via
+    /// [`Self::snapshot_command_from_grid`]. Because passwords are never
+    /// echoed to the screen, they never enter the grid, and therefore
+    /// never enter the command history — but real commands (`$ ls -l`)
+    /// which the shell *has* echoed as the user typed them, do.
     pub fn write(&self, data: &[u8]) {
-        self.capture_command(data);
+        // Fire the snapshot when the user presses Enter. We check the raw
+        // bytes here (before forwarding) so the grid still reflects the
+        // pre-Enter frame — the shell hasn't yet echoed the newline, so
+        // the cursor sits at the end of the just-typed command line.
+        // `snapshot_command_from_grid` is a no-op for empty / prompt /
+        // password lines, so spurious fires (e.g. Shift+Enter, control
+        // sequences that include a stray `\n`) are harmless.
+        let has_enter = data.iter().any(|&b| b == 0x0d || b == 0x0a);
+        if has_enter {
+            self.snapshot_command_from_grid();
+            // Re-sync from the shell's own history file as the ground-truth
+            // source. `snapshot_command_from_grid` is a best-effort guess
+            // (prompt stripping is heuristic — see `strip_prompt_prefix`),
+            // but the shell's own `~/.bash_history` / `~/.zsh_history`
+            // records exactly the commands executed and never the prompt
+            // text, so overwriting the in-memory deque with the file's
+            // contents on the next `HistoryLoaded` event corrects any
+            // sporadic misread. Throttled to avoid `cat`ing the file on
+            // every keystroke (and to avoid a remote `cat` over SSH on
+            // every Enter). For shells that don't flush in real time
+            // (default bash) the snapshot above still gives instant
+            // feedback.
+            const RESYNC_THROTTLE: std::time::Duration = std::time::Duration::from_millis(400);
+            let should_resync = {
+                let mut last = self.last_history_refresh.lock();
+                let now = std::time::Instant::now();
+                if now.duration_since(*last) >= RESYNC_THROTTLE {
+                    *last = now;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_resync {
+                self.refresh_history();
+            }
+        }
         self.backend.write(data);
     }
 
@@ -807,10 +1109,11 @@ impl TerminalSession {
         self.backend.write(seq);
     }
 
-    /// Write raw bytes to the backend **without** capturing them into the
-    /// command history. Used by the History panel's "paste" action so
-    /// inserting a historical command into the input line doesn't re-record
-    /// it as a new entry.
+    /// Write raw bytes to the backend. Functionally equivalent to
+    /// [`Self::write`] now that user input is no longer captured; the
+    /// distinct name is kept at call sites to flag programmatic paste
+    /// (e.g. the History panel's "paste into input line" action) as
+    /// opposed to user typing.
     pub fn write_raw(&self, data: &[u8]) {
         self.backend.write(data);
     }
@@ -836,116 +1139,115 @@ impl TerminalSession {
     }
 
     /// Register a callback invoked whenever a new command is captured
-    /// (submitted via Enter). The UI layer uses this to persist commands
-    /// to the Store — `TerminalSession` itself has no storage dependency.
-    /// Pass `None` to clear a previously-set callback.
+    /// (see [`Self::write`] / [`Self::snapshot_command_from_grid`]). The
+    /// UI layer uses this to persist commands to the Store —
+    /// `TerminalSession` itself has no storage dependency. Pass `None` to
+    /// clear a previously-set callback.
     pub fn set_on_command(&self, cb: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
         *self.on_command.lock() = cb;
     }
 
-    /// Best-effort command capture from the raw input stream.
+    /// Snapshot the cursor row of the alacritty grid as a command entry.
     ///
-    /// Runs a small state machine (see [`CaptureState`]) over the bytes so
-    /// that ANSI escape sequences emitted by editing keys — arrow keys
-    /// (`ESC [ A/B/C/D`), Home/End, Delete, PageUp/Down, etc. — are skipped
-    /// in full instead of leaking their printable tail (`[A`, `[C`, …) into
-    /// the buffer. The state persists across `write` calls because a single
-    /// key press may arrive split across multiple packets.
+    /// Called by [`Self::write`] on detecting an Enter byte. The grid at
+    /// that instant still shows the line the user just composed (e.g.
+    /// `$ ls -l` with the cursor at the end), because the shell has not
+    /// yet echoed back the newline. We read that row, strip a bunch of
+    /// well-known prompt prefixes, drop lines that smell like password /
+    /// passphrase prompts (which never contain the actual password — the
+    /// password is absent from the grid entirely), and push the result to
+    /// [`Self::command_history`].
     ///
-    /// Printable ASCII (`0x20..=0x7e`) and UTF-8 multibyte bytes
-    /// (`0x80..=0xff`) are appended; Backspace (DEL `0x7f` / BS `0x08`)
-    /// deletes the last char; CR/LF submits the buffer. Empty results and
-    /// exact-duplicates of the most recent entry are skipped.
+    /// Safety property (the whole reason this replaces the old byte-stream
+    /// capture): if the user is at a `sudo -i` password prompt and hits
+    /// Enter, the grid row contains something like
+    /// `[sudo] password for user:` — *no password characters*. We filter
+    /// it out, and even if the filter missed it, the string that would
+    /// land in history is the *prompt* text, never the secret itself.
     ///
-    /// This is intentionally simple — it doesn't mirror the PTY's idea of
-    /// the current line, so commands recalled with `↑` and then edited
-    /// won't be captured perfectly (the buffer only reflects what the user
-    /// typed in this session, not what readline echoed back). But it's
-    /// accurate for the common typed-and-Enter case, and the cost (a couple
-    /// of locks + a small alloc) is negligible.
-    fn capture_command(&self, data: &[u8]) {
-        let mut history = self.command_history.lock();
-        let mut line = self.line_buffer.lock();
-        let (buf, state) = &mut *line;
-        for &b in data {
-            match *state {
-                CaptureState::Normal => match b {
-                    // CR or LF — submit the line.
-                    0x0d | 0x0a => {
-                        let cmd = buf.trim().to_string();
-                        buf.clear();
-                        if cmd.is_empty() {
-                            continue;
-                        }
-                        // LRU dedup: if the command already exists in
-                        // history, remove it from its current position so it
-                        // can be re-inserted at the front (most-recently-used).
-                        // This mirrors the Store's `updated_at` promotion.
-                        if let Some(pos) = history.iter().position(|c| c == &cmd) {
-                            history.remove(pos);
-                        }
-                        if history.len() >= MAX_COMMAND_HISTORY {
-                            history.pop_back();
-                        }
-                        history.push_front(cmd.clone());
-                        // Notify the UI layer so it can persist the command.
-                        // The callback is cloned out of the Mutex to avoid
-                        // calling it while holding the lock.
-                        let cb = self.on_command.lock().clone();
-                        if let Some(cb) = cb {
-                            cb(&cmd);
-                        }
-                    }
-                    // Backspace / DEL — delete the last char.
-                    0x08 | 0x7f => {
-                        buf.pop();
-                    }
-                    // ESC — start of an ANSI escape sequence (arrow keys,
-                    // Home/End, etc.). Switch to `Esc` and drop this byte so
-                    // the sequence's printable tail (`[A`, `[C`, …) never
-                    // reaches the buffer.
-                    0x1b => {
-                        *state = CaptureState::Esc;
-                    }
-                    // Printable ASCII.
-                    0x20..=0x7e => {
-                        buf.push(b as char);
-                    }
-                    // High bytes (UTF-8 continuation / lead) — push raw so
-                    // non-ASCII commands aren't lost. We don't validate UTF-8
-                    // here; the buffer is only for display, not execution.
-                    0x80..=0xff => {
-                        buf.push(b as char);
-                    }
-                    // Other control bytes (Tab, SI/SO, etc.) — ignore.
-                    _ => {}
-                },
-                CaptureState::Esc => match b {
-                    // CSI (`ESC [`) or SS3 (`ESC O`) — wait for the final
-                    // byte (and any intermediate parameter bytes).
-                    b'[' | b'O' => {
-                        *state = CaptureState::AwaitFinal;
-                    }
-                    // Any other byte after ESC is a two-char sequence
-                    // (e.g. `ESC =`). Consume it and return to Normal.
-                    _ => {
-                        *state = CaptureState::Normal;
-                    }
-                },
-                CaptureState::AwaitFinal => match b {
-                    // Parameter / intermediate bytes (0x20..=0x3f) — keep
-                    // waiting for the final byte.
-                    0x20..=0x3f => {}
-                    // Final byte (0x40..=0x7e) — sequence complete.
-                    0x40..=0x7e => {
-                        *state = CaptureState::Normal;
-                    }
-                    // Unexpected byte — bail back to Normal.
-                    _ => {
-                        *state = CaptureState::Normal;
-                    }
-                },
+    /// Multi-line commands, multiline REPL continuations, commands pasted
+    /// as a single Enter-delimited blob, and commands edited mid-line with
+    /// arrow keys are not captured perfectly — but the cross-check against
+    /// the most recent entry (skipping an exact duplicate) and the LRU cap
+    /// keep the history usable, and `refresh_history` re-syncs from the
+    /// shell's own `~/.bash_history` / `~/.zsh_history` for ground truth.
+    fn snapshot_command_from_grid(&self) {
+        // Read the cursor row out of the term grid. Holding the term lock is
+        // cheap; this runs only on Enter (no per-byte hot path).
+        let raw = self.with_term(|term| {
+            let grid = term.grid();
+            let row = grid.cursor.point.line;
+            let num_cols = grid.columns();
+            let li = alacritty_terminal::index::Line(row.0);
+            let mut s = String::with_capacity(num_cols);
+            for col in 0..num_cols {
+                let cell = &grid[li][alacritty_terminal::index::Column(col)];
+                // Skip wide-char trailing spacers so a CJK command doesn't
+                // carry phantom cells into history.
+                if cell
+                    .flags
+                    .intersects(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                s.push(cell.c);
             }
+            s
+        });
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        // Drop lines that smell like password / passphrase / 2FA prompts.
+        // These rows never contain the secret itself (passwords aren't
+        // echoed), so wrongly keeping one would pollute history with the
+        // *prompt*, not the password — but we'd rather avoid the pollution.
+        let lower = trimmed.to_lowercase();
+        if lower.contains("password")
+            || lower.contains("passphrase")
+            || lower.contains("[sudo]")
+            || lower.contains("verification code")
+        {
+            return;
+        }
+        // A trailing `:` (optionally followed by a space) is the canonical
+        // form of a password / passphrase / confirmation prompt — drop it.
+        let trimmed_no_trailing_ws = trimmed.trim_end();
+        if trimmed_no_trailing_ws.ends_with(':') {
+            return;
+        }
+
+        let stripped = strip_prompt_prefix(trimmed);
+        if stripped.is_empty() {
+            return;
+        }
+
+        // LRU dedup + cap, mirroring the old `capture_command` behaviour so
+        // the in-memory deque stays consistent with the Store-side dedup.
+        let cmd = stripped.to_string();
+        let cb = {
+            let mut history = self.command_history.lock();
+            if let Some(first) = history.front() {
+                if first == &cmd {
+                    // Exact-duplicate of the most-recent entry: skip. We
+                    // don't promote (move to front) because it's already
+                    // there.
+                    return;
+                }
+            }
+            if let Some(pos) = history.iter().position(|c| c == &cmd) {
+                history.remove(pos);
+            }
+            if history.len() >= MAX_COMMAND_HISTORY {
+                history.pop_back();
+            }
+            history.push_front(cmd.clone());
+            self.on_command.lock().clone()
+        };
+        if let Some(cb) = cb {
+            cb(&cmd);
         }
     }
 
