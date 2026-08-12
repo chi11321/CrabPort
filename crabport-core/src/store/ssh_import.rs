@@ -111,8 +111,11 @@ impl Store {
         }
 
         // Existing jump links can combine with imported links into a longer
-        // cycle, so validate the complete post-import graph before commit.
-        validate_jump_graph(&transaction)?;
+        // cycle. Validate only the subgraph reachable from the hosts this
+        // import touched, so pre-existing unrelated cycle elsewhere in the DB
+        // does not block (and get blamed on) this import.
+        let imported_start_ids: HashSet<i64> = imported_ids.values().copied().collect();
+        validate_jump_graph(&transaction, &imported_start_ids)?;
 
         // Remove credentials replaced by updates only when no other host still
         // references them. Shared/manual credentials are deliberately kept.
@@ -289,8 +292,20 @@ fn resolve_unique_alias(
     }
 }
 
-/// Reject cycles in the complete post-import jump-host graph.
-fn validate_jump_graph(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+/// Reject cycles in the subgraph reachable from `start_ids` after the import.
+///
+/// Only paths rooted at hosts the current import created or updated are
+/// walked, so a pre-existing cycle elsewhere in the DB does not abort (and
+/// get misattributed to) an unrelated import. The whole jump-host table is
+/// still loaded once to build the adjacency, but only reachable nodes are
+/// tested for cycles.
+fn validate_jump_graph(
+    transaction: &rusqlite::Transaction<'_>,
+    start_ids: &HashSet<i64>,
+) -> Result<(), StoreError> {
+    if start_ids.is_empty() {
+        return Ok(());
+    }
     let mut statement = transaction
         .prepare("SELECT id, jump_host_id FROM hosts WHERE jump_host_id IS NOT NULL")
         .map_err(|error| StoreError::Db(error.to_string()))?;
@@ -299,14 +314,14 @@ fn validate_jump_graph(transaction: &rusqlite::Transaction<'_>) -> Result<(), St
             Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
         })
         .map_err(|error| StoreError::Db(error.to_string()))?;
-    let mut links = HashMap::new();
+    let mut links: HashMap<i64, Option<i64>> = HashMap::new();
     for row in rows {
         let (host_id, jump_host_id) = row.map_err(|error| StoreError::Db(error.to_string()))?;
         links.insert(host_id, jump_host_id);
     }
 
     let mut completed = HashSet::new();
-    for start in links.keys().copied() {
+    for &start in start_ids {
         if completed.contains(&start) {
             continue;
         }

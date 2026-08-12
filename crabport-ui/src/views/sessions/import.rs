@@ -53,8 +53,11 @@ enum ImportIssue {
     AmbiguousConflict,
     /// The private key could not be decoded by the real SSH backend.
     InvalidPrivateKey,
-    /// A jump alias exists neither in the scan nor in saved sessions.
+    /// A jump alias is neither in the scan nor among the saved sessions.
     JumpMissing(String),
+    /// The jump alias exists as a candidate but is itself blocked (e.g. its
+    /// private key is invalid) so importing it cannot satisfy the chain.
+    JumpNotImportable(String),
     /// More than one saved session matches a jump alias.
     JumpAmbiguous(String),
     /// A saved jump alias is not an SSH session.
@@ -484,7 +487,7 @@ impl SshImportState {
                     return true;
                 }
                 [] => {
-                    self.push_issue(root, ImportIssue::JumpMissing(alias.to_string()));
+                    self.push_issue(root, ImportIssue::JumpNotImportable(alias.to_string()));
                     return false;
                 }
             }
@@ -1040,6 +1043,9 @@ fn blocker_text(blocker: &SshImportBlocker) -> String {
         SshImportBlocker::UnsupportedIdentityToken(token) => {
             t!("ssh_import.blocker_key_token", token = token.as_str()).to_string()
         }
+        SshImportBlocker::LocalUsernameMissing => {
+            t!("ssh_import.blocker_local_username_missing").to_string()
+        }
         SshImportBlocker::UnsupportedProxyJump(jump) => {
             t!("ssh_import.blocker_proxy_jump", jump = jump.as_str()).to_string()
         }
@@ -1060,6 +1066,11 @@ fn issue_text(issue: &ImportIssue) -> String {
         ImportIssue::JumpMissing(alias) => {
             t!("ssh_import.issue_jump_missing", alias = alias.as_str()).to_string()
         }
+        ImportIssue::JumpNotImportable(alias) => t!(
+            "ssh_import.issue_jump_not_importable",
+            alias = alias.as_str()
+        )
+        .to_string(),
         ImportIssue::JumpAmbiguous(alias) => {
             t!("ssh_import.issue_jump_ambiguous", alias = alias.as_str()).to_string()
         }
@@ -1094,6 +1105,9 @@ fn notice_text(notice: &SshImportNotice) -> String {
     match notice {
         SshImportNotice::InferredHostName => t!("ssh_import.notice_host_inferred").to_string(),
         SshImportNotice::InferredUsername => t!("ssh_import.notice_user_inferred").to_string(),
+        SshImportNotice::RelativeIdentityPath => {
+            t!("ssh_import.notice_relative_identity_path").to_string()
+        }
         SshImportNotice::IgnoredDirectives(fields) => t!(
             "ssh_import.notice_ignored",
             fields = fields.join(", ").as_str()

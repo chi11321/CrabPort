@@ -53,6 +53,10 @@ pub enum SshImportNotice {
     InferredHostName,
     /// `User` was absent, so the current local account was used.
     InferredUsername,
+    /// `IdentityFile` was relative and resolved against the config file
+    /// directory. OpenSSH resolves relative paths against the process CWD,
+    /// so the resolved path may differ in non-default launch scenarios.
+    RelativeIdentityPath,
     /// Supported connection data was retained while these extras were omitted.
     IgnoredDirectives(Vec<String>),
 }
@@ -68,6 +72,11 @@ pub enum SshImportBlocker {
     IdentityFileMissing(PathBuf),
     /// The identity path contains a token CrabPort cannot resolve safely.
     UnsupportedIdentityToken(String),
+    /// `User` was absent and the current local username could not be resolved.
+    /// Surfaced as a blocker so import can proceed for hosts that do specify
+    /// `User` even when the ambient username is unavailable (e.g. some macOS
+    /// GUI launch paths lack USER/USERNAME).
+    LocalUsernameMissing,
     /// The jump specification is not a plain concrete alias.
     UnsupportedProxyJump(String),
     /// These directives change transport or authentication semantics.
@@ -140,6 +149,10 @@ impl fmt::Display for SshImportError {
             }
             Self::Io(error) => write!(f, "failed to read SSH config: {error}"),
             Self::Parse(error) => write!(f, "failed to parse SSH config: {error}"),
+            // No longer raised by scan_ssh_config (username resolution is now
+            // per-candidate and surfaces as SshImportBlocker::LocalUsernameMissing).
+            // Kept for binary compatibility with any external caller of the
+            // public scan API.
             Self::LocalUsernameUnavailable => {
                 write!(f, "cannot determine the current local username")
             }
@@ -157,26 +170,36 @@ pub fn default_ssh_config_path() -> Result<PathBuf, SshImportError> {
 }
 
 /// Scan the default OpenSSH user configuration for importable aliases.
+///
+/// The current local username is resolved best-effort (environment variables
+/// then the home directory name) and only used when a candidate omits `User`.
+/// Hosts that specify `User` import fine without any ambient username.
 pub fn scan_default_ssh_config() -> Result<SshImportScan, SshImportError> {
     let config_path = default_ssh_config_path()?;
-    let local_username = current_local_username()?;
-    scan_ssh_config(&config_path, &local_username)
+    let local_username = current_local_username().ok();
+    scan_ssh_config(&config_path, local_username.as_deref())
 }
 
 /// Parse `config_path` and build CrabPort import candidates.
 ///
 /// This path-taking variant is public so tests and future callers can scan an
 /// explicitly known OpenSSH config without mutating process environment.
+///
+/// `local_username` is best-effort: it is only consulted when a candidate
+/// omits `User` and the value is non-empty; otherwise the candidate gets a
+/// `LocalUsernameMissing` blocker and stays unselectable in the preview.
 pub fn scan_ssh_config(
     config_path: &Path,
-    local_username: &str,
+    local_username: Option<&str>,
 ) -> Result<SshImportScan, SshImportError> {
     if !config_path.is_file() {
         return Err(SshImportError::ConfigNotFound(config_path.to_path_buf()));
     }
-    if local_username.trim().is_empty() {
-        return Err(SshImportError::LocalUsernameUnavailable);
-    }
+    // Resolve once, then sanitize: a present-but-empty value (e.g. `USER=""`)
+    // should be treated the same as absent.
+    let local_username = local_username
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
 
     tracing::info!("ssh import: scanning {}", config_path.display());
     let file = File::open(config_path).map_err(|error| SshImportError::Io(error.to_string()))?;
@@ -234,7 +257,7 @@ fn build_candidate(
     params: HostParams,
     config_dir: &Path,
     home: &Path,
-    local_username: &str,
+    local_username: Option<&str>,
 ) -> SshImportCandidate {
     let mut notices = Vec::new();
     let mut blockers = Vec::new();
@@ -242,15 +265,29 @@ fn build_candidate(
         notices.push(SshImportNotice::InferredHostName);
         alias.to_string()
     });
-    let username = params.user.clone().unwrap_or_else(|| {
-        notices.push(SshImportNotice::InferredUsername);
-        local_username.to_string()
-    });
+    let username = match params.user.clone() {
+        Some(user) => user,
+        None => match local_username {
+            Some(name) => {
+                notices.push(SshImportNotice::InferredUsername);
+                name.to_string()
+            }
+            None => {
+                blockers.push(SshImportBlocker::LocalUsernameMissing);
+                String::new()
+            }
+        },
+    };
 
     let mut identity_files = Vec::new();
     for path in params.identity_file.clone().unwrap_or_default() {
         match expand_identity_path(&path, config_dir, home, &host, &username, local_username) {
-            Ok(path) => identity_files.push(path),
+            Ok((path, relative)) => {
+                if relative {
+                    notices.push(SshImportNotice::RelativeIdentityPath);
+                }
+                identity_files.push(path);
+            }
             Err(token) => blockers.push(SshImportBlocker::UnsupportedIdentityToken(token)),
         }
     }
@@ -352,14 +389,21 @@ fn classify_directives(params: &HostParams) -> (Vec<String>, Vec<String>) {
 }
 
 /// Expand the deterministic OpenSSH tokens supported by the import contract.
+///
+/// Returns the resolved path plus a flag indicating whether the source path
+/// was relative (neither absolute, nor `~`-anchored). OpenSSH resolves
+/// relative `IdentityFile` against the process CWD; CrabPort resolves it
+/// against the config file directory so imports stay reproducible regardless
+/// of how the app was launched. The flag lets the preview surface the
+/// difference as a non-blocking notice.
 fn expand_identity_path(
     path: &Path,
     config_dir: &Path,
     home: &Path,
     remote_host: &str,
     remote_user: &str,
-    local_user: &str,
-) -> Result<PathBuf, String> {
+    local_user: Option<&str>,
+) -> Result<(PathBuf, bool), String> {
     let raw = path.to_string_lossy();
     let mut expanded = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -376,30 +420,47 @@ fn expand_identity_path(
             'd' => expanded.push_str(&home.to_string_lossy()),
             'h' => expanded.push_str(remote_host),
             'r' => expanded.push_str(remote_user),
-            'u' => expanded.push_str(local_user),
+            'u' => match local_user {
+                Some(user) => expanded.push_str(user),
+                None => return Err("%u".to_string()),
+            },
             other => return Err(format!("%{other}")),
         }
     }
 
     // OpenSSH expands a leading home marker before interpreting the path.
-    let expanded = if let Some(relative) = expanded
+    let (expanded, was_tilde) = if let Some(relative) = expanded
         .strip_prefix("~/")
         .or_else(|| expanded.strip_prefix("~\\"))
     {
-        home.join(relative)
+        (home.join(relative), true)
     } else {
-        PathBuf::from(expanded)
+        (PathBuf::from(expanded), false)
     };
     if expanded.is_absolute() {
-        Ok(expanded)
+        Ok((expanded, false))
+    } else if was_tilde {
+        Ok((expanded, false))
     } else {
-        Ok(config_dir.join(expanded))
+        Ok((config_dir.join(expanded), true))
     }
 }
 
 /// Return true only for a literal, positive alias that can become one row.
+///
+/// Rejects any OpenSSH pattern wildcard or glob meta-character (`*`, `?`,
+/// character classes `[...]`, or a backslash escape) as well as negation.
+/// `ssh2-config` evaluates `Host` patterns with `wildmatch`, so a `Host` clause
+/// like `web[1-3]` would never match the literal string `web[1-3]` when
+/// queried, and emitting it as a concrete alias would yield a candidate
+/// populated from upstream wildcard blocks instead of its own. Excluding
+/// every meta-character avoids that silently-wrong candidate.
 fn is_concrete_alias(alias: &str) -> bool {
-    !alias.is_empty() && !alias.starts_with('!') && !alias.contains('*') && !alias.contains('?')
+    !alias.is_empty()
+        && !alias.starts_with('!')
+        && !alias
+            .chars()
+            .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '\\'))
 }
 
 /// Normalize an alias for case-insensitive conflict and deduplication checks.
@@ -408,12 +469,26 @@ pub fn normalize_alias(alias: &str) -> String {
 }
 
 /// Resolve the current local username without introducing platform-only APIs.
+///
+/// Tries the portable environment variables first (USER and USERNAME both
+/// work on macOS/Linux and Windows respectively), then falls back to the last
+/// component of the home directory. The home-directory fallback matters for
+/// GUI launches on macOS where launchd may not inject USER into the process
+/// environment, but `~/` is always `/Users/<name>`.
 fn current_local_username() -> Result<String, SshImportError> {
-    ["USERNAME", "USER"]
+    if let Some(name) = ["USERNAME", "USER"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok())
-        .filter(|name| !name.trim().is_empty())
-        .ok_or(SshImportError::LocalUsernameUnavailable)
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    {
+        return Ok(name);
+    }
+    let home = dirs::home_dir().ok_or(SshImportError::HomeDirectoryUnavailable)?;
+    home.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or(SshImportError::HomeDirectoryUnavailable)
 }
 
 #[cfg(test)]
@@ -464,7 +539,7 @@ Host prod-a prod-b *.internal !blocked
         );
         std::fs::write(fixture.dir.join("key.pem"), "key").unwrap();
 
-        let scan = scan_ssh_config(&fixture.path, "local-user").unwrap();
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
         assert_eq!(
             scan.candidates
                 .iter()
@@ -496,7 +571,7 @@ Host app
         std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
         std::fs::write(&key_path, "key").unwrap();
 
-        let scan = scan_ssh_config(&fixture.path, "local-user").unwrap();
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
         let candidate = &scan.candidates[0];
         assert_eq!(candidate.host, "app");
         assert_eq!(candidate.username, "local-user");
@@ -531,7 +606,7 @@ Host agent-only
 "#,
         );
 
-        let scan = scan_ssh_config(&fixture.path, "local-user").unwrap();
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
         assert!(
             scan.candidates[0]
                 .blockers
@@ -565,7 +640,7 @@ Host decorated
         );
         std::fs::write(fixture.dir.join("key"), "key").unwrap();
 
-        let scan = scan_ssh_config(&fixture.path, "local-user").unwrap();
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
         let target = scan.candidates.iter().find(|c| c.name == "target").unwrap();
         assert_eq!(target.proxy_jump, ["outer", "inner"]);
         let decorated = scan
@@ -597,7 +672,7 @@ Host decorated
         .unwrap();
         std::fs::write(fixture.dir.join("key"), "key").unwrap();
 
-        let scan = scan_ssh_config(&fixture.path, "local-user").unwrap();
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
         assert_eq!(scan.candidates.len(), 1);
         assert_eq!(scan.candidates[0].name, "included");
         assert_eq!(scan.candidates[0].host, "included.example.com");
@@ -623,10 +698,133 @@ Host decorated
             &home,
             "host",
             "remote",
-            "local",
+            Some("local"),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(path, home.join(".ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn relative_identity_path_is_config_relative_not_cwd() {
+        // OpenSSH resolves relative IdentityFile against CWD; CrabPort resolves
+        // it against the config file directory. A bare "keys/id_rsa" must land
+        // inside config_dir, and the resolver must report it as relative so the
+        // preview can surface the divergence as a notice.
+        let home = if cfg!(windows) {
+            PathBuf::from("C:/Users/example")
+        } else {
+            PathBuf::from("/home/example")
+        };
+        let config_dir = if cfg!(windows) {
+            PathBuf::from("C:/config")
+        } else {
+            PathBuf::from("/etc/ssh")
+        };
+        let (path, relative) = expand_identity_path(
+            Path::new("keys/id_rsa"),
+            &config_dir,
+            &home,
+            "host",
+            "remote",
+            Some("local"),
         )
         .unwrap();
-        assert_eq!(path, home.join(".ssh/id_ed25519"));
+        assert_eq!(path, config_dir.join("keys/id_rsa"));
+        assert!(relative);
+    }
+
+    #[test]
+    fn scans_with_explicit_user_does_not_require_local_username() {
+        // Absent ambient username must not abort the scan when every Host
+        // specifies User explicitly. The candidate imports cleanly (no
+        // InferredUsername, no LocalUsernameMissing blocker).
+        let fixture = TempConfig::new(
+            "explicit-user",
+            r#"
+Host prod
+    User deploy
+    HostName edge.example.com
+    IdentityFile key.pem
+"#,
+        );
+        std::fs::write(fixture.dir.join("key.pem"), "key").unwrap();
+
+        let scan = scan_ssh_config(&fixture.path, None).unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        let candidate = &scan.candidates[0];
+        assert_eq!(candidate.username, "deploy");
+        assert!(
+            !candidate
+                .blockers
+                .contains(&SshImportBlocker::LocalUsernameMissing)
+        );
+        assert!(
+            !candidate
+                .notices
+                .contains(&SshImportNotice::InferredUsername)
+        );
+    }
+
+    #[test]
+    fn inferred_user_without_local_username_blocks_candidate() {
+        // When User is missing AND ambient username is unavailable, the
+        // candidate still appears in the preview but is blocked, rather than
+        // aborting the whole scan.
+        let fixture = TempConfig::new(
+            "missing-user",
+            r#"
+Host prod
+    HostName edge.example.com
+    IdentityFile key.pem
+"#,
+        );
+        std::fs::write(fixture.dir.join("key.pem"), "key").unwrap();
+
+        let scan = scan_ssh_config(&fixture.path, None).unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        assert!(
+            scan.candidates[0]
+                .blockers
+                .contains(&SshImportBlocker::LocalUsernameMissing)
+        );
+    }
+
+    #[test]
+    fn glob_character_class_patterns_are_treated_as_non_concrete() {
+        // "Host web[1-3]" must be skipped, not emitted as a concrete alias.
+        // ssh2-config would evaluate the pattern with wildmatch where [1-3] is
+        // a character class, so query("web[1-3]") never matches the literal
+        // string; the candidate would silently inherit upstream wildcard
+        // params. Skipping it (alongside "*" and "?") avoids that.
+        let fixture = TempConfig::new(
+            "charclass",
+            r#"
+Host web[1-3] escaped\* literal
+    HostName edge.example.com
+    IdentityFile key.pem
+"#,
+        );
+        std::fs::write(fixture.dir.join("key.pem"), "key").unwrap();
+
+        let scan = scan_ssh_config(&fixture.path, Some("local-user")).unwrap();
+        assert_eq!(
+            scan.candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            ["literal"]
+        );
+        assert!(
+            scan.skipped_patterns
+                .iter()
+                .any(|pattern| pattern.contains("web[1-3]"))
+        );
+        assert!(
+            scan.skipped_patterns
+                .iter()
+                .any(|pattern| pattern.contains("escaped\\*"))
+        );
     }
 
     /// Build a relative path without adding a test-only dependency.
