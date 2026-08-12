@@ -10,6 +10,7 @@ use crate::credential::{
     CredentialEntry, CredentialKind, GroupKind, HostEntry, HostKind, PrivateKeyKind, ProxyEntry,
     ProxyKind, TunnelEntry, TunnelKind,
 };
+use crate::ssh_import::SshImportRecord;
 
 use super::Store;
 
@@ -27,10 +28,8 @@ struct TempStore {
 
 impl TempStore {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "crabport-store-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("crabport-store-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open_at(dir.clone()).expect("open test store");
         Self { store, dir }
@@ -195,6 +194,160 @@ fn deleting_jump_host_degrades_dependents_to_direct() {
     assert_eq!(inner.jump_host_id, None);
 }
 
+impl std::ops::DerefMut for TempStore {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
+#[test]
+fn ssh_import_creates_jump_chain_and_encrypts_key_fields() {
+    let mut s = TempStore::new("ssh-import-create");
+    let records = vec![
+        imported_record("outer", None, None),
+        imported_record("inner", None, Some("outer")),
+        imported_record("target", None, Some("inner")),
+    ];
+
+    let summary = s.import_ssh_hosts(&records).unwrap();
+    assert_eq!(summary.created, 3);
+    assert_eq!(summary.updated, 0);
+    let hosts = s.hosts().unwrap();
+    let outer = hosts.iter().find(|host| host.name == "outer").unwrap();
+    let inner = hosts.iter().find(|host| host.name == "inner").unwrap();
+    let target = hosts.iter().find(|host| host.name == "target").unwrap();
+    assert_eq!(inner.jump_host_id, Some(outer.id));
+    assert_eq!(target.jump_host_id, Some(inner.id));
+
+    let credential = s
+        .find_credential(target.credential_id.unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        credential.private_key,
+        records[2].identity_file.to_string_lossy()
+    );
+    assert_eq!(credential.secret, "key-passphrase");
+    let raw: Vec<u8> =
+        s.db.query_row(
+            "SELECT private_key FROM credentials WHERE id = ?1",
+            [target.credential_id.unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !raw.windows(b"target-key".len())
+            .any(|part| part == b"target-key")
+    );
+}
+
+#[test]
+fn ssh_import_update_preserves_crabport_fields() {
+    let mut s = TempStore::new("ssh-import-update");
+    let group_id = s.add_group("Production", GroupKind::Host, None).unwrap();
+    let proxy_id = s
+        .add_proxy(&ProxyEntry {
+            id: 0,
+            name: "proxy".into(),
+            kind: ProxyKind::Http,
+            host: "proxy.example.com".into(),
+            port: 8080,
+            username: None,
+            password: None,
+            created_at: 0,
+        })
+        .unwrap();
+    let old_credential = s.add_credential(&credential("old", "old-secret")).unwrap();
+    let mut existing = host("Prod");
+    existing.credential_id = Some(old_credential);
+    existing.favorite = true;
+    existing.group_id = Some(group_id);
+    existing.proxy_id = Some(proxy_id);
+    existing.last_login = Some(42);
+    existing.startup_command = "tmux attach".into();
+    let host_id = s.add_host(&existing).unwrap();
+
+    let record = imported_record("prod", Some(host_id), None);
+    let summary = s.import_ssh_hosts(&[record]).unwrap();
+    assert_eq!(summary.updated, 1);
+    let updated = s.find_host(host_id).unwrap().unwrap();
+    assert!(updated.favorite);
+    assert_eq!(updated.group_id, Some(group_id));
+    assert_eq!(updated.proxy_id, Some(proxy_id));
+    assert_eq!(updated.last_login, Some(42));
+    assert_eq!(updated.startup_command, "tmux attach");
+    assert!(s.find_credential(old_credential).unwrap().is_none());
+}
+
+#[test]
+fn ssh_import_rolls_back_every_row_when_a_late_update_fails() {
+    let mut s = TempStore::new("ssh-import-rollback");
+    let records = vec![
+        imported_record("created-first", None, None),
+        imported_record("missing-update", Some(999_999), None),
+    ];
+
+    assert!(s.import_ssh_hosts(&records).is_err());
+    assert!(s.hosts().unwrap().is_empty());
+    assert!(s.credentials().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_import_rejects_update_when_existing_kind_mismatches() {
+    // The OpenSSH import flow must never rewrite a Telnet/Serial row to SSH.
+    // Even if a future caller hands the store a stray existing_host_id that
+    // points at a non-SSH host, the transaction must abort and roll back.
+    let mut s = TempStore::new("ssh-import-kind");
+    let mut existing = host("router");
+    existing.kind = HostKind::Telnet;
+    existing.port = 23;
+    let host_id = s.add_host(&existing).unwrap();
+
+    let record = imported_record("router", Some(host_id), None);
+    let error = s.import_ssh_hosts(&[record]).unwrap_err();
+    assert!(error.to_string().contains("not an SSH host"));
+
+    // Existing non-SSH host is untouched and no credentials persisted.
+    let kept = s.find_host(host_id).unwrap().unwrap();
+    assert_eq!(kept.kind, HostKind::Telnet);
+    assert_eq!(kept.port, 23);
+    assert!(s.credentials().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_import_rejects_cycle_completed_through_existing_host() {
+    let mut s = TempStore::new("ssh-import-cycle");
+    let first_id = s.add_host(&host("first")).unwrap();
+    let mut second = host("second");
+    second.jump_host_id = Some(first_id);
+    let second_id = s.add_host(&second).unwrap();
+
+    let record = imported_record("first", Some(first_id), Some("second"));
+    assert!(s.import_ssh_hosts(&[record]).is_err());
+    let first = s.find_host(first_id).unwrap().unwrap();
+    let second = s.find_host(second_id).unwrap().unwrap();
+    assert_eq!(first.jump_host_id, None);
+    assert_eq!(second.jump_host_id, Some(first_id));
+}
+
+/// Build one valid transaction input with a deterministic test key path.
+fn imported_record(
+    name: &str,
+    existing_host_id: Option<i64>,
+    jump_host_name: Option<&str>,
+) -> SshImportRecord {
+    SshImportRecord {
+        name: name.into(),
+        host: format!("{name}.example.com"),
+        port: 22,
+        username: "deploy".into(),
+        identity_file: PathBuf::from(format!("C:/keys/{name}-key")),
+        passphrase: "key-passphrase".into(),
+        existing_host_id,
+        jump_host_name: jump_host_name.map(str::to_string),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
@@ -220,17 +373,15 @@ fn credential_roundtrip_and_encrypted_at_rest() {
 
     // At-rest check: the raw secret BLOB in SQLite must not contain the
     // plaintext bytes (AES-256-GCM ciphertext + nonce).
-    let raw: Vec<u8> = s
-        .db
-        .query_row(
-            "SELECT secret FROM credentials WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
+    let raw: Vec<u8> =
+        s.db.query_row("SELECT secret FROM credentials WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(!raw.is_empty());
     assert!(
-        !raw.windows(b"s3cr3t-pa55".len()).any(|w| w == b"s3cr3t-pa55"),
+        !raw.windows(b"s3cr3t-pa55".len())
+            .any(|w| w == b"s3cr3t-pa55"),
         "secret stored in plaintext"
     );
 
@@ -393,7 +544,9 @@ fn snippet_crud_and_ordering() {
     let s = TempStore::new("snippets");
     // Empty name falls back to the command text.
     let a = s.add_snippet("  ", "ls -la", false, None).unwrap();
-    let b = s.add_snippet("tail logs", "tail -f /var/log/syslog", false, None).unwrap();
+    let b = s
+        .add_snippet("tail logs", "tail -f /var/log/syslog", false, None)
+        .unwrap();
     let list = s.snippets().unwrap();
     assert_eq!(list.len(), 2);
     // Newest first (id DESC) among non-favorites.
@@ -408,7 +561,12 @@ fn snippet_crud_and_ordering() {
 
     // Update rewrites name/command and empty name falls back again.
     s.update_snippet(b, "", "htop", true, None).unwrap();
-    let updated = s.snippets().unwrap().into_iter().find(|x| x.id == b).unwrap();
+    let updated = s
+        .snippets()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == b)
+        .unwrap();
     assert_eq!(updated.name, "htop");
     assert_eq!(updated.command, "htop");
     assert!(updated.favorite);
@@ -476,23 +634,21 @@ fn command_history_dedups_and_promotes_reruns() {
     s.add_command(h, "pwd").unwrap();
     // Backdate `ls` so ordering is deterministic (add_command stamps
     // whole-second timestamps, which tie inside a fast test).
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'ls'",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'ls'",
+        [],
+    )
+    .unwrap();
     assert_eq!(s.commands_for_host(h).unwrap(), ["pwd", "ls"]);
 
     // Re-running `ls` promotes it (updated_at bumped to now) without
     // inserting a duplicate row.
     s.add_command(h, "ls").unwrap();
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'pwd'",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'pwd'",
+        [],
+    )
+    .unwrap();
     assert_eq!(s.commands_for_host(h).unwrap(), ["ls", "pwd"]);
 
     // History is per-host.
@@ -508,12 +664,11 @@ fn command_history_evicts_lru_beyond_cap() {
     // Insert one over the cap; backdate the first command so it's the
     // deterministic LRU victim despite same-second timestamps.
     s.add_command(h, "victim").unwrap();
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 100, created_at = created_at - 100",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 100, created_at = created_at - 100",
+        [],
+    )
+    .unwrap();
     for i in 0..300 {
         s.add_command(h, &format!("cmd-{i}")).unwrap();
     }

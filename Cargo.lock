@@ -1371,6 +1371,7 @@ dependencies = [
  "parking_lot",
  "rusqlite",
  "serde",
+ "ssh2-config",
  "sys-locale",
  "toml 0.8.23",
  "tracing",
@@ -6584,6 +6585,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh2-config"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f52f961ebce11d2717ec6e69447d97e62ead57a4bf1016fcf4d707d09e957530"
+dependencies = [
+ "bitflags 2.13.0",
+ "dirs 6.0.0",
+ "glob",
+ "log",
+ "thiserror 2.0.18",
+ "wildmatch",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8067,6 +8082,12 @@ dependencies = [
  "rustix 0.38.44",
  "winsafe",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29333c3ea1ba8b17211763463ff24ee84e41c78224c16b001cd907e663a38c68"
 
 [[package]]
 name = "winapi"

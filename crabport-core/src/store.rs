@@ -31,6 +31,7 @@ mod history;
 mod hosts;
 mod migrations;
 mod proxies;
+mod ssh_import;
 mod snippets;
 mod tunnels;
 

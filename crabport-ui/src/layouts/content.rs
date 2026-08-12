@@ -158,6 +158,9 @@ pub fn render_content(
                             Some(app_cb0(handle, |app, w, cx| {
                                 app.open_connection_form(w, cx)
                             })),
+                            Some(app_cb0(handle, |app, window, cx| {
+                                app.open_ssh_import(window, cx)
+                            })),
                             Some(app_cb1(handle, |app, id, _w, cx| {
                                 app.connect_to_host(id, cx)
                             })),

@@ -75,6 +75,11 @@ pub trait GroupedListView: GroupRenameView + Render + Sized + 'static {
     fn alert_handle(&self) -> Option<Entity<AlertController>>;
     fn on_new_cb(&self) -> Option<Rc<dyn Fn(&mut Window, &mut App)>>;
 
+    /// Optional actions rendered before the shared New button.
+    fn render_header_actions(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Vec::new()
+    }
+
     fn hover_state(&self) -> Option<(i64, bool)>;
     fn menu_row_state(&mut self) -> &mut Option<(i64, bool)>;
     fn collapsed_groups(&mut self) -> &mut HashSet<i64>;
@@ -239,6 +244,7 @@ pub fn render_grouped_list<V: GroupedListView>(
     let context_menu = view.context_menu_handle();
     let alert = view.alert_handle();
     let on_new = view.on_new_cb();
+    let header_actions = view.render_header_actions(cx);
     let entity = cx.entity().downgrade();
 
     // Load this view's groups once per render so newly-created groups
@@ -397,17 +403,24 @@ pub fn render_grouped_list<V: GroupedListView>(
                         ),
                 )
                 .child(
-                    Button::new(V::NEW_BUTTON_ID)
-                        .primary()
-                        .icon("icons/plus.svg")
-                        .w_auto()
-                        .px_2()
-                        .child(t!(V::NEW_BUTTON_KEY).to_string())
-                        .on_click(move |_e, w, cx| {
-                            if let Some(ref cb) = on_new {
-                                cb(w, cx);
-                            }
-                        }),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .children(header_actions)
+                        .child(
+                            Button::new(V::NEW_BUTTON_ID)
+                                .primary()
+                                .icon("icons/plus.svg")
+                                .w_auto()
+                                .px_2()
+                                .child(t!(V::NEW_BUTTON_KEY).to_string())
+                                .on_click(move |_e, w, cx| {
+                                    if let Some(ref cb) = on_new {
+                                        cb(w, cx);
+                                    }
+                                }),
+                        ),
                 ),
         )
         // --- Separator ---
