@@ -28,10 +28,8 @@ struct TempStore {
 
 impl TempStore {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "crabport-store-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("crabport-store-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open_at(dir.clone()).expect("open test store");
         Self { store, dir }
@@ -295,6 +293,28 @@ fn ssh_import_rolls_back_every_row_when_a_late_update_fails() {
 }
 
 #[test]
+fn ssh_import_rejects_update_when_existing_kind_mismatches() {
+    // The OpenSSH import flow must never rewrite a Telnet/Serial row to SSH.
+    // Even if a future caller hands the store a stray existing_host_id that
+    // points at a non-SSH host, the transaction must abort and roll back.
+    let mut s = TempStore::new("ssh-import-kind");
+    let mut existing = host("router");
+    existing.kind = HostKind::Telnet;
+    existing.port = 23;
+    let host_id = s.add_host(&existing).unwrap();
+
+    let record = imported_record("router", Some(host_id), None);
+    let error = s.import_ssh_hosts(&[record]).unwrap_err();
+    assert!(error.to_string().contains("not an SSH host"));
+
+    // Existing non-SSH host is untouched and no credentials persisted.
+    let kept = s.find_host(host_id).unwrap().unwrap();
+    assert_eq!(kept.kind, HostKind::Telnet);
+    assert_eq!(kept.port, 23);
+    assert!(s.credentials().unwrap().is_empty());
+}
+
+#[test]
 fn ssh_import_rejects_cycle_completed_through_existing_host() {
     let mut s = TempStore::new("ssh-import-cycle");
     let first_id = s.add_host(&host("first")).unwrap();
@@ -353,17 +373,15 @@ fn credential_roundtrip_and_encrypted_at_rest() {
 
     // At-rest check: the raw secret BLOB in SQLite must not contain the
     // plaintext bytes (AES-256-GCM ciphertext + nonce).
-    let raw: Vec<u8> = s
-        .db
-        .query_row(
-            "SELECT secret FROM credentials WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
+    let raw: Vec<u8> =
+        s.db.query_row("SELECT secret FROM credentials WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(!raw.is_empty());
     assert!(
-        !raw.windows(b"s3cr3t-pa55".len()).any(|w| w == b"s3cr3t-pa55"),
+        !raw.windows(b"s3cr3t-pa55".len())
+            .any(|w| w == b"s3cr3t-pa55"),
         "secret stored in plaintext"
     );
 
@@ -526,7 +544,9 @@ fn snippet_crud_and_ordering() {
     let s = TempStore::new("snippets");
     // Empty name falls back to the command text.
     let a = s.add_snippet("  ", "ls -la", false, None).unwrap();
-    let b = s.add_snippet("tail logs", "tail -f /var/log/syslog", false, None).unwrap();
+    let b = s
+        .add_snippet("tail logs", "tail -f /var/log/syslog", false, None)
+        .unwrap();
     let list = s.snippets().unwrap();
     assert_eq!(list.len(), 2);
     // Newest first (id DESC) among non-favorites.
@@ -541,7 +561,12 @@ fn snippet_crud_and_ordering() {
 
     // Update rewrites name/command and empty name falls back again.
     s.update_snippet(b, "", "htop", true, None).unwrap();
-    let updated = s.snippets().unwrap().into_iter().find(|x| x.id == b).unwrap();
+    let updated = s
+        .snippets()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == b)
+        .unwrap();
     assert_eq!(updated.name, "htop");
     assert_eq!(updated.command, "htop");
     assert!(updated.favorite);
@@ -609,23 +634,21 @@ fn command_history_dedups_and_promotes_reruns() {
     s.add_command(h, "pwd").unwrap();
     // Backdate `ls` so ordering is deterministic (add_command stamps
     // whole-second timestamps, which tie inside a fast test).
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'ls'",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'ls'",
+        [],
+    )
+    .unwrap();
     assert_eq!(s.commands_for_host(h).unwrap(), ["pwd", "ls"]);
 
     // Re-running `ls` promotes it (updated_at bumped to now) without
     // inserting a duplicate row.
     s.add_command(h, "ls").unwrap();
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'pwd'",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 10 WHERE command = 'pwd'",
+        [],
+    )
+    .unwrap();
     assert_eq!(s.commands_for_host(h).unwrap(), ["ls", "pwd"]);
 
     // History is per-host.
@@ -641,12 +664,11 @@ fn command_history_evicts_lru_beyond_cap() {
     // Insert one over the cap; backdate the first command so it's the
     // deterministic LRU victim despite same-second timestamps.
     s.add_command(h, "victim").unwrap();
-    s.db
-        .execute(
-            "UPDATE command_history SET updated_at = updated_at - 100, created_at = created_at - 100",
-            [],
-        )
-        .unwrap();
+    s.db.execute(
+        "UPDATE command_history SET updated_at = updated_at - 100, created_at = created_at - 100",
+        [],
+    )
+    .unwrap();
     for i in 0..300 {
         s.add_command(h, &format!("cmd-{i}")).unwrap();
     }

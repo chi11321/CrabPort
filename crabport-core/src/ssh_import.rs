@@ -605,10 +605,21 @@ Host decorated
 
     #[test]
     fn expands_tilde_identity_path_to_home_directory() {
-        let home = PathBuf::from("C:/Users/example");
+        // `Path::is_absolute()` is platform-dependent, so the fixture must
+        // mirror the host it runs on rather than hard-coding a Windows drive.
+        let home = if cfg!(windows) {
+            PathBuf::from("C:/Users/example")
+        } else {
+            PathBuf::from("/home/example")
+        };
+        let config_dir = if cfg!(windows) {
+            PathBuf::from("C:/config")
+        } else {
+            PathBuf::from("/etc/ssh")
+        };
         let path = expand_identity_path(
             Path::new("~/.ssh/id_ed25519"),
-            Path::new("C:/config"),
+            &config_dir,
             &home,
             "host",
             "remote",

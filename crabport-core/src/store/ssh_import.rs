@@ -233,19 +233,28 @@ fn insert_host(
 }
 
 /// Update SSH-owned columns and return the credential row that was replaced.
+///
+/// Aborts the transaction if the existing row is not an SSH host: updating a
+/// Telnet/Serial host through the OpenSSH import flow would silently rewrite
+/// its kind and overwrite host/port/username, leaving dead serial columns.
 fn update_host(
     transaction: &rusqlite::Transaction<'_>,
     host_id: i64,
     credential_id: i64,
     record: &SshImportRecord,
 ) -> Result<Option<i64>, StoreError> {
-    let old_credential = transaction
+    let (old_credential, old_kind) = transaction
         .query_row(
-            "SELECT credential_id FROM hosts WHERE id = ?1",
+            "SELECT credential_id, kind FROM hosts WHERE id = ?1",
             params![host_id],
-            |row| row.get::<_, Option<i64>>(0),
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|error| StoreError::Db(error.to_string()))?;
+    if old_kind != "Ssh" {
+        return Err(StoreError::Db(format!(
+            "SSH import host {host_id} is not an SSH host (kind = {old_kind})"
+        )));
+    }
     let changed = transaction
         .execute(
             "UPDATE hosts SET name=?1, host=?2, port=?3, username=?4, credential_id=?5, kind='Ssh' WHERE id=?6",

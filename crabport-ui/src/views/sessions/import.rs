@@ -67,6 +67,9 @@ enum ImportIssue {
         first: String,
         second: String,
     },
+    /// A saved connection has the same alias but a non-SSH kind, so importing
+    /// would either silently rewrite it to SSH or create a duplicate name.
+    KindMismatch,
     /// The resolved selected and existing links form a cycle.
     JumpCycle(String),
 }
@@ -90,6 +93,11 @@ pub struct SshImportPreviewRow {
     key_state: ImportKeyState,
     /// Whether multiple saved rows made the normalized conflict ambiguous.
     ambiguous_conflict: bool,
+    /// Whether a saved non-SSH row already uses the normalized alias. Importing
+    /// must not silently rewrite it, and creating a second same-named SSH row
+    /// would also be confusing, so the row stays blocked until the user renames
+    /// the existing connection.
+    non_ssh_conflict: bool,
 }
 
 impl SshImportPreviewRow {
@@ -98,6 +106,7 @@ impl SshImportPreviewRow {
         self.candidate.blockers.is_empty()
             && self.key_state != ImportKeyState::Invalid
             && !self.ambiguous_conflict
+            && !self.non_ssh_conflict
     }
 
     /// Return whether this selected row still has a blocking preview issue.
@@ -105,6 +114,7 @@ impl SshImportPreviewRow {
         !self.candidate.blockers.is_empty()
             || self.key_state == ImportKeyState::Invalid
             || self.ambiguous_conflict
+            || self.non_ssh_conflict
             || !self.issues.is_empty()
     }
 }
@@ -147,12 +157,22 @@ impl SshImportState {
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
+        // Update candidates are limited to SSH hosts: the OpenSSH import flow
+        // rebinds credential/host/port/username, which would silently rewrite
+        // a Telnet/Serial row. A same-named non-SSH row is tracked separately
+        // so the candidate can surface a kind mismatch and stay unselectable.
         let mut existing_by_alias: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut non_ssh_aliases: HashSet<String> = HashSet::new();
         for host in &existing_hosts {
-            existing_by_alias
-                .entry(normalize_alias(&host.name))
-                .or_default()
-                .push(host.id);
+            let normalized = normalize_alias(&host.name);
+            if host.kind == HostKind::Ssh {
+                existing_by_alias
+                    .entry(normalized)
+                    .or_default()
+                    .push(host.id);
+            } else {
+                non_ssh_aliases.insert(normalized);
+            }
         }
 
         // Inspect each unique path once; encrypted keys later share one input.
@@ -183,24 +203,31 @@ impl SshImportState {
             .candidates
             .into_iter()
             .map(|candidate| {
+                let normalized = normalize_alias(&candidate.name);
                 let matches = existing_by_alias
-                    .get(&normalize_alias(&candidate.name))
+                    .get(&normalized)
                     .cloned()
                     .unwrap_or_default();
                 let ambiguous_conflict = matches.len() > 1;
+                let non_ssh_conflict = non_ssh_aliases.contains(&normalized);
                 let existing_host_id = matches
                     .as_slice()
                     .first()
                     .copied()
-                    .filter(|_| !ambiguous_conflict);
+                    .filter(|_| !ambiguous_conflict && !non_ssh_conflict);
                 let key_state = candidate
                     .identity_file()
                     .and_then(|path| key_states.get(path).copied())
                     .unwrap_or(ImportKeyState::Invalid);
+                let mut issues = Vec::new();
+                if non_ssh_conflict {
+                    issues.push(ImportIssue::KindMismatch);
+                }
                 // Importable new rows start selected; name conflicts default to skip.
                 let selected = candidate.blockers.is_empty()
                     && key_state != ImportKeyState::Invalid
                     && !ambiguous_conflict
+                    && !non_ssh_conflict
                     && existing_host_id.is_none();
                 SshImportPreviewRow {
                     candidate,
@@ -208,9 +235,10 @@ impl SshImportState {
                     existing_host_id,
                     dependency: false,
                     jump_host_name: None,
-                    issues: Vec::new(),
+                    issues,
                     key_state,
                     ambiguous_conflict,
+                    non_ssh_conflict,
                 }
             })
             .collect();
@@ -1027,6 +1055,7 @@ fn blocker_text(blocker: &SshImportBlocker) -> String {
 fn issue_text(issue: &ImportIssue) -> String {
     match issue {
         ImportIssue::AmbiguousConflict => t!("ssh_import.issue_ambiguous_conflict").to_string(),
+        ImportIssue::KindMismatch => t!("ssh_import.issue_kind_mismatch").to_string(),
         ImportIssue::InvalidPrivateKey => t!("ssh_import.issue_invalid_key").to_string(),
         ImportIssue::JumpMissing(alias) => {
             t!("ssh_import.issue_jump_missing", alias = alias.as_str()).to_string()
