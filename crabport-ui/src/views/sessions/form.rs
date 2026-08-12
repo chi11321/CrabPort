@@ -1,6 +1,6 @@
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::input::InputState;
-use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use rust_i18n::t;
 use std::rc::Rc;
 
@@ -568,12 +568,20 @@ impl ConnectionFormView {
 }
 
 impl RenderOnce for ConnectionFormView {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let scroll_handle = window
+            .use_keyed_state(
+                ElementId::Name("conn-form-scroll-handle".into()),
+                cx,
+                |_, _| ScrollHandle::default(),
+            )
+            .read(cx)
+            .clone();
         render_overlay(
             ElementId::Name("conn-form-overlay".into()),
             self.active,
             self.on_close.clone(),
-            render_dialog(self, cx),
+            render_dialog(self, cx, scroll_handle),
         )
     }
 }
@@ -582,7 +590,11 @@ impl RenderOnce for ConnectionFormView {
 // Render helpers
 // ---------------------------------------------------------------------------
 
-fn render_dialog(view: ConnectionFormView, cx: &App) -> impl IntoElement {
+fn render_dialog(
+    view: ConnectionFormView,
+    cx: &App,
+    scroll_handle: ScrollHandle,
+) -> impl IntoElement {
     let ConnectionFormView {
         active,
         kind,
@@ -663,418 +675,457 @@ fn render_dialog(view: ConnectionFormView, cx: &App) -> impl IntoElement {
             )),
     )
     // Scrollable area: connection-type tabs. The `flex_1` + `min_h_0`
-    // lets this region shrink when the dialog hits `max_h`, and
-    // `overflow_y_scrollbar` activates the scrollbar.
+    // lets this region shrink when the dialog hits `max_h`.
+    //
+    // The scrollbar is ALWAYS visible (`ScrollbarShow::Always`) so users
+    // can tell the form scrolls — GitHub issue #66: fields below the
+    // fold were invisible and users reported phantom "required field"
+    // errors. `overflow_y_scrollbar()` can't do this (it inherits the
+    // theme's fade-out mode), so the scroll area is built manually:
+    // `track_scroll` shares the scroll handle with the `Scrollbar`
+    // overlay rendered as an absolutely-positioned sibling.
     //
     // IMPORTANT: the horizontal/bottom padding (px_6 / pb_4) lives on an
-    // INNER wrapper, NOT on this scroll element. The `Scrollable` wrapper
-    // (gpui-component) strips style off its direct element and reapplies
-    // it to the outer viewport div — if padding were set here, the
-    // scrollbar layer (which is absolutely positioned to fill the outer
-    // viewport) would span the padding region too, making its draggable
-    // track taller than the actual scroll area. That mismatch causes the
-    // thumb to overshoot: dragging to the bottom leaves a gap while wheel
-    // scrolling reaches the real bottom. Keeping padding on the inner
-    // child keeps the scrollbar track == scroll-area exactly.
+    // INNER wrapper, NOT on the scroller — the scrollbar track stays
+    // exactly as tall as the scroll area, so the thumb can't overshoot
+    // the real bottom.
     .child(
         div()
             .id(ElementId::Name("conn-form-scroll".into()))
+            .relative()
             .flex_1()
             .min_h_0()
-            .overflow_y_scrollbar()
             .child(
-                div().px_6().pb_4().child(
-                    Tabs::new("conn-type-tabs")
-                        .active(active_type_index)
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.ssh").to_string(),
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    // Username (shared across auth types)
-                                    // Host + Port row
-                                    .child(render_host_port_row(
-                                        host_input.clone(),
-                                        port_input.clone(),
-                                        errors.host.clone(),
-                                    ))
-                                    // Username (shared across auth types)
-                                    .child(div().child(text_field(
-                                        "username",
-                                        user_input.clone(),
-                                        t!("connection_form.username").to_string(),
-                                        errors.user.clone(),
-                                    )))
-                                    .child(
-                                        Tabs::new("conn-auth-tabs")
-                                            .active(auth_active_index)
-                                            .pane(
-                                                TabPane::new(
-                                                    t!("connection_form.auth_password").to_string(),
-                                                    div().flex().flex_col().gap_4().child(
-                                                        password_field(
-                                                            "password",
-                                                            pass_input.clone(),
-                                                            t!("connection_form.password")
+                div()
+                    .id(ElementId::Name("conn-form-scroll-area".into()))
+                    .flex()
+                    .size_full()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll_handle)
+                    .child(
+                        div().px_6().pb_4().child(
+                            Tabs::new("conn-type-tabs")
+                                .active(active_type_index)
+                                .pane(
+                                    TabPane::new(
+                                        t!("new_connection.ssh").to_string(),
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_4()
+                                            // Username (shared across auth types)
+                                            // Host + Port row
+                                            .child(render_host_port_row(
+                                                host_input.clone(),
+                                                port_input.clone(),
+                                                errors.host.clone(),
+                                            ))
+                                            // Username (shared across auth types)
+                                            .child(div().child(text_field(
+                                                "username",
+                                                user_input.clone(),
+                                                t!("connection_form.username").to_string(),
+                                                errors.user.clone(),
+                                            )))
+                                            .child(
+                                                Tabs::new("conn-auth-tabs")
+                                                    .active(auth_active_index)
+                                                    .pane(
+                                                        TabPane::new(
+                                                            t!("connection_form.auth_password")
                                                                 .to_string(),
-                                                            errors.pass.clone(),
-                                                        ),
-                                                    ),
-                                                )
-                                                .height(px({
-                                                    if errors.pass.is_some() { 80.0 } else { 57.0 }
-                                                })),
-                                            )
-                                            .pane(
-                                                TabPane::new(
-                                                    t!("connection_form.auth_certificate")
-                                                        .to_string(),
-                                                    WithCertificateForm {
-                                                        passphrase_input,
-                                                        private_key_input,
-                                                        private_key_path_input,
-                                                        private_key_error: errors
-                                                            .private_key
-                                                            .clone(),
-                                                        app: app.clone(),
-                                                    },
-                                                )
-                                                .height(px({
-                                                    let has_err = errors.private_key.is_some();
-                                                    let pass_h = if has_err { 80.0 } else { 57.0 };
-                                                    let path_h = if has_err { 80.0 } else { 57.0 };
-                                                    let pk_h = if has_err { 148.0 } else { 125.0 };
-                                                    pass_h + 16.0 + path_h + 16.0 + pk_h
-                                                })),
-                                            )
-                                            .on_change({
-                                                let app = app.clone();
-                                                move |index, _w, cx| {
-                                                    app.update(cx, |app, cx| {
-                                                        if let Some(ref mut form) =
-                                                            app.connection_form
-                                                        {
-                                                            form.auth_kind = match index {
-                                                                0 => AuthKind::Password,
-                                                                _ => AuthKind::Certificate,
-                                                            };
-                                                            cx.notify();
+                                                            div().flex().flex_col().gap_4().child(
+                                                                password_field(
+                                                                    "password",
+                                                                    pass_input.clone(),
+                                                                    t!("connection_form.password")
+                                                                        .to_string(),
+                                                                    errors.pass.clone(),
+                                                                ),
+                                                            ),
+                                                        )
+                                                        .height(px({
+                                                            if errors.pass.is_some() {
+                                                                80.0
+                                                            } else {
+                                                                57.0
+                                                            }
+                                                        })),
+                                                    )
+                                                    .pane(
+                                                        TabPane::new(
+                                                            t!("connection_form.auth_certificate")
+                                                                .to_string(),
+                                                            WithCertificateForm {
+                                                                passphrase_input,
+                                                                private_key_input,
+                                                                private_key_path_input,
+                                                                private_key_error: errors
+                                                                    .private_key
+                                                                    .clone(),
+                                                                app: app.clone(),
+                                                            },
+                                                        )
+                                                        .height(px({
+                                                            let has_err =
+                                                                errors.private_key.is_some();
+                                                            let pass_h =
+                                                                if has_err { 80.0 } else { 57.0 };
+                                                            let path_h =
+                                                                if has_err { 80.0 } else { 57.0 };
+                                                            let pk_h =
+                                                                if has_err { 148.0 } else { 125.0 };
+                                                            pass_h + 16.0 + path_h + 16.0 + pk_h
+                                                        })),
+                                                    )
+                                                    .on_change({
+                                                        let app = app.clone();
+                                                        move |index, _w, cx| {
+                                                            app.update(cx, |app, cx| {
+                                                                if let Some(ref mut form) =
+                                                                    app.connection_form
+                                                                {
+                                                                    form.auth_kind = match index {
+                                                                        0 => AuthKind::Password,
+                                                                        _ => AuthKind::Certificate,
+                                                                    };
+                                                                    cx.notify();
+                                                                }
+                                                            });
                                                         }
+                                                    }),
+                                            )
+                                            // Proxy tabs (None / System / Custom). Only
+                                            // Custom has content (a proxy URL input).
+                                            .child(WithProxyForm {
+                                                proxy_url_input: proxy_url_input.clone(),
+                                                proxy_kind,
+                                                proxy_url_error: errors.proxy_url.clone(),
+                                                app: app.clone(),
+                                            })
+                                            // Jump host (bastion) selector — lists
+                                            // saved SSH hosts to route this
+                                            // connection through (ProxyJump-style).
+                                            .child(render_jump_host_selector(
+                                                jump_host_id,
+                                                jump_host_dropdown_open,
+                                                editing_host_id,
+                                                app.clone(),
+                                                cx,
+                                            ))
+                                            // Startup command — sent to the remote shell
+                                            // once the SSH session is ready.
+                                            .child(
+                                                text_field(
+                                                    "ssh-startup-command",
+                                                    startup_command_input.clone(),
+                                                    t!("connection_form.startup_command")
+                                                        .to_string(),
+                                                    None,
+                                                )
+                                                .multi_line(true)
+                                                .rows(3),
+                                            ),
+                                    )
+                                    .height(px({
+                                        let field_h = |err: bool| if err { 80.0 } else { 57.0 };
+                                        let auth_pane = match auth_kind {
+                                            AuthKind::Password => field_h(errors.pass.is_some()),
+                                            AuthKind::Certificate => {
+                                                let has_err = errors.private_key.is_some();
+                                                let pass_h = field_h(has_err);
+                                                let path_h = field_h(has_err);
+                                                let pk_h = if has_err { 148.0 } else { 125.0 };
+                                                pass_h + 16.0 + path_h + 16.0 + pk_h
+                                            }
+                                        };
+                                        let auth_h = field_h(errors.host.is_some())
+                                            + 16.0
+                                            + field_h(errors.user.is_some())
+                                            + 16.0
+                                            + 35.0
+                                            + 8.0
+                                            + auth_pane;
+                                        let proxy_pane = if proxy_kind == ProxyKind::Custom {
+                                            field_h(errors.proxy_url.is_some())
+                                        } else {
+                                            0.0
+                                        };
+                                        let proxy_h = 16.0 + 21.0 + 4.0 + 35.0 + 8.0 + proxy_pane;
+                                        // Jump-host selector: gap + label + gap +
+                                        // dropdown (mirrors the group selector).
+                                        let jump_h = 16.0 + 21.0 + 4.0 + 35.0;
+                                        let startup_h = 16.0 + 85.0;
+                                        auth_h + proxy_h + jump_h + startup_h
+                                    })),
+                                )
+                                .pane(
+                                    TabPane::new(
+                                        t!("new_connection.telnet").to_string(),
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_4()
+                                            // Host + Port row
+                                            .child(render_host_port_row(
+                                                host_input.clone(),
+                                                port_input.clone(),
+                                                errors.host.clone(),
+                                            ))
+                                            // Username
+                                            .child(div().child(text_field(
+                                                "telnet-username",
+                                                user_input.clone(),
+                                                t!("connection_form.username").to_string(),
+                                                errors.user.clone(),
+                                            )))
+                                            // Password
+                                            .child(div().child(password_field(
+                                                "telnet-password",
+                                                pass_input.clone(),
+                                                t!("connection_form.password").to_string(),
+                                                errors.pass.clone(),
+                                            )))
+                                            // Proxy tabs
+                                            .child(WithProxyForm {
+                                                proxy_url_input: proxy_url_input.clone(),
+                                                proxy_kind,
+                                                proxy_url_error: errors.proxy_url.clone(),
+                                                app: app.clone(),
+                                            })
+                                            // Startup command — sent after the telnet
+                                            // connection is established.
+                                            .child(
+                                                text_field(
+                                                    "telnet-startup-command",
+                                                    startup_command_input.clone(),
+                                                    t!("connection_form.startup_command")
+                                                        .to_string(),
+                                                    None,
+                                                )
+                                                .multi_line(true)
+                                                .rows(3),
+                                            ),
+                                    )
+                                    .height(px({
+                                        let field_h = |err: bool| if err { 80.0 } else { 57.0 };
+                                        let proxy_pane = if proxy_kind == ProxyKind::Custom {
+                                            field_h(errors.proxy_url.is_some())
+                                        } else {
+                                            0.0
+                                        };
+                                        field_h(errors.host.is_some())
+                                            + 16.0
+                                            + field_h(errors.user.is_some())
+                                            + 16.0
+                                            + field_h(errors.pass.is_some())
+                                            + 16.0
+                                            + 21.0
+                                            + 4.0
+                                            + 35.0
+                                            + 8.0
+                                            + proxy_pane
+                                            + 16.0
+                                            + 85.0
+                                    })),
+                                )
+                                .pane(
+                                    TabPane::new(
+                                        t!("new_connection.serial").to_string(),
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_4()
+                                            // Serial port selector — enumerates
+                                            // available serial ports on the
+                                            // system via `serialport`. The
+                                            // selected device path is stored in
+                                            // the `host_input` field (which the
+                                            // backend reads as the device path).
+                                            .child(render_serial_port_selector(
+                                                serial_port_open,
+                                                host_input.clone(),
+                                                errors.host.clone(),
+                                                app.clone(),
+                                                cx,
+                                            ))
+                                            // Baud rate (text input)
+                                            .child(div().child(text_field(
+                                                "serial-baud",
+                                                serial_baud_rate_input.clone(),
+                                                t!("connection_form.baud_rate").to_string(),
+                                                None,
+                                            )))
+                                            // Data bits dropdown (8 / 7 / 6 / 5)
+                                            .child(render_serial_dropdown(
+                                                "serial-data-bits".to_string(),
+                                                t!("connection_form.data_bits").to_string(),
+                                                serial_data_bits_open,
+                                                vec![
+                                                    ("8".to_string(), "8".to_string()),
+                                                    ("7".to_string(), "7".to_string()),
+                                                    ("6".to_string(), "6".to_string()),
+                                                    ("5".to_string(), "5".to_string()),
+                                                ],
+                                                match serial_data_bits {
+                                                    8 => 0,
+                                                    7 => 1,
+                                                    6 => 2,
+                                                    _ => 3,
+                                                },
+                                                app.clone(),
+                                                SerialField::DataBits,
+                                            ))
+                                            // Parity dropdown (none / odd / even)
+                                            .child(render_serial_dropdown(
+                                                "serial-parity".to_string(),
+                                                t!("connection_form.parity").to_string(),
+                                                serial_parity_open,
+                                                vec![
+                                                    (
+                                                        t!("connection_form.parity_none")
+                                                            .to_string(),
+                                                        "none".to_string(),
+                                                    ),
+                                                    (
+                                                        t!("connection_form.parity_odd")
+                                                            .to_string(),
+                                                        "odd".to_string(),
+                                                    ),
+                                                    (
+                                                        t!("connection_form.parity_even")
+                                                            .to_string(),
+                                                        "even".to_string(),
+                                                    ),
+                                                ],
+                                                match serial_parity.as_str() {
+                                                    "odd" => 1,
+                                                    "even" => 2,
+                                                    _ => 0,
+                                                },
+                                                app.clone(),
+                                                SerialField::Parity,
+                                            ))
+                                            // Stop bits dropdown (1 / 2)
+                                            .child(render_serial_dropdown(
+                                                "serial-stop-bits".to_string(),
+                                                t!("connection_form.stop_bits").to_string(),
+                                                serial_stop_bits_open,
+                                                vec![
+                                                    ("1".to_string(), "1".to_string()),
+                                                    ("2".to_string(), "2".to_string()),
+                                                ],
+                                                if serial_stop_bits == 2 { 1 } else { 0 },
+                                                app.clone(),
+                                                SerialField::StopBits,
+                                            ))
+                                            // Flow control dropdown (none / software / hardware)
+                                            .child(render_serial_dropdown(
+                                                "serial-flow-control".to_string(),
+                                                t!("connection_form.flow_control").to_string(),
+                                                serial_flow_control_open,
+                                                vec![
+                                                    (
+                                                        t!("connection_form.flow_none").to_string(),
+                                                        "none".to_string(),
+                                                    ),
+                                                    (
+                                                        t!("connection_form.flow_software")
+                                                            .to_string(),
+                                                        "software".to_string(),
+                                                    ),
+                                                    (
+                                                        t!("connection_form.flow_hardware")
+                                                            .to_string(),
+                                                        "hardware".to_string(),
+                                                    ),
+                                                ],
+                                                match serial_flow_control.as_str() {
+                                                    "software" => 1,
+                                                    "hardware" => 2,
+                                                    _ => 0,
+                                                },
+                                                app.clone(),
+                                                SerialField::FlowControl,
+                                            ))
+                                            // Startup command — sent to the serial
+                                            // device once the connection is ready.
+                                            .child(
+                                                text_field(
+                                                    "serial-startup-command",
+                                                    startup_command_input.clone(),
+                                                    t!("connection_form.startup_command")
+                                                        .to_string(),
+                                                    None,
+                                                )
+                                                .multi_line(true)
+                                                .rows(3),
+                                            ),
+                                    )
+                                    .height(px({
+                                        let field_h = 57.0;
+                                        // device + baud + 4 dropdowns + startup
+                                        // + 16px bottom padding so the startup
+                                        // command isn't flush against the pane edge.
+                                        field_h
+                                            + 16.0
+                                            + field_h
+                                            + 16.0
+                                            + field_h
+                                            + 16.0
+                                            + field_h
+                                            + 16.0
+                                            + field_h
+                                            + 16.0
+                                            + field_h
+                                            + 16.0
+                                            + 85.0
+                                            + 16.0
+                                    })),
+                                )
+                                .on_change({
+                                    let app = app.clone();
+                                    move |index, w, cx| {
+                                        app.update(cx, |app, cx| {
+                                            if let Some(ref mut form) = app.connection_form {
+                                                form.kind = match index {
+                                                    0 => ConnectionKind::SSH,
+                                                    1 => ConnectionKind::Telnet,
+                                                    _ => ConnectionKind::Serial,
+                                                };
+                                                let cur = form.port_text(cx);
+                                                let new_port = match form.kind {
+                                                    ConnectionKind::SSH => "22",
+                                                    ConnectionKind::Telnet => "23",
+                                                    ConnectionKind::Serial => "",
+                                                };
+                                                if cur == "22" || cur == "23" || cur.is_empty() {
+                                                    form.port_input.update(cx, |state, cx| {
+                                                        state.set_value(new_port, w, cx);
                                                     });
                                                 }
-                                            }),
-                                    )
-                                    // Proxy tabs (None / System / Custom). Only
-                                    // Custom has content (a proxy URL input).
-                                    .child(WithProxyForm {
-                                        proxy_url_input: proxy_url_input.clone(),
-                                        proxy_kind,
-                                        proxy_url_error: errors.proxy_url.clone(),
-                                        app: app.clone(),
-                                    })
-                                    // Jump host (bastion) selector — lists
-                                    // saved SSH hosts to route this
-                                    // connection through (ProxyJump-style).
-                                    .child(render_jump_host_selector(
-                                        jump_host_id,
-                                        jump_host_dropdown_open,
-                                        editing_host_id,
-                                        app.clone(),
-                                        cx,
-                                    ))
-                                    // Startup command — sent to the remote shell
-                                    // once the SSH session is ready.
-                                    .child(
-                                        text_field(
-                                            "ssh-startup-command",
-                                            startup_command_input.clone(),
-                                            t!("connection_form.startup_command").to_string(),
-                                            None,
-                                        )
-                                        .multi_line(true)
-                                        .rows(3),
-                                    ),
-                            )
-                            .height(px({
-                                let field_h = |err: bool| if err { 80.0 } else { 57.0 };
-                                let auth_pane = match auth_kind {
-                                    AuthKind::Password => field_h(errors.pass.is_some()),
-                                    AuthKind::Certificate => {
-                                        let has_err = errors.private_key.is_some();
-                                        let pass_h = field_h(has_err);
-                                        let path_h = field_h(has_err);
-                                        let pk_h = if has_err { 148.0 } else { 125.0 };
-                                        pass_h + 16.0 + path_h + 16.0 + pk_h
+                                                cx.notify();
+                                            }
+                                        });
                                     }
-                                };
-                                let auth_h = field_h(errors.host.is_some())
-                                    + 16.0
-                                    + field_h(errors.user.is_some())
-                                    + 16.0
-                                    + 35.0
-                                    + 8.0
-                                    + auth_pane;
-                                let proxy_pane = if proxy_kind == ProxyKind::Custom {
-                                    field_h(errors.proxy_url.is_some())
-                                } else {
-                                    0.0
-                                };
-                                let proxy_h = 16.0 + 21.0 + 4.0 + 35.0 + 8.0 + proxy_pane;
-                                // Jump-host selector: gap + label + gap +
-                                // dropdown (mirrors the group selector).
-                                let jump_h = 16.0 + 21.0 + 4.0 + 35.0;
-                                let startup_h = 16.0 + 85.0;
-                                auth_h + proxy_h + jump_h + startup_h
-                            })),
-                        )
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.telnet").to_string(),
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    // Host + Port row
-                                    .child(render_host_port_row(
-                                        host_input.clone(),
-                                        port_input.clone(),
-                                        errors.host.clone(),
-                                    ))
-                                    // Username
-                                    .child(div().child(text_field(
-                                        "telnet-username",
-                                        user_input.clone(),
-                                        t!("connection_form.username").to_string(),
-                                        errors.user.clone(),
-                                    )))
-                                    // Password
-                                    .child(div().child(password_field(
-                                        "telnet-password",
-                                        pass_input.clone(),
-                                        t!("connection_form.password").to_string(),
-                                        errors.pass.clone(),
-                                    )))
-                                    // Proxy tabs
-                                    .child(WithProxyForm {
-                                        proxy_url_input: proxy_url_input.clone(),
-                                        proxy_kind,
-                                        proxy_url_error: errors.proxy_url.clone(),
-                                        app: app.clone(),
-                                    })
-                                    // Startup command — sent after the telnet
-                                    // connection is established.
-                                    .child(
-                                        text_field(
-                                            "telnet-startup-command",
-                                            startup_command_input.clone(),
-                                            t!("connection_form.startup_command").to_string(),
-                                            None,
-                                        )
-                                        .multi_line(true)
-                                        .rows(3),
-                                    ),
-                            )
-                            .height(px({
-                                let field_h = |err: bool| if err { 80.0 } else { 57.0 };
-                                let proxy_pane = if proxy_kind == ProxyKind::Custom {
-                                    field_h(errors.proxy_url.is_some())
-                                } else {
-                                    0.0
-                                };
-                                field_h(errors.host.is_some())
-                                    + 16.0
-                                    + field_h(errors.user.is_some())
-                                    + 16.0
-                                    + field_h(errors.pass.is_some())
-                                    + 16.0
-                                    + 21.0
-                                    + 4.0
-                                    + 35.0
-                                    + 8.0
-                                    + proxy_pane
-                                    + 16.0
-                                    + 85.0
-                            })),
-                        )
-                        .pane(
-                            TabPane::new(
-                                t!("new_connection.serial").to_string(),
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_4()
-                                    // Serial port selector — enumerates
-                                    // available serial ports on the
-                                    // system via `serialport`. The
-                                    // selected device path is stored in
-                                    // the `host_input` field (which the
-                                    // backend reads as the device path).
-                                    .child(render_serial_port_selector(
-                                        serial_port_open,
-                                        host_input.clone(),
-                                        errors.host.clone(),
-                                        app.clone(),
-                                        cx,
-                                    ))
-                                    // Baud rate (text input)
-                                    .child(div().child(text_field(
-                                        "serial-baud",
-                                        serial_baud_rate_input.clone(),
-                                        t!("connection_form.baud_rate").to_string(),
-                                        None,
-                                    )))
-                                    // Data bits dropdown (8 / 7 / 6 / 5)
-                                    .child(render_serial_dropdown(
-                                        "serial-data-bits".to_string(),
-                                        t!("connection_form.data_bits").to_string(),
-                                        serial_data_bits_open,
-                                        vec![
-                                            ("8".to_string(), "8".to_string()),
-                                            ("7".to_string(), "7".to_string()),
-                                            ("6".to_string(), "6".to_string()),
-                                            ("5".to_string(), "5".to_string()),
-                                        ],
-                                        match serial_data_bits {
-                                            8 => 0,
-                                            7 => 1,
-                                            6 => 2,
-                                            _ => 3,
-                                        },
-                                        app.clone(),
-                                        SerialField::DataBits,
-                                    ))
-                                    // Parity dropdown (none / odd / even)
-                                    .child(render_serial_dropdown(
-                                        "serial-parity".to_string(),
-                                        t!("connection_form.parity").to_string(),
-                                        serial_parity_open,
-                                        vec![
-                                            (
-                                                t!("connection_form.parity_none").to_string(),
-                                                "none".to_string(),
-                                            ),
-                                            (
-                                                t!("connection_form.parity_odd").to_string(),
-                                                "odd".to_string(),
-                                            ),
-                                            (
-                                                t!("connection_form.parity_even").to_string(),
-                                                "even".to_string(),
-                                            ),
-                                        ],
-                                        match serial_parity.as_str() {
-                                            "odd" => 1,
-                                            "even" => 2,
-                                            _ => 0,
-                                        },
-                                        app.clone(),
-                                        SerialField::Parity,
-                                    ))
-                                    // Stop bits dropdown (1 / 2)
-                                    .child(render_serial_dropdown(
-                                        "serial-stop-bits".to_string(),
-                                        t!("connection_form.stop_bits").to_string(),
-                                        serial_stop_bits_open,
-                                        vec![
-                                            ("1".to_string(), "1".to_string()),
-                                            ("2".to_string(), "2".to_string()),
-                                        ],
-                                        if serial_stop_bits == 2 { 1 } else { 0 },
-                                        app.clone(),
-                                        SerialField::StopBits,
-                                    ))
-                                    // Flow control dropdown (none / software / hardware)
-                                    .child(render_serial_dropdown(
-                                        "serial-flow-control".to_string(),
-                                        t!("connection_form.flow_control").to_string(),
-                                        serial_flow_control_open,
-                                        vec![
-                                            (
-                                                t!("connection_form.flow_none").to_string(),
-                                                "none".to_string(),
-                                            ),
-                                            (
-                                                t!("connection_form.flow_software").to_string(),
-                                                "software".to_string(),
-                                            ),
-                                            (
-                                                t!("connection_form.flow_hardware").to_string(),
-                                                "hardware".to_string(),
-                                            ),
-                                        ],
-                                        match serial_flow_control.as_str() {
-                                            "software" => 1,
-                                            "hardware" => 2,
-                                            _ => 0,
-                                        },
-                                        app.clone(),
-                                        SerialField::FlowControl,
-                                    ))
-                                    // Startup command — sent to the serial
-                                    // device once the connection is ready.
-                                    .child(
-                                        text_field(
-                                            "serial-startup-command",
-                                            startup_command_input.clone(),
-                                            t!("connection_form.startup_command").to_string(),
-                                            None,
-                                        )
-                                        .multi_line(true)
-                                        .rows(3),
-                                    ),
-                            )
-                            .height(px({
-                                let field_h = 57.0;
-                                // device + baud + 4 dropdowns + startup
-                                // + 16px bottom padding so the startup
-                                // command isn't flush against the pane edge.
-                                field_h
-                                    + 16.0
-                                    + field_h
-                                    + 16.0
-                                    + field_h
-                                    + 16.0
-                                    + field_h
-                                    + 16.0
-                                    + field_h
-                                    + 16.0
-                                    + field_h
-                                    + 16.0
-                                    + 85.0
-                                    + 16.0
-                            })),
-                        )
-                        .on_change({
-                            let app = app.clone();
-                            move |index, w, cx| {
-                                app.update(cx, |app, cx| {
-                                    if let Some(ref mut form) = app.connection_form {
-                                        form.kind = match index {
-                                            0 => ConnectionKind::SSH,
-                                            1 => ConnectionKind::Telnet,
-                                            _ => ConnectionKind::Serial,
-                                        };
-                                        let cur = form.port_text(cx);
-                                        let new_port = match form.kind {
-                                            ConnectionKind::SSH => "22",
-                                            ConnectionKind::Telnet => "23",
-                                            ConnectionKind::Serial => "",
-                                        };
-                                        if cur == "22" || cur == "23" || cur.is_empty() {
-                                            form.port_input.update(cx, |state, cx| {
-                                                state.set_value(new_port, w, cx);
-                                            });
-                                        }
-                                        cx.notify();
-                                    }
-                                });
-                            }
-                        }),
-                ), // close inner padding div's .child(Tabs)
-            ), // close scrollable div's .child (inner padding div)
-    ) // close scrollable div
+                                }),
+                        ), // close inner padding div's .child(Tabs)
+                    ), // close scroll-area div's .child (inner padding div)
+            ) // close scroll-area div
+            // Always-visible scrollbar overlay (issue #66).
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(16.0))
+                    .child(
+                        Scrollbar::vertical(&scroll_handle).scrollbar_show(ScrollbarShow::Always),
+                    ),
+            ),
+    ) // close scroll container
     // Buttons (fixed at bottom — do not scroll)
     .child(
         div()
