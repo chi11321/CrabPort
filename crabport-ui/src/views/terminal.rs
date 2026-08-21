@@ -2068,6 +2068,38 @@ impl Render for TerminalView {
                         }
                     }
                 }
+                // Key-repeat bypass for plain printable characters. macOS
+                // swallows `isARepeat` keydowns for character keys by routing
+                // them to the press-and-hold accent picker (gpui's
+                // `apple_press_and_hold_enabled` defaults to true and
+                // ElementInputHandler in gpui 0.2 offers no override), so
+                // holding a key (e.g. `D` in vim normal mode) would only fire
+                // once. When no IME composition is active, write the repeated
+                // character straight to the PTY here — the same thing the
+                // platform would do via insertText:, minus the swallow.
+                // Composition keys still fall through to the IME path below.
+                let composing = this
+                    .marked_text
+                    .lock()
+                    .as_ref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let m = &event.keystroke.modifiers;
+                if !composing
+                    && event.is_held
+                    && !m.control
+                    && !m.alt
+                    && !m.platform
+                    && !m.function
+                    && let Some(ch) = event.keystroke.key_char.as_deref()
+                    && !ch.is_empty()
+                {
+                    this.session.write(ch.as_bytes());
+                    this.session.scroll_to_bottom();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
                         this.pending_copy = true;
