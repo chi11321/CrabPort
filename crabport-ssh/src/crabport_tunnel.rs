@@ -84,6 +84,14 @@ pub trait CrabPortTunnel: Send + Sync {
     /// `server_channel_open_forwarded_tcpip` handler can dispatch incoming
     /// connections.
     fn reverse_registry(&self) -> Arc<ReverseForwardRegistry>;
+
+    /// Tear down the transport itself after all of this manager's tunnels
+    /// have stopped. Default: no-op — borrowed sources must keep the tab's
+    /// shared SSH session alive. Owned sessions override this to close their
+    /// dedicated connection, which is what guarantees server-side cleanup of
+    /// `-R` listeners even when a `cancel_tcpip_forward` request failed or
+    /// raced: sshd frees its listeners the moment the connection dies.
+    async fn shutdown(&self) {}
 }
 
 // `TunnelId`, `TunnelStatus`, `TunnelInfo`, `TunnelKind`, `LocalTarget`, and
@@ -354,6 +362,20 @@ impl TunnelManager {
 
         let bound_port = bound_port as u16;
 
+        // russh 0.45 quirk: for a fixed-port request the server's SUCCESS
+        // reply carries no payload, and russh resolves it to `Some(0)`. That
+        // 0 does NOT mean the server bound port 0 — it accepted the port we
+        // asked for. Re-keying the registry on `bound_port != bind_port`
+        // would therefore move the entry to a phantom `("addr", 0)` key and
+        // every inbound forwarded-tcpip hit would miss ("no registered
+        // target"). Only re-key when the server GENUINELY allocated a port,
+        // i.e. the caller asked for an ephemeral one (`bind_port == 0`).
+        let bound_port = if bound_port == 0 && bind_port != 0 {
+            bind_port
+        } else {
+            bound_port
+        };
+
         // If the server chose a port (bind_port == 0), move the registry
         // entry from the requested key to the actual key.
         if bound_port != bind_port {
@@ -562,6 +584,10 @@ impl TunnelManager {
         for id in ids {
             self.stop(id).await;
         }
+        // All tunnels are gone — let the source close its transport (no-op
+        // for borrowed sources, closes the dedicated connection for owned
+        // sessions).
+        self.source.shutdown().await;
     }
 
     /// Snapshot of all tunnels (for UI rendering / polling).
