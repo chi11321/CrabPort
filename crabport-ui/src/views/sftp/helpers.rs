@@ -432,6 +432,24 @@ pub(super) fn trigger_remote_download_from_button(
     trigger_batch_download(entries, on_download, cx);
 }
 
+/// Picker options for SFTP uploads: multi-select, files allowed.
+///
+/// Only macOS can natively mix files *and* folders in one dialog
+/// (`NSOpenPanel` sets the two flags independently). On Windows,
+/// `IFileDialog`'s `FOS_PICKFOLDERS` is an either/or mode toggle that
+/// hides every file when set (gpui ignores `files: true` there), and
+/// the Linux portal's `.directory()` behaves the same way — so on those
+/// platforms we request files only; folder uploads still work via drag
+/// & drop. See <https://github.com/chi11321/CrabPort/issues/73>.
+pub(crate) fn upload_picker_options(prompt: SharedString) -> PathPromptOptions {
+    PathPromptOptions {
+        files: true,
+        directories: cfg!(target_os = "macos"),
+        multiple: true,
+        prompt: Some(prompt),
+    }
+}
+
 /// Upload button handler: open a native multi-select file picker and
 /// upload each chosen file into the current remote cwd.
 pub(super) fn trigger_upload(
@@ -448,12 +466,9 @@ pub(super) fn trigger_upload(
     let Some(cwd) = cwd else { return };
     let cwd = cwd.as_str().to_string();
 
-    let rx = cx.prompt_for_paths(PathPromptOptions {
-        files: true,
-        directories: true,
-        multiple: true,
-        prompt: Some(t!("sftp.upload_prompt").to_string().into()),
-    });
+    let rx = cx.prompt_for_paths(upload_picker_options(
+        t!("sftp.upload_prompt").to_string().into(),
+    ));
 
     cx.spawn(async move |cx| {
         let picked = match rx.await {

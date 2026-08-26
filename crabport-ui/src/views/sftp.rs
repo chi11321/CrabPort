@@ -16,6 +16,7 @@ pub mod transfer_history;
 pub mod view;
 
 pub use drag::{LocalFileDragValue, SftpDragValue};
+pub(crate) use helpers::upload_picker_options;
 pub use toolbar::render_sftp_history_toggle;
 pub use transfer_history::{TransferHistoryController, TransferRecord};
 pub use view::{PanelHost, SftpTabView};
