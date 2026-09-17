@@ -426,9 +426,18 @@ pub fn render_grouped_list<V: GroupedListView>(
         // --- Separator ---
         .child(div().h_px().bg(rgb(border())).mx_4())
         // --- List (or empty state) ---
+        //
+        // `min_h_0` is load-bearing: gpui's `flex_1` only sets
+        // grow/shrink/basis, and a flex item refuses to shrink below its
+        // content height by default. Without it a long list grows past the
+        // panel bounds, pushing the bottom rows — and the scrollbar — off
+        // the visible area (matching the bug where the list's tail could
+        // never be reached). All other scroll regions in this crate pair
+        // `flex_1` with `min_h_0` for the same reason.
         .child(
             div()
                 .flex_1()
+                .min_h_0()
                 .overflow_y_scrollbar()
                 .px_4()
                 .py_2()
