@@ -1,6 +1,7 @@
 <!--
   Info.plist extension — merged into the generated Info.plist by
-  `cargo-bundle` (see `osx_info_plist_exts` in Cargo.toml).
+  `cargo-bundle` (see `info_plist_exts` under
+  `[package.metadata.bundle.osx]` in Cargo.toml).
 
   Two things are declared here:
 

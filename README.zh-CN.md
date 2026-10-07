@@ -92,8 +92,7 @@ sudo apt-get install -y \
   libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
   libfontconfig1-dev libfreetype6-dev \
   libasound2-dev libpulse-dev libdbus-1-dev \
-  libssl-dev pkg-config \
-  squashfs-tools   # 打包 .AppImage 所需的 mksquashfs
+  libssl-dev pkg-config
 ```
 
 **Windows** —— MSVC 工具链（随 Visual Studio Build Tools 安装）。
@@ -110,7 +109,7 @@ cargo build --release     # Release 编译
 
 ### 打包为各平台安装包
 
-需先安装 [cargo-bundle](https://github.com/burtonageo/cargo-bundle)：
+需先安装 [cargo-bundle](https://github.com/burtonageo/cargo-bundle)（打包配置使用 v0.12 的元数据格式，需要 0.12 或更高版本）：
 
 ```bash
 cargo install cargo-bundle --locked
@@ -118,7 +117,7 @@ cargo install cargo-bundle --locked
 
 | 平台 | 命令 | 产物 |
 |------|------|------|
-| macOS | `cargo bundle --release --format dmg` | `target/release/bundle/dmg/CrabPort_*.dmg` |
+| macOS | `cargo bundle --release --format dmg` | `target/release/bundle/dmg/CrabPort.dmg` |
 | Linux | `cargo bundle --release --format appimage` | `target/release/bundle/appimage/CrabPort_*.AppImage` |
 | Windows | `cargo build --release`，然后手动压缩 `.exe` | `CrabPort.exe`（`.zip`） |
 
