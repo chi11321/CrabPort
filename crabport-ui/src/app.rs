@@ -248,6 +248,7 @@ impl CrabportApp {
         let history_panel =
             cx.new(|_cx| crate::views::panel::history_command_panel::HistoryCommandPanel::new());
         let tunnels_panel = cx.new(|_cx| crate::views::panel::tunnels_panel::TunnelsPanel::new());
+        let ai_panel = cx.new(|_cx| crate::views::panel::ai::AiPanel::new());
         let app_entity = cx.entity();
         let sessions_view =
             cx.new(|_cx| crate::views::sessions::SessionsView::new(app_entity.clone()));
@@ -297,6 +298,7 @@ impl CrabportApp {
             snippets_panel,
             history_panel,
             tunnels_panel,
+            ai_panel,
             sessions_view,
             snippets_view,
             tunnels_view,

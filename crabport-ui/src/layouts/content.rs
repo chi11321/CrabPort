@@ -118,6 +118,7 @@ pub fn render_content(
 ) -> Div {
     // Unpack the shared context once — every field is a cheap handle/Arc.
     let sftp_panel = &ctx.sftp_panel;
+    let ai_panel = &ctx.ai_panel;
     let snippets_panel = &ctx.snippets_panel;
     let history_panel = &ctx.history_panel;
     let tunnels_panel = &ctx.tunnels_panel;
@@ -598,6 +599,9 @@ pub fn render_content(
             })
         })
         .unwrap_or((false, false, false, false));
+    // AI assistant panel capability — endpoint-scoped, not backend-scoped:
+    // available on any terminal tab while AI is enabled in settings.
+    let cap_ai = crabport_core::config::snapshot().ai.enabled;
     // SFTP panel visibility follows the backend's capability (`cap_sftp`),
     // used directly below — no separate `has_sftp` alias needed.
     sftp_panel.update(cx, |panel, cx| {
@@ -722,6 +726,15 @@ pub fn render_content(
         );
     });
 
+    // ---- AI assistant panel ----
+    //
+    // The panel reads config/store directly; `set_state` only ensures the
+    // lazily-created input exists, clears the box after a send, and
+    // triggers the once-per-endpoint model-list fetch.
+    ai_panel.update(cx, |panel, cx| {
+        panel.set_state(window, cx);
+    });
+
     // ---- Host-key prompt ----
     //
     // If the active terminal view has a pending host-key prompt (pushed by
@@ -810,7 +823,8 @@ pub fn render_content(
                 .relative()
                 .child(view)
                 .when(
-                    panel_show && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
+                    panel_show
+                        && (cap_sftp || cap_history || cap_snippets || cap_tunnels || cap_ai),
                     |el| el.child(render_panel_divider(handle, panel_width)),
                 )
                 .child({
@@ -824,6 +838,7 @@ pub fn render_content(
                     let c_history = cap_history;
                     let c_snippets = cap_snippets;
                     let c_tunnels = cap_tunnels;
+                    let c_ai = cap_ai;
                     render_panel(
                         panel_show,
                         panel_active_tab,
@@ -832,15 +847,17 @@ pub fn render_content(
                             history: c_history,
                             snippets: c_snippets,
                             tunnels: c_tunnels,
+                            ai: c_ai,
                         },
                         sftp_panel.clone(),
                         snippets_panel.clone(),
                         history_panel.clone(),
                         tunnels_panel.clone(),
+                        ai_panel.clone(),
                         Some(std::rc::Rc::new(move |idx, _w, cx| {
                             // Rebuild the visible-kind list in the same fixed
                             // order as `render_panel` so the index aligns.
-                            let mut kinds: Vec<PanelKind> = Vec::with_capacity(4);
+                            let mut kinds: Vec<PanelKind> = Vec::with_capacity(5);
                             if c_sftp {
                                 kinds.push(PanelKind::Sftp);
                             }
@@ -852,6 +869,9 @@ pub fn render_content(
                             }
                             if c_tunnels {
                                 kinds.push(PanelKind::Tunnels);
+                            }
+                            if c_ai {
+                                kinds.push(PanelKind::Ai);
                             }
                             handle_for_panel.update(cx, |app, cx| {
                                 if let Some(k) = kinds.get(idx).copied() {

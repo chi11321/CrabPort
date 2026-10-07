@@ -412,6 +412,32 @@ placeholder = "Settings UI is under construction."
 general = "General"
 appearance = "Appearance"
 keybinds = "Keybinds"
+ai = "AI"
+
+[window.settings.ai]
+section_ai = "AI Assistant"
+disable = "Disable AI"
+disable_desc = "The AI assistant is enabled by default; turn the switch on to disable it."
+section_providers = "Providers"
+add_desc = "Configure additional OpenAI-compatible endpoints; keys are stored encrypted on this machine and never written to config.toml."
+add_provider = "Add Provider"
+remove_provider = "Remove"
+entry_type = "Type"
+type_openai = "OpenAI Completion"
+entry_name = "Name"
+entry_name_placeholder = "OpenAI"
+entry_base_url = "API Base URL"
+entry_api_key = "API Key"
+entry_shared_key = "Shares the {name} API key"
+
+[ai_panel]
+placeholder = "Message the CrabPort assistant to get things done"
+model = "Select model"
+search_models = "Search models"
+fetching = "Fetching models…"
+fetch_failed = "Failed to fetch models"
+not_configured = "Not configured: add an API key in Settings → AI."
+thinking = "Thinking"
 
 [window.settings.general]
 section_startup = "Startup"

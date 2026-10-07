@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod history_command_panel;
 pub mod scaffold;
 pub mod sftp;
@@ -17,4 +18,7 @@ pub enum PanelKind {
     Snippets,
     Sftp,
     Tunnels,
+    /// AI assistant. Endpoint-scoped (not backend-scoped): shown on any
+    /// terminal tab while `config.ai.enabled` is true.
+    Ai,
 }

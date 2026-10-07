@@ -411,6 +411,32 @@ placeholder = "设置界面建设中。"
 general = "通用"
 appearance = "外观"
 keybinds = "快捷键"
+ai = "AI"
+
+[window.settings.ai]
+section_ai = "AI 助手"
+disable = "禁用 AI"
+disable_desc = "AI 助手默认启用；打开开关可禁用。"
+section_providers = "Provider"
+add_desc = "配置额外的 OpenAI 兼容端点；密钥加密存储在本机，不会写入 config.toml。"
+add_provider = "添加 Provider"
+remove_provider = "删除"
+entry_type = "类型"
+type_openai = "OpenAI Completion"
+entry_name = "名称"
+entry_name_placeholder = "OpenAI"
+entry_base_url = "API 地址"
+entry_api_key = "API Key"
+entry_shared_key = "与 {name} 共用 API Key"
+
+[ai_panel]
+placeholder = "发送消息给 CrabPort 助手来完成操作"
+model = "选择模型"
+search_models = "搜索模型"
+fetching = "获取模型…"
+fetch_failed = "模型列表获取失败"
+not_configured = "尚未配置：请在 设置 → AI 中填写 API Key。"
+thinking = "思考过程"
 
 [window.settings.general]
 section_startup = "启动"

@@ -680,3 +680,60 @@ fn command_history_evicts_lru_beyond_cap() {
         "oldest (LRU) entry must be evicted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AI secrets
+// ---------------------------------------------------------------------------
+
+/// Per-provider key CRUD: unset → `None`, upsert overwrites, keys are
+/// isolated between provider ids, delete removes the row, and an empty key
+/// round-trips as `Some("")` ("set but blank").
+#[test]
+fn ai_api_key_roundtrip_and_isolation() {
+    let t = TempStore::new("ai-secrets");
+    assert_eq!(t.store.ai_api_key("p1").unwrap(), None);
+
+    t.store.set_ai_api_key("p1", "sk-abc").unwrap();
+    assert_eq!(t.store.ai_api_key("p1").unwrap().as_deref(), Some("sk-abc"));
+
+    // Keys are per provider — p2 stays independent.
+    t.store.set_ai_api_key("p2", "sk-xyz").unwrap();
+    assert_eq!(t.store.ai_api_key("p2").unwrap().as_deref(), Some("sk-xyz"));
+    assert_eq!(t.store.ai_api_key("p1").unwrap().as_deref(), Some("sk-abc"));
+
+    // Upsert overwrites.
+    t.store.set_ai_api_key("p1", "sk-new").unwrap();
+    assert_eq!(t.store.ai_api_key("p1").unwrap().as_deref(), Some("sk-new"));
+
+    // Empty key stores an empty blob, read back as Some("").
+    t.store.set_ai_api_key("p9", "").unwrap();
+    assert_eq!(t.store.ai_api_key("p9").unwrap().as_deref(), Some(""));
+
+    // Delete removes the row.
+    t.store.delete_ai_api_key("p1").unwrap();
+    assert_eq!(t.store.ai_api_key("p1").unwrap(), None);
+}
+
+/// An encrypted key survives a store close + reopen (same key file).
+#[test]
+fn ai_api_key_survives_reopen() {
+    let dir = std::env::temp_dir().join(format!(
+        "crabport-store-test-{}-ai-secrets-reopen",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let store = Store::open_at(dir.clone()).expect("open");
+        store.set_ai_api_key("p1", "sk-persist").unwrap();
+    }
+    {
+        let store = Store::open_at(dir.clone()).expect("reopen");
+        assert_eq!(
+            store.ai_api_key("p1").unwrap().as_deref(),
+            Some("sk-persist")
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

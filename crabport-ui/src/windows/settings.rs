@@ -14,13 +14,17 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::label::Label;
 use rust_i18n::t;
 
-use crabport_core::config::{self, AnimationSpeed, StartupPage};
+use crabport_core::config::{
+    self, AiProviderConfig, AnimationSpeed, StartupPage, is_builtin_provider,
+};
 use crabport_core::credential::HostEntry;
 
+use crate::ai::PROVIDER_TYPES;
 use crate::app_state::AppState;
 use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
+use crate::components::input::StyledInput;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
 use crate::components::settings_section::Section;
 use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
@@ -38,13 +42,15 @@ pub enum SettingsTab {
     General,
     Appearance,
     Keybinds,
+    Ai,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 3] = [
+    const ALL: [SettingsTab; 4] = [
         SettingsTab::General,
         SettingsTab::Appearance,
         SettingsTab::Keybinds,
+        SettingsTab::Ai,
     ];
 
     fn label(self) -> SharedString {
@@ -52,6 +58,7 @@ impl SettingsTab {
             SettingsTab::General => t!("window.settings.tab.general").into(),
             SettingsTab::Appearance => t!("window.settings.tab.appearance").into(),
             SettingsTab::Keybinds => t!("window.settings.tab.keybinds").into(),
+            SettingsTab::Ai => t!("window.settings.tab.ai").into(),
         }
     }
 
@@ -81,6 +88,14 @@ pub struct SettingsWindow {
     font_family_dropdown_open: bool,
     startup_dropdown_open: bool,
     animation_speed_dropdown_open: bool,
+    /// AI preset dropdown currently open — the entry id, or `None` when all
+    /// are closed (only one dropdown open at a time).
+    ai_open_dropdown: Option<String>,
+    /// Per-entry input entities (base URL / model / masked API key),
+    /// matched to `config.ai.providers` by entry id. Built on app start and
+    /// extended/trimmed by add/remove; id-based lookups keep hand-edits of
+    /// config.toml from desyncing the render.
+    ai_entry_inputs: Vec<AiEntryInputs>,
     /// Search input backing the terminal font-family dropdown. Lets the
     /// user type to filter the (potentially long) list of installed fonts.
     font_search_input: Entity<InputState>,
@@ -107,6 +122,16 @@ pub struct SettingsWindow {
     /// Error message for the action currently being recorded, if any
     /// (e.g. conflict with another binding).
     keybind_error: Option<String>,
+}
+
+/// Input entities for one AI provider entry, matched to its
+/// `config.ai.providers` row by stable id. Subscriptions persist edits
+/// straight into config/store — see [`SettingsWindow::build_ai_entry_inputs`].
+struct AiEntryInputs {
+    entry_id: String,
+    name: Entity<InputState>,
+    base_url: Entity<InputState>,
+    api_key: Entity<InputState>,
 }
 
 impl SettingsWindow {
@@ -185,6 +210,14 @@ impl SettingsWindow {
             cx.refresh_windows();
         })
         .detach();
+        // AI provider entries — one input triple per configured endpoint,
+        // built from the persisted config so the pane opens pre-filled.
+        let ai_entry_inputs: Vec<AiEntryInputs> = config::snapshot()
+            .ai
+            .providers
+            .iter()
+            .map(|entry| Self::build_ai_entry_inputs(entry, window, cx))
+            .collect();
         // Search box for the font-family dropdown — filters the list of
         // installed fonts by case-insensitive substring.
         let font_search_input = cx.new(|cx| {
@@ -201,6 +234,8 @@ impl SettingsWindow {
             font_size_input,
             font_size_focused: false,
             keepalive_input,
+            ai_open_dropdown: None,
+            ai_entry_inputs,
             mono_font_names: Vec::new(),
             recording_action: None,
             focus_handle: cx.focus_handle(),
@@ -388,6 +423,355 @@ impl SettingsWindow {
                         }),
                 ),
         )
+    }
+
+    // -------------------------------------------------------------------
+    // AI pane (provider entry management)
+    // -------------------------------------------------------------------
+
+    fn render_ai_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ai = config::snapshot().ai;
+        let handle = cx.entity().clone();
+
+        // Per-entry sections, in config list order. Entries whose inputs
+        // are missing (e.g. config.toml hand-edited since open) are skipped,
+        // and a built-in that borrows another entry's key is folded into its
+        // owner's section — OpenCode's Zen and Go endpoints are one account
+        // behind one key, so they read as a single "OpenCode" entry.
+        let entry_sections: Vec<AnyElement> = ai
+            .providers
+            .iter()
+            .filter(|entry| !(is_builtin_provider(&entry.id) && entry.key_id.is_some()))
+            .filter_map(|entry| {
+                let inputs = self
+                    .ai_entry_inputs
+                    .iter()
+                    .find(|i| i.entry_id == entry.id)?;
+                Some(self.render_ai_entry(entry, inputs, &handle, cx))
+            })
+            .collect();
+
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-ai-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                // --- Enabled section (phrased as a *disable* toggle: AI is
+                // on by default) ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.ai.section_ai"))
+                        .desc(t!("window.settings.ai.disable_desc"))
+                        .field(
+                            t!("window.settings.ai.disable").to_string(),
+                            div().w(px(180.0)).child(
+                                crate::components::switch::Switch::new("settings-ai-enabled")
+                                    .checked(!ai.enabled)
+                                    .on_change({
+                                        let h = handle.clone();
+                                        move |checked, _w, cx| {
+                                            let _ =
+                                                config::update(|cfg| cfg.ai.enabled = !*checked);
+                                            h.update(cx, |_, cx| cx.notify());
+                                        }
+                                    }),
+                            ),
+                        ),
+                )
+                // --- One section per configured provider entry ---
+                .children(entry_sections)
+                // --- Add entry ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.ai.section_providers"))
+                        .desc(t!("window.settings.ai.add_desc"))
+                        .bare(
+                            Button::new("settings-ai-add")
+                                .child(t!("window.settings.ai.add_provider").to_string())
+                                .w_auto()
+                                .centered(true)
+                                .on_click({
+                                    let h = handle.clone();
+                                    move |_e, w, cx| {
+                                        h.update(cx, |view, cx| view.ai_add_provider(w, cx));
+                                    }
+                                }),
+                        ),
+                ),
+        )
+    }
+
+    /// One provider entry. User-added entries show the full form (type /
+    /// name / base URL / masked key + remove). Built-in entries (see
+    /// [`BUILTIN_PROVIDER_IDS`](crabport_core::config::BUILTIN_PROVIDER_IDS))
+    /// have no subtitle and expose only their API key — type, name and
+    /// endpoint are fixed by the product. An entry that borrows another
+    /// entry's key (`key_id`, e.g. OpenCode Go off Zen) shows a pointer to
+    /// the owner instead of a key field of its own.
+    fn render_ai_entry(
+        &self,
+        entry: &AiProviderConfig,
+        inputs: &AiEntryInputs,
+        handle: &Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entry_title: SharedString = {
+            let type_label = crate::ai::provider_type_by_id(&entry.provider_type)
+                .map(|tpe| t!(tpe.label_key).to_string())
+                .unwrap_or_else(|| entry.provider_type.clone());
+            if entry.name.trim().is_empty() {
+                type_label
+            } else {
+                entry.name.clone()
+            }
+            .into()
+        };
+        // Either the entry's own masked key input, or — when it borrows
+        // another entry's key — a muted pointer at the owner, whose field is
+        // the one that writes the shared secret.
+        let key_field = if let Some(owner_id) = entry.key_id.as_deref() {
+            let owner = config::snapshot()
+                .ai
+                .providers
+                .iter()
+                .find(|p| p.id == owner_id)
+                .and_then(|p| {
+                    let label = if p.name.trim().is_empty() {
+                        p.base_url.trim()
+                    } else {
+                        p.name.trim()
+                    };
+                    (!label.is_empty()).then(|| label.to_string())
+                })
+                .unwrap_or_else(|| owner_id.to_string());
+            div()
+                .w(px(280.0))
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(t!("window.settings.ai.entry_shared_key", name = owner.as_str()).to_string())
+                .into_any_element()
+        } else {
+            div()
+                .w(px(280.0))
+                .child(StyledInput::new(
+                    format!("settings-ai-api-key-{}", entry.id),
+                    inputs.api_key.clone(),
+                ))
+                .into_any_element()
+        };
+
+        // Built-in entries: type / name / endpoint are fixed by the
+        // product, so the pane only exposes the API key — and the entry is
+        // unremovable (config normalization re-seeds every built-in).
+        if is_builtin_provider(&entry.id) {
+            return Section::new()
+                .header(entry_title)
+                .field(
+                    t!("window.settings.ai.entry_api_key").to_string(),
+                    key_field,
+                )
+                .into_any_element();
+        }
+
+        let selected_idx = PROVIDER_TYPES
+            .iter()
+            .position(|tpe| tpe.id == entry.provider_type)
+            .unwrap_or(0);
+        let mut dd = Dropdown::new(ElementId::Name(
+            format!("settings-ai-type-{}", entry.id).into(),
+        ))
+        .is_open(self.ai_open_dropdown.as_deref() == Some(entry.id.as_str()))
+        .selected(selected_idx);
+        for tpe in PROVIDER_TYPES {
+            dd = dd.item_with_value(t!(tpe.label_key).to_string(), tpe.id.to_string());
+        }
+        let dd = dd
+            .on_toggle({
+                let h = handle.clone();
+                let eid = entry.id.clone();
+                move |_w, cx| {
+                    h.update(cx, |view, cx| {
+                        let open = view.ai_open_dropdown.as_deref() == Some(eid.as_str());
+                        view.ai_open_dropdown = if open { None } else { Some(eid.clone()) };
+                        cx.notify();
+                    });
+                }
+            })
+            .on_change({
+                let h = handle.clone();
+                let eid = entry.id.clone();
+                move |idx, _w, cx| {
+                    if let Some(tpe) = PROVIDER_TYPES.get(idx) {
+                        let _ = config::update(|cfg| {
+                            if let Some(e) = cfg.ai.providers.iter_mut().find(|e| e.id == eid) {
+                                e.provider_type = tpe.id.into();
+                            }
+                        });
+                    }
+                    h.update(cx, |view, cx| {
+                        view.ai_open_dropdown = None;
+                        cx.notify();
+                    });
+                }
+            });
+
+        let eid = entry.id.clone();
+        let h = handle.clone();
+        Section::new()
+            .header(entry_title)
+            .field(
+                t!("window.settings.ai.entry_type").to_string(),
+                div().w(px(280.0)).child(dd),
+            )
+            .field(
+                t!("window.settings.ai.entry_name").to_string(),
+                div().w(px(280.0)).child(StyledInput::new(
+                    format!("settings-ai-name-{}", entry.id),
+                    inputs.name.clone(),
+                )),
+            )
+            .field(
+                t!("window.settings.ai.entry_base_url").to_string(),
+                div().w(px(280.0)).child(StyledInput::new(
+                    format!("settings-ai-base-url-{}", entry.id),
+                    inputs.base_url.clone(),
+                )),
+            )
+            .field(
+                t!("window.settings.ai.entry_api_key").to_string(),
+                key_field,
+            )
+            .bare(
+                Button::new(ElementId::Name(
+                    format!("settings-ai-remove-{}", entry.id).into(),
+                ))
+                .child(t!("window.settings.ai.remove_provider").to_string())
+                .w_auto()
+                .centered(true)
+                .on_click(move |_e, _w, cx| {
+                    h.update(cx, |view, cx| view.ai_remove_provider(&eid, cx));
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Build the input trio for one entry and wire per-keystroke
+    /// persistence: name + base URL into `config.toml` (`[ai]`), API key
+    /// into the store's encrypted `ai_secrets` table. Subscriptions match
+    /// the entry by id, so a hand-deleted entry turns the write into a
+    /// no-op instead of resurrecting it.
+    fn build_ai_entry_inputs(
+        entry: &AiProviderConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AiEntryInputs {
+        let name = cx.new(|cx| {
+            let mut s = InputState::new(window, cx)
+                .placeholder(t!("window.settings.ai.entry_name_placeholder").to_string());
+            s.set_value(entry.name.clone(), window, cx);
+            s
+        });
+        let base_url = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("https://api.openai.com/v1");
+            s.set_value(entry.base_url.clone(), window, cx);
+            s
+        });
+        let stored_key = AppState::store(cx)
+            .lock()
+            .ai_api_key(entry.effective_key_id())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let api_key = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("sk-…");
+            state.set_masked(true, window, cx);
+            state.set_value(stored_key.clone(), window, cx);
+            state
+        });
+
+        let eid = entry.id.clone();
+        cx.subscribe(&name, move |_this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let text = input.read(cx).value().to_string();
+                let _ = config::update(|cfg| {
+                    if let Some(e) = cfg.ai.providers.iter_mut().find(|e| e.id == eid) {
+                        e.name = text;
+                    }
+                });
+            }
+        })
+        .detach();
+        let eid = entry.id.clone();
+        cx.subscribe(&base_url, move |_this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let text = input.read(cx).value().to_string();
+                let _ = config::update(|cfg| {
+                    if let Some(e) = cfg.ai.providers.iter_mut().find(|e| e.id == eid) {
+                        e.base_url = text;
+                    }
+                });
+            }
+        })
+        .detach();
+        let eid = entry.effective_key_id().to_string();
+        cx.subscribe(&api_key, move |_this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let text = input.read(cx).value().to_string();
+                let _ = AppState::store(cx).lock().set_ai_api_key(&eid, &text);
+            }
+        })
+        .detach();
+
+        AiEntryInputs {
+            entry_id: entry.id.clone(),
+            name,
+            base_url,
+            api_key,
+        }
+    }
+
+    /// Append a new OpenAI-compatible entry (empty fields) and build its
+    /// inputs. Anthropic is not selectable yet — see `PROVIDER_TYPES`.
+    fn ai_add_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = format!(
+            "p{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let entry = AiProviderConfig {
+            id: id.clone(),
+            provider_type: "openai".into(),
+            name: String::new(),
+            base_url: String::new(),
+            key_id: None,
+        };
+        let inputs = Self::build_ai_entry_inputs(&entry, window, cx);
+        self.ai_entry_inputs.push(inputs);
+        self.ai_open_dropdown = None;
+        let _ = config::update(|cfg| cfg.ai.providers.push(entry));
+        cx.notify();
+    }
+
+    /// Drop the entry from config + its inputs, and delete its stored API
+    /// key so it doesn't linger on disk. Built-in entries are not
+    /// removable — [`normalize`](crabport_core::config) would re-seed them.
+    fn ai_remove_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        if is_builtin_provider(id) {
+            return;
+        }
+        self.ai_entry_inputs.retain(|i| i.entry_id != id);
+        let _ = config::update(|cfg| cfg.ai.providers.retain(|p| p.id != id));
+        if self.ai_open_dropdown.as_deref() == Some(id) {
+            self.ai_open_dropdown = None;
+        }
+        let _ = AppState::store(cx).lock().delete_ai_api_key(id);
+        cx.notify();
     }
 
     // -------------------------------------------------------------------
@@ -965,6 +1349,7 @@ impl Render for SettingsWindow {
         let content: AnyElement = match self.tab {
             SettingsTab::General => self.render_general_pane(cx).into_any_element(),
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
+            SettingsTab::Ai => self.render_ai_pane(cx).into_any_element(),
             SettingsTab::Keybinds => self.render_keybinds_pane(cx).into_any_element(),
         };
 
