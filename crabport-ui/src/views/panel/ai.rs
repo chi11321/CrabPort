@@ -34,7 +34,9 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Sizable as _, Size};
 use rust_i18n::t;
 
-use crabport_ai::{AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent};
+use crabport_ai::{
+    AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent, ToolCall, ToolSpec,
+};
 use crabport_core::config;
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
@@ -46,10 +48,113 @@ use crate::components::dropdown::Dropdown;
 use crate::motion::RADIUS_MD;
 use crate::views::terminal::TerminalView;
 
-/// Pinned ahead of every conversation. Kept short; the agent prompt (tools,
-/// safety rules) will extend this in a later phase.
-const SYSTEM_PROMPT: &str =
-    "You are the built-in AI assistant of CrabPort, an SSH/SFTP client. Be concise and practical.";
+/// Pinned ahead of every conversation.
+///
+/// The agent prompt: the model may inspect and drive *its own* terminal, but
+/// nothing happens without the user approving it. Keep the rules short and
+/// concrete — the tools themselves carry the detail.
+const SYSTEM_PROMPT: &str = "\
+You are the built-in AI assistant of CrabPort, an SSH/SFTP client, working \
+inside one terminal session. Be concise and practical.\n\n\
+You can use two tools on that terminal:\n\
+- terminal_read: read the most recent output lines. Use it before asking \
+questions the screen can answer, and after a command to see what happened.\n\
+- terminal_execute: send one command line to the shell.\n\n\
+Every tool call is shown to the user for approval, so call a tool only when \
+it earns its place: say why you are reading, and what you expect a command \
+to do. Never batch speculative commands — one command, then read the result. \
+When the user asks for something you can answer without touching the \
+terminal, just answer.";
+
+/// Tools advertised to the model. Names are stable — the wire history replays
+/// them, and the panel dispatches on them in [`AiPanel::execute_tool`].
+fn agent_tools() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new(
+            "terminal_read",
+            "Read the most recent lines of this terminal's output (scrollback + \
+             visible screen). Use it to see command results, error messages, or \
+             what the user is looking at before answering.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "How many of the most recent lines to read (1-500)."
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Why you need this output — shown to the user for approval."
+                    }
+                },
+                "required": ["lines", "purpose"]
+            }),
+        ),
+        ToolSpec::new(
+            "terminal_execute",
+            "Send one command line to this terminal's shell, exactly as if the \
+             user typed it and pressed Enter. Returns immediately — use \
+             terminal_read afterwards to see the result.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact command line to run."
+                    },
+                    "expected": {
+                        "type": "string",
+                        "description": "What you expect this command to do — shown to the user for approval."
+                    }
+                },
+                "required": ["command", "expected"]
+            }),
+        ),
+    ]
+}
+
+/// The user's decision on one tool call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolDecision {
+    /// Waiting for the user; the turn does not continue until it is resolved.
+    Pending,
+    Allowed,
+    Denied,
+}
+
+/// One tool call the assistant asked for, together with its decision and —
+/// once allowed — its result. Lives on the [`DisplayMessage`] that requested
+/// it, so the conversation list can render the approval card and the wire
+/// history can replay the call and its result.
+#[derive(Clone)]
+struct ToolCallState {
+    call: ToolCall,
+    /// Parsed `call.arguments`; `None` when the model sent invalid JSON (the
+    /// card then shows the raw text and approving executes nothing).
+    args: Option<serde_json::Value>,
+    decision: ToolDecision,
+    /// Result text: tool output, or why it was refused. `None` while the call
+    /// is still running (or still waiting for a decision).
+    result: Option<String>,
+    /// True between approving an `execute` and its output settling — the card
+    /// shows a running state and the loop waits instead of continuing.
+    running: bool,
+}
+
+impl ToolCallState {
+    /// Human-readable view of the card's arguments, falling back to the raw
+    /// JSON text when the model sent malformed arguments.
+    fn arg_str(&self, key: &str) -> Option<&str> {
+        match self.args.as_ref()?.get(key)?.as_str() {
+            Some(value) => Some(value),
+            None => None,
+        }
+    }
+
+    fn arg_u64(&self, key: &str) -> Option<u64> {
+        self.args.as_ref()?.get(key)?.as_u64()
+    }
+}
 
 /// Body text size for the conversation (user bubbles, assistant answers and
 /// the live streaming tail), in px. Deliberately below the app default
@@ -57,6 +162,24 @@ const SYSTEM_PROMPT: &str =
 /// compact chat sidebar instead of a document. Markdown headings and code
 /// blocks are scaled from this too.
 const CONVERSATION_TEXT_SIZE: f32 = 13.0;
+
+/// How many lines of terminal output a `terminal_read` (and the execute
+/// output wait) samples. Plenty for a screenful plus recent scrollback.
+const AGENT_READ_LINES: usize = 400;
+
+/// How often the execute wait re-samples the terminal's output.
+const OUTPUT_POLL: std::time::Duration = std::time::Duration::from_millis(120);
+/// How long the output must stop changing before a command counts as done.
+const OUTPUT_QUIET: std::time::Duration = std::time::Duration::from_millis(360);
+/// Upper bound on the wait: a command that keeps printing (a log tail, a
+/// build) gets this long before its output-so-far is handed over.
+const OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Cap on the text one tool result may carry back to the model, in bytes. A
+/// command that prints a whole file would otherwise fill the conversation's
+/// context with one answer; the *tail* is kept, which is where a command's
+/// interesting output (errors, the final summary) usually is.
+const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
 /// Terminal session an AI panel is bound to.
 ///
@@ -82,7 +205,7 @@ struct ComboItem {
 }
 
 /// Committed display role.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DisplayRole {
     User,
     Assistant,
@@ -99,6 +222,10 @@ struct DisplayMessage {
     content: String,
     reasoning: String,
     reasoning_expanded: bool,
+    /// Tool calls this turn asked for. Empty for plain turns; the assistant
+    /// message is only sent back to the model with its calls and results
+    /// once every call has been resolved by the user.
+    tool_calls: Vec<ToolCallState>,
 }
 
 /// AI assistant panel view.
@@ -296,6 +423,14 @@ impl AiPanel {
         if text.is_empty() {
             return;
         }
+        // A turn that asked for tools is not over until every call has been
+        // approved or refused: the wire history can't carry an unanswered
+        // call, so hold the draft instead of sending a broken request.
+        if self.pending_tool_calls() > 0 {
+            self.error = Some(t!("ai_panel.tools_pending").to_string());
+            cx.notify();
+            return;
+        }
         let Some(provider) = ai::resolve_provider_session(cx, &self.session_id) else {
             self.error = Some(t!("ai_panel.not_configured").to_string());
             cx.notify();
@@ -311,22 +446,33 @@ impl AiPanel {
             content: text,
             reasoning: String::new(),
             reasoning_expanded: false,
+            tool_calls: Vec::new(),
         });
         if stick {
             self.scroll_list_to_end();
         }
 
         let model = config::snapshot().ai.model;
-        let mut wire: Vec<ChatMessage> = Vec::with_capacity(self.messages.len() + 1);
-        wire.push(ChatMessage::system(SYSTEM_PROMPT));
-        for msg in &self.messages {
-            wire.push(match msg.role {
-                DisplayRole::User => ChatMessage::user(msg.content.clone()),
-                DisplayRole::Assistant => ChatMessage::assistant(msg.content.clone()),
-            });
-        }
-        let request = ChatRequest::new(model).with_messages(wire);
+        let wire = self.wire_history();
+        let request = ChatRequest::new(model)
+            .with_messages(wire)
+            .with_tools(agent_tools());
 
+        self.pending_clear = true;
+        self.start_stream(provider, request, cx);
+    }
+
+    /// Spawn the worker for one request and pump its events into the panel.
+    ///
+    /// Shared by the first turn ([`Self::send`]) and every follow-up turn the
+    /// agent loop starts after tools ran ([`Self::continue_after_tools`]) —
+    /// both want the same streaming tail, cancellation and generation guard.
+    fn start_stream(
+        &mut self,
+        provider: crabport_ai::OpenAiProvider,
+        request: ChatRequest,
+        cx: &mut Context<Self>,
+    ) {
         let stream = crabport_ai::spawn_chat_stream(Arc::new(provider), request);
         self.generation += 1;
         let generation = self.generation;
@@ -334,7 +480,6 @@ impl AiPanel {
         self.stream_buf.clear();
         self.stream_reasoning.clear();
         self.error = None;
-        self.pending_clear = true;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -381,6 +526,18 @@ impl AiPanel {
         let partial_reasoning = std::mem::take(&mut self.stream_reasoning);
         match outcome {
             Ok(response) => {
+                // One line per finished turn: the fastest way to tell "the
+                // model answered" from "the model asked for tools" when a
+                // card doesn't show up where it was expected.
+                let calls = response.message.tool_calls.clone();
+                tracing::debug!(
+                    "ai panel: turn finished — finish_reason={:?}, content={} chars, \
+                     reasoning={} chars, tool_calls={}",
+                    response.finish_reason,
+                    response.message.content.chars().count(),
+                    response.reasoning.chars().count(),
+                    calls.len(),
+                );
                 let text = if response.message.content.trim().is_empty() {
                     partial
                 } else {
@@ -391,26 +548,412 @@ impl AiPanel {
                 } else {
                     response.reasoning
                 };
-                self.push_partial(text, reasoning);
-                // Tools aren't advertised in the chat MVP, so
-                // `finish_reason == ToolCalls` can't occur here.
+                self.push_partial(text, reasoning, Vec::new());
+                // Tool calls requested by this turn are attached now — the
+                // card rows are what the user approves before anything runs.
+                if !calls.is_empty() {
+                    self.push_tool_calls(calls, cx);
+                }
             }
             Err(AiError::Cancelled) => {
                 // Keep whatever streamed in before the stop.
-                self.push_partial(partial, partial_reasoning);
+                self.push_partial(partial, partial_reasoning, Vec::new());
             }
             Err(err) => {
-                self.push_partial(partial, partial_reasoning);
+                self.push_partial(partial, partial_reasoning, Vec::new());
                 self.error = Some(err.to_string());
             }
         }
         cx.notify();
     }
 
+    /// Attach the tool calls from one assistant turn to the conversation.
+    ///
+    /// The assistant's own text (if any) is already committed by
+    /// [`Self::push_partial`]; when the model answered with *only* tool calls
+    /// that leaves nothing to show, so this pushes an empty assistant turn to
+    /// carry the calls — the card is the turn.
+    fn push_tool_calls(&mut self, calls: Vec<ToolCall>, cx: &mut Context<Self>) {
+        let states: Vec<ToolCallState> = calls
+            .into_iter()
+            .map(|call| {
+                let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+                ToolCallState {
+                    call,
+                    args,
+                    decision: ToolDecision::Pending,
+                    result: None,
+                    running: false,
+                }
+            })
+            .collect();
+
+        let attach_to_last = self
+            .messages
+            .last()
+            .is_some_and(|msg| msg.role == DisplayRole::Assistant && msg.tool_calls.is_empty());
+        if attach_to_last {
+            self.messages.last_mut().unwrap().tool_calls = states;
+        } else {
+            self.messages.push(DisplayMessage {
+                role: DisplayRole::Assistant,
+                content: String::new(),
+                reasoning: String::new(),
+                reasoning_expanded: false,
+                tool_calls: states,
+            });
+        }
+        // The last row grew (or a new one appeared); make sure the list
+        // re-measures it, and bring it into view — the user has something to
+        // approve.
+        self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
+        self.scroll_list_to_end();
+        cx.notify();
+    }
+
+    /// Tool calls the loop is still waiting on: awaiting the user's decision,
+    /// or executing with its output not settled yet. The panel refuses to
+    /// send while any of these exist, and the agent loop only continues once
+    /// there are none.
+    fn pending_tool_calls(&self) -> usize {
+        self.messages
+            .iter()
+            .flat_map(|msg| msg.tool_calls.iter())
+            .filter(|call| call.decision == ToolDecision::Pending || call.running)
+            .count()
+    }
+
+    /// The request history: the system prompt, every committed turn, and —
+    /// for assistant turns that asked for tools — the calls plus their
+    /// results, which is the shape OpenAI-compatible servers require (a
+    /// `tool` message must answer the `tool_calls` of the message before it).
+    ///
+    /// Turns with unresolved calls are skipped entirely: they cannot be
+    /// replayed, and [`Self::send`] refuses to build a request while any call
+    /// is pending.
+    fn wire_history(&self) -> Vec<ChatMessage> {
+        let mut wire: Vec<ChatMessage> = Vec::with_capacity(self.messages.len() + 1);
+        wire.push(ChatMessage::system(SYSTEM_PROMPT));
+        for msg in &self.messages {
+            match msg.role {
+                DisplayRole::User => wire.push(ChatMessage::user(msg.content.clone())),
+                DisplayRole::Assistant => {
+                    if msg.tool_calls.iter().any(|c| c.result.is_none()) {
+                        continue;
+                    }
+                    let mut assistant = ChatMessage::assistant(msg.content.clone());
+                    assistant.tool_calls = msg.tool_calls.iter().map(|c| c.call.clone()).collect();
+                    wire.push(assistant);
+                    for call in &msg.tool_calls {
+                        wire.push(ChatMessage::tool_result(
+                            call.call.id.clone(),
+                            call.call.name.clone(),
+                            call.result.clone().unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+        }
+        wire
+    }
+
+    /// Record the user's decision for one call and, once every call of the
+    /// turn is resolved, send the results back to the model — that is what
+    /// keeps the agent loop going, and it is why an approval is never a
+    /// silent no-op.
+    fn resolve_tool(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(call_state) = self
+            .messages
+            .get_mut(msg_index)
+            .and_then(|msg| msg.tool_calls.get_mut(call_index))
+        else {
+            return;
+        };
+        if call_state.decision != ToolDecision::Pending {
+            return;
+        }
+        let call = call_state.call.clone();
+        let has_args = call_state.args.is_some();
+        // The model's arguments were unparseable: nothing may run, and it must
+        // be told that instead of assuming success.
+        if !has_args {
+            if let Some(state) = self
+                .messages
+                .get_mut(msg_index)
+                .and_then(|msg| msg.tool_calls.get_mut(call_index))
+            {
+                state.decision = ToolDecision::Denied;
+                state.result = Some(t!("ai_panel.tool_bad_args").to_string());
+            }
+            self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+            self.maybe_continue_after_tools(cx);
+            return;
+        }
+
+        if allow && call.name == "terminal_execute" {
+            // Sample the terminal *before* the command runs: the tool result
+            // is what appears after this point, so the model gets the
+            // command's own output instead of a round trip through
+            // `terminal_read`.
+            let before = self
+                .session
+                .terminal
+                .upgrade()
+                .map(|view| view.read(cx).dump_text(AGENT_READ_LINES))
+                .unwrap_or_default();
+            let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .ok()
+                .and_then(|args| Some(args.get("command")?.as_str()?.to_string()));
+            let Some(command) = command else {
+                if let Some(state) = self
+                    .messages
+                    .get_mut(msg_index)
+                    .and_then(|msg| msg.tool_calls.get_mut(call_index))
+                {
+                    state.decision = ToolDecision::Denied;
+                    state.result = Some(t!("ai_panel.tool_bad_args").to_string());
+                }
+                self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+                self.maybe_continue_after_tools(cx);
+                return;
+            };
+            let Some(terminal) = self.session.terminal.upgrade() else {
+                if let Some(state) = self
+                    .messages
+                    .get_mut(msg_index)
+                    .and_then(|msg| msg.tool_calls.get_mut(call_index))
+                {
+                    state.decision = ToolDecision::Denied;
+                    state.result = Some(t!("ai_panel.tool_terminal_closed").to_string());
+                }
+                self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+                self.maybe_continue_after_tools(cx);
+                return;
+            };
+
+            if let Some(state) = self
+                .messages
+                .get_mut(msg_index)
+                .and_then(|msg| msg.tool_calls.get_mut(call_index))
+            {
+                state.decision = ToolDecision::Allowed;
+                state.running = true;
+            }
+            // Same path the snippets panel uses: the line, then a carriage
+            // return, so the shell runs it as if it had been typed.
+            let mut bytes = command.into_bytes();
+            bytes.push(b'\r');
+            terminal.read(cx).write_raw(&bytes);
+            self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+            self.await_command_output(msg_index, call_index, before, cx);
+            cx.notify();
+            return;
+        }
+
+        if allow {
+            let result = self.execute_tool(&call, cx);
+            if let Some(state) = self
+                .messages
+                .get_mut(msg_index)
+                .and_then(|msg| msg.tool_calls.get_mut(call_index))
+            {
+                state.decision = ToolDecision::Allowed;
+                state.result = Some(result);
+            }
+        } else if let Some(state) = self
+            .messages
+            .get_mut(msg_index)
+            .and_then(|msg| msg.tool_calls.get_mut(call_index))
+        {
+            state.decision = ToolDecision::Denied;
+            state.result = Some(t!("ai_panel.tool_denied").to_string());
+        }
+
+        // Re-measure the row: the card turns from buttons into a result.
+        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        self.maybe_continue_after_tools(cx);
+    }
+
+    /// Send the resolved tool results back to the model, so it can act on
+    /// them.
+    ///
+    /// There is deliberately no cap on how many rounds a turn may take: every
+    /// call is approved by the user before it runs, so the loop only continues
+    /// while they keep saying yes — and they can stop it at any point with the
+    /// composer's stop button.
+    fn continue_after_tools(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = ai::resolve_provider_session(cx, &self.session_id) else {
+            self.error = Some(t!("ai_panel.not_configured").to_string());
+            cx.notify();
+            return;
+        };
+        let model = config::snapshot().ai.model;
+        let request = ChatRequest::new(model)
+            .with_messages(self.wire_history())
+            .with_tools(agent_tools());
+        self.start_stream(provider, request, cx);
+    }
+
+    /// Run one approved tool call against this panel's terminal and return
+    /// the text to hand back to the model.
+    ///
+    /// `terminal_read` is answered inline; `terminal_execute` is *started*
+    /// here and its result arrives later — see [`Self::await_command_output`]
+    /// — because the useful answer to "run this" is the command's output, not
+    /// an acknowledgement.
+    fn execute_tool(&mut self, call: &ToolCall, cx: &mut Context<Self>) -> String {
+        let Some(terminal) = self.session.terminal.upgrade() else {
+            return t!("ai_panel.tool_terminal_closed").to_string();
+        };
+        match call.name.as_str() {
+            "terminal_read" => {
+                let lines = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .ok()
+                    .and_then(|args| args.get("lines")?.as_u64())
+                    .unwrap_or(200) as usize;
+                let text = terminal.read(cx).dump_text(lines);
+                if text.trim().is_empty() {
+                    t!("ai_panel.tool_read_empty").to_string()
+                } else {
+                    text
+                }
+            }
+            "terminal_execute" => {
+                let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .ok()
+                    .and_then(|args| Some(args.get("command")?.as_str()?.to_string()));
+                let Some(command) = command else {
+                    return t!("ai_panel.tool_bad_args").to_string();
+                };
+                // Same path the snippets panel uses: write the line, then a
+                // carriage return, so the shell runs it as if typed.
+                let mut bytes = command.clone().into_bytes();
+                bytes.push(b'\r');
+                terminal.read(cx).write_raw(&bytes);
+                // Placeholder for the instant between writing the command and
+                // its output settling; replaced by the real output.
+                t!("ai_panel.tool_exec_running").to_string()
+            }
+            other => t!("ai_panel.tool_unknown", name = other).to_string(),
+        }
+    }
+
+    /// Wait for an approved command's output to settle and hand it to the
+    /// model as the tool result.
+    ///
+    /// "Settled" is a heuristic, because a shell gives no signal that a
+    /// command finished unless it is integrated (OSC 133): the output is
+    /// sampled every [`OUTPUT_POLL`] and considered done after
+    /// [`OUTPUT_QUIET`] without any change, or after [`OUTPUT_TIMEOUT`] when
+    /// the command keeps printing. What the model gets is the text that
+    /// appeared *since* the command was written — that is the answer to
+    /// "run this", and it saves a round trip through `terminal_read`.
+    fn await_command_output(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        before: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.session.terminal.upgrade() else {
+            self.finish_tool_call(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_terminal_closed").to_string(),
+                cx,
+            );
+            return;
+        };
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            let started = std::time::Instant::now();
+            let mut last = before.clone();
+            let mut quiet_since = std::time::Instant::now();
+            let mut timed_out = false;
+            loop {
+                cx.background_executor().timer(OUTPUT_POLL).await;
+                let Ok(now) =
+                    terminal.read_with(cx, |view, _cx| view.try_dump_text(AGENT_READ_LINES))
+                else {
+                    break; // terminal view went away
+                };
+                let Some(now) = now else {
+                    continue; // lock held by the reader thread; try next tick
+                };
+                if now != last {
+                    last = now;
+                    quiet_since = std::time::Instant::now();
+                } else if quiet_since.elapsed() >= OUTPUT_QUIET {
+                    break;
+                }
+                if started.elapsed() >= OUTPUT_TIMEOUT {
+                    timed_out = true;
+                    break;
+                }
+            }
+            let result = new_since(&before, &last);
+            let result = if result.trim().is_empty() {
+                if timed_out {
+                    t!("ai_panel.tool_exec_no_output_timeout").to_string()
+                } else {
+                    t!("ai_panel.tool_exec_no_output").to_string()
+                }
+            } else {
+                result
+            };
+            let _ = entity.update(cx, |panel, cx| {
+                panel.finish_tool_call(msg_index, call_index, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Store a tool call's result, re-measure its card and — once nothing is
+    /// waiting any more — let the model act on it.
+    fn finish_tool_call(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        result: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self
+            .messages
+            .get_mut(msg_index)
+            .and_then(|msg| msg.tool_calls.get_mut(call_index))
+        {
+            state.result = Some(result);
+            state.running = false;
+        }
+        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        self.maybe_continue_after_tools(cx);
+        cx.notify();
+    }
+
+    /// Continue the loop when every tool call has produced a result; wait
+    /// otherwise (a second call may still be running, or await the user).
+    fn maybe_continue_after_tools(&mut self, cx: &mut Context<Self>) {
+        if self
+            .messages
+            .iter()
+            .flat_map(|msg| msg.tool_calls.iter())
+            .any(|call| call.result.is_none())
+        {
+            return;
+        }
+        self.continue_after_tools(cx);
+    }
+
     /// Commit an assistant turn unless both streams (answer and reasoning)
     /// are blank.
-    fn push_partial(&mut self, content: String, reasoning: String) {
-        if content.trim().is_empty() && reasoning.trim().is_empty() {
+    fn push_partial(&mut self, content: String, reasoning: String, tool_calls: Vec<ToolCallState>) {
+        if content.trim().is_empty() && reasoning.trim().is_empty() && tool_calls.is_empty() {
             return;
         }
         self.messages.push(DisplayMessage {
@@ -420,16 +963,12 @@ impl AiPanel {
             // Disclosure starts collapsed; the live streaming tail shows
             // reasoning in full while it streams.
             reasoning_expanded: false,
+            tool_calls,
         });
         // The committed block (Markdown) replaces the streaming tail (plain
         // text) at the same list index, usually with a different height —
-        // drop the cached row measurement so the list re-measures it. Only
-        // when the tail actually made it into the list (its presence is what
-        // makes the cached row count line up with `messages`).
-        let count = self.list_state.item_count();
-        if count > 0 && count == self.messages.len() {
-            self.list_state.splice(count - 1..count, 1);
-        }
+        // drop the cached row measurement so the list re-measures it.
+        self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
     }
 
     /// Flip one turn's thinking disclosure (the whole header row is the
@@ -438,6 +977,50 @@ impl AiPanel {
         if let Some(msg) = self.messages.get_mut(index) {
             msg.reasoning_expanded = !msg.reasoning_expanded;
             cx.notify();
+        }
+    }
+
+    /// Number of rows the conversation list holds right now: one per
+    /// committed turn, one per tool call (cards sit between turns), and one
+    /// for the live streaming tail while there is one.
+    ///
+    /// The list state is keyed by these rows, so **every** place that splices
+    /// or measures a row has to agree with this count — a card that the count
+    /// doesn't know about is a card the list never renders.
+    fn list_row_count(&self) -> usize {
+        self.messages.len()
+            + self.total_tool_calls()
+            + usize::from(!self.stream_reasoning.is_empty() || !self.stream_buf.is_empty())
+    }
+
+    /// Total tool calls across the conversation (one card row each).
+    fn total_tool_calls(&self) -> usize {
+        self.messages.iter().map(|msg| msg.tool_calls.len()).sum()
+    }
+
+    /// List row index of `messages[msg_index]`.
+    fn list_row_of_message(&self, msg_index: usize) -> usize {
+        msg_index
+            + self
+                .messages
+                .iter()
+                .take(msg_index)
+                .map(|msg| msg.tool_calls.len())
+                .sum::<usize>()
+    }
+
+    /// List row index of the card for one tool call.
+    fn list_row_of_tool_call(&self, msg_index: usize, call_ix: usize) -> usize {
+        self.list_row_of_message(msg_index) + 1 + call_ix
+    }
+
+    /// Re-measure one row: drop its cached measurement so the next frame lays
+    /// it out again (used when a card grows from buttons into a result, or a
+    /// turn's content changes identity).
+    fn remeasure_row(&self, row: usize) {
+        let known = self.list_state.item_count();
+        if row < known {
+            self.list_state.splice(row..row + 1, 1);
         }
     }
 
@@ -470,21 +1053,44 @@ impl AiPanel {
     /// Snapshot of the conversation for the virtualized list's render
     /// closure, which cannot borrow the view. Rebuilt each render; the
     /// string clones are cheap relative to element layout.
-    fn message_items(&self) -> Vec<MessageItem> {
-        let mut items: Vec<MessageItem> = self
-            .messages
-            .iter()
-            .map(|msg| match msg.role {
+    /// Snapshot of the conversation for the virtualized list's render
+    /// closure, which cannot borrow the view. `cwd` is the terminal's
+    /// last-reported working directory (resolved by `render`, which has
+    /// `cx`); tool cards show it on `execute` requests.
+    ///
+    /// Rows and messages are *different* indices: a message with tool calls
+    /// is followed by one card row per call, so `messages[ix]` is not
+    /// `items[ix]`. Cards carry the message index they belong to (for the
+    /// approve/deny callbacks) and the assistant rows carry theirs (for the
+    /// thinking toggle) — mixing the two is what made every approval after
+    /// the first one land on a message that doesn't exist.
+    fn message_items(&self, cwd: Option<&str>) -> Vec<MessageItem> {
+        let mut items: Vec<MessageItem> = Vec::with_capacity(self.list_row_count());
+        for (message_ix, msg) in self.messages.iter().enumerate() {
+            items.push(match msg.role {
                 DisplayRole::User => MessageItem::User {
                     content: msg.content.clone(),
                 },
                 DisplayRole::Assistant => MessageItem::Assistant {
+                    message_ix,
                     reasoning: msg.reasoning.clone(),
                     content: msg.content.clone(),
                     reasoning_expanded: msg.reasoning_expanded,
                 },
-            })
-            .collect();
+            });
+            // One row per tool call, right after the turn that asked for it —
+            // approvals are the only interactive thing in the conversation, so
+            // they get their own row rather than being buried in the assistant
+            // bubble.
+            for (call_ix, call) in msg.tool_calls.iter().enumerate() {
+                items.push(MessageItem::Tool {
+                    message_ix,
+                    call_ix,
+                    state: call.clone(),
+                    cwd: cwd.map(str::to_string),
+                });
+            }
+        }
         if !self.stream_reasoning.is_empty() || !self.stream_buf.is_empty() {
             items.push(MessageItem::Streaming {
                 reasoning: self.stream_reasoning.clone(),
@@ -674,8 +1280,7 @@ impl Render for AiPanel {
         // grows with the conversation. The row count is synced here, in
         // render: `splice` rather than `reset`, because `reset` drops the
         // logical scroll position (the view would jump back to the top).
-        let item_count = self.messages.len()
-            + usize::from(!self.stream_reasoning.is_empty() || !self.stream_buf.is_empty());
+        let item_count = self.list_row_count();
         let known = self.list_state.item_count();
         if known < item_count {
             self.list_state.splice(known..known, item_count - known);
@@ -685,7 +1290,15 @@ impl Render for AiPanel {
         // The list's render closure cannot borrow the view, so rows are
         // built from a per-frame snapshot plus a weak handle (used by the
         // thinking disclosures).
-        let items: Rc<Vec<MessageItem>> = Rc::new(self.message_items());
+        // The terminal's last-reported cwd, for the execute card's
+        // "execution path" line. Read once per frame — the handle is weak, so
+        // a closed pane simply yields `None`.
+        let terminal_cwd = self
+            .session
+            .terminal
+            .upgrade()
+            .and_then(|view| view.read(cx).cwd().map(str::to_string));
+        let items: Rc<Vec<MessageItem>> = Rc::new(self.message_items(terminal_cwd.as_deref()));
         let item_entity = cx.entity().downgrade();
         let item_style = md_style.clone();
         let list_el = list(self.list_state.clone(), move |ix, window, cx| {
@@ -857,15 +1470,61 @@ enum MessageItem {
         content: String,
     },
     Assistant {
+        /// Index into `AiPanel::messages` — the thinking toggle needs the
+        /// message, not the list row (they differ once cards exist).
+        message_ix: usize,
         reasoning: String,
         content: String,
         reasoning_expanded: bool,
+    },
+    /// One tool call awaiting the user's approval — or showing what they
+    /// decided. Carries everything the card needs so the list's render
+    /// closure (which cannot borrow the panel) stays self-contained.
+    Tool {
+        /// Index of the assistant turn that requested it (for the resolve
+        /// callback).
+        message_ix: usize,
+        /// Index within that turn's calls.
+        call_ix: usize,
+        state: ToolCallState,
+        /// Directory the command would run in, when the shell reports one.
+        cwd: Option<String>,
     },
     Streaming {
         reasoning: String,
         content: String,
         streaming: bool,
     },
+}
+
+/// The part of `after` that appeared since `before`, used to answer an
+/// `execute` call with the command's own output instead of the whole screen.
+///
+/// Terminals scroll, so the interesting text is the suffix the two dumps
+/// don't share; the common prefix is computed on bytes and then walked back
+/// to a char boundary so the slice can't panic on multi-byte output. The
+/// result is capped at [`MAX_TOOL_RESULT_BYTES`] (keeping the tail, which is
+/// where the interesting part of a long output lives) so a chatty command
+/// can't blow up the conversation's context.
+fn new_since(before: &str, after: &str) -> String {
+    let before = before.as_bytes();
+    let after_bytes = after.as_bytes();
+    let mut ix = 0;
+    while ix < before.len() && ix < after_bytes.len() && before[ix] == after_bytes[ix] {
+        ix += 1;
+    }
+    while ix > 0 && !after.is_char_boundary(ix) {
+        ix -= 1;
+    }
+    let tail = after[ix..].trim_matches('\n');
+    if tail.len() <= MAX_TOOL_RESULT_BYTES {
+        return tail.to_string();
+    }
+    let mut cut = tail.len() - MAX_TOOL_RESULT_BYTES;
+    while cut < tail.len() && !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("(earlier output omitted — {} bytes)\n{}", cut, &tail[cut..])
 }
 
 /// Fresh id for a conversation's session header. Only needs to be unique
@@ -920,15 +1579,33 @@ fn render_list_item(
             ))
             .into_any_element(),
         Some(MessageItem::Assistant {
+            message_ix,
             reasoning,
             content,
             reasoning_expanded,
         }) => row
             .child(assistant_block(
-                ix,
+                *message_ix,
                 reasoning.clone(),
                 content.clone(),
                 *reasoning_expanded,
+                entity,
+                md_style,
+                window,
+                cx,
+            ))
+            .into_any_element(),
+        Some(MessageItem::Tool {
+            message_ix,
+            call_ix,
+            state,
+            cwd,
+        }) => row
+            .child(tool_card(
+                *message_ix,
+                *call_ix,
+                state.clone(),
+                cwd.as_deref(),
                 entity,
                 md_style,
                 window,
@@ -948,6 +1625,284 @@ fn render_list_item(
             .into_any_element(),
         None => row.into_any_element(),
     }
+}
+
+/// The authorization card for one tool call.
+///
+/// Nothing runs without the user's click: the card spells out what the call
+/// would do — the lines it would read and why, or the exact command, the
+/// directory it runs in and what the model expects — then offers
+/// deny/approve. Once decided it shows the outcome instead of the buttons, so
+/// the transcript keeps a record of both the request and what came of it.
+#[allow(clippy::too_many_arguments)]
+fn tool_card(
+    message_ix: usize,
+    call_ix: usize,
+    state: ToolCallState,
+    cwd: Option<&str>,
+    entity: &WeakEntity<AiPanel>,
+    md_style: &TextViewStyle,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let is_execute = state.call.name == "terminal_execute";
+    let title = if is_execute {
+        t!("ai_panel.tool_exec_title").to_string()
+    } else {
+        t!("ai_panel.tool_read_title").to_string()
+    };
+    let accent = if is_execute {
+        term_yellow()
+    } else {
+        term_blue()
+    };
+
+    let mut card = div()
+        .w_full()
+        .rounded(RADIUS_MD)
+        .border_1()
+        .border_color(rgba((accent << 8) | 0x66))
+        .bg(rgba((accent << 8) | 0x14))
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_size(px(CONVERSATION_TEXT_SIZE))
+        // Header: which terminal tool is asking, and — once the user has
+        // decided — a check or a cross in the corner. The decision is not
+        // spelled out in words: the card already carries the outcome below.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            svg()
+                                .path("icons/sparkles.svg")
+                                .size(px(12.0))
+                                .text_color(rgb(accent)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(accent))
+                                .child(title),
+                        ),
+                )
+                .when_some(
+                    state_icon(&state.decision, state.running),
+                    |el, (path, color)| {
+                        el.child(svg().path(path).size(px(14.0)).text_color(rgb(color)))
+                    },
+                ),
+        );
+
+    // Body: the fields the user asked for, per tool.
+    if is_execute {
+        let command = state.arg_str("command").unwrap_or("");
+        let expected = state.arg_str("expected").unwrap_or("");
+        card = card
+            .child(tool_card_field(
+                t!("ai_panel.tool_field_path").as_ref(),
+                cwd.map(str::to_string)
+                    .unwrap_or_else(|| t!("ai_panel.tool_field_path_unknown").to_string()),
+                false,
+            ))
+            .child(tool_card_field(
+                t!("ai_panel.tool_field_command").as_ref(),
+                command.to_string(),
+                true,
+            ));
+        if !expected.is_empty() {
+            card = card.child(tool_card_field(
+                t!("ai_panel.tool_field_expected").as_ref(),
+                expected.to_string(),
+                false,
+            ));
+        }
+    } else {
+        let lines = state.arg_u64("lines").unwrap_or(200);
+        let purpose = state.arg_str("purpose").unwrap_or("");
+        card = card.child(tool_card_field(
+            t!("ai_panel.tool_field_read").as_ref(),
+            t!("ai_panel.tool_field_read_lines", lines = lines).to_string(),
+            false,
+        ));
+        if !purpose.is_empty() {
+            card = card.child(tool_card_field(
+                t!("ai_panel.tool_field_purpose").as_ref(),
+                purpose.to_string(),
+                false,
+            ));
+        }
+    }
+
+    // Malformed arguments: say so instead of offering a decision that would
+    // do nothing.
+    if state.args.is_none() {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(input_border_error()))
+                .child(t!("ai_panel.tool_bad_args").to_string()),
+        );
+    }
+
+    match state.decision {
+        ToolDecision::Pending => {
+            let h_allow = entity.clone();
+            let h_deny = entity.clone();
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new(ElementId::Name(
+                            format!("ai-tool-deny-{message_ix}-{call_ix}").into(),
+                        ))
+                        .child(t!("ai_panel.tool_deny").to_string())
+                        .w_auto()
+                        .px_2()
+                        .centered(true)
+                        .on_click(move |_e, _w, cx| {
+                            let _ = h_deny.update(cx, |panel, cx| {
+                                panel.resolve_tool(message_ix, call_ix, false, cx)
+                            });
+                        }),
+                    )
+                    .child(
+                        Button::new(ElementId::Name(
+                            format!("ai-tool-allow-{message_ix}-{call_ix}").into(),
+                        ))
+                        .child(t!("ai_panel.tool_allow").to_string())
+                        .primary()
+                        .w_auto()
+                        .px_2()
+                        .centered(true)
+                        .on_click(move |_e, _w, cx| {
+                            let _ = h_allow.update(cx, |panel, cx| {
+                                panel.resolve_tool(message_ix, call_ix, true, cx)
+                            });
+                        }),
+                    ),
+            )
+        }
+        ToolDecision::Allowed | ToolDecision::Denied => {
+            // The header icon already says what the user decided (and whether
+            // a command is still running); here we only show what came back.
+            // While an `execute` is in flight the result is not in yet, so the
+            // card says so rather than looking empty.
+            let result = state
+                .result
+                .clone()
+                .unwrap_or_else(|| t!("ai_panel.tool_exec_running").to_string());
+            let result_view: AnyElement = if result.trim().is_empty() {
+                div().into_any_element()
+            } else {
+                let border_color = if state.decision == ToolDecision::Allowed {
+                    rgb(border())
+                } else {
+                    rgba((term_red() << 8) | 0x66)
+                };
+                div()
+                    .w_full()
+                    .text_size(px(CONVERSATION_TEXT_SIZE))
+                    .border_l_1()
+                    .border_color(border_color)
+                    .pl_2()
+                    .child(
+                        TextView::markdown(
+                            ElementId::Name(
+                                format!("ai-tool-result-{message_ix}-{call_ix}").into(),
+                            ),
+                            {
+                                let fence = code_fence(&result);
+                                format!("{fence}\n{}\n{fence}", result.trim())
+                            },
+                            window,
+                            cx,
+                        )
+                        .selectable(true)
+                        .h_auto()
+                        .style(md_style.clone()),
+                    )
+                    .into_any_element()
+            };
+            card = card.child(result_view);
+        }
+    }
+
+    card.into_any_element()
+}
+
+/// The corner glyph for a card: a check once the call ran, a cross when the
+/// user refused it, a loader while a command is still producing output.
+/// `None` while it is still waiting for a click.
+fn state_icon(decision: &ToolDecision, running: bool) -> Option<(&'static str, u32)> {
+    if running {
+        return Some(("icons/loader-circle.svg", text_muted()));
+    }
+    match decision {
+        ToolDecision::Pending => None,
+        ToolDecision::Allowed => Some(("icons/check.svg", term_green())),
+        ToolDecision::Denied => Some(("icons/x.svg", term_red())),
+    }
+}
+
+/// Fence long enough to survive the output itself containing backticks: a
+/// fence closes only on a run at least as long as it is, so one backtick
+/// longer than the longest run inside the text is always safe. Without this
+/// a command that prints ``` would cut the card's code block short.
+fn code_fence(text: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for ch in text.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(longest.max(2) + 1)
+}
+
+/// One labelled field of a tool card: a muted caption over the value, the
+/// value in the mono face when it is something that will be typed into a
+/// shell.
+fn tool_card_field(label: &str, value: String, monospace: bool) -> AnyElement {
+    let mut value_el = div()
+        .w_full()
+        .whitespace_normal()
+        .text_color(rgb(text_primary()))
+        .child(value);
+    if monospace {
+        // The same family the terminal itself renders with, so a command on a
+        // card looks like the command about to be typed into the shell.
+        value_el = value_el.font_family(TerminalView::mono_font_family());
+    }
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(label.to_string()),
+        )
+        .child(value_el)
+        .into_any_element()
 }
 
 /// Zed-style assistant turn: the thinking section (when present) sits above

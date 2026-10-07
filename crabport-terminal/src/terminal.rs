@@ -521,6 +521,28 @@ mod tests {
 
     use super::{MAX_COMMAND_HISTORY, merge_history_entries, strip_prompt_prefix};
 
+    /// `dump_text` is what the AI agent's `terminal_read` tool hands to the
+    /// model, so it has to be plain, trimmed text: no trailing blanks per
+    /// line, no padding cells of the grid, and the *last* lines when the
+    /// session has more output than asked for.
+    #[test]
+    fn dump_text_returns_recent_lines_trimmed() {
+        let backend = std::sync::Arc::new(crate::pty::FailedPtyBackend::new("test".into()));
+        let session = super::TerminalSession::new(backend, 40, 5);
+        // Feed two lines of output; `\r\n` is what a shell emits.
+        session.feed_escape(b"hello\r\nworld\r\n");
+
+        let text = session.dump_text(10);
+        assert_eq!(text, "hello\nworld");
+
+        // A one-line request keeps the most recent line, not the oldest.
+        let text = session.dump_text(1);
+        assert_eq!(text, "world");
+
+        // Blank rows (the rest of a short screen) never leak into the dump.
+        assert!(!session.dump_text(50).contains("\n\n"));
+    }
+
     // Regression for issue #69: macOS zsh default PS1 `%n@%m %1~ %#`
     // renders as `weed@MacBook-Pro ~ %` — no trailing space after the
     // marker. The original heuristic only looked for `<marker><space>`
@@ -1528,6 +1550,55 @@ impl TerminalSession {
         // Nothing was emitted (e.g. legacy format coordinate overflow) —
         // report `false` so the caller falls back to its local handling.
         false
+    }
+
+    // -----------------------------------------------------------------
+    /// Plain-text dump of the terminal's last `max_lines` lines (scrollback
+    /// plus the visible screen), for callers that need to *read* the session
+    /// rather than render it — the AI agent's `terminal_read` tool, and any
+    /// future "summarize what just happened" features.
+    ///
+    /// Trailing whitespace is trimmed per line and the result is trimmed at
+    /// the end, so a screen full of short prompts costs little. `max_lines`
+    /// is clamped to a sane range (1..=2000) to keep a chatty session from
+    /// dumping megabytes into a request.
+    pub fn dump_text(&self, max_lines: usize) -> String {
+        let max_lines = max_lines.clamp(1, 2000);
+        let term = self.term.lock();
+        Self::dump_grid_text(&term, max_lines)
+    }
+
+    /// Non-blocking [`Self::dump_text`]: `None` when the reader thread holds
+    /// the terminal lock right now. Callers that poll (the agent's command
+    /// output wait) use this so they never stall on the lock.
+    pub fn try_dump_text(&self, max_lines: usize) -> Option<String> {
+        let max_lines = max_lines.clamp(1, 2000);
+        let term = self.term.try_lock_unfair()?;
+        Some(Self::dump_grid_text(&term, max_lines))
+    }
+
+    /// Format the last `max_lines` non-blank lines of a terminal grid.
+    fn dump_grid_text(term: &Term<EventProxy>, max_lines: usize) -> String {
+        let grid = term.grid();
+        // Every row of the grid, blank trailing rows of the screen included —
+        // they are trimmed off below, so "the last N lines" means the last N
+        // lines *of output* rather than the empty bottom of the screen.
+        let lines: Vec<String> = (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(|row| {
+                let line = &grid[Line(row)];
+                (0..=grid.last_column().0)
+                    .map(|column| line[Column(column)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let end = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |ix| ix + 1);
+        let start = end.saturating_sub(max_lines);
+        lines[start..end].join("\n")
     }
 
     // -----------------------------------------------------------------

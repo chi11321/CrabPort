@@ -197,6 +197,14 @@ pub struct TerminalView {
     /// new cwd, and the foreground process name (e.g. `zsh`, `cargo`), so
     /// the app can find the right tab to update its title.
     on_cwd_changed: Option<Rc<dyn Fn(u64, std::path::PathBuf, String, &mut App)>>,
+    /// Last cwd the shell reported (OSC 7), kept for the AI agent's tool
+    /// cards — an `execute` call shows the directory it will run in — and
+    /// for anything else that needs the session's location without
+    /// observing the tab-title callback.
+    last_cwd: Option<String>,
+    /// Last foreground process name reported by the shell integration, if
+    /// any (`zsh`, `cargo`, ...). Shown next to the cwd on tool cards.
+    last_process: Option<String>,
     /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
     /// session. Used by the Tunnels panel to start "borrowed" tunnels that
     /// reuse this tab's SSH connection instead of opening a dedicated owned
@@ -612,6 +620,8 @@ impl TerminalView {
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
             on_cwd_changed: None,
+            last_cwd: None,
+            last_process: None,
             reconnect_attempts: Arc::new(AtomicU32::new(0)),
             tunnel_source: None,
             search_state: None,
@@ -838,8 +848,13 @@ impl TerminalView {
                         process_name,
                     } => {
                         // Foreground process changed (cwd and/or name).
-                        // Forward to the app so it can update the tab title.
+                        // Forward to the app so it can update the tab title,
+                        // and remember it here: the AI agent's tool cards show
+                        // the directory a command is about to run in.
+                        let process_name_for_store = process_name.clone();
                         let _ = entity.update(cx, |this, cx| {
+                            this.last_cwd = Some(cwd.display().to_string());
+                            this.last_process = Some(process_name_for_store);
                             let cb = this.on_cwd_changed.clone();
                             let tab_id = this.count;
                             if let Some(cb) = cb {
@@ -1122,6 +1137,38 @@ impl TerminalView {
     /// historical command into the input line doesn't re-record it.
     pub fn write_raw(&self, data: &[u8]) {
         self.session.write_raw(data);
+    }
+
+    /// Plain-text dump of the session's last `max_lines` lines (scrollback +
+    /// visible screen). Used by the AI agent's `terminal_read` tool.
+    pub fn dump_text(&self, max_lines: usize) -> String {
+        self.session.dump_text(max_lines)
+    }
+
+    /// Like [`Self::dump_text`], but never blocks: `None` when the reader
+    /// thread holds the terminal lock, so the caller can retry on its next
+    /// tick instead of stalling whatever it is doing (the agent's command
+    /// output wait polls this while the UI keeps painting).
+    pub fn try_dump_text(&self, max_lines: usize) -> Option<String> {
+        self.session.try_dump_text(max_lines)
+    }
+
+    /// The font family terminals render with, per the user's settings. Exposed
+    /// so other surfaces can present shell text in the same face — the AI
+    /// panel's tool cards show a command exactly as the terminal will.
+    pub fn mono_font_family() -> String {
+        fonts::font_family()
+    }
+
+    /// Directory the shell last reported (OSC 7), if shell integration is
+    /// active. Tool cards show it so the user knows where a command runs.
+    pub fn cwd(&self) -> Option<&str> {
+        self.last_cwd.as_deref()
+    }
+
+    /// Foreground process name last reported by shell integration.
+    pub fn foreground_process(&self) -> Option<&str> {
+        self.last_process.as_deref()
     }
 
     /// Copy the current selection (or the whole visible grid if no
