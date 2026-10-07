@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use russh::{ChannelMsg, client};
+use russh::{
+    Channel, ChannelMsg,
+    client::{self, Msg},
+};
 use tokio::sync::Mutex as TokioMutex;
 
 use crabport_terminal::terminal::{
-    CpuStats, DiskStats, MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
+    CpuStats, DiskStats, ExecOutput, MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
 };
 
 use crate::backend::MonitorState;
@@ -364,6 +367,77 @@ pub(crate) async fn exec_with_status(
     }
 
     (exit_code, String::from_utf8_lossy(&output).into_owned())
+}
+
+/// Open a session channel and start `cmd` as an exec, returning the channel
+/// to read — deliberately split from [`drain_exec_capture`] so callers can
+/// drop the session-handle lock before the (possibly minutes-long) drain.
+///
+/// The command runs without a tty: anything that prompts for input fails or
+/// waits for stdin that never comes, which is the intended safety net for
+/// the agent's implicit execution mode.
+pub(crate) async fn start_exec_capture(
+    handle: &client::Handle<SshHandler>,
+    cmd: &str,
+) -> Result<Channel<Msg>, String> {
+    let ch = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("failed to open channel: {e}"))?;
+    ch.exec(true, cmd)
+        .await
+        .map_err(|e| format!("failed to start exec: {e}"))?;
+    Ok(ch)
+}
+
+/// Read a started exec channel to completion, giving up after `timeout`.
+///
+/// stdout and stderr share the output buffer (in arrival order), matching
+/// [`exec_with_status`]. On timeout the channel is closed — sshd terminates
+/// the remote process when its channel goes away — and the output captured
+/// so far is returned with [`ExecOutput::timed_out`] set.
+pub(crate) async fn drain_exec_capture(
+    mut ch: Channel<Msg>,
+    timeout: std::time::Duration,
+) -> ExecOutput {
+    let mut output = Vec::new();
+    let mut exit_code = None;
+    let mut saw_exit_status = false;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let msg = match tokio::time::timeout_at(deadline, ch.wait()).await {
+            Ok(msg) => msg,
+            Err(_) => {
+                let _ = ch.close().await;
+                return ExecOutput {
+                    output: String::from_utf8_lossy(&output).into_owned(),
+                    exit_code: None,
+                    timed_out: true,
+                };
+            }
+        };
+        match msg {
+            // russh delivers stdout and stderr on separate message variants
+            // — capture both into the same buffer.
+            Some(ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => output.extend_from_slice(&data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = Some(exit_status);
+                saw_exit_status = true;
+            }
+            // `Eof` can arrive before `ExitStatus` on some servers — keep
+            // draining until the status or a full close (same reasoning as
+            // `exec_with_status`).
+            Some(ChannelMsg::Close) | None => break,
+            Some(ChannelMsg::Eof) if saw_exit_status => break,
+            _ => {}
+        }
+    }
+    ExecOutput {
+        output: String::from_utf8_lossy(&output).into_owned(),
+        exit_code,
+        timed_out: false,
+    }
 }
 
 #[cfg(test)]

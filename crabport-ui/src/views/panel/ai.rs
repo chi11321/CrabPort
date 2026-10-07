@@ -38,6 +38,7 @@ use crabport_ai::{
     AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent, ToolCall, ToolSpec,
 };
 use crabport_core::config;
+use crabport_terminal::terminal::ExecOutput;
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
 
@@ -56,18 +57,31 @@ use crate::views::terminal::TerminalView;
 const SYSTEM_PROMPT: &str = "\
 You are the built-in AI assistant of CrabPort, an SSH/SFTP client, working \
 inside one terminal session. Be concise and practical.\n\n\
-You can use two tools on that terminal:\n\
+You can use three tools on that terminal:\n\
 - terminal_read: read the most recent output lines. Use it before asking \
-questions the screen can answer, and after a command to see what happened.\n\
-- terminal_execute: send one command line to the shell.\n\n\
+questions the screen can answer, and after a visible command to see what \
+happened.\n\
+- terminal_exec (your default): run one command out of band and get its \
+captured stdout, stderr and exit code directly. It does not appear in the \
+user's terminal and cannot answer prompts. Reach for this by default.\n\
+- terminal_run: type one command into the user's live terminal, exactly as \
+if they typed it, so its output streams where they can watch it. Use it only \
+when the output must be followed while it runs (dev servers, log tails, slow \
+builds, progress output) or the command is interactive (REPLs, anything that \
+may prompt for input such as sudo).\n\n\
 Every tool call is shown to the user for approval, so call a tool only when \
 it earns its place: say why you are reading, and what you expect a command \
 to do. Never batch speculative commands — one command, then read the result. \
 When the user asks for something you can answer without touching the \
-terminal, just answer.";
+terminal, just answer.\n\n\
+Safety: when a command could have destructive or otherwise high-risk \
+effects — deleting or overwriting data, changing system or service \
+configuration, touching production, anything hard to undo — repeat it in \
+your reply **in bold** and say plainly what could go wrong, so the user \
+cannot miss it while approving.";
 
 /// Tools advertised to the model. Names are stable — the wire history replays
-/// them, and the panel dispatches on them in [`AiPanel::execute_tool`].
+/// them, and the panel dispatches on them in [`ToolKind::of`].
 fn agent_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -91,10 +105,37 @@ fn agent_tools() -> Vec<ToolSpec> {
             }),
         ),
         ToolSpec::new(
-            "terminal_execute",
-            "Send one command line to this terminal's shell, exactly as if the \
-             user typed it and pressed Enter. Returns immediately — use \
-             terminal_read afterwards to see the result.",
+            "terminal_exec",
+            "Run one command out of band and return its captured stdout + stderr \
+             and exit code. This is the default execution tool: the command does \
+             not appear in the user's terminal and has no tty, so anything \
+             interactive (prompts, pagers, editors) will fail or time out \
+             instead of waiting forever. Use terminal_run only when the output \
+             must stream where the user can watch it, or the command needs to \
+             prompt for input.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact command line to run."
+                    },
+                    "expected": {
+                        "type": "string",
+                        "description": "What you expect this command to do — shown to the user for approval."
+                    }
+                },
+                "required": ["command", "expected"]
+            }),
+        ),
+        ToolSpec::new(
+            "terminal_run",
+            "Type one command line into the user's live terminal, exactly as if \
+             the user typed it and pressed Enter, and return the output that \
+             appears. Use it only for long-running, streaming or interactive \
+             commands (dev servers, log tails, builds, REPLs, anything that \
+             may prompt for input such as sudo) — otherwise prefer \
+             terminal_exec.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -120,6 +161,37 @@ enum ToolDecision {
     Pending,
     Allowed,
     Denied,
+    /// The call cannot run on this connection — resolved without a click
+    /// (e.g. captured execution on a backend with a single byte stream).
+    /// The result explains why, and the loop continues so the model can
+    /// retry with a tool that works.
+    Unavailable,
+}
+
+/// Which agent tool a call names. The names are the wire contract with the
+/// model, so they are mapped in exactly one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolKind {
+    /// `terminal_read` — snapshot of the recent screen, answered inline.
+    Read,
+    /// `terminal_exec` — run out of band, output captured directly.
+    ExecCapture,
+    /// `terminal_run` — typed into the live terminal, output read from the
+    /// screen once it settles.
+    Run,
+    /// Anything else the model invented; refused with a readable error.
+    Unknown,
+}
+
+impl ToolKind {
+    fn of(name: &str) -> Self {
+        match name {
+            "terminal_read" => Self::Read,
+            "terminal_exec" => Self::ExecCapture,
+            "terminal_run" => Self::Run,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// One tool call the assistant asked for, together with its decision and —
@@ -136,9 +208,16 @@ struct ToolCallState {
     /// Result text: tool output, or why it was refused. `None` while the call
     /// is still running (or still waiting for a decision).
     result: Option<String>,
-    /// True between approving an `execute` and its output settling — the card
+    /// True between approving an execution and its output settling — the card
     /// shows a running state and the loop waits instead of continuing.
     running: bool,
+    /// Exit status of a captured (`terminal_exec`) command, when one was
+    /// reported. `None` for reads, visible runs, and commands whose status
+    /// never arrived.
+    exit_code: Option<u32>,
+    /// True when a captured command outlived its deadline; the card says so
+    /// and the model is told the output was cut short.
+    timed_out: bool,
 }
 
 impl ToolCallState {
@@ -153,6 +232,21 @@ impl ToolCallState {
 
     fn arg_u64(&self, key: &str) -> Option<u64> {
         self.args.as_ref()?.get(key)?.as_u64()
+    }
+
+    /// The result as the model sees it. An exit status or the timeout
+    /// marker is prefixed so even an empty output carries the outcome —
+    /// "it ran and printed nothing" and "it never finished" must not look
+    /// the same.
+    fn result_for_model(&self) -> String {
+        let body = self.result.clone().unwrap_or_default();
+        if self.timed_out {
+            return format!("[timed out; output so far]\n{body}");
+        }
+        match self.exit_code {
+            Some(code) => format!("[exit code: {code}]\n{body}"),
+            None => body,
+        }
     }
 }
 
@@ -180,6 +274,12 @@ const OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// context with one answer; the *tail* is kept, which is where a command's
 /// interesting output (errors, the final summary) usually is.
 const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
+
+/// How long an implicit (`terminal_exec`) command may run before its backend
+/// gives up and hands over the output so far. Generous enough for a normal
+/// non-interactive command, bounded so a `tail -f`-style slip-up cannot
+/// wedge the conversation forever.
+const EXEC_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Terminal session an AI panel is bound to.
 ///
@@ -526,18 +626,7 @@ impl AiPanel {
         let partial_reasoning = std::mem::take(&mut self.stream_reasoning);
         match outcome {
             Ok(response) => {
-                // One line per finished turn: the fastest way to tell "the
-                // model answered" from "the model asked for tools" when a
-                // card doesn't show up where it was expected.
                 let calls = response.message.tool_calls.clone();
-                tracing::debug!(
-                    "ai panel: turn finished — finish_reason={:?}, content={} chars, \
-                     reasoning={} chars, tool_calls={}",
-                    response.finish_reason,
-                    response.message.content.chars().count(),
-                    response.reasoning.chars().count(),
-                    calls.len(),
-                );
                 let text = if response.message.content.trim().is_empty() {
                     partial
                 } else {
@@ -574,17 +663,40 @@ impl AiPanel {
     /// that leaves nothing to show, so this pushes an empty assistant turn to
     /// carry the calls — the card is the turn.
     fn push_tool_calls(&mut self, calls: Vec<ToolCall>, cx: &mut Context<Self>) {
+        // An implicit execution on a backend that cannot run one is refused
+        // right here, without a click: nothing would happen on approval, and
+        // the model is better off hearing "use terminal_run" immediately so
+        // it can retry while the user watches.
+        let capture_block = match self.session.terminal.upgrade() {
+            None => Some(t!("ai_panel.tool_terminal_closed").to_string()),
+            Some(view) if !view.read(cx).allow_exec_capture() => {
+                Some(t!("ai_panel.tool_exec_unsupported").to_string())
+            }
+            Some(_) => None,
+        };
+
+        let mut auto_resolved = false;
         let states: Vec<ToolCallState> = calls
             .into_iter()
             .map(|call| {
                 let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
-                ToolCallState {
+                let mut state = ToolCallState {
                     call,
                     args,
                     decision: ToolDecision::Pending,
                     result: None,
                     running: false,
+                    exit_code: None,
+                    timed_out: false,
+                };
+                if ToolKind::of(&state.call.name) == ToolKind::ExecCapture {
+                    if let Some(reason) = &capture_block {
+                        state.decision = ToolDecision::Unavailable;
+                        state.result = Some(reason.clone());
+                        auto_resolved = true;
+                    }
                 }
+                state
             })
             .collect();
 
@@ -609,6 +721,11 @@ impl AiPanel {
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
         self.scroll_list_to_end();
         cx.notify();
+        // Some calls were answered without the user: let the model react to
+        // the refusal instead of waiting for a click nobody needs to make.
+        if auto_resolved {
+            self.maybe_continue_after_tools(cx);
+        }
     }
 
     /// Tool calls the loop is still waiting on: awaiting the user's decision,
@@ -648,7 +765,7 @@ impl AiPanel {
                         wire.push(ChatMessage::tool_result(
                             call.call.id.clone(),
                             call.call.name.clone(),
-                            call.result.clone().unwrap_or_default(),
+                            call.result_for_model(),
                         ));
                     }
                 }
@@ -668,116 +785,217 @@ impl AiPanel {
         allow: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(call_state) = self
-            .messages
-            .get_mut(msg_index)
-            .and_then(|msg| msg.tool_calls.get_mut(call_index))
-        else {
+        let Some(state) = self.tool_state_mut(msg_index, call_index) else {
             return;
         };
-        if call_state.decision != ToolDecision::Pending {
+        if state.decision != ToolDecision::Pending {
             return;
         }
-        let call = call_state.call.clone();
-        let has_args = call_state.args.is_some();
+        let call = state.call.clone();
+        let args = state.args.clone();
         // The model's arguments were unparseable: nothing may run, and it must
         // be told that instead of assuming success.
-        if !has_args {
-            if let Some(state) = self
-                .messages
-                .get_mut(msg_index)
-                .and_then(|msg| msg.tool_calls.get_mut(call_index))
-            {
-                state.decision = ToolDecision::Denied;
-                state.result = Some(t!("ai_panel.tool_bad_args").to_string());
-            }
-            self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-            self.maybe_continue_after_tools(cx);
+        if args.is_none() {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_bad_args").to_string(),
+                ToolDecision::Denied,
+                cx,
+            );
+            return;
+        }
+        if !allow {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_denied").to_string(),
+                ToolDecision::Denied,
+                cx,
+            );
             return;
         }
 
-        if allow && call.name == "terminal_execute" {
-            // Sample the terminal *before* the command runs: the tool result
-            // is what appears after this point, so the model gets the
-            // command's own output instead of a round trip through
-            // `terminal_read`.
-            let before = self
-                .session
-                .terminal
-                .upgrade()
-                .map(|view| view.read(cx).dump_text(AGENT_READ_LINES))
-                .unwrap_or_default();
-            let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .ok()
-                .and_then(|args| Some(args.get("command")?.as_str()?.to_string()));
-            let Some(command) = command else {
-                if let Some(state) = self
-                    .messages
-                    .get_mut(msg_index)
-                    .and_then(|msg| msg.tool_calls.get_mut(call_index))
-                {
-                    state.decision = ToolDecision::Denied;
-                    state.result = Some(t!("ai_panel.tool_bad_args").to_string());
-                }
-                self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-                self.maybe_continue_after_tools(cx);
-                return;
-            };
-            let Some(terminal) = self.session.terminal.upgrade() else {
-                if let Some(state) = self
-                    .messages
-                    .get_mut(msg_index)
-                    .and_then(|msg| msg.tool_calls.get_mut(call_index))
-                {
-                    state.decision = ToolDecision::Denied;
-                    state.result = Some(t!("ai_panel.tool_terminal_closed").to_string());
-                }
-                self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-                self.maybe_continue_after_tools(cx);
-                return;
-            };
-
-            if let Some(state) = self
-                .messages
-                .get_mut(msg_index)
-                .and_then(|msg| msg.tool_calls.get_mut(call_index))
-            {
-                state.decision = ToolDecision::Allowed;
-                state.running = true;
+        // Both execution tools take `command`; a missing one is malformed
+        // even when the JSON itself parsed.
+        let command = args
+            .as_ref()
+            .and_then(|args| args.get("command")?.as_str())
+            .map(str::to_string);
+        match ToolKind::of(&call.name) {
+            ToolKind::Read => {
+                let result = self.execute_tool(&call, cx);
+                self.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
             }
-            // Same path the snippets panel uses: the line, then a carriage
-            // return, so the shell runs it as if it had been typed.
-            let mut bytes = command.into_bytes();
-            bytes.push(b'\r');
-            terminal.read(cx).write_raw(&bytes);
-            self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-            self.await_command_output(msg_index, call_index, before, cx);
-            cx.notify();
-            return;
+            ToolKind::ExecCapture => match command {
+                Some(command) => self.start_capture(msg_index, call_index, command, cx),
+                None => self.settle_tool_result(
+                    msg_index,
+                    call_index,
+                    t!("ai_panel.tool_bad_args").to_string(),
+                    ToolDecision::Denied,
+                    cx,
+                ),
+            },
+            ToolKind::Run => match command {
+                Some(command) => self.start_visible_run(msg_index, call_index, command, cx),
+                None => self.settle_tool_result(
+                    msg_index,
+                    call_index,
+                    t!("ai_panel.tool_bad_args").to_string(),
+                    ToolDecision::Denied,
+                    cx,
+                ),
+            },
+            ToolKind::Unknown => self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_unknown", name = call.name.as_str()).to_string(),
+                ToolDecision::Denied,
+                cx,
+            ),
         }
+    }
 
-        if allow {
-            let result = self.execute_tool(&call, cx);
-            if let Some(state) = self
-                .messages
-                .get_mut(msg_index)
-                .and_then(|msg| msg.tool_calls.get_mut(call_index))
-            {
-                state.decision = ToolDecision::Allowed;
-                state.result = Some(result);
-            }
-        } else if let Some(state) = self
-            .messages
-            .get_mut(msg_index)
-            .and_then(|msg| msg.tool_calls.get_mut(call_index))
-        {
-            state.decision = ToolDecision::Denied;
-            state.result = Some(t!("ai_panel.tool_denied").to_string());
+    /// The state of one tool call, if that call exists.
+    fn tool_state_mut(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+    ) -> Option<&mut ToolCallState> {
+        self.messages
+            .get_mut(msg_index)?
+            .tool_calls
+            .get_mut(call_index)
+    }
+
+    /// Store a decision plus its result, re-measure the card and continue
+    /// the loop when nothing else is outstanding.
+    fn settle_tool_result(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        result: String,
+        decision: ToolDecision,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.decision = decision;
+            state.result = Some(result);
+            state.running = false;
         }
+        self.settle_tool(msg_index, call_index, cx);
+    }
 
-        // Re-measure the row: the card turns from buttons into a result.
+    /// Re-measure one card's row — it just changed height, from buttons to a
+    /// result or from a placeholder to real output — and let the model act on
+    /// the results once every call of the turn has one.
+    fn settle_tool(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
         self.maybe_continue_after_tools(cx);
+        cx.notify();
+    }
+
+    /// Start an approved implicit (`terminal_exec`) command: out of band on
+    /// an extra channel/process, its output captured directly.
+    ///
+    /// The command is run in the directory the terminal last reported (when
+    /// there is one) so it behaves like something typed there, but nothing is
+    /// written to the shell — the session and its screen stay untouched.
+    fn start_capture(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        command: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.session.terminal.upgrade() else {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_terminal_closed").to_string(),
+                ToolDecision::Allowed,
+                cx,
+            );
+            return;
+        };
+        // Backends that can't run a command out of band: say so instead of
+        // half-running it in the user's shell.
+        if !terminal.read(cx).allow_exec_capture() {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_exec_unsupported").to_string(),
+                ToolDecision::Unavailable,
+                cx,
+            );
+            return;
+        }
+        let cwd = terminal.read(cx).cwd().map(str::to_string);
+        let effective = with_cwd(&command, cwd.as_deref());
+        let rx = terminal
+            .read(cx)
+            .exec_capture(&effective, EXEC_CAPTURE_TIMEOUT);
+
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.decision = ToolDecision::Allowed;
+            state.running = true;
+        }
+        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        cx.notify();
+
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            // The backend's completion callback fires exactly once; a closed
+            // receiver without an outcome means the backend went away with
+            // the session.
+            let out = rx.recv().await.unwrap_or_else(|_| ExecOutput {
+                output: t!("ai_panel.tool_exec_capture_failed").to_string(),
+                ..Default::default()
+            });
+            let _ = entity.update(cx, |panel, cx| {
+                panel.finish_tool_capture(msg_index, call_index, out, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Start an approved explicit (`terminal_run`) command: type the line
+    /// into the live shell — the user watches it there — then hand over the
+    /// output the screen gained once it settles.
+    fn start_visible_run(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        command: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.session.terminal.upgrade() else {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_terminal_closed").to_string(),
+                ToolDecision::Allowed,
+                cx,
+            );
+            return;
+        };
+        // Sample the terminal *before* the command runs: the tool result is
+        // what appears after this point, so the model gets the command's own
+        // output instead of a round trip through `terminal_read`.
+        let before = terminal.read(cx).dump_text(AGENT_READ_LINES);
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.decision = ToolDecision::Allowed;
+            state.running = true;
+        }
+        // Same path the snippets panel uses: the line, then a carriage
+        // return, so the shell runs it as if it had been typed.
+        let mut bytes = command.into_bytes();
+        bytes.push(b'\r');
+        terminal.read(cx).write_raw(&bytes);
+        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        self.await_command_output(msg_index, call_index, before, cx);
+        cx.notify();
     }
 
     /// Send the resolved tool results back to the model, so it can act on
@@ -800,19 +1018,19 @@ impl AiPanel {
         self.start_stream(provider, request, cx);
     }
 
-    /// Run one approved tool call against this panel's terminal and return
-    /// the text to hand back to the model.
+    /// Run one approved tool call that answers inline against this panel's
+    /// terminal and return the text to hand back to the model.
     ///
-    /// `terminal_read` is answered inline; `terminal_execute` is *started*
-    /// here and its result arrives later — see [`Self::await_command_output`]
-    /// — because the useful answer to "run this" is the command's output, not
-    /// an acknowledgement.
+    /// Only `terminal_read` lands here — the two execution tools start async
+    /// work instead (see [`Self::start_capture`] / [`Self::start_visible_run`])
+    /// because the useful answer to "run this" is the command's output, not an
+    /// acknowledgement.
     fn execute_tool(&mut self, call: &ToolCall, cx: &mut Context<Self>) -> String {
         let Some(terminal) = self.session.terminal.upgrade() else {
             return t!("ai_panel.tool_terminal_closed").to_string();
         };
-        match call.name.as_str() {
-            "terminal_read" => {
+        match ToolKind::of(&call.name) {
+            ToolKind::Read => {
                 let lines = serde_json::from_str::<serde_json::Value>(&call.arguments)
                     .ok()
                     .and_then(|args| args.get("lines")?.as_u64())
@@ -824,23 +1042,7 @@ impl AiPanel {
                     text
                 }
             }
-            "terminal_execute" => {
-                let command = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .ok()
-                    .and_then(|args| Some(args.get("command")?.as_str()?.to_string()));
-                let Some(command) = command else {
-                    return t!("ai_panel.tool_bad_args").to_string();
-                };
-                // Same path the snippets panel uses: write the line, then a
-                // carriage return, so the shell runs it as if typed.
-                let mut bytes = command.clone().into_bytes();
-                bytes.push(b'\r');
-                terminal.read(cx).write_raw(&bytes);
-                // Placeholder for the instant between writing the command and
-                // its output settling; replaced by the real output.
-                t!("ai_panel.tool_exec_running").to_string()
-            }
-            other => t!("ai_panel.tool_unknown", name = other).to_string(),
+            _ => t!("ai_panel.tool_unknown", name = call.name.as_str()).to_string(),
         }
     }
 
@@ -862,10 +1064,11 @@ impl AiPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(terminal) = self.session.terminal.upgrade() else {
-            self.finish_tool_call(
+            self.settle_tool_result(
                 msg_index,
                 call_index,
                 t!("ai_panel.tool_terminal_closed").to_string(),
+                ToolDecision::Allowed,
                 cx,
             );
             return;
@@ -908,32 +1111,35 @@ impl AiPanel {
                 result
             };
             let _ = entity.update(cx, |panel, cx| {
-                panel.finish_tool_call(msg_index, call_index, result, cx);
+                panel.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
             });
         })
         .detach();
     }
 
-    /// Store a tool call's result, re-measure its card and — once nothing is
-    /// waiting any more — let the model act on it.
-    fn finish_tool_call(
+    /// Store a captured (`terminal_exec`) result: the output, plus the exit
+    /// status and timeout flag that let the card and the model-visible result
+    /// be honest about how the command ended.
+    fn finish_tool_capture(
         &mut self,
         msg_index: usize,
         call_index: usize,
-        result: String,
+        out: ExecOutput,
         cx: &mut Context<Self>,
     ) {
-        if let Some(state) = self
-            .messages
-            .get_mut(msg_index)
-            .and_then(|msg| msg.tool_calls.get_mut(call_index))
-        {
-            state.result = Some(result);
+        let text = cap_tool_result(out.output.trim_matches('\n'));
+        let text = if text.trim().is_empty() {
+            t!("ai_panel.tool_exec_no_output").to_string()
+        } else {
+            text
+        };
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.result = Some(text);
+            state.exit_code = out.exit_code;
+            state.timed_out = out.timed_out;
             state.running = false;
         }
-        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-        self.maybe_continue_after_tools(cx);
-        cx.notify();
+        self.settle_tool(msg_index, call_index, cx);
     }
 
     /// Continue the loop when every tool call has produced a result; wait
@@ -1516,15 +1722,43 @@ fn new_since(before: &str, after: &str) -> String {
     while ix > 0 && !after.is_char_boundary(ix) {
         ix -= 1;
     }
-    let tail = after[ix..].trim_matches('\n');
-    if tail.len() <= MAX_TOOL_RESULT_BYTES {
-        return tail.to_string();
+    cap_tool_result(after[ix..].trim_matches('\n'))
+}
+
+/// Cap a tool result at [`MAX_TOOL_RESULT_BYTES`], keeping the tail (where a
+/// command's errors and summary usually are) and noting how much was dropped.
+/// The cut is walked to a char boundary so the slice can't panic on
+/// multi-byte output.
+fn cap_tool_result(text: &str) -> String {
+    if text.len() <= MAX_TOOL_RESULT_BYTES {
+        return text.to_string();
     }
-    let mut cut = tail.len() - MAX_TOOL_RESULT_BYTES;
-    while cut < tail.len() && !tail.is_char_boundary(cut) {
+    let mut cut = text.len() - MAX_TOOL_RESULT_BYTES;
+    while cut < text.len() && !text.is_char_boundary(cut) {
         cut += 1;
     }
-    format!("(earlier output omitted — {} bytes)\n{}", cut, &tail[cut..])
+    format!("(earlier output omitted — {} bytes)\n{}", cut, &text[cut..])
+}
+
+/// Prefix a captured command with `cd <dir> &&` when the shell has reported
+/// its directory.
+///
+/// An out-of-band command starts in the login shell's directory (usually
+/// `$HOME`), not where the user's terminal is — so without this a `ls` would
+/// list the wrong directory. A visible run needs no prefix: it is typed into
+/// the very shell the user is looking at.
+fn with_cwd(command: &str, cwd: Option<&str>) -> String {
+    match cwd {
+        Some(dir) if !dir.is_empty() => format!("cd {} && {}", quote_shell(dir), command),
+        _ => command.to_string(),
+    }
+}
+
+/// Single-quote `text` for a POSIX shell, closing and reopening around
+/// embedded quotes (`'` → `'\''`). Enough for the directory names
+/// interpolated here, and the same quoting a user would expect from a shell.
+fn quote_shell(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Fresh id for a conversation's session header. Only needs to be unique
@@ -1645,17 +1879,22 @@ fn tool_card(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let is_execute = state.call.name == "terminal_execute";
-    let title = if is_execute {
-        t!("ai_panel.tool_exec_title").to_string()
-    } else {
-        t!("ai_panel.tool_read_title").to_string()
+    let kind = ToolKind::of(&state.call.name);
+    // Both execution tools share one card — the user is approving "run this
+    // command", and whether it runs out of band or in their own terminal is
+    // an implementation detail not worth telling apart at a glance. Reads
+    // keep their own blue so they don't look like something that will run.
+    let (title, accent) = match kind {
+        ToolKind::Read => (t!("ai_panel.tool_read_title").to_string(), term_blue()),
+        ToolKind::ExecCapture | ToolKind::Run => {
+            (t!("ai_panel.tool_exec_title").to_string(), term_yellow())
+        }
+        ToolKind::Unknown => (
+            t!("ai_panel.tool_unknown", name = state.call.name.as_str()).to_string(),
+            text_muted(),
+        ),
     };
-    let accent = if is_execute {
-        term_yellow()
-    } else {
-        term_blue()
-    };
+    let is_execute = matches!(kind, ToolKind::ExecCapture | ToolKind::Run);
 
     let mut card = div()
         .w_full()
@@ -1728,7 +1967,7 @@ fn tool_card(
                 false,
             ));
         }
-    } else {
+    } else if kind == ToolKind::Read {
         let lines = state.arg_u64("lines").unwrap_or(200);
         let purpose = state.arg_str("purpose").unwrap_or("");
         card = card.child(tool_card_field(
@@ -1753,6 +1992,28 @@ fn tool_card(
                 .text_xs()
                 .text_color(rgb(input_border_error()))
                 .child(t!("ai_panel.tool_bad_args").to_string()),
+        );
+    }
+
+    // How a captured command ended, in the same muted register as the field
+    // labels: the green check in the corner already says "it ran", so only a
+    // non-zero status (and a timeout) is worth spelling out.
+    if state.timed_out {
+        card = card.child(
+            div().text_xs().text_color(rgb(term_yellow())).child(
+                t!(
+                    "ai_panel.tool_capture_timed_out",
+                    secs = EXEC_CAPTURE_TIMEOUT.as_secs()
+                )
+                .to_string(),
+            ),
+        );
+    } else if let Some(code) = state.exit_code.filter(|code| *code != 0) {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(term_red()))
+                .child(t!("ai_panel.tool_exit_code", code = code.to_string()).to_string()),
         );
     }
 
@@ -1797,10 +2058,10 @@ fn tool_card(
                     ),
             )
         }
-        ToolDecision::Allowed | ToolDecision::Denied => {
+        ToolDecision::Allowed | ToolDecision::Denied | ToolDecision::Unavailable => {
             // The header icon already says what the user decided (and whether
             // a command is still running); here we only show what came back.
-            // While an `execute` is in flight the result is not in yet, so the
+            // While an execution is in flight the result is not in yet, so the
             // card says so rather than looking empty.
             let result = state
                 .result
@@ -1809,10 +2070,9 @@ fn tool_card(
             let result_view: AnyElement = if result.trim().is_empty() {
                 div().into_any_element()
             } else {
-                let border_color = if state.decision == ToolDecision::Allowed {
-                    rgb(border())
-                } else {
-                    rgba((term_red() << 8) | 0x66)
+                let border_color = match state.decision {
+                    ToolDecision::Allowed => rgb(border()),
+                    _ => rgba((term_red() << 8) | 0x66),
                 };
                 div()
                     .w_full()
@@ -1846,7 +2106,8 @@ fn tool_card(
 }
 
 /// The corner glyph for a card: a check once the call ran, a cross when the
-/// user refused it, a loader while a command is still producing output.
+/// user refused it, a loader while a command is still producing output, and
+/// a muted alert when the connection can't run the call at all.
 /// `None` while it is still waiting for a click.
 fn state_icon(decision: &ToolDecision, running: bool) -> Option<(&'static str, u32)> {
     if running {
@@ -1856,6 +2117,7 @@ fn state_icon(decision: &ToolDecision, running: bool) -> Option<(&'static str, u
         ToolDecision::Pending => None,
         ToolDecision::Allowed => Some(("icons/check.svg", term_green())),
         ToolDecision::Denied => Some(("icons/x.svg", term_red())),
+        ToolDecision::Unavailable => Some(("icons/circle-alert.svg", text_muted())),
     }
 }
 
@@ -2127,4 +2389,51 @@ fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyEl
         );
     }
     col.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TOOL_RESULT_BYTES, ToolKind, cap_tool_result, quote_shell, with_cwd};
+
+    #[test]
+    fn tool_kind_maps_wire_names() {
+        assert_eq!(ToolKind::of("terminal_read"), ToolKind::Read);
+        assert_eq!(ToolKind::of("terminal_exec"), ToolKind::ExecCapture);
+        assert_eq!(ToolKind::of("terminal_run"), ToolKind::Run);
+        assert_eq!(ToolKind::of("terminal_execute"), ToolKind::Unknown);
+    }
+
+    /// A captured command starts where the user's terminal is, not in the
+    /// login shell's default directory — and paths with quotes/quotes-spaces
+    /// must survive the interpolation.
+    #[test]
+    fn with_cwd_prefixes_quoted_directory() {
+        assert_eq!(with_cwd("ls", None), "ls");
+        assert_eq!(with_cwd("ls", Some("")), "ls");
+        assert_eq!(with_cwd("ls", Some("/var/log")), "cd '/var/log' && ls");
+        assert_eq!(
+            with_cwd("cat file", Some("/tmp/it's here")),
+            "cd '/tmp/it'\\''s here' && cat file"
+        );
+    }
+
+    #[test]
+    fn quote_shell_escapes_single_quotes() {
+        assert_eq!(quote_shell("plain"), "'plain'");
+        assert_eq!(quote_shell("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn cap_tool_result_keeps_the_tail_on_a_char_boundary() {
+        let short = "hello";
+        assert_eq!(cap_tool_result(short), short);
+
+        // Multi-byte output longer than the cap: the cut must not split a
+        // char, and it must land near the end.
+        let long = "⇒".repeat(MAX_TOOL_RESULT_BYTES);
+        let capped = cap_tool_result(&long);
+        assert!(capped.len() < long.len());
+        assert!(capped.starts_with("(earlier output omitted"));
+        assert!(capped.ends_with("⇒"));
+    }
 }

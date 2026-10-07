@@ -165,6 +165,26 @@ pub enum SftpTransferStage {
     CleanUp,
 }
 
+/// Result of an out-of-band command execution started via
+/// [`CrabPortTerminal::exec_capture`].
+#[derive(Debug, Clone, Default)]
+pub struct ExecOutput {
+    /// Combined stdout + stderr, in arrival order.
+    pub output: String,
+    /// Process exit status, when the backend got one. `None` means "no
+    /// status was reported" — a timed-out command, a killed channel, or a
+    /// backend that couldn't start the command at all (the `output` then
+    /// carries the explanation).
+    pub exit_code: Option<u32>,
+    /// True when the backend stopped waiting before the command finished;
+    /// `output` carries whatever was captured so far.
+    pub timed_out: bool,
+}
+
+/// Completion callback for [`CrabPortTerminal::exec_capture`]. Invoked
+/// exactly once, on a backend-owned thread or runtime task.
+pub type ExecCallback = std::sync::Arc<dyn Fn(ExecOutput) + Send + Sync>;
+
 pub trait CrabPortTerminal: Send + Sync {
     fn write(&self, data: &[u8]);
     fn resize(&self, cols: u16, rows: u16);
@@ -287,6 +307,36 @@ pub trait CrabPortTerminal: Send + Sync {
         _rows: u16,
     ) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
         None
+    }
+
+    /// Whether this backend can run commands out of band — see
+    /// [`Self::exec_capture`]. True for backends that can open an
+    /// independent command channel or spawn an extra child process (SSH,
+    /// local PTY); false for connection types whose only stream is the
+    /// interactive session (Telnet, Serial).
+    fn allow_exec_capture(&self) -> bool {
+        false
+    }
+
+    /// Run `command` out of band — **not** through the interactive shell —
+    /// and report the result through `done`, exactly once.
+    ///
+    /// This is what the AI agent's implicit execution mode is built on: the
+    /// command never appears in the user's terminal, stdout/stderr are
+    /// captured directly, and no tty is involved (so anything that prompts
+    /// for input fails or times out instead of hanging the session).
+    ///
+    /// `timeout` bounds the wait: when it elapses the backend stops reading
+    /// and reports the output so far with [`ExecOutput::timed_out`].
+    ///
+    /// Backends for which [`Self::allow_exec_capture`] is false never have
+    /// this called; the default implementation answers with an explanatory
+    /// error instead of hanging should one ever be.
+    fn exec_capture(&self, _command: &str, _timeout: std::time::Duration, done: ExecCallback) {
+        done(ExecOutput {
+            output: "captured execution is not supported on this connection".to_string(),
+            ..Default::default()
+        });
     }
 }
 
@@ -541,6 +591,22 @@ mod tests {
 
         // Blank rows (the rest of a short screen) never leak into the dump.
         assert!(!session.dump_text(50).contains("\n\n"));
+    }
+
+    /// The AI agent's implicit execution mode goes through
+    /// `TerminalSession::exec_capture`; a backend that can't run commands
+    /// out of band must say so — and answer with exactly one outcome —
+    /// rather than leaving the tool call hanging forever.
+    #[test]
+    fn exec_capture_answers_unsupported_backends() {
+        let backend = std::sync::Arc::new(crate::pty::FailedPtyBackend::new("test".into()));
+        let session = super::TerminalSession::new(backend, 40, 5);
+        assert!(!session.allow_exec_capture());
+        let rx = session.exec_capture("echo hi", std::time::Duration::from_secs(1));
+        let out = smol::block_on(rx.recv()).expect("exactly one outcome");
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, None);
+        assert!(out.output.contains("not supported"), "{}", out.output);
     }
 
     // Regression for issue #69: macOS zsh default PS1 `%n@%m %1~ %#`
@@ -1319,6 +1385,32 @@ impl TerminalSession {
     /// which [`TerminalSession::start`] forwards into `command_history`.
     pub fn refresh_history(&self) {
         self.backend.refresh_history();
+    }
+
+    /// Whether the backend can run commands out of band — the AI agent's
+    /// implicit execution mode. See [`CrabPortTerminal::exec_capture`].
+    pub fn allow_exec_capture(&self) -> bool {
+        self.backend.allow_exec_capture()
+    }
+
+    /// Run `command` out of band and capture its output. The returned
+    /// receiver yields exactly once — when the command finishes or
+    /// `timeout` elapses. The session's terminal is never touched: this is
+    /// an extra channel/process, not a write to the interactive shell.
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> async_channel::Receiver<ExecOutput> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.backend.exec_capture(
+            command,
+            timeout,
+            std::sync::Arc::new(move |out| {
+                let _ = tx.try_send(out);
+            }),
+        );
+        rx
     }
 
     pub fn allow_snippets(&self) -> bool {

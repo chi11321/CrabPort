@@ -4,7 +4,8 @@ use async_broadcast::Receiver as BroadcastReceiver;
 
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{
-    BackendEvent, CrabPortMonitor, CrabPortTerminal, RemoteMetrics, RemoteStatus, SftpTransferKind,
+    BackendEvent, CrabPortMonitor, CrabPortTerminal, ExecCallback, ExecOutput, RemoteMetrics,
+    RemoteStatus, SftpTransferKind,
 };
 
 use crate::TOKIO;
@@ -349,6 +350,50 @@ impl CrabPortTerminal for SshBackend {
         // use `TOKIO.block_on(...)`.
         let backend = TOKIO.block_on(self.new_channel_backend(cols, rows)).ok()?;
         Some(std::sync::Arc::new(backend))
+    }
+
+    fn allow_exec_capture(&self) -> bool {
+        true
+    }
+
+    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
+        let handle = self.handle.clone();
+        let command = command.to_string();
+        TOKIO.spawn(async move {
+            // Reach the live `Handle` through the same guarded chain as
+            // `refresh_history` — but hold the locks only for channel setup:
+            // a captured command may run for minutes, and keeping the
+            // session handle locked that long would stall the monitor, SFTP
+            // navigation and new panes.
+            let started = {
+                let handle_guard = handle.lock().await;
+                match handle_guard.as_ref() {
+                    Some(inner) => {
+                        let h = inner.lock().await;
+                        Some(crate::monitor::start_exec_capture(&h, &command).await)
+                    }
+                    None => None,
+                }
+            };
+            let ch = match started {
+                None => {
+                    done(ExecOutput {
+                        output: "the SSH session is not connected".to_string(),
+                        ..Default::default()
+                    });
+                    return;
+                }
+                Some(Err(err)) => {
+                    done(ExecOutput {
+                        output: err,
+                        ..Default::default()
+                    });
+                    return;
+                }
+                Some(Ok(ch)) => ch,
+            };
+            done(crate::monitor::drain_exec_capture(ch, timeout).await);
+        });
     }
 }
 

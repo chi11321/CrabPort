@@ -457,6 +457,10 @@ tool_read_empty = "(the terminal's output is empty)"
 tool_exec_running = "Running…"
 tool_exec_no_output = "(the command produced no output)"
 tool_exec_no_output_timeout = "(still running after 12s — output so far was empty)"
+tool_exec_unsupported = "This connection cannot run captured (out-of-band) commands; use terminal_run to run it in the terminal instead."
+tool_exec_capture_failed = "The captured command never reported back — the session went away."
+tool_capture_timed_out = "Still running after %{secs}s — the output below is what was captured so far"
+tool_exit_code = "exit code %{code}"
 tool_unknown = "Unknown tool: %{name}"
 
 [window.settings.general]

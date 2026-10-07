@@ -69,8 +69,8 @@ use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
 use crate::terminal::{
-    BackendEvent, CpuStats, CrabPortMonitor, CrabPortTerminal, DiskStats, MemoryStats,
-    NetworkStats, RemoteMetrics, RemoteStatus,
+    BackendEvent, CpuStats, CrabPortMonitor, CrabPortTerminal, DiskStats, ExecCallback, ExecOutput,
+    MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
 };
 
 // ===========================================================================
@@ -1028,6 +1028,117 @@ impl PtyBackend {
 }
 
 // ===========================================================================
+// Captured (out-of-band) command execution
+// ===========================================================================
+
+/// Run one command for a **local** session out of band: the user's shell
+/// with `-c`, its output piped and captured, and a hard deadline.
+///
+/// This backs [`CrabPortTerminal::exec_capture`] for local PTY sessions
+/// (the AI agent's implicit execution mode). It deliberately does not go
+/// through the session's own shell — no cwd, alias, or job state is shared
+/// with the interactive terminal, and nothing the user sees is touched;
+/// callers that care about the directory prefix the command themselves.
+///
+/// stdin is `/dev/null`, so anything that tries to read it sees EOF
+/// instead of stealing the user's input. On timeout the child is killed and
+/// the output captured so far is reported with `timed_out` set.
+#[cfg(unix)]
+fn capture_via_shell(command: &str, timeout: Duration, done: ExecCallback) {
+    let command = command.to_string();
+    // Spawn off-thread: the caller is the UI thread (a tool-card click) and
+    // must not block on fork/exec, pipe reads, or the wait loop.
+    thread::spawn(move || {
+        // `$SHELL` is what the user's own terminal runs; `/bin/sh` is the
+        // POSIX fallback (and the only thing guaranteed to exist, e.g. for
+        // GUI apps whose environment never had a `$SHELL` to inherit).
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut child = match std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                done(ExecOutput {
+                    output: format!("failed to start {shell}: {err}"),
+                    ..Default::default()
+                });
+                return;
+            }
+        };
+
+        // Drain both pipes on their own threads: a command that fills the
+        // stdout pipe buffer would otherwise block forever while we wait on
+        // the process — and the same goes for stderr.
+        fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                buf
+            })
+        }
+        let stdout = child.stdout.take().map(drain);
+        let stderr = child.stderr.take().map(drain);
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        // Same policy as the SSH backend: stop the command
+                        // rather than leaving it running unobserved.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        timed_out = true;
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => break None,
+            }
+        };
+
+        let collect = |handle: Option<thread::JoinHandle<Vec<u8>>>| {
+            String::from_utf8_lossy(
+                &handle
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default(),
+            )
+            .into_owned()
+        };
+        // stdout then stderr — the two pipes are read independently, so the
+        // interleaving the terminal would show is not recoverable here.
+        let mut output = collect(stdout);
+        let err_text = collect(stderr);
+        if !err_text.is_empty() {
+            output.push_str(&err_text);
+        }
+        done(ExecOutput {
+            output,
+            exit_code: status.and_then(|s| s.code()).map(|code| code as u32),
+            timed_out,
+        });
+    });
+}
+
+/// Captured execution is Unix-only today: it is built on `sh -c`, and the
+/// local Windows shells (PowerShell / cmd) don't share those semantics.
+/// `allow_exec_capture` reports false there, so this is only a safety net.
+#[cfg(not(unix))]
+fn capture_via_shell(_command: &str, _timeout: std::time::Duration, done: ExecCallback) {
+    done(ExecOutput {
+        output: "captured execution is not supported on this platform".to_string(),
+        ..Default::default()
+    });
+}
+
+// ===========================================================================
 // CrabPortTerminal impl — shared between platforms
 // ===========================================================================
 
@@ -1072,6 +1183,14 @@ impl CrabPortTerminal for PtyBackend {
             let cmds = read_local_shell_history();
             let _ = event_tx.try_broadcast(BackendEvent::HistoryLoaded(cmds));
         });
+    }
+
+    fn allow_exec_capture(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
+        capture_via_shell(command, timeout, done);
     }
 }
 
@@ -1390,6 +1509,23 @@ impl CrabPortTerminal for PendingPtyBackend {
             });
         }
     }
+
+    fn allow_exec_capture(&self) -> bool {
+        match self.state.backend.get() {
+            Some(backend) => backend.allow_exec_capture(),
+            None => cfg!(unix),
+        }
+    }
+
+    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
+        // Captured execution never touches the PTY — it spawns its own
+        // child — so it works even while the shell is still being
+        // constructed, and while the real backend isn't installed yet.
+        match self.state.backend.get() {
+            Some(backend) => backend.exec_capture(command, timeout, done),
+            None => capture_via_shell(command, timeout, done),
+        }
+    }
 }
 
 impl CrabPortMonitor for PendingPtyBackend {
@@ -1510,5 +1646,50 @@ fn push_local_cmd(out: &mut Vec<String>, s: String) {
     let trimmed = s.trim();
     if !trimmed.is_empty() {
         out.push(trimmed.to_string());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn capture(command: &str, timeout: Duration) -> ExecOutput {
+        let (tx, rx) = async_channel::bounded(1);
+        capture_via_shell(
+            command,
+            timeout,
+            Arc::new(move |out| {
+                let _ = tx.try_send(out);
+            }),
+        );
+        smol::block_on(rx.recv()).expect("capture answers exactly once")
+    }
+
+    /// stdout and stderr both reach the caller, with the exit status — this
+    /// is what the AI agent's implicit execution mode hands the model.
+    #[test]
+    fn capture_via_shell_collects_output_and_exit_code() {
+        let out = capture("echo hello; echo oops >&2", Duration::from_secs(10));
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.output.contains("hello"), "{}", out.output);
+        assert!(out.output.contains("oops"), "{}", out.output);
+    }
+
+    #[test]
+    fn capture_via_shell_reports_nonzero_exit() {
+        let out = capture("exit 3", Duration::from_secs(10));
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, Some(3));
+    }
+
+    /// A command that outlives its deadline is killed, and whatever it had
+    /// already printed still comes back with `timed_out` set.
+    #[test]
+    fn capture_via_shell_times_out_and_keeps_partial_output() {
+        let out = capture("echo started; sleep 30", Duration::from_millis(400));
+        assert!(out.timed_out);
+        assert_eq!(out.exit_code, None);
+        assert!(out.output.contains("started"), "{}", out.output);
     }
 }

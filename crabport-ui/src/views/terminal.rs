@@ -1153,6 +1153,27 @@ impl TerminalView {
         self.session.try_dump_text(max_lines)
     }
 
+    /// Whether this session's backend can run commands out of band — the AI
+    /// agent's implicit execution mode (`terminal_exec`). False for
+    /// connection types whose only stream is the interactive session
+    /// (Telnet, Serial), and on platforms without a local captured-exec
+    /// implementation.
+    pub fn allow_exec_capture(&self) -> bool {
+        self.session.allow_exec_capture()
+    }
+
+    /// Run `command` out of band and capture its output — an extra
+    /// channel/process on the same connection, never a write to the shell.
+    /// The receiver yields exactly once: the command's combined output and
+    /// exit status, or the output so far when `timeout` elapses.
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> async_channel::Receiver<crabport_terminal::terminal::ExecOutput> {
+        self.session.exec_capture(command, timeout)
+    }
+
     /// The font family terminals render with, per the user's settings. Exposed
     /// so other surfaces can present shell text in the same face — the AI
     /// panel's tool cards show a command exactly as the terminal will.
