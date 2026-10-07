@@ -14,10 +14,10 @@ use crate::views::panel::snippets_panel::SnippetsPanel;
 /// Default panel width for a fresh install / reset.
 pub const PANEL_WIDTH: f32 = 220.0;
 /// Minimum draggable panel width — keeps the panel usable.
-pub const MIN_PANEL_WIDTH: f32 = 200.0;
+pub const MIN_PANEL_WIDTH: f32 = 280.0;
 /// Maximum draggable panel width — prevents the panel from swallowing
 /// the terminal area on very wide windows.
-pub const MAX_PANEL_WIDTH: f32 = 600.0;
+pub const MAX_PANEL_WIDTH: f32 = 900.0;
 
 /// Half-width of the grabbable band around the panel divider, in px.
 pub const PANEL_DIVIDER_HIT: f32 = 3.0;

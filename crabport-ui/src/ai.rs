@@ -118,22 +118,11 @@ pub fn configured(cx: &App) -> bool {
 /// Resolve the active endpoint into a provider for a chat turn, tagged with
 /// the conversation's `session_id` where the gateway needs one. Callers
 /// surface the "not configured" state in their own UI (see [`configured`]).
-///
-/// Logs the exact endpoint / model / session-header decision once per turn —
-/// the first thing to check when a gateway rejects a request.
 pub fn resolve_provider_session(cx: &App, session_id: &str) -> Option<OpenAiProvider> {
     let ai = config::snapshot().ai;
     if !ai.enabled || ai.model.trim().is_empty() {
         return None;
     }
     let entry = ai.active_provider()?;
-    let with_session = wants_session_header(entry);
-    tracing::info!(
-        "ai: chat endpoint={} model={} session_header={} session={}",
-        entry.base_url.trim(),
-        ai.model,
-        with_session,
-        if with_session { session_id } else { "(none)" },
-    );
     resolve_entry_session(cx, entry, Some(session_id))
 }
