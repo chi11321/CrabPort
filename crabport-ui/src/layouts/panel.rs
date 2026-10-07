@@ -63,7 +63,10 @@ pub fn render_panel(
     snippets_panel: Entity<SnippetsPanel>,
     history_panel: Entity<HistoryCommandPanel>,
     tunnels_panel: Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
-    ai_panel: Entity<AiPanel>,
+    // The active terminal pane's AI panel. `None` on tabs without a terminal
+    // session (the Home page): panels are per terminal, so there is nothing
+    // to show. Callers pass `caps.ai` already gated on this being `Some`.
+    ai_panel: Option<Entity<AiPanel>>,
     on_change: Option<std::rc::Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     // Current panel width in px (live drag value or persisted config value).
     width: f32,
@@ -148,7 +151,9 @@ pub fn render_panel(
         tabs = tabs.pane(TabPane::new("", tunnels_panel).icon("icons/waypoints.svg"));
     }
     if caps.ai {
-        tabs = tabs.pane(TabPane::new("", ai_panel).icon("icons/sparkles.svg"));
+        if let Some(ai_panel) = ai_panel {
+            tabs = tabs.pane(TabPane::new("", ai_panel).icon("icons/sparkles.svg"));
+        }
     }
 
     // Always use the same `with_transition` element so the animation

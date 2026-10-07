@@ -24,7 +24,6 @@ use crate::components::notification::NotificationController;
 use crate::components::tooltip::TooltipController;
 use crate::layouts::command_palette::CommandView;
 use crate::views::history::HistoryView;
-use crate::views::panel::ai::AiPanel;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
@@ -71,9 +70,6 @@ pub struct AppCtx {
     pub snippets_panel: Entity<SnippetsPanel>,
     pub history_panel: Entity<HistoryCommandPanel>,
     pub tunnels_panel: Entity<TunnelsPanel>,
-    /// AI assistant pane — visible on any terminal tab while
-    /// `config.ai.enabled` is true.
-    pub ai_panel: Entity<AiPanel>,
 
     // -- Full-page sidebar views (rendered on the Home tab) --
     pub sessions_view: Entity<SessionsView>,

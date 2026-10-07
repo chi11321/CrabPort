@@ -44,6 +44,7 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::motion::RADIUS_MD;
+use crate::views::terminal::TerminalView;
 
 /// Pinned ahead of every conversation. Kept short; the agent prompt (tools,
 /// safety rules) will extend this in a later phase.
@@ -56,6 +57,22 @@ const SYSTEM_PROMPT: &str =
 /// compact chat sidebar instead of a document. Markdown headings and code
 /// blocks are scaled from this too.
 const CONVERSATION_TEXT_SIZE: f32 = 13.0;
+
+/// Terminal session an AI panel is bound to.
+///
+/// One panel instance exists per terminal pane (see
+/// `CrabportApp::ai_panels`), so every terminal keeps its own conversation —
+/// and the agent's terminal tools act on *this* session, never on another
+/// tab's. The handle is weak so a closed pane doesn't keep its view alive;
+/// tool calls on a dead session report "terminal closed".
+#[derive(Clone)]
+pub struct AiSession {
+    /// Pane id — the key of `CrabportApp::pane_views`.
+    pub pane_id: u64,
+    /// The pane's terminal view. Tools read output and send input through
+    /// this handle.
+    pub terminal: WeakEntity<TerminalView>,
+}
 
 /// One entry in the combined provider·model picker.
 #[derive(Clone)]
@@ -135,10 +152,13 @@ pub struct AiPanel {
     /// holds a single conversation, and the id only has to be stable across
     /// that conversation's requests.
     session_id: String,
+    /// The terminal this panel (and its agent) belongs to.
+    session: AiSession,
 }
 
-impl Default for AiPanel {
-    fn default() -> Self {
+impl AiPanel {
+    /// Build the panel for one terminal session.
+    pub fn new(session: AiSession) -> Self {
         Self {
             messages: Vec::new(),
             stream_buf: String::new(),
@@ -156,13 +176,13 @@ impl Default for AiPanel {
             fetching_count: 0,
             combo_open: false,
             session_id: new_session_id(),
+            session,
         }
     }
-}
 
-impl AiPanel {
-    pub fn new() -> Self {
-        Self::default()
+    /// The terminal this panel belongs to.
+    pub fn session(&self) -> &AiSession {
+        &self.session
     }
 
     /// Called by the content layout every render.

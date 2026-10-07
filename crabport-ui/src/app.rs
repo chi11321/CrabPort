@@ -117,6 +117,11 @@ pub struct CrabportApp {
     /// tunnel-borrow logic in `content.rs` keeps working without per-pane
     /// lookups.
     pub pane_views: HashMap<u64, Entity<TerminalView>>,
+    /// Per-terminal AI assistant panels, keyed by pane id. Each terminal
+    /// session owns its own conversation (and its own agent session), so
+    /// switching panes switches the AI panel with it. Entries are created on
+    /// demand in `render` and dropped when the pane (or its tab) closes.
+    pub ai_panels: HashMap<u64, Entity<crate::views::panel::ai::AiPanel>>,
     /// Monotonic pane-id counter, so pane ids are unique across the whole app
     /// (avoids id collisions in the gpui element-id space when a pane is
     /// moved between tabs in the future).
@@ -248,7 +253,6 @@ impl CrabportApp {
         let history_panel =
             cx.new(|_cx| crate::views::panel::history_command_panel::HistoryCommandPanel::new());
         let tunnels_panel = cx.new(|_cx| crate::views::panel::tunnels_panel::TunnelsPanel::new());
-        let ai_panel = cx.new(|_cx| crate::views::panel::ai::AiPanel::new());
         let app_entity = cx.entity();
         let sessions_view =
             cx.new(|_cx| crate::views::sessions::SessionsView::new(app_entity.clone()));
@@ -298,7 +302,6 @@ impl CrabportApp {
             snippets_panel,
             history_panel,
             tunnels_panel,
-            ai_panel,
             sessions_view,
             snippets_view,
             tunnels_view,
@@ -315,6 +318,7 @@ impl CrabportApp {
             sftp_view,
             split_trees: HashMap::new(),
             pane_views: HashMap::new(),
+            ai_panels: HashMap::new(),
             next_pane_id: 1,
             last_focused_pane: None,
             pending_focus_pane: None,
@@ -549,6 +553,15 @@ impl Render for CrabportApp {
             .get(&self.active_tab_id)
             .copied()
             .unwrap_or(panel_open_default);
+        // The AI panel belongs to a terminal session, so resolve the active
+        // tab's active pane and hand *its* panel to the layout. Created on
+        // first use (and dropped when the pane closes), which keeps the map
+        // free of entries for panes the user never opened the panel on.
+        let active_ai_panel = self
+            .split_trees
+            .get(&self.active_tab_id)
+            .map(|tree| tree.active_pane)
+            .and_then(|pane_id| self.ai_panel_for(pane_id, cx));
 
         let content = crate::layouts::content::render_content(
             self.sidebar_item,
@@ -568,6 +581,7 @@ impl Render for CrabportApp {
             snippet_form_state,
             panel_width,
             panel_dragging,
+            active_ai_panel.as_ref(),
             &self.app_ctx,
             _window,
             cx,

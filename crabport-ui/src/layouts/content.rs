@@ -16,6 +16,7 @@ use crate::layouts::panel::{
 use crate::layouts::tabbar::render_tab_bar;
 use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_fast};
 use crate::views::panel::PanelKind;
+use crate::views::panel::ai::AiPanel;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
@@ -112,13 +113,18 @@ pub fn render_content(
     panel_width: f32,
     // Whether a panel resize drag is in progress.
     panel_dragging: bool,
+    // The active terminal pane's AI assistant panel, if that pane has one.
+    // One panel exists per terminal session (see `CrabportApp::ai_panels`),
+    // so switching panes switches the conversation with it; `None` on tabs
+    // without a terminal (the Home page).
+    ai_panel: Option<&Entity<AiPanel>>,
     ctx: &AppCtx,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
     // Unpack the shared context once — every field is a cheap handle/Arc.
     let sftp_panel = &ctx.sftp_panel;
-    let ai_panel = &ctx.ai_panel;
+    let ai_panel = ai_panel.cloned();
     let snippets_panel = &ctx.snippets_panel;
     let history_panel = &ctx.history_panel;
     let tunnels_panel = &ctx.tunnels_panel;
@@ -600,8 +606,10 @@ pub fn render_content(
         })
         .unwrap_or((false, false, false, false));
     // AI assistant panel capability — endpoint-scoped, not backend-scoped:
-    // available on any terminal tab while AI is enabled in settings.
-    let cap_ai = crabport_core::config::snapshot().ai.enabled;
+    // available on any terminal tab while AI is enabled in settings. A pane
+    // must exist too: panels are per terminal session, so the Home page (and
+    // any tab without a terminal) has none.
+    let cap_ai = crabport_core::config::snapshot().ai.enabled && ai_panel.is_some();
     // SFTP panel visibility follows the backend's capability (`cap_sftp`),
     // used directly below — no separate `has_sftp` alias needed.
     sftp_panel.update(cx, |panel, cx| {
@@ -730,10 +738,13 @@ pub fn render_content(
     //
     // The panel reads config/store directly; `set_state` only ensures the
     // lazily-created input exists, clears the box after a send, and
-    // triggers the once-per-endpoint model-list fetch.
-    ai_panel.update(cx, |panel, cx| {
-        panel.set_state(window, cx);
-    });
+    // triggers the once-per-endpoint model-list fetch. Each terminal pane
+    // owns its own panel, so this only touches the active pane's.
+    if let Some(ai_panel) = &ai_panel {
+        ai_panel.update(cx, |panel, cx| {
+            panel.set_state(window, cx);
+        });
+    }
 
     // ---- Host-key prompt ----
     //
