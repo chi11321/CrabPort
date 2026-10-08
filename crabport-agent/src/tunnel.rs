@@ -90,4 +90,62 @@ impl AgentTunnel {
             },
         }
     }
+
+    /// One labelled row of the `tunnel_list` table: id / name / kind /
+    /// address / status. The id token leads — it is what the open / close /
+    /// delete calls take.
+    pub(crate) fn list_row(&self, manager: Option<&Arc<TunnelManager>>) -> Vec<String> {
+        let mut address = self.addresses();
+        let status = match &self.state {
+            AgentTunnelState::Running(id) => {
+                if let Some(info) = manager.and_then(|manager| manager.get(*id)) {
+                    address = format!("{}:{}", info.bind_addr, info.bind_port);
+                    if !info.target_host.is_empty() && info.target_port != 0 {
+                        address.push_str(&format!(" -> {}:{}", info.target_host, info.target_port));
+                    }
+                }
+                t!("ai_panel.tunnel_state_running")
+            }
+            AgentTunnelState::Created => t!("ai_panel.tunnel_state_created"),
+            AgentTunnelState::Closed => t!("ai_panel.tunnel_state_closed"),
+            AgentTunnelState::Deleted => t!("ai_panel.tunnel_state_deleted"),
+            AgentTunnelState::Failed(_) => t!("ai_panel.tunnel_state_failed"),
+        };
+        vec![
+            self.handle(),
+            self.name.clone(),
+            self.kind.as_str().to_string(),
+            address,
+            status.to_string(),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `tunnel_list` row: the actionable id token first, kind and
+    /// addresses next, and the state word last; a running tunnel reports the
+    /// *actual* listen address from the manager when it has one.
+    #[test]
+    fn list_row_carries_token_kind_address_status() {
+        let tunnel = AgentTunnel {
+            agent_id: 3,
+            kind: TunnelKind::Local,
+            name: "db".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            bind_port: 15432,
+            target_host: "db.internal".to_string(),
+            target_port: 5432,
+            state: AgentTunnelState::Created,
+        };
+        let row = tunnel.list_row(None);
+        assert_eq!(row[0], "a3");
+        assert_eq!(row[1], "db");
+        assert_eq!(row[2], "local");
+        assert!(row[3].contains("127.0.0.1:15432"), "{}", row[3]);
+        assert!(row[3].contains("db.internal:5432"), "{}", row[3]);
+        assert!(!row[4].is_empty());
+    }
 }

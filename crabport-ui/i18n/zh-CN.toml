@@ -540,6 +540,9 @@ tool_sftp_transfer_timeout = "传输超过 %{mins} 分钟仍未结束。"
 compacting = "正在压缩上下文…"
 compact_failed = "上下文压缩失败"
 context_summary = "较早的对话已压缩为摘要"
+table_more = "…还有 %{more} 项未显示"
+tool_wait_stopped = "已停止等待——操作可能仍在后台运行。"
+tool_cancelled_by_run = "已跳过：用户取消了这一轮。"
 
 [window.settings.general]
 section_startup = "启动"

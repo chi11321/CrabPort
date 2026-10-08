@@ -27,7 +27,7 @@ pub mod text;
 pub mod tools;
 pub mod tunnel;
 
-pub use agent::{Agent, Executed, ToolOutcome};
+pub use agent::{Agent, Executed, ToolOutcome, ToolTable};
 pub use compaction::{
     COMPACTED_HEADER, COMPACTION_PROMPT, CompactCall, CompactTurn, TurnRole, compaction_cut,
     compaction_transcript,
