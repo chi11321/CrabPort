@@ -828,81 +828,11 @@ pub fn render_content(
         .child(
             div()
                 .flex_1()
-                .min_h_0()
                 .flex()
                 .flex_row()
                 .overflow_hidden()
                 .relative()
-                // The toolbar belongs to the *view column* — a bottom strip
-                // under the terminal / SFTP view, not a window-wide one.
-                // Below the whole row it would shrink the row's height on
-                // every transfer, shoving the side panel's bottom edge up by
-                // the toolbar's height for as long as a progress chip is
-                // visible (the panel spans this row). Keeping it here means
-                // only the terminal column gives up the height, and the
-                // panel's panels stay where the user put them.
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        // The view gives up only the height the toolbar
-                        // currently animates in; `min_h_0` keeps a hidden
-                        // (h_0) toolbar from reserving space.
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(view),
-                        )
-                        .child(render_terminal_toolbar(
-                            TerminalToolbarInput::new(is_terminal, status, metrics, sftp_progress),
-                            // The caller already passes `app_ctx` (which owns
-                            // the context menu controller) into
-                            // `render_content`, so we grab it directly here.
-                            // Going through `handle.read_with(cx, ...)` would
-                            // panic — `CrabportApp` is already borrowed mutably
-                            // by its own `render` method, and GPUI forbids
-                            // nested reads of the same entity ("cannot read
-                            // while it is already being updated").
-                            Some(ctx.context_menu.clone()),
-                            // SFTP tab: inject the "transfer history" toggle
-                            // button as a trailing element so it appears in
-                            // the toolbar without the terminal toolbar knowing
-                            // about SFTP. Terminal tabs pass an empty vec.
-                            if is_sftp_tab {
-                                let transfer_history = ctx.transfer_history.clone();
-                                let on = transfer_history.read_with(cx, |c, _| c.is_open());
-                                vec![
-                                    crate::views::sftp::render_sftp_history_toggle(
-                                        transfer_history,
-                                        on,
-                                    )
-                                    .into_any_element(),
-                                ]
-                            } else {
-                                Vec::new()
-                            },
-                            {
-                                let handle = handle.clone();
-                                move |id, cx| {
-                                    // Toggle the slot's visibility flag in
-                                    // config and persist. The toolbar reads the
-                                    // flag on the next render, so the ctxmenu
-                                    // checkmark updates immediately.
-                                    let _ = crabport_core::config::update(|cfg| {
-                                        cfg.appearance.terminal.toolbar.toggle(id);
-                                    });
-                                    let _ = handle.update(cx, |_, cx| cx.notify());
-                                }
-                            },
-                        )),
-                )
+                .child(view)
                 .when(
                     panel_show
                         && (cap_sftp || cap_history || cap_snippets || cap_tunnels || cap_ai),
@@ -972,6 +902,42 @@ pub fn render_content(
                 // paint phase — see `render_panel_drag_canvas`).
                 .child(render_panel_drag_canvas(handle)),
         )
+        .child(render_terminal_toolbar(
+            TerminalToolbarInput::new(is_terminal, status, metrics, sftp_progress),
+            // The caller already passes `app_ctx` (which owns the context
+            // menu controller) into `render_content`, so we grab it
+            // directly here. Going through `handle.read_with(cx, ...)` would
+            // panic — `CrabportApp` is already borrowed mutably by its own
+            // `render` method, and GPUI forbids nested reads of the same
+            // entity ("cannot read while it is already being updated").
+            Some(ctx.context_menu.clone()),
+            // SFTP tab: inject the "transfer history" toggle button as a
+            // trailing element so it appears in the toolbar without the
+            // terminal toolbar knowing about SFTP. Terminal tabs pass an
+            // empty vec (no trailing buttons).
+            if is_sftp_tab {
+                let transfer_history = ctx.transfer_history.clone();
+                let on = transfer_history.read_with(cx, |c, _| c.is_open());
+                vec![
+                    crate::views::sftp::render_sftp_history_toggle(transfer_history, on)
+                        .into_any_element(),
+                ]
+            } else {
+                Vec::new()
+            },
+            {
+                let handle = handle.clone();
+                move |id, cx| {
+                    // Toggle the slot's visibility flag in config and persist.
+                    // The toolbar reads the flag on the next render, so the
+                    // ctxmenu checkmark updates immediately.
+                    let _ = crabport_core::config::update(|cfg| {
+                        cfg.appearance.terminal.toolbar.toggle(id);
+                    });
+                    let _ = handle.update(cx, |_, cx| cx.notify());
+                }
+            },
+        ))
 }
 
 // ---------------------------------------------------------------------------
