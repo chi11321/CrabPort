@@ -814,6 +814,13 @@ pub fn render_content(
 
     div()
         .flex_1()
+        // Without this the column's min-content width (the toolbar's slot
+        // row, dominated by the progress chip's long path) is its flex floor:
+        // once a chip's natural width exceeds the window, the whole column —
+        // side panel included — gets pushed out to the right. Letting the
+        // column shrink hands the overflow to the toolbar's own
+        // `overflow_hidden` instead.
+        .min_w_0()
         .h_full()
         .bg(rgb(bg_base()))
         .flex()
