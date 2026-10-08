@@ -1405,6 +1405,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabport-agent"
+version = "0.1.5"
+dependencies = [
+ "async-broadcast",
+ "async-channel 2.5.0",
+ "crabport-ai",
+ "crabport-sftp",
+ "crabport-ssh",
+ "crabport-terminal",
+ "rust-i18n",
+ "serde_json",
+ "smol",
+ "ureq",
+]
+
+[[package]]
 name = "crabport-ai"
 version = "0.1.5"
 dependencies = [
@@ -1548,6 +1564,7 @@ dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
  "chrono",
+ "crabport-agent",
  "crabport-ai",
  "crabport-core",
  "crabport-serial",

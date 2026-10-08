@@ -53,6 +53,7 @@ panic = "abort"
 
 [workspace]
 members = [
+    "crabport-agent",
     "crabport-ai",
     "crabport-core",
     "crabport-ssh",

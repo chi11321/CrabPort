@@ -503,6 +503,7 @@ tool_tunnel_list_host = "Configured for this host (managed in the Tunnels page):
 tunnel_status_active = "active"
 tunnel_running_at = "active on %{bind}"
 tunnel_stopped_at = "stopped (%{bind})"
+tunnel_start_timeout = "did not start in time"
 tunnel_source_borrowed = "borrowed from this terminal"
 tunnel_source_owned = "own SSH connection"
 tool_read_file_binary = "(binary file, %{bytes} bytes — content not shown)"

@@ -18,6 +18,14 @@
 //! `ChatStream` clone — clones share the same channels. A `generation`
 //! counter drops late events from superseded streams.
 //!
+//! The agent itself — the system prompt, the tool specs and every tool
+//! implementation (captured/visible execution, local file reads, HTTP fetch,
+//! tunnel lifecycle, SFTP), plus the compaction rules — lives in
+//! `crabport-agent`. This panel adds the streaming pump, the approval cards,
+//! and [`UiAgentSession`]: the cx-free adapter that hands the agent a snapshot
+//! of this pane's terminal (the crate cannot depend on GPUI, so the UI
+//! implements its `AgentSession` trait).
+//!
 //! Model lists: fetched per provider from each endpoint's `/models` API
 //! (via [`crabport_ai::OpenAiProvider::list_models`], offloaded to a
 //! background thread with `smol::unblock`), auto-fetched once per endpoint
@@ -26,7 +34,9 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_broadcast::Receiver;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -34,13 +44,19 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Sizable as _, Size};
 use rust_i18n::t;
 
+use crabport_agent::limits::EXEC_CAPTURE_TIMEOUT;
+use crabport_agent::{
+    Agent, AgentSession, COMPACTED_HEADER, COMPACTION_PROMPT, CompactCall, CompactTurn, Executed,
+    RegistryTunnel, ToolKind, ToolOutcome, TurnRole, agent_tools, compaction_cut,
+    compaction_transcript, system_prompt,
+};
 use crabport_ai::{
-    AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, MESSAGE_OVERHEAD_TOKENS,
-    StreamEvent, TOOL_CALL_OVERHEAD_TOKENS, ToolCall, ToolSpec, estimate_tokens,
+    AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent, ToolCall,
 };
 use crabport_core::config;
-use crabport_ssh::{TunnelId, TunnelKind, TunnelManager, TunnelStatus};
-use crabport_terminal::terminal::{BackendEvent, ExecCancel, ExecOutput, SftpTransferKind};
+use crabport_sftp::FileEntry;
+use crabport_ssh::TunnelManager;
+use crabport_terminal::terminal::{BackendEvent, ExecCallback, ExecCancel};
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
 
@@ -49,418 +65,8 @@ use crate::color::*;
 use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::motion::RADIUS_MD;
-use crate::views::terminal::TerminalView;
-
-/// Pinned ahead of every conversation.
-///
-/// The agent prompt: the model may inspect and drive *its own* terminal and
-/// this machine, but nothing happens without the user approving it. Keep the
-/// rules short and concrete — the tools themselves carry the detail.
-const BASE_PROMPT: &str = "\
-You are the built-in AI assistant of CrabPort, an SSH/SFTP client, working \
-inside one terminal session. Be concise and practical.\n\n\
-Every tool call is shown to the user for approval, so call a tool only when \
-it earns its place: say why you are reading, and what you expect a call to \
-do. Never batch speculative calls — one call, then read the result. When \
-the user asks for something you can answer without a tool, just answer.\n\n\
-Terminal tools — this session's shell only:\n\
-- terminal_read: read the most recent output lines. Use it before asking \
-questions the screen can answer, and after a visible command to see what \
-happened.\n\
-- terminal_exec (your default executor): run one command out of band and get \
-its captured stdout, stderr and exit code directly. It does not appear in \
-the user's terminal and cannot answer prompts.\n\
-- terminal_run: type one command into the user's live terminal, exactly as \
-if they typed it, so its output streams where they can watch it. Use it only \
-when the output must be followed while it runs or the command is interactive \
-(REPLs, anything that may prompt for input such as sudo).\n\n\
-Local tools — the machine CrabPort itself runs on, never the remote host:\n\
-- read_file: read one local file.\n\
-- read_directory: list one local directory.\n\n\
-Network:\n\
-- fetch: send one HTTP request from inside CrabPort, returning status, \
-headers and body. It runs on the local machine's network, not the remote \
-host's; pass a proxy URL to route it elsewhere — typically a dynamic tunnel \
-you created and opened on this session, as socks5h://127.0.0.1:<port> (the \
-h matters: the hostname is then resolved on the remote side).\n\n\
-Tunnel tools — the current tab's SSH connection only (tunnels ride it; no \
-extra connection is opened; unavailable on local, telnet and serial \
-terminals):\n\
-- tunnel_list: see the tunnels available here - ids for tunnels you \
-created here start with a-N, Tunnels-page configs on this host start \
-with t-N; both work with open / close / delete.\n\
-- tunnel_create: define a temporary, session-local tunnel (local / dynamic \
-/ remote, not started; never persisted); \
-tunnel_open starts it and reports the address it listens on, tunnel_close \
-stops it, tunnel_delete removes it.\n\
-SFTP tools — this session's connection only (unavailable without SFTP):\n\
-- sftp_list: list a remote directory — the default way to look at the \
-remote filesystem (this also moves the SFTP panel's view there). When this \
-session has no SFTP, look at files with shell commands instead \
-(terminal_exec: ls, find, du, …).\n\
-- sftp_download / sftp_upload: transfer one file between the remote host \
-and the local machine.\n\n\
-Safety: when a call could have destructive or otherwise high-risk effects — \
-deleting or overwriting data, changing system or service configuration, \
-touching production, anything hard to undo — repeat it in your reply \
-**in bold** and say plainly what could go wrong, so the user cannot miss it \
-while approving.";
-
-/// Platform note appended to the prompt, so the agent writes local paths the
-/// way the machine CrabPort runs on expects — on Windows that means `C:\...`
-/// style paths for read_file / read_directory and the local side of the SFTP
-/// transfers. Conditionally compiled: the note exists only when it is true.
-#[cfg(windows)]
-const PLATFORM_NOTE: &str = "\n\nNote: CrabPort itself is running on Windows, so \
-every *local* path you use — read_file, read_directory, and the local side \
-of sftp_download / sftp_upload — must be Windows-style, e.g. C:\\Users\\... . \
-Remote paths follow the remote host's operating system.";
-#[cfg(not(windows))]
-const PLATFORM_NOTE: &str = "\n\nNote: CrabPort itself is running on a Unix-like \
-system, so every *local* path you use — read_file, read_directory, and the \
-local side of sftp_download / sftp_upload — is POSIX-style, e.g. /home/... . \
-Remote paths follow the remote host's operating system.";
-
-/// The pinned system prompt: base rules plus the platform note.
-fn system_prompt() -> String {
-    format!("{BASE_PROMPT}{PLATFORM_NOTE}")
-}
-
-/// Tools advertised to the model. Names are stable — the wire history replays
-/// them, and the panel dispatches on them in [`ToolKind::of`].
-fn agent_tools() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec::new(
-            "terminal_read",
-            "Read the most recent lines of this terminal's output (scrollback + \
-             visible screen). Use it to see command results, error messages, or \
-             what the user is looking at before answering.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "lines": {
-                        "type": "integer",
-                        "description": "How many of the most recent lines to read (1-500)."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need this output — shown to the user for approval."
-                    }
-                },
-                "required": ["lines", "purpose"]
-            }),
-        ),
-        ToolSpec::new(
-            "terminal_exec",
-            "Run one command out of band and return its captured stdout + stderr \
-             and exit code. This is the default execution tool: the command does \
-             not appear in the user's terminal and has no tty, so anything \
-             interactive (prompts, pagers, editors) will fail or time out \
-             instead of waiting forever. Use terminal_run only when the output \
-             must stream where the user can watch it, or the command needs to \
-             prompt for input.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The exact command line to run."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this command to do — shown to the user for approval."
-                    }
-                },
-                "required": ["command", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "terminal_run",
-            "Type one command line into the user's live terminal, exactly as if \
-             the user typed it and pressed Enter, and return the output that \
-             appears. Use it only for long-running, streaming or interactive \
-             commands (dev servers, log tails, builds, REPLs, anything that \
-             may prompt for input such as sudo) — otherwise prefer \
-             terminal_exec.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The exact command line to run."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this command to do — shown to the user for approval."
-                    }
-                },
-                "required": ["command", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "read_file",
-            "Read one file on the machine CrabPort itself runs on — the local \
-             machine, never the remote host. Use it for files the user \
-             mentions, or that a fetch/command produced locally.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Local path of the file to read."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need it — shown to the user for approval."
-                    }
-                },
-                "required": ["path", "purpose"]
-            }),
-        ),
-        ToolSpec::new(
-            "read_directory",
-            "List one directory on the machine CrabPort itself runs on — the \
-             local machine, never the remote host. Returns names, types and \
-             sizes, not file contents.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Local path of the directory to list."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need it — shown to the user for approval."
-                    }
-                },
-                "required": ["path", "purpose"]
-            }),
-        ),
-        ToolSpec::new(
-            "fetch",
-            "Send one HTTP request from inside CrabPort and return the status, \
-             response headers and body. It runs on the local machine's \
-             network, not the remote host's — pass a proxy URL to route it \
-             elsewhere. To reach an address only the remote host can reach, \
-             first create and open a dynamic tunnel on this session, then pass \
-             its proxy as socks5h://127.0.0.1:<port> (the h matters: the \
-             hostname is then resolved on the remote side).",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "Absolute URL to request."
-                    },
-                    "method": {
-                        "type": "string",
-                        "enum": ["GET", "POST", "PUT", "DELETE", "HEAD"],
-                        "description": "HTTP method; defaults to GET."
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Request body, for POST/PUT."
-                    },
-                    "proxy": {
-                        "type": "string",
-                        "description": "Optional proxy URL, e.g. socks5h://127.0.0.1:1080 from a dynamic tunnel."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this request to do — shown to the user for approval."
-                    }
-                },
-                "required": ["url", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "tunnel_create",
-            "Define a *temporary* tunnel on the current tab's SSH connection \
-             (not started yet; no extra connection is opened — tunnels ride \
-             the tab's session). It lives only in this conversation: it is \
-             never persisted, the Tunnels page never shows it, and it is gone \
-             when this terminal closes. For a persistent tunnel, ask the user \
-             to create it in the Tunnels page instead. Kinds: local forwards a \
-             local port to a remote target; dynamic opens a SOCKS5 proxy on a \
-             local port (no target — each client picks the destination per \
-             connection); remote asks the remote server to listen and forward \
-             back to this machine.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["local", "dynamic", "remote"],
-                        "description": "Tunnel type."
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Short name for the tunnel."
-                    },
-                    "bind_port": {
-                        "type": "integer",
-                        "description": "Port to listen on; 0 picks a free one."
-                    },
-                    "target_host": {
-                        "type": "string",
-                        "description": "Forward target host — required for local/remote, ignored for dynamic."
-                    },
-                    "target_port": {
-                        "type": "integer",
-                        "description": "Forward target port — required for local/remote, ignored for dynamic."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect the tunnel to be used for — shown to the user for approval."
-                    }
-                },
-                "required": ["kind", "name", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "tunnel_list",
-            "List the tunnels available on this tab: the ones you created here \
-             (ids starting with a), plus the Tunnels-page configs bound to this \
-             tab's host (ids starting with t) — running or stopped. Both id \
-             kinds work with tunnel_open / tunnel_close / tunnel_delete.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        ),
-        ToolSpec::new(
-            "tunnel_open",
-            "Start a tunnel and get back the address it listens on. Use an id \
-             token from tunnel_list / tunnel_create: `a…` is a tunnel you \
-             created in this session, `t…` is a Tunnels-page config bound to \
-             this host (opening it borrows the tab's SSH connection).",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tunnel_id": {
-                        "type": "string",
-                        "description": "Id token as returned by tunnel_list / tunnel_create (a… or t…)."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this to do — shown to the user for approval."
-                    }
-                },
-                "required": ["tunnel_id", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "tunnel_close",
-            "Stop a running tunnel. Its port stops listening; existing \
-             connections are torn down. Id tokens from tunnel_list: `a…` for \
-             tunnels you created, `t…` for Tunnels-page configs on this host.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tunnel_id": {
-                        "type": "string",
-                        "description": "Id token as returned by tunnel_list / tunnel_create (a… or t…)."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this to do — shown to the user for approval."
-                    }
-                },
-                "required": ["tunnel_id", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "tunnel_delete",
-            "Delete a tunnel — stopping it first when it is running. `a…` \
-             tokens delete tunnels you created here; `t…` tokens delete the \
-             Tunnels-page config itself.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tunnel_id": {
-                        "type": "string",
-                        "description": "Id token as returned by tunnel_list / tunnel_create (a… or t…)."
-                    },
-                    "expected": {
-                        "type": "string",
-                        "description": "What you expect this to do — shown to the user for approval."
-                    }
-                },
-                "required": ["tunnel_id", "expected"]
-            }),
-        ),
-        ToolSpec::new(
-            "sftp_list",
-            "List one directory on the remote host over this session's SFTP \
-             connection: names, types, sizes. Note that this also moves the \
-             SFTP panel's view to that directory.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Remote directory to list."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need it — shown to the user for approval."
-                    }
-                },
-                "required": ["path", "purpose"]
-            }),
-        ),
-        ToolSpec::new(
-            "sftp_download",
-            "Download one file from the remote host to a local path, over this \
-             session's SFTP connection. The local path lives on the machine \
-             CrabPort runs on.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "remote_path": {
-                        "type": "string",
-                        "description": "Path of the file on the remote host."
-                    },
-                    "local_path": {
-                        "type": "string",
-                        "description": "Destination path on the local machine."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need it — shown to the user for approval."
-                    }
-                },
-                "required": ["remote_path", "local_path", "purpose"]
-            }),
-        ),
-        ToolSpec::new(
-            "sftp_upload",
-            "Upload one local file to the remote host, over this session's \
-             SFTP connection. The local path lives on the machine CrabPort \
-             runs on.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "local_path": {
-                        "type": "string",
-                        "description": "Path of the file on the local machine."
-                    },
-                    "remote_path": {
-                        "type": "string",
-                        "description": "Destination path on the remote host."
-                    },
-                    "purpose": {
-                        "type": "string",
-                        "description": "Why you need it — shown to the user for approval."
-                    }
-                },
-                "required": ["local_path", "remote_path", "purpose"]
-            }),
-        ),
-    ]
-}
+use crate::views::terminal::{AgentTerminalHandles, TerminalView};
+use crate::views::tunnels::TunnelRegistry;
 
 /// The user's decision on one tool call.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -474,44 +80,6 @@ enum ToolDecision {
     /// The result explains why, and the loop continues so the model can
     /// retry with a tool that works.
     Unavailable,
-}
-
-/// Which agent tool a call names. The names are the wire contract with the
-/// model, so they are mapped in exactly one place.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ToolKind {
-    /// `terminal_read` — snapshot of the recent screen, answered inline.
-    TerminalRead,
-    /// `terminal_exec` — run out of band, output captured directly.
-    ExecCapture,
-    /// `terminal_run` — typed into the live terminal, output read from the
-    /// screen once it settles.
-    Run,
-    /// `fetch` — one HTTP request from inside CrabPort, optional proxy.
-    Fetch,
-    /// `read_file` / `read_directory` — the local filesystem.
-    LocalFs,
-    /// `tunnel_create` / `tunnel_open` / `tunnel_close` / `tunnel_delete`.
-    Tunnel,
-    /// `sftp_list` / `sftp_download` / `sftp_upload`.
-    Sftp,
-    /// Anything else the model invented; refused with a readable error.
-    Unknown,
-}
-
-impl ToolKind {
-    fn of(name: &str) -> Self {
-        match name {
-            "terminal_read" => Self::TerminalRead,
-            "terminal_exec" => Self::ExecCapture,
-            "terminal_run" => Self::Run,
-            "fetch" => Self::Fetch,
-            "read_file" | "read_directory" => Self::LocalFs,
-            name if name.starts_with("tunnel_") => Self::Tunnel,
-            name if name.starts_with("sftp_") => Self::Sftp,
-            _ => Self::Unknown,
-        }
-    }
 }
 
 /// The card's title for one tool.
@@ -547,91 +115,6 @@ fn tool_accent(name: &str) -> u32 {
             _ => term_yellow(),
         },
         ToolKind::Unknown => text_muted(),
-    }
-}
-
-/// One tunnel the agent defined through this terminal's connection.
-///
-/// Agent-facing ids are stable and never reused (a delete keeps its slot),
-/// so a `tunnel_open` the model issues later cannot hit the wrong tunnel.
-/// The tunnels live in the panel's own [`TunnelManager`] — scoped to this
-/// terminal's connection, invisible to every other tab.
-#[derive(Clone)]
-struct AgentTunnel {
-    agent_id: u64,
-    kind: TunnelKind,
-    name: String,
-    bind_addr: String,
-    bind_port: u16,
-    target_host: String,
-    target_port: u16,
-    state: AgentTunnelState,
-}
-
-/// Lifecycle of an agent-created tunnel.
-#[derive(Clone)]
-enum AgentTunnelState {
-    /// Defined, not started.
-    Created,
-    /// Started; carries the manager's tunnel id.
-    Running(TunnelId),
-    /// Stopped — the manager's entry is gone. Can be opened again.
-    Closed,
-    /// The last open attempt failed, with the reason.
-    Failed(String),
-    /// Deleted. Kept in the list so earlier ids stay valid.
-    Deleted,
-}
-
-impl AgentTunnel {
-    /// The token the agent refers to this tunnel by — `a<agent_id>`, so it
-    /// can never collide with a Tunnels-page config id (`t<db id>`).
-    fn handle(&self) -> String {
-        format!("a{}", self.agent_id)
-    }
-
-    /// The full address pair of this tunnel — `bind -> target` for local and
-    /// remote tunnels (the model needs both ends), just the bind port for
-    /// dynamic ones (whose target is picked per connection). `0` as a bind
-    /// port means "unused / pick a free one at open".
-    fn addresses(&self) -> String {
-        let mut out = format!("{}:{}", self.bind_addr, self.bind_port);
-        if self.kind != TunnelKind::Dynamic && !self.target_host.is_empty() && self.target_port != 0
-        {
-            out.push_str(&format!(" -> {}:{}", self.target_host, self.target_port));
-        }
-        out
-    }
-
-    /// One-line description for cards and results.
-    fn describe(&self, manager: Option<&Arc<TunnelManager>>) -> String {
-        let base = format!("{} {} ({})", self.handle(), self.name, self.kind.as_str());
-        match &self.state {
-            AgentTunnelState::Created => {
-                format!("{base} — created, not started ({})", self.addresses())
-            }
-            AgentTunnelState::Closed => format!("{base} — closed ({})", self.addresses()),
-            AgentTunnelState::Deleted => format!("{base} — deleted ({})", self.addresses()),
-            AgentTunnelState::Failed(reason) => {
-                format!("{base} — open failed: {reason} ({})", self.addresses())
-            }
-            AgentTunnelState::Running(id) => match manager.and_then(|m| m.get(*id)) {
-                Some(info) => {
-                    let mut text = format!(
-                        "{base} — {}",
-                        t!(
-                            "ai_panel.tunnel_running_at",
-                            bind = format!("{}:{}", info.bind_addr, info.bind_port)
-                        )
-                    );
-                    if !info.target_host.is_empty() && info.target_port != 0 {
-                        text.push_str(&format!(" -> {}:{}", info.target_host, info.target_port));
-                    }
-                    text
-                }
-                None => format!("{base} — running ({})", self.addresses()),
-            },
-        }
     }
 }
 
@@ -710,56 +193,6 @@ impl ToolCallState {
 /// blocks are scaled from this too.
 const CONVERSATION_TEXT_SIZE: f32 = 13.0;
 
-/// How many lines of terminal output a `terminal_read` (and the execute
-/// output wait) samples. Plenty for a screenful plus recent scrollback.
-const AGENT_READ_LINES: usize = 400;
-
-/// How often the execute wait re-samples the terminal's output.
-const OUTPUT_POLL: std::time::Duration = std::time::Duration::from_millis(120);
-/// How long the output must stop changing before a command counts as done.
-const OUTPUT_QUIET: std::time::Duration = std::time::Duration::from_millis(360);
-/// Upper bound on the wait: a command that keeps printing (a log tail, a
-/// build) gets this long before its output-so-far is handed over.
-const OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
-
-/// Cap on the text one tool result may carry back to the model, in bytes. A
-/// command that prints a whole file would otherwise fill the conversation's
-/// context with one answer; the *tail* is kept, which is where a command's
-/// interesting output (errors, the final summary) usually is.
-const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
-
-/// How long a captured (`terminal_exec`) command may run before its backend
-/// gives up and hands over the output so far. Generous enough for a normal
-/// non-interactive command, bounded so a `tail -f`-style slip-up cannot
-/// wedge the conversation forever.
-const EXEC_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Most bytes a `read_file` loads before the result is capped for the model.
-/// Big enough for any source file or config, small enough that pointing the
-/// tool at a video cannot stall the panel.
-const READ_FILE_LIMIT: u64 = 256 * 1024;
-
-/// Most entries a `read_directory` lists before it says there were more.
-const READ_DIR_LIMIT: usize = 500;
-
-/// `fetch`'s overall HTTP timeout — a hung request must not wedge the
-/// conversation any more than a hung command may.
-const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How long `sftp_list` waits for the backend's navigation to land before it
-/// reports the directory as unreadable (the backend logs failures silently).
-/// The first listing on a session also pays the SFTP subsystem handshake, so
-/// this is generous.
-const SFTP_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long an SFTP transfer may run before the tool call reports what has
-/// happened so far. Long — transfers can genuinely take minutes — but bounded.
-const SFTP_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// How long a tunnel's start may stay in "starting" before `tunnel_open`
-/// reports it failed.
-const TUNNEL_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Context window assumed when the endpoint's `/models` response doesn't
 /// advertise one. Most current endpoints are at least this large, and
 /// compacting a little early is much better than overflowing the window.
@@ -773,30 +206,6 @@ const COMPACT_AT: f32 = 0.75;
 /// the summary replaces everything older.
 const COMPACT_KEEP: f32 = 0.4;
 
-/// Longest single tool result fed into a compaction transcript, in bytes.
-/// The transcript is the *input* of the summarizer, so a handful of huge
-/// command outputs must not blow up the very request meant to shrink the
-/// conversation; `compaction_transcript` keeps the tail of a longer result,
-/// where a command's errors and summary usually are.
-const COMPACT_RESULT_CAP: usize = 4 * 1024;
-
-/// Instruction for the compaction round: what the summary must preserve so
-/// the work can continue without the original messages.
-const COMPACTION_PROMPT: &str = "\
-You maintain the working memory of a terminal-operating agent. Summarize the \
-conversation transcript below into notes for yourself, so the work can \
-continue without the original messages. Preserve: the user's goals and \
-constraints (and anything they asked you to remember), decisions made, the \
-commands that ran with their key output (paths, errors, numbers), the state \
-of anything still running, and open questions. Be specific and terse — no \
-pleasantries, no restating the obvious. Reply with the summary only, as \
-Markdown.";
-
-/// Preamble for a compaction summary in the wire history. Spelled out so
-/// the model reads it as context rather than as a fresh instruction.
-const COMPACTED_HEADER: &str =
-    "Summary of the earlier conversation, compacted to save context:\n\n";
-
 /// Terminal session an AI panel is bound to.
 ///
 /// One panel instance exists per terminal pane (see
@@ -806,20 +215,205 @@ const COMPACTED_HEADER: &str =
 /// tool calls on a dead session report "terminal closed".
 #[derive(Clone)]
 pub struct AiSession {
-    /// Pane id — the key of `CrabportApp::pane_views`.
-    pub pane_id: u64,
-    /// The pane's terminal view. Tools read output and send input through
-    /// this handle.
+    /// The pane's terminal view. Tool calls take a cx-free snapshot of it
+    /// (see [`UiAgentSession`]) so the agent can work off the UI thread.
     pub terminal: WeakEntity<TerminalView>,
     /// The app's tunnel registry — lets `tunnel_list` also report the
     /// tunnels the Tunnels page started *borrowing this terminal's*
     /// connection. Read-only here: the agent manages only the tunnels it
     /// created itself.
-    pub tunnels: Arc<crate::views::tunnels::TunnelRegistry>,
-    /// The owning app entity — registry tunnels (`t…` ids) are started,
-    /// stopped and deleted through the app's own machinery so the Tunnels
-    /// page and the store stay consistent.
-    pub app: WeakEntity<crate::app::CrabportApp>,
+    pub tunnels: Arc<TunnelRegistry>,
+    /// Where registry-tunnel mutations go: the UI thread drains it and calls
+    /// the app's own start/stop/delete machinery, so the store and the
+    /// Tunnels page stay consistent. A channel rather than the app entity
+    /// because the agent's tools call this from background threads, where no
+    /// `cx` exists.
+    pub registry_commands: async_channel::Sender<RegistryCommand>,
+}
+
+/// A Tunnels-page mutation an agent tool asked for.
+///
+/// The registry itself is context-free, but starting / stopping / deleting a
+/// config goes through [`crate::app::CrabportApp`]'s methods, which own the
+/// store and notify the Tunnels page; the panel drains these on the UI
+/// thread and calls the app there.
+#[derive(Clone, Copy, Debug)]
+pub enum RegistryCommand {
+    /// Start `config_id`, borrowing the terminal pane `tab_id`'s connection.
+    Open { config_id: i64, tab_id: u64 },
+    /// Stop a running config (owned or borrowed).
+    Close(i64),
+    /// Delete a config, stopping it first when it runs.
+    Delete(i64),
+}
+
+/// The UI side of the agent's session boundary: one terminal pane's shared
+/// handles plus the panel's tunnel plumbing, as the agent's tools see them.
+///
+/// `crabport-agent` defines its `AgentSession` trait free of GPUI — that is
+/// what lets the tools (command capture, output polling, SFTP waits, tunnel
+/// lifecycle) run on background threads while this side only awaits their
+/// result — and this implements it over handles the terminal view hands out
+/// without an entity read. Two things cannot travel through those handles,
+/// because they are panel state rather than terminal state:
+///
+/// - the agent's *own* [`TunnelManager`], kept on the panel so `tunnel_open`
+///   and `tunnel_close` hit the same manager across calls (and so the
+///   panel's `Drop` can stop everything it started);
+/// - the [`RegistryCommand`] channel, because registry mutations must run on
+///   the UI thread (see the enum's doc).
+struct UiAgentSession {
+    handles: AgentTerminalHandles,
+    /// The manager the agent's own tunnels live in. `None` on terminals with
+    /// no SSH source, which is what makes `allow_tunnels` false and blocks
+    /// the tunnel tools.
+    manager: Option<Arc<TunnelManager>>,
+    /// The app's tunnel registry, read live (cx-free) so `tunnel_list` and
+    /// the `t…` handlers see the current state, not the panel's last render.
+    registry: Arc<TunnelRegistry>,
+    /// Where registry mutations are sent; the panel's drain task owns the
+    /// receiving end.
+    commands: async_channel::Sender<RegistryCommand>,
+}
+
+impl UiAgentSession {
+    fn new(
+        handles: AgentTerminalHandles,
+        registry: Arc<TunnelRegistry>,
+        commands: async_channel::Sender<RegistryCommand>,
+        manager: Option<Arc<TunnelManager>>,
+    ) -> Self {
+        Self {
+            handles,
+            manager,
+            registry,
+            commands,
+        }
+    }
+}
+
+impl AgentSession for UiAgentSession {
+    fn allow_exec_capture(&self) -> bool {
+        self.handles.session.allow_exec_capture()
+    }
+
+    fn allow_sftp(&self) -> bool {
+        self.handles.session.allow_sftp()
+    }
+
+    fn allow_tunnels(&self) -> bool {
+        self.manager.is_some()
+    }
+
+    fn cwd(&self) -> Option<String> {
+        self.handles.cwd.clone()
+    }
+
+    fn host_id(&self) -> Option<i64> {
+        self.handles.host_id
+    }
+
+    fn dump_text(&self, lines: usize) -> String {
+        self.handles.session.dump_text(lines)
+    }
+
+    fn try_dump_text(&self, lines: usize) -> Option<String> {
+        self.handles.session.try_dump_text(lines)
+    }
+
+    fn write_raw(&self, data: &[u8]) {
+        self.handles.session.write_raw(data);
+    }
+
+    fn exec_capture(
+        &self,
+        command: &str,
+        timeout: Duration,
+        cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
+        self.handles
+            .backend
+            .exec_capture(command, timeout, cancel, done);
+    }
+
+    fn subscribe_events(&self) -> Option<Receiver<BackendEvent>> {
+        Some(self.handles.session.subscribe_backend())
+    }
+
+    fn sftp_listing(&self) -> Option<(String, Arc<Vec<FileEntry>>)> {
+        let cwd = self.handles.session.sftp_cwd()?;
+        let entries = self.handles.session.sftp_entries()?;
+        Some((cwd.as_str().to_string(), entries))
+    }
+
+    fn sftp_navigate(&self, path: &str) {
+        self.handles.session.sftp_navigate(path);
+    }
+
+    fn sftp_download(&self, remote_path: &str, local_path: &str) {
+        self.handles.session.sftp_download(remote_path, local_path);
+    }
+
+    fn sftp_upload(&self, local_path: &str, remote_path: &str) {
+        self.handles.session.sftp_upload(local_path, remote_path);
+    }
+
+    fn tunnel_manager(&self) -> Option<Arc<TunnelManager>> {
+        self.manager.clone()
+    }
+
+    fn registry_tunnels(&self) -> Vec<RegistryTunnel> {
+        let Some(host_id) = self.handles.host_id else {
+            return Vec::new();
+        };
+        self.registry
+            .list()
+            .into_iter()
+            .filter(|view| view.host_id == host_id)
+            .map(|view| RegistryTunnel {
+                id: view.id,
+                name: view.name,
+                kind: view.kind,
+                bind_addr: view.bind_addr,
+                bind_port: view.bind_port,
+                target_host: view.target_host,
+                target_port: view.target_port,
+                running: view.running,
+                borrowed: view.borrowed_tab_id.is_some(),
+            })
+            .collect()
+    }
+
+    fn registry_is_running(&self, config_id: i64) -> bool {
+        self.registry.is_running(config_id)
+    }
+
+    fn registry_live(&self, config_id: i64) -> Option<(String, u16, String, u16)> {
+        let manager = self.registry.manager_for(config_id)?;
+        let info = manager.list().into_iter().next()?;
+        Some((
+            info.bind_addr,
+            info.bind_port,
+            info.target_host,
+            info.target_port,
+        ))
+    }
+
+    fn registry_open(&self, config_id: i64) {
+        let _ = self.commands.try_send(RegistryCommand::Open {
+            config_id,
+            tab_id: self.handles.pane_id,
+        });
+    }
+
+    fn registry_close(&self, config_id: i64) {
+        let _ = self.commands.try_send(RegistryCommand::Close(config_id));
+    }
+
+    fn registry_delete(&self, config_id: i64) {
+        let _ = self.commands.try_send(RegistryCommand::Delete(config_id));
+    }
 }
 
 /// One entry in the combined provider·model picker.
@@ -921,15 +515,15 @@ pub struct AiPanel {
     session_id: String,
     /// The terminal this panel (and its agent) belongs to.
     session: AiSession,
+    /// This panel's agent: the tools' own state (the session-local tunnels
+    /// it defined, with their never-reused ids). The terminal it acts on is
+    /// supplied per call as a cx-free snapshot, so a reconnect or split
+    /// cannot leave the agent holding a stale session.
+    agent: Agent,
     /// This terminal's tunnel manager — created from the terminal's SSH
     /// source on first use, so every tunnel tool acts only on tunnels this
     /// panel started. `None` on terminals without an SSH source.
     tunnel_manager: Option<Arc<TunnelManager>>,
-    /// Tunnels the agent defined, in creation order. Agent-facing ids index
-    /// into this list (stable, never reused).
-    agent_tunnels: Vec<AgentTunnel>,
-    /// Next agent-facing tunnel id (1-based).
-    next_tunnel_id: u64,
     /// Context windows learned from the endpoints' `/models` responses,
     /// keyed `"{provider_id}|{model}"`. A missing entry falls back to
     /// [`FALLBACK_CONTEXT_WINDOW`].
@@ -972,9 +566,8 @@ impl AiPanel {
             combo_open: false,
             session_id: new_session_id(),
             session,
+            agent: Agent::new(),
             tunnel_manager: None,
-            agent_tunnels: Vec::new(),
-            next_tunnel_id: 1,
             model_windows: HashMap::new(),
             context_used: 0,
             compaction: None,
@@ -1250,31 +843,12 @@ impl AiPanel {
         // better off hearing "use a tool that works" immediately so it can
         // retry while the user watches (terminal_run on a Serial connection,
         // the tunnel/SFTP tools on a local terminal, …).
-        let terminal = self.session.terminal.upgrade();
-        let (terminal_closed, exec_ok, tunnel_ok, sftp_ok) = match &terminal {
-            None => (true, false, false, false),
-            Some(view) => {
-                let view = view.read(cx);
-                (
-                    false,
-                    view.allow_exec_capture(),
-                    view.tunnel_source().is_some(),
-                    view.allow_sftp(),
-                )
-            }
-        };
+        let session = self.agent_session(cx);
         let blocked = |name: &str| -> Option<String> {
-            if terminal_closed {
+            let Some(session) = session.as_ref() else {
                 return Some(t!("ai_panel.tool_terminal_closed").to_string());
-            }
-            match ToolKind::of(name) {
-                ToolKind::ExecCapture if !exec_ok => {
-                    Some(t!("ai_panel.tool_exec_unsupported").to_string())
-                }
-                ToolKind::Tunnel if !tunnel_ok => Some(t!("ai_panel.tool_no_tunnel").to_string()),
-                ToolKind::Sftp if !sftp_ok => Some(t!("ai_panel.tool_no_sftp").to_string()),
-                _ => None,
-            }
+            };
+            self.agent.blocked_reason(session.as_ref(), name)
         };
 
         let mut auto_resolved = false;
@@ -1401,11 +975,9 @@ impl AiPanel {
         if state.decision != ToolDecision::Pending {
             return;
         }
-        let call = state.call.clone();
-        let args = state.args.clone();
         // The model's arguments were unparseable: nothing may run, and it must
         // be told that instead of assuming success.
-        if args.is_none() {
+        if state.args.is_none() {
             self.settle_tool_result(
                 msg_index,
                 call_index,
@@ -1426,49 +998,107 @@ impl AiPanel {
             return;
         }
 
-        // Both execution tools take `command`; a missing one is malformed
-        // even when the JSON itself parsed.
-        let command = args
-            .as_ref()
-            .and_then(|args| args.get("command")?.as_str())
-            .map(str::to_string);
-        match ToolKind::of(&call.name) {
-            ToolKind::TerminalRead => {
-                let result = self.execute_tool(&call, cx);
-                self.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
-            }
-            ToolKind::ExecCapture => match command {
-                Some(command) => self.start_capture(msg_index, call_index, command, cx),
-                None => self.settle_tool_result(
-                    msg_index,
-                    call_index,
-                    t!("ai_panel.tool_bad_args").to_string(),
-                    ToolDecision::Denied,
-                    cx,
-                ),
-            },
-            ToolKind::Run => match command {
-                Some(command) => self.start_visible_run(msg_index, call_index, command, cx),
-                None => self.settle_tool_result(
-                    msg_index,
-                    call_index,
-                    t!("ai_panel.tool_bad_args").to_string(),
-                    ToolDecision::Denied,
-                    cx,
-                ),
-            },
-            ToolKind::Fetch => self.start_fetch(msg_index, call_index, cx),
-            ToolKind::LocalFs => self.start_local_fs(&call, msg_index, call_index, cx),
-            ToolKind::Tunnel => self.start_tunnel_op(&call, msg_index, call_index, cx),
-            ToolKind::Sftp => self.start_sftp_op(&call, msg_index, call_index, cx),
-            ToolKind::Unknown => self.settle_tool_result(
+        self.run_tool(msg_index, call_index, cx);
+    }
+
+    /// Run one approved call through the agent and settle its card with the
+    /// outcome.
+    ///
+    /// The agent owns the work — including the polling loops, which is why it
+    /// can live off the UI thread at all. It answers either a finished result
+    /// ([`Executed::Done`]), a running one on a channel this side awaits
+    /// ([`Executed::Pending`]), or a refusal when the call cannot start
+    /// ([`Executed::Refused`]: missing arguments at execution time, or a
+    /// capability the session turned out not to have).
+    fn run_tool(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+        let Some(state) = self.tool_state_mut(msg_index, call_index) else {
+            return;
+        };
+        let name = state.call.name.clone();
+        let Some(args) = state.args.clone() else {
+            self.settle_tool_result(
                 msg_index,
                 call_index,
-                t!("ai_panel.tool_unknown", name = call.name.as_str()).to_string(),
+                t!("ai_panel.tool_bad_args").to_string(),
                 ToolDecision::Denied,
                 cx,
-            ),
+            );
+            return;
+        };
+        let Some(session) = self.agent_session(cx) else {
+            self.settle_tool_result(
+                msg_index,
+                call_index,
+                t!("ai_panel.tool_terminal_closed").to_string(),
+                ToolDecision::Allowed,
+                cx,
+            );
+            return;
+        };
+        match self.agent.run(&session, &name, &args) {
+            Executed::Done(outcome) => self.finish_tool(msg_index, call_index, outcome, cx),
+            Executed::Refused(reason) => {
+                self.settle_tool_result(msg_index, call_index, reason, ToolDecision::Denied, cx)
+            }
+            Executed::Pending { outcome, cancel } => {
+                if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+                    state.decision = ToolDecision::Allowed;
+                    state.running = true;
+                    state.cancel = cancel;
+                }
+                self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+                cx.notify();
+                let entity = cx.entity().downgrade();
+                cx.spawn(async move |_this, cx| {
+                    // The agent sends exactly once; a closed channel without
+                    // an outcome means its worker went away mid-call.
+                    let outcome = outcome.recv().await.unwrap_or_else(|_| {
+                        ToolOutcome::text(t!("ai_panel.tool_exec_capture_failed").to_string())
+                    });
+                    let _ = entity.update(cx, |panel, cx| {
+                        panel.finish_tool(msg_index, call_index, outcome, cx);
+                    });
+                })
+                .detach();
+            }
         }
+    }
+
+    /// Store one finished call's outcome on its card and continue the loop.
+    fn finish_tool(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        outcome: ToolOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.result = Some(outcome.text);
+            state.exit_code = outcome.exit_code;
+            state.timed_out = outcome.timed_out;
+            state.cancelled = outcome.cancelled;
+            state.running = false;
+        }
+        self.settle_tool(msg_index, call_index, cx);
+    }
+
+    /// A cx-free snapshot of this panel's terminal for the agent's tools,
+    /// plus the panel-scoped tunnel plumbing: the manager the agent's own
+    /// tunnels live in (created on first use from the terminal's SSH source)
+    /// and the registry-command channel. `None` when the terminal is gone.
+    fn agent_session(&mut self, cx: &mut Context<Self>) -> Option<Arc<dyn AgentSession>> {
+        let handles = self.session.terminal.upgrade()?.read(cx).agent_handles();
+        if self.tunnel_manager.is_none()
+            && let Some(source) = handles.tunnel_source.clone()
+        {
+            self.tunnel_manager = Some(Arc::new(TunnelManager::new(source, Arc::new(|| {}))));
+        }
+        Some(Arc::new(UiAgentSession::new(
+            handles,
+            self.session.tunnels.clone(),
+            self.session.registry_commands.clone(),
+            self.tunnel_manager.clone(),
+        )))
     }
 
     /// The state of one tool call, if that call exists.
@@ -1509,1019 +1139,6 @@ impl AiPanel {
         self.refresh_context_used();
         self.maybe_continue_after_tools(cx);
         cx.notify();
-    }
-
-    /// Start an approved implicit (`terminal_exec`) command: out of band on
-    /// an extra channel/process, its output captured directly.
-    ///
-    /// The command is run in the directory the terminal last reported (when
-    /// there is one) so it behaves like something typed there, but nothing is
-    /// written to the shell — the session and its screen stay untouched.
-    fn start_capture(
-        &mut self,
-        msg_index: usize,
-        call_index: usize,
-        command: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        // Backends that can't run a command out of band: say so instead of
-        // half-running it in the user's shell.
-        if !terminal.read(cx).allow_exec_capture() {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_exec_unsupported").to_string(),
-                ToolDecision::Unavailable,
-                cx,
-            );
-            return;
-        }
-        let cwd = terminal.read(cx).cwd().map(str::to_string);
-        let effective = with_cwd(&command, cwd.as_deref());
-        // The token the card's stop button flips; the backend then reports
-        // the output captured up to that moment.
-        let cancel = ExecCancel::default();
-        let rx = terminal
-            .read(cx)
-            .exec_capture(&effective, EXEC_CAPTURE_TIMEOUT, cancel.clone());
-
-        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
-            state.decision = ToolDecision::Allowed;
-            state.running = true;
-            state.cancel = cancel;
-        }
-        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-        cx.notify();
-
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            // The backend's completion callback fires exactly once; a closed
-            // receiver without an outcome means the backend went away with
-            // the session.
-            let out = rx.recv().await.unwrap_or_else(|_| ExecOutput {
-                output: t!("ai_panel.tool_exec_capture_failed").to_string(),
-                ..Default::default()
-            });
-            let _ = entity.update(cx, |panel, cx| {
-                panel.finish_tool_capture(msg_index, call_index, out, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Start an approved explicit (`terminal_run`) command: type the line
-    /// into the live shell — the user watches it there — then hand over the
-    /// output the screen gained once it settles.
-    fn start_visible_run(
-        &mut self,
-        msg_index: usize,
-        call_index: usize,
-        command: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        // Sample the terminal *before* the command runs: the tool result is
-        // what appears after this point, so the model gets the command's own
-        // output instead of a round trip through `terminal_read`.
-        let before = terminal.read(cx).dump_text(AGENT_READ_LINES);
-        // The card's stop button ends the *wait* — the command itself keeps
-        // running in the user's terminal, which is where they can interrupt
-        // it for real.
-        let cancel = ExecCancel::default();
-        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
-            state.decision = ToolDecision::Allowed;
-            state.running = true;
-            state.cancel = cancel.clone();
-        }
-        // Same path the snippets panel uses: the line, then a carriage
-        // return, so the shell runs it as if it had been typed.
-        let mut bytes = command.into_bytes();
-        bytes.push(b'\r');
-        terminal.read(cx).write_raw(&bytes);
-        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-        self.await_command_output(msg_index, call_index, before, cancel, cx);
-        cx.notify();
-    }
-
-    /// Mark an approved call as running: the card turns from buttons into a
-    /// running state.
-    fn mark_running(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
-        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
-            state.decision = ToolDecision::Allowed;
-            state.running = true;
-        }
-        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-        cx.notify();
-    }
-
-    /// Run an approved `fetch` off the UI thread: CrabPort's own HTTP client,
-    /// optionally through a proxy URL.
-    fn start_fetch(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
-        let args = self
-            .tool_state_mut(msg_index, call_index)
-            .and_then(|state| state.args.clone());
-        let arg_str = |key: &str| -> Option<String> {
-            args.as_ref()
-                .and_then(|args| args.get(key)?.as_str())
-                .map(str::to_string)
-        };
-        let Some(url) = arg_str("url") else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_bad_args").to_string(),
-                ToolDecision::Denied,
-                cx,
-            );
-            return;
-        };
-        let proxy = arg_str("proxy");
-        let method = arg_str("method")
-            .map(|method| method.to_ascii_uppercase())
-            .unwrap_or_else(|| "GET".to_string());
-        let body = arg_str("body");
-
-        self.mark_running(msg_index, call_index, cx);
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            let result =
-                smol::unblock(move || fetch_url(&url, proxy.as_deref(), &method, body.as_deref()))
-                    .await;
-            let _ = entity.update(cx, |panel, cx| {
-                panel.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Read an approved local file / directory off the UI thread.
-    fn start_local_fs(
-        &mut self,
-        call: &ToolCall,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(path) = self
-            .tool_state_mut(msg_index, call_index)
-            .and_then(|state| state.arg_str("path").map(str::to_string))
-        else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_bad_args").to_string(),
-                ToolDecision::Denied,
-                cx,
-            );
-            return;
-        };
-        self.mark_running(msg_index, call_index, cx);
-        let is_file = call.name == "read_file";
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            let result = smol::unblock(move || {
-                if is_file {
-                    read_local_file(&path)
-                } else {
-                    read_local_directory(&path)
-                }
-            })
-            .await;
-            let _ = entity.update(cx, |panel, cx| {
-                panel.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// This terminal's tunnel manager — created from the terminal's SSH
-    /// source on first use, so every tunnel tool acts only on tunnels this
-    /// panel started. `None` when the terminal has no SSH connection.
-    fn tunnel_manager(&mut self, cx: &mut Context<Self>) -> Option<Arc<TunnelManager>> {
-        if self.tunnel_manager.is_none() {
-            let source = self
-                .session
-                .terminal
-                .upgrade()?
-                .read(cx)
-                .tunnel_source()
-                .cloned()?;
-            self.tunnel_manager = Some(Arc::new(TunnelManager::new(source, Arc::new(|| {}))));
-        }
-        self.tunnel_manager.clone()
-    }
-
-    /// Handle one approved tunnel tool call: create (define), open (start),
-    /// close (stop) and delete (stop + retire). Everything runs against the
-    /// panel's own manager — never another terminal's connection.
-    fn start_tunnel_op(
-        &mut self,
-        call: &ToolCall,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let args = self
-            .tool_state_mut(msg_index, call_index)
-            .and_then(|state| state.args.clone());
-        let arg_u64 = |key: &str| args.as_ref().and_then(|args| args.get(key)?.as_u64());
-        let arg_str = |key: &str| -> Option<String> {
-            args.as_ref()
-                .and_then(|args| args.get(key)?.as_str())
-                .map(str::to_string)
-        };
-
-        match call.name.as_str() {
-            "tunnel_list" => {
-                // The agent's own tunnels first (their ids are what
-                // open/close/delete take), then everything configured for
-                // this terminal's host — however it runs: owned from the
-                // Tunnels page, borrowed from this tab, or stopped. Those are
-                // managed from the Tunnels page; the agent only reports them.
-                let manager = self.tunnel_manager.as_ref();
-                let mine: Vec<String> = self
-                    .agent_tunnels
-                    .iter()
-                    .map(|tunnel| tunnel.describe(manager))
-                    .collect();
-                let mut lines: Vec<String> = Vec::new();
-                if !mine.is_empty() {
-                    lines.push(t!("ai_panel.tool_tunnel_list_mine").to_string());
-                    lines.extend(mine);
-                }
-                let host_id = self
-                    .session
-                    .terminal
-                    .upgrade()
-                    .and_then(|view| view.read(cx).host_id());
-                if let Some(host_id) = host_id {
-                    let configured: Vec<String> = self
-                        .session
-                        .tunnels
-                        .list()
-                        .into_iter()
-                        .filter(|view| view.host_id == host_id)
-                        .map(|view| {
-                            let source = if view.borrowed_tab_id.is_some() {
-                                t!("ai_panel.tunnel_source_borrowed")
-                            } else {
-                                t!("ai_panel.tunnel_source_owned")
-                            };
-                            // The id token leads the line — it is what
-                            // tunnel_open / tunnel_close / tunnel_delete take.
-                            // Both ends of a local/remote tunnel follow: the
-                            // model needs host *and* port to use or talk
-                            // about the tunnel.
-                            let mut line = format!(
-                                "t{} {} ({}, {})",
-                                view.id,
-                                view.name,
-                                view.kind.as_str(),
-                                source
-                            );
-                            let mut addresses = format!("{}:{}", view.bind_addr, view.bind_port);
-                            if !view.target_host.is_empty() && view.target_port != 0 {
-                                addresses.push_str(&format!(
-                                    " -> {}:{}",
-                                    view.target_host, view.target_port
-                                ));
-                            }
-                            if view.running {
-                                line.push_str(&format!(
-                                    " — {}",
-                                    t!("ai_panel.tunnel_running_at", bind = addresses)
-                                ));
-                            } else {
-                                line.push_str(&format!(
-                                    " — {}",
-                                    t!("ai_panel.tunnel_stopped_at", bind = addresses)
-                                ));
-                            }
-                            line
-                        })
-                        .collect();
-                    if !configured.is_empty() {
-                        lines.push(t!("ai_panel.tool_tunnel_list_host").to_string());
-                        lines.extend(configured);
-                    }
-                }
-                let text = if lines.is_empty() {
-                    t!("ai_panel.tool_tunnel_list_empty").to_string()
-                } else {
-                    lines.join("\n")
-                };
-                self.settle_tool_result(msg_index, call_index, text, ToolDecision::Allowed, cx);
-            }
-            "tunnel_create" => {
-                let kind = TunnelKind::from_str(arg_str("kind").as_deref().unwrap_or("dynamic"));
-                let name = arg_str("name")
-                    .unwrap_or_else(|| format!("agent-tunnel-{}", self.next_tunnel_id));
-                let bind_port = arg_u64("bind_port").unwrap_or(0) as u16;
-                let bind_addr = arg_str("bind_addr").unwrap_or_else(|| "127.0.0.1".to_string());
-                let target_host = arg_str("target_host").unwrap_or_default();
-                let target_port = arg_u64("target_port").unwrap_or(0) as u16;
-                // local/remote need a target: refuse the malformed definition
-                // instead of keeping something that can never start.
-                if matches!(kind, TunnelKind::Local | TunnelKind::Remote)
-                    && (target_host.is_empty() || target_port == 0)
-                {
-                    self.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_bad_args").to_string(),
-                        ToolDecision::Denied,
-                        cx,
-                    );
-                    return;
-                }
-                let agent_id = self.next_tunnel_id;
-                self.next_tunnel_id += 1;
-                self.agent_tunnels.push(AgentTunnel {
-                    agent_id,
-                    kind,
-                    name,
-                    bind_addr,
-                    bind_port,
-                    target_host,
-                    target_port,
-                    state: AgentTunnelState::Created,
-                });
-                let result =
-                    t!("ai_panel.tool_tunnel_created", id = agent_id.to_string()).to_string();
-                self.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
-                let handle = format!("a{}", agent_id);
-                let result = t!("ai_panel.tool_tunnel_created", id = handle).to_string();
-                self.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
-            }
-            "tunnel_open" | "tunnel_close" | "tunnel_delete" => {
-                // The id token decides where the tunnel lives: `a<N>` is one
-                // the agent created here, `t<N>` a Tunnels-page config bound
-                // to this terminal's host.
-                let Some(token) = arg_str("tunnel_id") else {
-                    self.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_bad_args").to_string(),
-                        ToolDecision::Denied,
-                        cx,
-                    );
-                    return;
-                };
-                let (kind, number) = (
-                    token.chars().next().unwrap_or(' '),
-                    token[1..].parse::<u64>().ok(),
-                );
-                match (kind, number) {
-                    ('a', Some(agent_id)) => {
-                        let Some(spec_ix) = self
-                            .agent_tunnels
-                            .iter()
-                            .position(|tunnel| tunnel.agent_id == agent_id)
-                        else {
-                            self.settle_tool_result(
-                                msg_index,
-                                call_index,
-                                t!("ai_panel.tool_tunnel_unknown", id = token.as_str()).to_string(),
-                                ToolDecision::Denied,
-                                cx,
-                            );
-                            return;
-                        };
-                        match call.name.as_str() {
-                            "tunnel_open" => self.tunnel_open(spec_ix, msg_index, call_index, cx),
-                            "tunnel_close" => self.tunnel_close(spec_ix, msg_index, call_index, cx),
-                            "tunnel_delete" => {
-                                self.tunnel_delete(spec_ix, msg_index, call_index, cx)
-                            }
-                            _ => {}
-                        }
-                    }
-                    ('t', Some(number)) => {
-                        self.tunnel_registry_op(
-                            call.name.as_str(),
-                            number as i64,
-                            msg_index,
-                            call_index,
-                            cx,
-                        );
-                    }
-                    _ => {
-                        self.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            t!("ai_panel.tool_tunnel_unknown", id = token.as_str()).to_string(),
-                            ToolDecision::Denied,
-                            cx,
-                        );
-                    }
-                }
-            }
-            other => {
-                self.settle_tool_result(
-                    msg_index,
-                    call_index,
-                    t!("ai_panel.tool_unknown", name = other).to_string(),
-                    ToolDecision::Denied,
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// Start a defined tunnel and report it live: the model cannot use the
-    /// port until it is listening, so the call waits for the manager to
-    /// report Active (or the failure) before settling.
-    fn tunnel_open(
-        &mut self,
-        spec_ix: usize,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if matches!(
-            self.agent_tunnels[spec_ix].state,
-            AgentTunnelState::Running(_)
-        ) {
-            let text = t!("ai_panel.tool_tunnel_already").to_string();
-            self.settle_tool_result(msg_index, call_index, text, ToolDecision::Allowed, cx);
-            return;
-        }
-        let Some(manager) = self.tunnel_manager(cx) else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_no_tunnel").to_string(),
-                ToolDecision::Unavailable,
-                cx,
-            );
-            return;
-        };
-        let (kind, name, bind_addr, bind_port, target_host, target_port) = {
-            let spec = &self.agent_tunnels[spec_ix];
-            (
-                spec.kind,
-                spec.name.clone(),
-                spec.bind_addr.clone(),
-                spec.bind_port,
-                spec.target_host.clone(),
-                spec.target_port,
-            )
-        };
-        let agent_id = self.agent_tunnels[spec_ix].agent_id;
-        self.mark_running(msg_index, call_index, cx);
-        let entity = cx.entity().downgrade();
-        let manager_for_start = manager.clone();
-        cx.spawn(async move |_this, cx| {
-            let outcome = smol::unblock(move || {
-                let start = async {
-                    match kind {
-                        TunnelKind::Dynamic => {
-                            manager_for_start
-                                .start_dynamic(name, bind_addr, bind_port)
-                                .await
-                        }
-                        TunnelKind::Local => {
-                            manager_for_start
-                                .start_local(name, bind_addr, bind_port, target_host, target_port)
-                                .await
-                        }
-                        TunnelKind::Remote => {
-                            manager_for_start
-                                .start_remote(name, bind_addr, bind_port, target_host, target_port)
-                                .await
-                        }
-                    }
-                };
-                crabport_ssh::TOKIO.block_on(start)
-            })
-            .await;
-            let result = match outcome {
-                Ok(tunnel_id) => {
-                    let started_at = std::time::Instant::now();
-                    loop {
-                        match manager.get(tunnel_id).map(|info| info.status) {
-                            Some(TunnelStatus::Active) => break Ok(tunnel_id),
-                            Some(TunnelStatus::Failed(reason)) => break Err(reason),
-                            Some(TunnelStatus::Closed) => {
-                                break Err("tunnel closed while starting".to_string());
-                            }
-                            _ if started_at.elapsed() >= TUNNEL_START_TIMEOUT => {
-                                break Err(format!(
-                                    "still starting after {}s",
-                                    TUNNEL_START_TIMEOUT.as_secs()
-                                ));
-                            }
-                            _ => {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(100))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                Err(reason) => Err(reason),
-            };
-            let _ = entity.update(cx, |panel, cx| {
-                let Some(spec) = panel
-                    .agent_tunnels
-                    .iter_mut()
-                    .find(|tunnel| tunnel.agent_id == agent_id)
-                else {
-                    return;
-                };
-                match &result {
-                    Ok(tunnel_id) => spec.state = AgentTunnelState::Running(*tunnel_id),
-                    Err(reason) => spec.state = AgentTunnelState::Failed(reason.clone()),
-                }
-                let text = match &result {
-                    Ok(_) => spec.describe(panel.tunnel_manager.as_ref()),
-                    Err(reason) => format!("{}: {reason}", t!("ai_panel.tool_tunnel_open_failed")),
-                };
-                panel.settle_tool_result(msg_index, call_index, text, ToolDecision::Allowed, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Stop one running tunnel. The manager's entry is removed; the spec
-    /// stays and can be opened again.
-    fn tunnel_close(
-        &mut self,
-        spec_ix: usize,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let agent_id = self.agent_tunnels[spec_ix].agent_id;
-        let running = match &self.agent_tunnels[spec_ix].state {
-            AgentTunnelState::Running(tunnel_id) => Some(*tunnel_id),
-            _ => None,
-        };
-        let Some((tunnel_id, manager)) = running.zip(self.tunnel_manager(cx)) else {
-            let text = t!(
-                "ai_panel.tool_tunnel_not_running",
-                id = agent_id.to_string()
-            )
-            .to_string();
-            self.settle_tool_result(msg_index, call_index, text, ToolDecision::Allowed, cx);
-            return;
-        };
-        self.mark_running(msg_index, call_index, cx);
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            smol::unblock(move || crabport_ssh::TOKIO.block_on(manager.stop(tunnel_id))).await;
-            let _ = entity.update(cx, |panel, cx| {
-                if let Some(spec) = panel
-                    .agent_tunnels
-                    .iter_mut()
-                    .find(|tunnel| tunnel.agent_id == agent_id)
-                {
-                    spec.state = AgentTunnelState::Closed;
-                }
-                panel.settle_tool_result(
-                    msg_index,
-                    call_index,
-                    t!("ai_panel.tool_tunnel_closed", id = agent_id.to_string()).to_string(),
-                    ToolDecision::Allowed,
-                    cx,
-                );
-            });
-        })
-        .detach();
-    }
-
-    /// Delete one tunnel: stop it first when it is running, then retire the
-    /// spec (the slot stays so earlier ids remain valid).
-    fn tunnel_delete(
-        &mut self,
-        spec_ix: usize,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let agent_id = self.agent_tunnels[spec_ix].agent_id;
-        let running = match &self.agent_tunnels[spec_ix].state {
-            AgentTunnelState::Running(tunnel_id) => Some(*tunnel_id),
-            _ => None,
-        };
-        if let (Some(tunnel_id), Some(manager)) = (running, self.tunnel_manager(cx)) {
-            self.mark_running(msg_index, call_index, cx);
-            let entity = cx.entity().downgrade();
-            cx.spawn(async move |_this, cx| {
-                smol::unblock(move || crabport_ssh::TOKIO.block_on(manager.stop(tunnel_id))).await;
-                let _ = entity.update(cx, |panel, cx| {
-                    if let Some(spec) = panel
-                        .agent_tunnels
-                        .iter_mut()
-                        .find(|tunnel| tunnel.agent_id == agent_id)
-                    {
-                        spec.state = AgentTunnelState::Deleted;
-                    }
-                    panel.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_tunnel_deleted", id = agent_id.to_string()).to_string(),
-                        ToolDecision::Allowed,
-                        cx,
-                    );
-                });
-            })
-            .detach();
-            return;
-        }
-        if let Some(spec) = self.agent_tunnels.get_mut(spec_ix) {
-            spec.state = AgentTunnelState::Deleted;
-        }
-        self.settle_tool_result(
-            msg_index,
-            call_index,
-            t!("ai_panel.tool_tunnel_deleted", id = agent_id.to_string()).to_string(),
-            ToolDecision::Allowed,
-            cx,
-        );
-    }
-
-    /// Run a tunnel tool against a *Tunnels-page* config bound to this
-    /// terminal's host. `open` borrows this terminal's SSH connection for the
-    /// run; close/delete go through the app's own machinery so the Tunnels
-    /// page and the store stay consistent — the agent never edits another
-    /// host's (let alone another terminal's) tunnels.
-    fn tunnel_registry_op(
-        &mut self,
-        op: &str,
-        config_id: i64,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        let host_id = terminal.read(cx).host_id();
-        // Only tunnels configured for this terminal's host exist here —
-        // anything else reports as an unknown id.
-        let not_reachable = !self
-            .session
-            .tunnels
-            .list()
-            .iter()
-            .any(|view| view.id == config_id && Some(view.host_id) == host_id);
-        if not_reachable {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_tunnel_unknown", id = format!("t{config_id}")).to_string(),
-                ToolDecision::Denied,
-                cx,
-            );
-            return;
-        }
-        let Some(app) = self.session.app.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        let registry = self.session.tunnels.clone();
-        let id_token = format!("t{config_id}");
-
-        match op {
-            "tunnel_open" => {
-                if registry.is_running(config_id) {
-                    let text = t!("ai_panel.tool_tunnel_already").to_string();
-                    self.settle_tool_result(msg_index, call_index, text, ToolDecision::Allowed, cx);
-                    return;
-                }
-                let tab_id = terminal.read(cx).pane_id();
-                app.update(cx, |app, cx| {
-                    app.start_tunnel_borrowed(config_id, tab_id, cx)
-                });
-                self.mark_running(msg_index, call_index, cx);
-                let entity = cx.entity().downgrade();
-                cx.spawn(async move |_this, cx| {
-                    let started_at = std::time::Instant::now();
-                    let result = loop {
-                        if registry.is_running(config_id) {
-                            break Ok(());
-                        }
-                        if started_at.elapsed() >= TUNNEL_START_TIMEOUT {
-                            break Err(t!("ai_panel.tunnel_status_stopped").to_string());
-                        }
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(120))
-                            .await;
-                    };
-                    let text = match (&result, registry.manager_for(config_id)) {
-                        (Ok(_), Some(manager)) => match manager.list().first() {
-                            Some(info) => {
-                                let mut text = format!(
-                                    "{} — {}",
-                                    id_token,
-                                    t!(
-                                        "ai_panel.tunnel_running_at",
-                                        bind = format!("{}:{}", info.bind_addr, info.bind_port)
-                                    )
-                                );
-                                if !info.target_host.is_empty() && info.target_port != 0 {
-                                    text.push_str(&format!(
-                                        " -> {}:{}",
-                                        info.target_host, info.target_port
-                                    ));
-                                }
-                                text
-                            }
-                            None => id_token.clone(),
-                        },
-                        _ => format!(
-                            "{}: {}",
-                            t!("ai_panel.tool_tunnel_open_failed"),
-                            match &result {
-                                Err(reason) => reason.clone(),
-                                Ok(_) => String::new(),
-                            }
-                        ),
-                    };
-                    let _ = entity.update(cx, |panel, cx| {
-                        panel.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            text,
-                            ToolDecision::Allowed,
-                            cx,
-                        );
-                    });
-                })
-                .detach();
-            }
-            "tunnel_close" => {
-                if !registry.is_running(config_id) {
-                    self.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_tunnel_not_running", id = id_token.as_str()).to_string(),
-                        ToolDecision::Allowed,
-                        cx,
-                    );
-                    return;
-                }
-                app.update(cx, |app, cx| app.stop_tunnel(config_id, cx));
-                self.mark_running(msg_index, call_index, cx);
-                let entity = cx.entity().downgrade();
-                cx.spawn(async move |_this, cx| {
-                    let started_at = std::time::Instant::now();
-                    while registry.is_running(config_id)
-                        && started_at.elapsed() < TUNNEL_START_TIMEOUT
-                    {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(120))
-                            .await;
-                    }
-                    let _ = entity.update(cx, |panel, cx| {
-                        panel.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            t!("ai_panel.tool_tunnel_closed", id = id_token.as_str()).to_string(),
-                            ToolDecision::Allowed,
-                            cx,
-                        );
-                    });
-                })
-                .detach();
-            }
-            "tunnel_delete" => {
-                app.update(cx, |app, cx| app.remove_tunnel(config_id, cx));
-                self.mark_running(msg_index, call_index, cx);
-                let entity = cx.entity().downgrade();
-                cx.spawn(async move |_this, cx| {
-                    let started_at = std::time::Instant::now();
-                    while registry.list().iter().any(|view| view.id == config_id)
-                        && started_at.elapsed() < TUNNEL_START_TIMEOUT
-                    {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(120))
-                            .await;
-                    }
-                    let _ = entity.update(cx, |panel, cx| {
-                        panel.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            t!("ai_panel.tool_tunnel_deleted", id = id_token.as_str()).to_string(),
-                            ToolDecision::Allowed,
-                            cx,
-                        );
-                    });
-                })
-                .detach();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle one approved SFTP tool call: list a directory, or move a file
-    /// between the remote host and the local machine — always on this
-    /// session's connection.
-    fn start_sftp_op(
-        &mut self,
-        call: &ToolCall,
-        msg_index: usize,
-        call_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let args = self
-            .tool_state_mut(msg_index, call_index)
-            .and_then(|state| state.args.clone());
-        let arg_str = |key: &str| -> Option<String> {
-            args.as_ref()
-                .and_then(|args| args.get(key)?.as_str())
-                .map(str::to_string)
-        };
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        match call.name.as_str() {
-            "sftp_list" => {
-                let Some(path) = arg_str("path") else {
-                    self.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_bad_args").to_string(),
-                        ToolDecision::Denied,
-                        cx,
-                    );
-                    return;
-                };
-                // Snapshot the listing *identity* before navigating: the
-                // backend installs a fresh entries Arc on every successful
-                // read_dir, so a pointer change — not a cwd change — is what
-                // says "the listing I asked for arrived". Comparing cwd
-                // alone hangs forever when the SFTP panel already sits in
-                // the requested directory, which is why the first listing
-                // (usually the home directory) always timed out.
-                let before_entries = terminal.read(cx).sftp_entries();
-                self.mark_running(msg_index, call_index, cx);
-                terminal.read(cx).sftp_navigate(&path);
-                let entity = cx.entity().downgrade();
-                cx.spawn(async move |_this, cx| {
-                    let started_at = std::time::Instant::now();
-                    let mut result: Option<String> = None;
-                    while started_at.elapsed() < SFTP_LIST_TIMEOUT {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(120))
-                            .await;
-                        // The backend logs a failed navigation silently; the
-                        // timeout below is what reports it.
-                        let Ok(arrived) = terminal.read_with(cx, |view, _| {
-                            let entries = view.sftp_entries();
-                            let refreshed = match (&before_entries, &entries) {
-                                (None, Some(_)) => true,
-                                (Some(old), Some(new)) => !Arc::ptr_eq(old, new),
-                                _ => false,
-                            };
-                            refreshed.then(|| view.sftp_cwd().zip(entries))
-                        }) else {
-                            break; // terminal view went away
-                        };
-                        let Some((cwd, entries)) = arrived.flatten() else {
-                            continue;
-                        };
-                        result = Some(format_remote_listing(cwd.as_str(), &entries));
-                        break;
-                    }
-                    let result =
-                        result.unwrap_or_else(|| t!("ai_panel.tool_sftp_list_timeout").to_string());
-                    let _ = entity.update(cx, |panel, cx| {
-                        panel.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            result,
-                            ToolDecision::Allowed,
-                            cx,
-                        );
-                    });
-                })
-                .detach();
-            }
-            "sftp_download" | "sftp_upload" => {
-                let (Some(remote_path), Some(local_path)) =
-                    (arg_str("remote_path"), arg_str("local_path"))
-                else {
-                    self.settle_tool_result(
-                        msg_index,
-                        call_index,
-                        t!("ai_panel.tool_bad_args").to_string(),
-                        ToolDecision::Denied,
-                        cx,
-                    );
-                    return;
-                };
-                self.mark_running(msg_index, call_index, cx);
-                // Subscribe *before* starting: the completion event is the
-                // only signal a transfer finished.
-                let mut events = terminal.read(cx).subscribe_backend();
-                if call.name == "sftp_download" {
-                    terminal.read(cx).sftp_download(&remote_path, &local_path);
-                } else {
-                    terminal.read(cx).sftp_upload(&local_path, &remote_path);
-                }
-                let want_download = call.name == "sftp_download";
-                let entity = cx.entity().downgrade();
-                cx.spawn(async move |_this, cx| {
-                    let started_at = std::time::Instant::now();
-                    let mut outcome: Option<(bool, String)> = None;
-                    while outcome.is_none() && started_at.elapsed() < SFTP_TRANSFER_TIMEOUT {
-                        cx.background_executor().timer(OUTPUT_POLL).await;
-                        loop {
-                            match events.try_recv() {
-                                Ok(BackendEvent::SftpTransferFinished {
-                                    kind,
-                                    success,
-                                    message,
-                                }) => {
-                                    let wanted = want_download
-                                        && kind == SftpTransferKind::Download
-                                        || !want_download && kind == SftpTransferKind::Upload;
-                                    if wanted {
-                                        outcome = Some((success, message));
-                                        break;
-                                    }
-                                }
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    let result = match outcome {
-                        Some((true, message)) => {
-                            t!("ai_panel.tool_sftp_done", message = message).to_string()
-                        }
-                        Some((false, message)) => {
-                            format!("{}: {message}", t!("ai_panel.tool_sftp_failed"))
-                        }
-                        None => t!(
-                            "ai_panel.tool_sftp_transfer_timeout",
-                            mins = (SFTP_TRANSFER_TIMEOUT.as_secs() / 60).to_string()
-                        )
-                        .to_string(),
-                    };
-                    let _ = entity.update(cx, |panel, cx| {
-                        panel.settle_tool_result(
-                            msg_index,
-                            call_index,
-                            result,
-                            ToolDecision::Allowed,
-                            cx,
-                        );
-                    });
-                })
-                .detach();
-            }
-            other => {
-                self.settle_tool_result(
-                    msg_index,
-                    call_index,
-                    t!("ai_panel.tool_unknown", name = other).to_string(),
-                    ToolDecision::Denied,
-                    cx,
-                );
-            }
-        }
     }
 
     /// Send the resolved tool results back to the model, so it can act on
@@ -2599,12 +1216,12 @@ impl AiPanel {
             return false;
         };
         let keep = (self.context_window() as f32 * COMPACT_KEEP) as usize;
-        let cut = compaction_cut(&self.messages, keep);
+        let cut = compaction_cut(&self.compact_turns(self.messages.len()), keep);
         if cut == 0 {
             // Everything is recent enough to keep — nothing to summarize.
             return false;
         }
-        let transcript = compaction_transcript(&self.messages[..cut]);
+        let transcript = compaction_transcript(&self.compact_turns(cut));
         let model = config::snapshot().ai.model;
         let request = ChatRequest::new(model).with_messages(vec![
             ChatMessage::system(COMPACTION_PROMPT),
@@ -2671,6 +1288,31 @@ impl AiPanel {
         self.start_turn(cx);
     }
 
+    /// The conversation as the compaction helpers see it: the first `count`
+    /// turns, borrowed for the duration of one compaction decision.
+    fn compact_turns(&self, count: usize) -> Vec<CompactTurn<'_>> {
+        self.messages[..count]
+            .iter()
+            .map(|msg| CompactTurn {
+                role: match msg.role {
+                    DisplayRole::User => TurnRole::User,
+                    DisplayRole::Assistant => TurnRole::Assistant,
+                    DisplayRole::Summary => TurnRole::Summary,
+                },
+                content: &msg.content,
+                tool_calls: msg
+                    .tool_calls
+                    .iter()
+                    .map(|call| CompactCall {
+                        name: &call.call.name,
+                        arguments: &call.call.arguments,
+                        result: call.result.as_deref(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     /// Replace `messages[..cut]` with one summary turn. The transcript keeps
     /// its place — as a collapsed block at the top of the conversation — so
     /// the user can always see that history was compacted, and what it became.
@@ -2701,159 +1343,6 @@ impl AiPanel {
             msg.reasoning_expanded = !msg.reasoning_expanded;
             cx.notify();
         }
-    }
-
-    /// Run one approved tool call that answers inline against this panel's
-    /// terminal and return the text to hand back to the model.
-    ///
-    /// Only `terminal_read` lands here — the two execution tools start async
-    /// work instead (see [`Self::start_capture`] / [`Self::start_visible_run`])
-    /// because the useful answer to "run this" is the command's output, not an
-    /// acknowledgement.
-    fn execute_tool(&mut self, call: &ToolCall, cx: &mut Context<Self>) -> String {
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            return t!("ai_panel.tool_terminal_closed").to_string();
-        };
-        match ToolKind::of(&call.name) {
-            ToolKind::TerminalRead => {
-                let lines = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                    .ok()
-                    .and_then(|args| args.get("lines")?.as_u64())
-                    .unwrap_or(200) as usize;
-                let text = terminal.read(cx).dump_text(lines);
-                if text.trim().is_empty() {
-                    t!("ai_panel.tool_read_empty").to_string()
-                } else {
-                    text
-                }
-            }
-            _ => t!("ai_panel.tool_unknown", name = call.name.as_str()).to_string(),
-        }
-    }
-
-    /// Wait for an approved command's output to settle and hand it to the
-    /// model as the tool result.
-    ///
-    /// "Settled" is a heuristic, because a shell gives no signal that a
-    /// command finished unless it is integrated (OSC 133): the output is
-    /// sampled every [`OUTPUT_POLL`] and considered done after
-    /// [`OUTPUT_QUIET`] without any change, or after [`OUTPUT_TIMEOUT`] when
-    /// the command keeps printing. What the model gets is the text that
-    /// appeared *since* the command was written — that is the answer to
-    /// "run this", and it saves a round trip through `terminal_read`.
-    fn await_command_output(
-        &mut self,
-        msg_index: usize,
-        call_index: usize,
-        before: String,
-        cancel: ExecCancel,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.session.terminal.upgrade() else {
-            self.settle_tool_result(
-                msg_index,
-                call_index,
-                t!("ai_panel.tool_terminal_closed").to_string(),
-                ToolDecision::Allowed,
-                cx,
-            );
-            return;
-        };
-        let entity = cx.entity().downgrade();
-        cx.spawn(async move |_this, cx| {
-            let started = std::time::Instant::now();
-            let mut last = before.clone();
-            let mut quiet_since = std::time::Instant::now();
-            let mut timed_out = false;
-            let mut cancelled = false;
-            loop {
-                cx.background_executor().timer(OUTPUT_POLL).await;
-                if cancel.is_cancelled() {
-                    cancelled = true;
-                    break;
-                }
-                let Ok(now) =
-                    terminal.read_with(cx, |view, _cx| view.try_dump_text(AGENT_READ_LINES))
-                else {
-                    break; // terminal view went away
-                };
-                let Some(now) = now else {
-                    continue; // lock held by the reader thread; try next tick
-                };
-                if now != last {
-                    last = now;
-                    quiet_since = std::time::Instant::now();
-                } else if quiet_since.elapsed() >= OUTPUT_QUIET {
-                    break;
-                }
-                if started.elapsed() >= OUTPUT_TIMEOUT {
-                    timed_out = true;
-                    break;
-                }
-            }
-            let result = new_since(&before, &last);
-            let result = if result.trim().is_empty() {
-                if cancelled {
-                    // The caption under the fields already says it was
-                    // stopped; an empty body is honest.
-                    String::new()
-                } else if timed_out {
-                    t!("ai_panel.tool_exec_no_output_timeout").to_string()
-                } else {
-                    t!("ai_panel.tool_exec_no_output").to_string()
-                }
-            } else {
-                result
-            };
-            let _ = entity.update(cx, |panel, cx| {
-                panel.finish_tool_run(msg_index, call_index, result, cancelled, cx);
-            });
-        })
-        .detach();
-    }
-
-    /// Store a captured (`terminal_exec`) result: the output, plus the exit
-    /// status and timeout flag that let the card and the model-visible result
-    /// be honest about how the command ended.
-    fn finish_tool_capture(
-        &mut self,
-        msg_index: usize,
-        call_index: usize,
-        out: ExecOutput,
-        cx: &mut Context<Self>,
-    ) {
-        let text = cap_tool_result(out.output.trim_matches('\n'));
-        let text = if text.trim().is_empty() {
-            t!("ai_panel.tool_exec_no_output").to_string()
-        } else {
-            text
-        };
-        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
-            state.result = Some(text);
-            state.exit_code = out.exit_code;
-            state.timed_out = out.timed_out;
-            state.cancelled = out.cancelled;
-            state.running = false;
-        }
-        self.settle_tool(msg_index, call_index, cx);
-    }
-
-    /// Store a visible run's result: the output the screen gained, plus
-    /// whether the user ended the wait before it settled.
-    fn finish_tool_run(
-        &mut self,
-        msg_index: usize,
-        call_index: usize,
-        result: String,
-        cancelled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
-            state.result = Some(result);
-            state.cancelled = cancelled;
-            state.running = false;
-        }
-        self.settle_tool(msg_index, call_index, cx);
     }
 
     /// Stop a running tool call — the card's stop button. A captured command
@@ -3026,35 +1515,30 @@ impl AiPanel {
             for (call_ix, call) in msg.tool_calls.iter().enumerate() {
                 let tunnel = if ToolKind::of(&call.call.name) == ToolKind::Tunnel {
                     call.arg_str("tunnel_id").map(|token| {
-                        // `a…` ids resolve against this panel's own tunnels;
-                        // `t…` ids against the Tunnels-page registry (host-
-                        // scoped; anything else shows the token untouched).
-                        match token
-                            .strip_prefix('a')
-                            .and_then(|number| number.parse::<u64>().ok())
-                        {
-                            Some(agent_id) => self
-                                .agent_tunnels
-                                .iter()
-                                .find(|tunnel| tunnel.agent_id == agent_id)
-                                .map(|tunnel| tunnel.describe(self.tunnel_manager.as_ref()))
-                                .unwrap_or_else(|| token.to_string()),
-                            None => match token
-                                .strip_prefix('t')
-                                .and_then(|number| number.parse::<i64>().ok())
-                                .and_then(|config_id| {
-                                    self.session
-                                        .tunnels
-                                        .list()
-                                        .into_iter()
-                                        .find(|view| view.id == config_id)
-                                }) {
-                                Some(view) => {
-                                    format!("{} {} ({})", token, view.name, view.kind.as_str())
+                        // `a…` ids resolve against this panel's own agent (the
+                        // tunnels it defined); `t…` ids against the Tunnels-page
+                        // registry (host-scoped; anything else shows the token
+                        // untouched).
+                        self.agent
+                            .describe_tunnel_token(self.tunnel_manager.as_ref(), token)
+                            .unwrap_or_else(|| {
+                                let known = token
+                                    .strip_prefix('t')
+                                    .and_then(|number| number.parse::<i64>().ok())
+                                    .and_then(|config_id| {
+                                        self.session
+                                            .tunnels
+                                            .list()
+                                            .into_iter()
+                                            .find(|view| view.id == config_id)
+                                    });
+                                match known {
+                                    Some(view) => {
+                                        format!("{} {} ({})", token, view.name, view.kind.as_str())
+                                    }
+                                    None => token.to_string(),
                                 }
-                                None => token.to_string(),
-                            },
-                        }
+                            })
                     })
                 } else {
                     None
@@ -3511,309 +1995,6 @@ enum MessageItem {
         content: String,
         streaming: bool,
     },
-}
-
-/// The part of `after` that appeared since `before`, used to answer an
-/// `execute` call with the command's own output instead of the whole screen.
-///
-/// Terminals scroll, so the interesting text is the suffix the two dumps
-/// don't share; the common prefix is computed on bytes and then walked back
-/// to a char boundary so the slice can't panic on multi-byte output. The
-/// result is capped at [`MAX_TOOL_RESULT_BYTES`] (keeping the tail, which is
-/// where the interesting part of a long output lives) so a chatty command
-/// can't blow up the conversation's context.
-fn new_since(before: &str, after: &str) -> String {
-    let before = before.as_bytes();
-    let after_bytes = after.as_bytes();
-    let mut ix = 0;
-    while ix < before.len() && ix < after_bytes.len() && before[ix] == after_bytes[ix] {
-        ix += 1;
-    }
-    while ix > 0 && !after.is_char_boundary(ix) {
-        ix -= 1;
-    }
-    cap_tool_result(after[ix..].trim_matches('\n'))
-}
-
-/// Cap a tool result at [`MAX_TOOL_RESULT_BYTES`], keeping the tail (where a
-/// command's errors and summary usually are) and noting how much was dropped.
-/// The cut is walked to a char boundary so the slice can't panic on
-/// multi-byte output.
-fn cap_tool_result(text: &str) -> String {
-    if text.len() <= MAX_TOOL_RESULT_BYTES {
-        return text.to_string();
-    }
-    let mut cut = text.len() - MAX_TOOL_RESULT_BYTES;
-    while cut < text.len() && !text.is_char_boundary(cut) {
-        cut += 1;
-    }
-    format!("(earlier output omitted — {} bytes)\n{}", cut, &text[cut..])
-}
-
-/// Most bytes of an HTTP body a `fetch` reads before capping. Bounds the
-/// memory the read holds; the result is capped again for the model.
-const FETCH_BODY_LIMIT: u64 = 256 * 1024;
-
-/// Cap a tool result at [`MAX_TOOL_RESULT_BYTES`] keeping the *head* — used
-/// where the beginning of the text is the interesting part (HTTP bodies, file
-/// contents) — and note how much was dropped. The cut is walked back to a
-/// char boundary so the slice can't panic on multi-byte output.
-fn cap_tool_result_head(text: &str) -> String {
-    if text.len() <= MAX_TOOL_RESULT_BYTES {
-        return text.to_string();
-    }
-    let mut end = MAX_TOOL_RESULT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n(later output omitted — {} bytes)",
-        &text[..end],
-        text.len() - end
-    )
-}
-
-/// Send one HTTP request with CrabPort's own HTTP client, optionally through
-/// a proxy URL, and return the text to hand back to the model. Never fails:
-/// every problem becomes readable text.
-fn fetch_url(url: &str, proxy: Option<&str>, method: &str, body: Option<&str>) -> String {
-    let mut config = ureq::Agent::config_builder().timeout_global(Some(FETCH_TIMEOUT));
-    if let Some(proxy_url) = proxy {
-        match ureq::Proxy::new(proxy_url) {
-            Ok(proxy) => config = config.proxy(Some(proxy)),
-            Err(err) => return format!("invalid proxy url: {err}"),
-        }
-    }
-    let agent = ureq::Agent::new_with_config(config.build());
-
-    let outcome = match method {
-        "POST" => agent.post(url).send(body.unwrap_or_default()),
-        "PUT" => agent.put(url).send(body.unwrap_or_default()),
-        "DELETE" => agent.delete(url).call(),
-        "HEAD" => agent.head(url).call(),
-        _ => agent.get(url).call(),
-    };
-    match outcome {
-        Ok(mut resp) => {
-            let mut text = format!("HTTP {}\n", resp.status());
-            for (name, value) in resp.headers() {
-                text.push_str(&format!("{name}: {}\n", value.to_str().unwrap_or("…")));
-            }
-            match resp
-                .body_mut()
-                .with_config()
-                .limit(FETCH_BODY_LIMIT)
-                .read_to_string()
-            {
-                Ok(body_text) => {
-                    text.push('\n');
-                    text.push_str(&cap_tool_result_head(body_text.trim_end()));
-                }
-                Err(err) => text.push_str(&format!("\n(body unreadable: {err})")),
-            }
-            text
-        }
-        Err(err) => format!("request failed: {err}"),
-    }
-}
-
-/// Read up to [`READ_FILE_LIMIT`] bytes of a local file; binary content is
-/// reported rather than dumped. Never fails — every problem becomes text.
-fn read_local_file(path: &str) -> String {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) => return format!("cannot open {path}: {err}"),
-    };
-    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    let mut reader = file.take(READ_FILE_LIMIT);
-    let mut buf = Vec::new();
-    use std::io::Read as _;
-    if let Err(err) = reader.read_to_end(&mut buf) {
-        return format!("reading {path} failed: {err}");
-    }
-    if buf.contains(&0) {
-        return t!("ai_panel.tool_read_file_binary", bytes = size.to_string()).to_string();
-    }
-    cap_tool_result_head(&String::from_utf8_lossy(&buf))
-}
-
-/// List a local directory: one line per entry, directories marked with a
-/// trailing slash, capped at [`READ_DIR_LIMIT`]. Never fails — every problem
-/// becomes text.
-fn read_local_directory(path: &str) -> String {
-    let dir = match std::fs::read_dir(path) {
-        Ok(dir) => dir,
-        Err(err) => return format!("cannot list {path}: {err}"),
-    };
-    let mut rows: Vec<String> = Vec::new();
-    let mut overflow = 0usize;
-    for entry in dir {
-        let Ok(entry) = entry else { continue };
-        if rows.len() >= READ_DIR_LIMIT {
-            overflow += 1;
-            continue;
-        }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if is_dir {
-            rows.push(format!("{name}/"));
-        } else {
-            let size = entry
-                .metadata()
-                .map(|meta| meta.len().to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            rows.push(format!("{name}  {size}"));
-        }
-    }
-    if rows.is_empty() {
-        return t!("ai_panel.tool_dir_empty").to_string();
-    }
-    let mut out = rows.join("\n");
-    if overflow > 0 {
-        out.push('\n');
-        out.push_str(&t!("ai_panel.tool_dir_truncated", more = overflow));
-    }
-    out
-}
-
-/// Format a remote SFTP directory listing for the model: the resolved
-/// directory, then one line per entry (directories marked with a trailing
-/// slash), capped at [`READ_DIR_LIMIT`].
-fn format_remote_listing(cwd: &str, entries: &[crabport_sftp::FileEntry]) -> String {
-    let mut out = format!("{cwd}:\n");
-    for entry in entries.iter().take(READ_DIR_LIMIT) {
-        if entry.is_dir {
-            out.push_str(&format!("{}/\n", entry.name));
-        } else {
-            let size = entry
-                .size
-                .map(|bytes| bytes.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            out.push_str(&format!("{}  {size}\n", entry.name));
-        }
-    }
-    if entries.len() > READ_DIR_LIMIT {
-        out.push_str(&t!(
-            "ai_panel.tool_dir_truncated",
-            more = entries.len() - READ_DIR_LIMIT
-        ));
-    }
-    if entries.is_empty() {
-        return t!("ai_panel.tool_dir_empty").to_string();
-    }
-    out
-}
-
-/// Prefix a captured command with `cd <dir> &&` when the shell has reported
-/// its directory.
-///
-/// An out-of-band command starts in the login shell's directory (usually
-/// `$HOME`), not where the user's terminal is — so without this a `ls` would
-/// list the wrong directory. A visible run needs no prefix: it is typed into
-/// the very shell the user is looking at.
-fn with_cwd(command: &str, cwd: Option<&str>) -> String {
-    match cwd {
-        Some(dir) if !dir.is_empty() => format!("cd {} && {}", quote_shell(dir), command),
-        _ => command.to_string(),
-    }
-}
-
-/// Single-quote `text` for a POSIX shell, closing and reopening around
-/// embedded quotes (`'` → `'\''`). Enough for the directory names
-/// interpolated here, and the same quoting a user would expect from a shell.
-fn quote_shell(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
-/// Rough token size of one display turn, matching what its wire form costs:
-/// the content plus every tool call's arguments and result. Reasoning is not
-/// counted — it is display-only and never replayed.
-fn message_tokens(msg: &DisplayMessage) -> usize {
-    let mut total = MESSAGE_OVERHEAD_TOKENS + estimate_tokens(&msg.content);
-    for call in &msg.tool_calls {
-        total += TOOL_CALL_OVERHEAD_TOKENS
-            + estimate_tokens(&call.call.name)
-            + estimate_tokens(&call.call.arguments)
-            + call.result.as_deref().map(estimate_tokens).unwrap_or(0);
-    }
-    total
-}
-
-/// Index of the first message to keep verbatim when compacting a
-/// conversation.
-///
-/// Walks backwards, keeping messages until roughly `keep_tokens` is reached,
-/// then snaps the cut back to the user turn that opened that block: an
-/// assistant's tool calls and their results must travel together, and the
-/// kept tail reads best starting with the user's ask. `0` means "nothing old
-/// enough to summarize" — the caller then leaves the history alone.
-fn compaction_cut(messages: &[DisplayMessage], keep_tokens: usize) -> usize {
-    let mut used = 0usize;
-    for (ix, msg) in messages.iter().enumerate().rev() {
-        used += message_tokens(msg);
-        if used >= keep_tokens {
-            return messages[..=ix]
-                .iter()
-                .rposition(|msg| msg.role == DisplayRole::User)
-                .unwrap_or(0);
-        }
-    }
-    0
-}
-
-/// Plain-text transcript of the turns being compacted, for the summarizer.
-///
-/// Tool results are capped ([`COMPACT_RESULT_CAP`], tail kept) so a few huge
-/// command outputs can't make the compaction request larger than the
-/// conversation it is meant to shrink.
-fn compaction_transcript(messages: &[DisplayMessage]) -> String {
-    let mut out = String::new();
-    for msg in messages {
-        match msg.role {
-            DisplayRole::User => {
-                out.push_str("USER: ");
-                out.push_str(msg.content.trim());
-                out.push('\n');
-            }
-            DisplayRole::Summary => {
-                out.push_str("SUMMARY SO FAR: ");
-                out.push_str(msg.content.trim());
-                out.push('\n');
-            }
-            DisplayRole::Assistant => {
-                if !msg.content.trim().is_empty() {
-                    out.push_str("ASSISTANT: ");
-                    out.push_str(msg.content.trim());
-                    out.push('\n');
-                }
-                for call in &msg.tool_calls {
-                    out.push_str("  [");
-                    out.push_str(&call.call.name);
-                    out.push_str("] ");
-                    out.push_str(call.call.arguments.trim());
-                    if let Some(result) = &call.result {
-                        out.push_str(" -> ");
-                        out.push_str(cap_for_summary(result.trim()));
-                    }
-                    out.push('\n');
-                }
-            }
-        }
-    }
-    out
-}
-
-/// `text` shortened to [`COMPACT_RESULT_CAP`] from the front (keeping the
-/// tail, where a command's errors and summary usually are) when it is longer.
-fn cap_for_summary(text: &str) -> &str {
-    if text.len() <= COMPACT_RESULT_CAP {
-        return text;
-    }
-    let mut cut = text.len() - COMPACT_RESULT_CAP;
-    while cut < text.len() && !text.is_char_boundary(cut) {
-        cut += 1;
-    }
-    &text[cut..]
 }
 
 /// Fresh id for a conversation's session header. Only needs to be unique
@@ -4686,166 +2867,4 @@ fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyEl
         );
     }
     col.into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        COMPACT_RESULT_CAP, DisplayMessage, DisplayRole, MAX_TOOL_RESULT_BYTES, ToolCallState,
-        ToolDecision, ToolKind, cap_tool_result, cap_tool_result_head, compaction_cut,
-        compaction_transcript, format_remote_listing, message_tokens, quote_shell, with_cwd,
-    };
-
-    fn msg(role: DisplayRole, content: &str) -> DisplayMessage {
-        DisplayMessage {
-            role,
-            content: content.to_string(),
-            reasoning: String::new(),
-            reasoning_expanded: false,
-            tool_calls: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn tool_kind_maps_wire_names() {
-        assert_eq!(ToolKind::of("terminal_read"), ToolKind::TerminalRead);
-        assert_eq!(ToolKind::of("terminal_exec"), ToolKind::ExecCapture);
-        assert_eq!(ToolKind::of("terminal_run"), ToolKind::Run);
-        assert_eq!(ToolKind::of("terminal_execute"), ToolKind::Unknown);
-        assert_eq!(ToolKind::of("fetch"), ToolKind::Fetch);
-        assert_eq!(ToolKind::of("read_file"), ToolKind::LocalFs);
-        assert_eq!(ToolKind::of("read_directory"), ToolKind::LocalFs);
-        assert_eq!(ToolKind::of("tunnel_create"), ToolKind::Tunnel);
-        assert_eq!(ToolKind::of("tunnel_open"), ToolKind::Tunnel);
-        assert_eq!(ToolKind::of("tunnel_close"), ToolKind::Tunnel);
-        assert_eq!(ToolKind::of("tunnel_delete"), ToolKind::Tunnel);
-        assert_eq!(ToolKind::of("sftp_list"), ToolKind::Sftp);
-        assert_eq!(ToolKind::of("sftp_download"), ToolKind::Sftp);
-        assert_eq!(ToolKind::of("sftp_upload"), ToolKind::Sftp);
-        assert_eq!(ToolKind::of("sftp_delete"), ToolKind::Sftp);
-    }
-
-    /// A captured command starts where the user's terminal is, not in the
-    /// login shell's default directory — and paths with quotes/quotes-spaces
-    /// must survive the interpolation.
-    #[test]
-    fn with_cwd_prefixes_quoted_directory() {
-        assert_eq!(with_cwd("ls", None), "ls");
-        assert_eq!(with_cwd("ls", Some("")), "ls");
-        assert_eq!(with_cwd("ls", Some("/var/log")), "cd '/var/log' && ls");
-        assert_eq!(
-            with_cwd("cat file", Some("/tmp/it's here")),
-            "cd '/tmp/it'\\''s here' && cat file"
-        );
-    }
-
-    #[test]
-    fn quote_shell_escapes_single_quotes() {
-        assert_eq!(quote_shell("plain"), "'plain'");
-        assert_eq!(quote_shell("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn cap_tool_result_keeps_the_tail_on_a_char_boundary() {
-        let short = "hello";
-        assert_eq!(cap_tool_result(short), short);
-
-        // Multi-byte output longer than the cap: the cut must not split a
-        // char, and it must land near the end.
-        let long = "⇒".repeat(MAX_TOOL_RESULT_BYTES);
-        let capped = cap_tool_result(&long);
-        assert!(capped.len() < long.len());
-        assert!(capped.starts_with("(earlier output omitted"));
-        assert!(capped.ends_with("⇒"));
-    }
-
-    /// Compaction keeps the recent tail and snaps its cut back to a user
-    /// turn, so an assistant's tool calls never get separated from the
-    /// results that answer them.
-    #[test]
-    fn compaction_cut_keeps_recent_turns_and_snaps_to_user() {
-        let messages = vec![
-            msg(DisplayRole::User, "u1"),
-            msg(DisplayRole::Assistant, "a1"),
-            msg(DisplayRole::User, "u2"),
-            msg(DisplayRole::Assistant, "a2"),
-            msg(DisplayRole::User, "u3"),
-        ];
-        // A tiny budget keeps only the newest user turn.
-        assert_eq!(compaction_cut(&messages, 1), 4);
-        // A budget covering `u3` and `a2` snaps back to the turn that opened
-        // the block: `a2` must not travel without `u2`.
-        let keep = message_tokens(&messages[4]) + message_tokens(&messages[3]);
-        assert_eq!(compaction_cut(&messages, keep), 2);
-        // Everything fits: nothing old enough to summarize.
-        assert_eq!(compaction_cut(&messages, usize::MAX), 0);
-        assert_eq!(compaction_cut(&[], 10), 0);
-    }
-
-    /// The transcript fed to the summarizer labels roles, carries tool calls
-    /// with their results, and caps huge results so the compaction request
-    /// cannot be bigger than the history it is shrinking.
-    #[test]
-    fn compaction_transcript_labels_roles_and_caps_results() {
-        let long_result = "x".repeat(COMPACT_RESULT_CAP * 2);
-        let mut assistant = msg(DisplayRole::Assistant, "done");
-        assistant.tool_calls.push(ToolCallState {
-            call: crabport_ai::ToolCall {
-                id: "c1".into(),
-                name: "terminal_exec".into(),
-                arguments: r#"{"command":"ls"}"#.into(),
-            },
-            args: None,
-            decision: ToolDecision::Allowed,
-            result: Some(long_result.clone()),
-            running: false,
-            exit_code: Some(0),
-            timed_out: false,
-            cancel: crabport_terminal::terminal::ExecCancel::default(),
-            cancelled: false,
-        });
-        let text = compaction_transcript(&[msg(DisplayRole::User, "hi"), assistant]);
-        assert!(text.contains("USER: hi"), "{text}");
-        assert!(
-            text.contains("[terminal_exec] {\"command\":\"ls\"} -> "),
-            "{text}"
-        );
-        // The capped result must not carry more than one cap of text.
-        assert!(!text.contains(&"x".repeat(COMPACT_RESULT_CAP + 1)));
-    }
-
-    /// The head-keeping cap is for HTTP bodies and file contents: the
-    /// beginning survives, the dropped amount is noted, and multi-byte
-    /// output is never split.
-    #[test]
-    fn cap_tool_result_head_keeps_the_front_on_a_char_boundary() {
-        let short = "hello";
-        assert_eq!(cap_tool_result_head(short), short);
-
-        let long = "⇒".repeat(MAX_TOOL_RESULT_BYTES * 2);
-        let capped = cap_tool_result_head(&long);
-        assert!(capped.len() < long.len());
-        assert!(capped.contains("(later output omitted"));
-        assert!(capped.starts_with("⇒"));
-    }
-
-    /// A remote listing marks directories with a trailing slash, carries
-    /// sizes where known, and resolves the directory it lists.
-    #[test]
-    fn format_remote_listing_marks_dirs_and_sizes() {
-        let entry = |name: &str, is_dir: bool, size: Option<u64>| crabport_sftp::FileEntry {
-            name: name.to_string(),
-            is_dir,
-            size,
-            permissions: None,
-            modified: None,
-        };
-        let text = format_remote_listing(
-            "/var/log",
-            &[entry("src", true, None), entry("a.txt", false, Some(12))],
-        );
-        assert!(text.starts_with("/var/log:\n"), "{text}");
-        assert!(text.contains("src/\n"), "{text}");
-        assert!(text.contains("a.txt  12\n"), "{text}");
-    }
 }

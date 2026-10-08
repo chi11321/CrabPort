@@ -665,11 +665,30 @@ impl CrabportApp {
             return Some(panel.clone());
         }
         let view = self.pane_views.get(&pane_id)?.clone();
+        // Registry-tunnel mutations an agent tool asks for are drained here,
+        // on the UI thread: the registry itself is context-free, but starting
+        // / stopping / deleting a config goes through the app's own methods,
+        // which own the store and notify the Tunnels page. The task exits when
+        // the panel drops the sender.
+        let (registry_commands, command_rx) = async_channel::unbounded();
+        let app = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            use crate::views::panel::ai::RegistryCommand;
+            while let Ok(command) = command_rx.recv().await {
+                let _ = app.update(cx, |app, cx| match command {
+                    RegistryCommand::Open { config_id, tab_id } => {
+                        app.start_tunnel_borrowed(config_id, tab_id, cx)
+                    }
+                    RegistryCommand::Close(config_id) => app.stop_tunnel(config_id, cx),
+                    RegistryCommand::Delete(config_id) => app.remove_tunnel(config_id, cx),
+                });
+            }
+        })
+        .detach();
         let session = crate::views::panel::ai::AiSession {
-            pane_id,
             terminal: view.downgrade(),
             tunnels: self.app_ctx.tunnels.clone(),
-            app: cx.entity().downgrade(),
+            registry_commands,
         };
         let panel = cx.new(|_cx| crate::views::panel::ai::AiPanel::new(session));
         self.ai_panels.insert(pane_id, panel.clone());

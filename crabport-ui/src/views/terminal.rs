@@ -58,6 +58,28 @@ mod selection;
 
 // ---- TerminalView ----
 
+/// Cx-free handles into one terminal session, for work that must run off the
+/// UI thread — the AI agent's tools. Both the session and the backend are
+/// shared `Arc`s, so a snapshot taken with [`TerminalView::agent_handles`]
+/// keeps working without an entity read, and keeps pointing at the session
+/// that was current when it was taken.
+pub struct AgentTerminalHandles {
+    /// The session's grid + input/output plumbing (dump, write, exec,
+    /// SFTP).
+    pub session: Arc<TerminalSession>,
+    /// The backend itself — needed for the callback-style
+    /// [`crabport_terminal::terminal::CrabPortTerminal::exec_capture`].
+    pub backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+    /// The SSH connection a tunnel may borrow, when this is an SSH session.
+    pub tunnel_source: Option<Arc<dyn CrabPortTunnel>>,
+    /// Persisted host id, for filtering the Tunnels-page registry.
+    pub host_id: Option<i64>,
+    /// The pane id this view was created with (see [`TerminalView::pane_id`]).
+    pub pane_id: u64,
+    /// Directory the shell last reported (OSC 7), as of the snapshot.
+    pub cwd: Option<String>,
+}
+
 /// Snapshot of an in-flight SFTP transfer, surfaced to the toolbar so the
 /// user can see which stage (compress / transfer / decompress / cleanup)
 /// is currently running and which path it's working on.
@@ -1476,6 +1498,20 @@ impl TerminalView {
     /// The tunnel source Arc, if any (for SSH tabs).
     pub fn tunnel_source_arc(&self) -> Option<Arc<dyn CrabPortTunnel>> {
         self.tunnel_source.clone()
+    }
+
+    /// Cx-free handles into this session, snapshotted for work that must run
+    /// off the UI thread (the AI agent's tools — see
+    /// [`crate::views::panel::ai`]).
+    pub fn agent_handles(&self) -> AgentTerminalHandles {
+        AgentTerminalHandles {
+            session: self.session.clone(),
+            backend: self.backend.clone(),
+            tunnel_source: self.tunnel_source.clone(),
+            host_id: self.host_id,
+            pane_id: self.count,
+            cwd: self.last_cwd.clone(),
+        }
     }
 
     /// Set the tunnel source (optional builder, used by split-pane creation
