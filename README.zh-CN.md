@@ -1,6 +1,6 @@
 <p align="center">
   <img src="./assets/readme/hero.zh-CN.svg" width="100%"
-       alt="CrabPort —— 基于 Rust + GPUI 的 SSH / Telnet / 串口 / SFTP / 隧道 / 代理 终端">
+       alt="CrabPort —— 基于 Rust + GPUI 的 SSH / Telnet / 串口 / SFTP / 隧道 / 代理 / 内置轻量 AI Agent 终端">
 </p>
 
 <p align="center">
@@ -16,9 +16,9 @@
 
 ---
 
-CrabPort 旨在实现一个把 SSH、Telnet、串口、SFTP、隧道和代理路由收进同一窗口的跨平台终端 —— 使用 Rust 编写，基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 编辑器的 GPU 加速 UI 框架）渲染。
+CrabPort 旨在实现一个把 SSH、Telnet、串口、SFTP、隧道、代理路由和内置轻量 AI Agent 收进同一窗口的跨平台终端 —— 使用 Rust 编写，基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 编辑器的 GPU 加速 UI 框架）渲染。
 
-每条主机配置自带凭据、代理和串口参数；打开终端标签页时，如果后端支持，SFTP、隧道和命令历史会一并挂载。凭据使用 AES-256-GCM 在本地加密存储。
+每条主机配置自带凭据、代理和串口参数；打开终端标签页时，如果后端支持，SFTP、隧道和命令历史会一并挂载，另有一个专属的 AI 助手面板。凭据使用 AES-256-GCM 在本地加密存储。
 
 ## 截图
 
@@ -32,17 +32,28 @@ CrabPort 旨在实现一个把 SSH、Telnet、串口、SFTP、隧道和代理路
 
 <p align="center">
   <img src="./assets/readme/features.zh-CN.svg" width="100%"
-       alt="功能网格：多标签终端、SFTP 面板、SSH 隧道、代理路由、串口、凭据加密、历史与片段、主题、设置">
+       alt="功能网格：多标签终端、SFTP 面板、SSH 隧道、代理路由、串口、凭据加密、历史与片段、主题、设置，以及能在终端会话里干活的内置轻量 AI Agent">
 </p>
+
+## 内置轻量 AI Agent
+
+每个终端标签页都自带一个轻量 AI Agent，而且它不只是回答问题——它能在那个会话里干活：读取终端输出、在带外执行命令或把命令敲进实时终端、读取本地文件与目录、发起 HTTP 请求、在当前连接上定义临时隧道，以及通过 SFTP 浏览和传输文件。
+
+<p align="center">
+  <img src="./assets/readme/ai-agent.zh-CN.svg" width="100%"
+       alt="一张工具调用审批卡片：写明要执行的命令，右侧是拒绝与允许按钮；旁边是 Agent 的工具清单和按工具的权限设置">
+</p>
+
+任何操作都先经过你。每次工具调用都会有一张卡片，写明确切的命令或路径、以及它想达成什么，由你决定拒绝还是允许。信得过的工具可以按工具设置为不再询问，不想让它碰的直接拒绝——都在「设置 → AI → Agent 权限」里。长对话会自动压缩历史，工作可以一直继续，不会卡在模型的上下文窗口上。
 
 ## 架构概览
 
 <p align="center">
   <img src="./assets/readme/architecture.zh-CN.svg" width="100%"
-       alt="示意图：主机配置经由代理层流向 SSH / Telnet / 串口后端，再驱动一个挂载了 SFTP、隧道和历史的终端标签页">
+       alt="示意图：主机配置经由代理层流向 SSH / Telnet / 串口后端，再驱动一个挂载了 SFTP、隧道、历史和轻量 AI Agent 的终端标签页">
 </p>
 
-每条主机记录把连接类型、凭据、代理和串口参数存入本地 SQLite 数据库。代理层包裹传输（直连 TCP、SOCKS5 或 HTTP(S) CONNECT），再把流交给 SSH（russh）、Telnet（RFC 854）或串口（`serialport`）后端。所有后端共享同一个 tokio 运行时；SSH 后端额外向标签页暴露 SFTP、隧道和命令历史。
+每条主机记录把连接类型、凭据、代理和串口参数存入本地 SQLite 数据库。代理层包裹传输（直连 TCP、SOCKS5 或 HTTP(S) CONNECT），再把流交给 SSH（russh）、Telnet（RFC 854）或串口（`serialport`）后端。所有后端共享同一个 tokio 运行时；SSH 后端额外向标签页暴露 SFTP、隧道和命令历史。轻量 AI Agent（`crabport-agent` crate）驱动的也是这条会话：工具在后台线程运行，每次调用都先在面板里等你确认。
 
 ## 下载安装
 
@@ -150,7 +161,7 @@ cargo install cargo-bundle --locked
 
 <p align="center">
   <img src="./assets/readme/roadmap.zh-CN.svg" width="100%"
-       alt="路线图：已完成——设置、主题、连接、SFTP、隧道、代理、历史；待办——会话同步、插件">
+       alt="路线图：已完成——设置、主题、连接、SFTP、隧道、代理、历史、内置轻量 AI Agent；待办——会话同步、插件">
 </p>
 
 ## 许可证

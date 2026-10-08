@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="1200" height="380" viewBox="0 0 1200 380"
+     width="1200" height="404" viewBox="0 0 1200 404"
      role="img" aria-labelledby="arch-title arch-desc">
   <title id="arch-title">CrabPort 连接是如何串起来的</title>
-  <desc id="arch-desc">主机配置（含代理与凭据）经由代理层连接到 SSH / Telnet / 串口后端，再驱动一个终端标签页。SFTP、隧道与命令面板挂载到 SSH 后端。</desc>
+  <desc id="arch-desc">主机配置（含代理与凭据）经由代理层连接到 SSH / Telnet / 串口后端，再驱动一个终端标签页。SFTP、隧道、命令面板与 AI Agent 挂载到这条会话上。</desc>
 
-  <rect width="1200" height="380" rx="26" fill="#14161c"/>
-  <rect x="1" y="1" width="1198" height="378" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+  <rect width="1200" height="404" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="402" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
 
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -67,19 +67,20 @@
 
   <!-- 终端标签页 -->
   <g transform="translate(844 130)">
-    <rect x="0" y="0" width="292" height="120" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <rect x="0" y="0" width="292" height="144" rx="10" fill="#0f1116" stroke="#23262f"/>
     <text x="16" y="28" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="600" fill="#8b90a0" letter-spacing="1">终端标签页</text>
     <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#c1c5d0">
       <text x="16" y="54"><tspan fill="#4ade80" font-weight="600">$</tspan> alacritty_terminal PTY</text>
       <text x="16" y="74" fill="#818cf8">+ SFTP 面板</text>
       <text x="16" y="94" fill="#818cf8">+ 隧道（L/R/D）</text>
       <text x="16" y="112" fill="#818cf8">+ 历史与片段</text>
+      <text x="16" y="134" fill="#818cf8">+ 轻量 AI Agent（每次调用先确认）</text>
     </g>
   </g>
 
-  <text x="64" y="316"
+  <text x="64" y="344"
         font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
         font-size="15" fill="#8b90a0">
-    每条主机自带代理与凭据；SSH 后端额外暴露 SFTP、隧道与命令历史。
+    每条主机自带代理与凭据；SSH 后端额外暴露 SFTP、隧道与命令历史，AI Agent 驱动的也是这条会话。
   </text>
 </svg>

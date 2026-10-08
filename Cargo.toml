@@ -85,5 +85,5 @@ gpui-component = { path = "vendor/gpui-component" }
 # we intentionally do NOT set `[package.metadata.bundle].version` so there
 # is nothing to keep in sync. Bumping a release only touches this one line.
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"

@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="1200" height="420" viewBox="0 0 1200 420"
+     width="1200" height="460" viewBox="0 0 1200 460"
      role="img" aria-labelledby="roadmap-title roadmap-desc">
   <title id="roadmap-title">CrabPort roadmap</title>
-  <desc id="roadmap-desc">Done: settings panel, configurable themes, SSH/Telnet/serial/local terminal connections, SFTP file management, port forwarding / SSH tunnels, proxy connections, command history and snippets. Planned: terminal session sync, plugin system.</desc>
+  <desc id="roadmap-desc">Done: settings panel, configurable themes, SSH/Telnet/serial/local terminal connections, SFTP file management, port forwarding / SSH tunnels, proxy connections, command history and snippets, and the built-in AI agent. Planned: terminal session sync, plugin system.</desc>
 
-  <rect width="1200" height="420" rx="26" fill="#14161c"/>
-  <rect x="1" y="1" width="1198" height="418" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+  <rect width="1200" height="460" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="458" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
 
   <defs>
     <symbol id="check" viewBox="0 0 16 16">
@@ -47,11 +47,13 @@
       <text x="28" y="224">Proxy connections</text>
       <use href="#check" x="0" y="248" width="16" height="16"/>
       <text x="28" y="262">Command history &amp; snippets</text>
+      <use href="#check" x="0" y="286" width="16" height="16"/>
+      <text x="28" y="300">Built-in AI agent</text>
     </g>
   </g>
 
   <!-- vertical divider -->
-  <line x1="740" y1="120" x2="740" y2="380" stroke="#23262f" stroke-width="1"/>
+  <line x1="740" y1="120" x2="740" y2="420" stroke="#23262f" stroke-width="1"/>
 
   <!-- RIGHT column: Planned -->
   <g transform="translate(792 120)">

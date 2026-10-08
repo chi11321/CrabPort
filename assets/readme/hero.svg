@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg"
      width="1200" height="360" viewBox="0 0 1200 360"
      role="img" aria-labelledby="hero-title hero-desc">
-  <title id="hero-title">CrabPort — a GPU-accelerated Rust terminal for SSH, Telnet, serial, SFTP, tunnels, and proxies</title>
+  <title id="hero-title">CrabPort — a GPU-accelerated Rust terminal for SSH, Telnet, serial, SFTP, tunnels, proxies, and a lightweight AI agent</title>
   <desc id="hero-desc">Left: project category, name, one-line value, a port-node connection motif, and platform / Rust / license metadata. Right: a stylized terminal + SFTP split panel using the project's modern-dark palette.</desc>
 
   <!-- Background: project's modern-dark base, with its own fill so it reads on GitHub light & dark -->
@@ -46,7 +46,7 @@
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif"
           font-size="24" font-weight="500"
           fill="#8b90a0">
-      SFTP, tunnels, and proxies — built in Rust.
+      SFTP, tunnels, proxies — a lightweight AI agent, in Rust.
     </text>
 
     <!-- port-node connection motif: saved hosts as ports linked together.

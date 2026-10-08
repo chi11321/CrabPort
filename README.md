@@ -1,6 +1,6 @@
 <p align="center">
   <img src="./assets/readme/hero.svg" width="100%"
-       alt="CrabPort — a GPU-accelerated Rust terminal for SSH, Telnet, serial, SFTP, tunnels, and proxies">
+       alt="CrabPort — a GPU-accelerated Rust terminal for SSH, Telnet, serial, SFTP, tunnels, proxies, and a built-in lightweight AI agent">
 </p>
 
 <p align="center">
@@ -16,9 +16,9 @@
 
 ---
 
-CrabPort aims to be a cross-platform terminal that brings SSH, Telnet, serial, SFTP, tunnels, and proxy routing into one window — written in Rust and rendered with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the GPU-accelerated UI framework behind the Zed editor.
+CrabPort aims to be a cross-platform terminal that brings SSH, Telnet, serial, SFTP, tunnels, proxy routing, and a built-in lightweight AI agent into one window — written in Rust and rendered with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the GPU-accelerated UI framework behind the Zed editor.
 
-One host entry carries its own credentials, proxy, and serial settings; a terminal tab opens with SFTP, tunnels, and shell history attached when the backend supports them. Credentials are encrypted at rest with AES-256-GCM.
+One host entry carries its own credentials, proxy, and serial settings; a terminal tab opens with SFTP, tunnels, and shell history attached when the backend supports them, plus its own AI assistant panel. Credentials are encrypted at rest with AES-256-GCM.
 
 ## Screenshots
 
@@ -32,17 +32,28 @@ One host entry carries its own credentials, proxy, and serial settings; a termin
 
 <p align="center">
   <img src="./assets/readme/features.svg" width="100%"
-       alt="Feature grid: multi-tab terminal, SFTP panel, SSH tunnels, proxy routing, serial, encrypted credentials, history and snippets, themes, settings">
+       alt="Feature grid: multi-tab terminal, SFTP panel, SSH tunnels, proxy routing, serial, encrypted credentials, history and snippets, themes, settings, and a lightweight built-in AI agent that works in the terminal session">
 </p>
+
+## Built-in lightweight AI agent
+
+Every terminal tab carries its own lightweight AI agent, and it does more than answer questions: it can work in that session — read the terminal's output, run a command out of band or type one into the live shell, read local files and directories, send HTTP requests, define temporary tunnels on the tab's connection, and browse and transfer files over SFTP.
+
+<p align="center">
+  <img src="./assets/readme/ai-agent.svg" width="100%"
+       alt="An approval card showing the exact command it wants to run with Deny and Allow buttons, next to the agent's tool list and its per-tool permission setting">
+</p>
+
+Nothing runs without you. Every tool call shows a card with the exact command or path and what the model expects from it; you deny or allow it there. Tools you trust can be switched to run without asking, and ones it should never touch can be denied outright — per tool, under Settings → AI → Agent permissions. Long conversations are compacted automatically, so the work keeps going past the model's context window.
 
 ## How it fits together
 
 <p align="center">
   <img src="./assets/readme/architecture.svg" width="100%"
-       alt="Diagram: host config flows through the proxy layer to an SSH/Telnet/serial backend, which powers a terminal tab with SFTP, tunnels, and history attached">
+       alt="Diagram: host config flows through the proxy layer to an SSH/Telnet/serial backend, which powers a terminal tab with SFTP, tunnels, history, and the lightweight AI agent attached">
 </p>
 
-Each host entry stores its connection kind, credentials, proxy, and serial settings in a local SQLite database. The proxy layer wraps the transport (direct TCP, SOCKS5, or HTTP(S) CONNECT) before handing the stream to the SSH (russh), Telnet (RFC 854), or serial (`serialport`) backend. All backends share a single tokio runtime. SSH backends additionally expose SFTP, tunnels, and shell history to the tab.
+Each host entry stores its connection kind, credentials, proxy, and serial settings in a local SQLite database. The proxy layer wraps the transport (direct TCP, SOCKS5, or HTTP(S) CONNECT) before handing the stream to the SSH (russh), Telnet (RFC 854), or serial (`serialport`) backend. All backends share a single tokio runtime. SSH backends additionally expose SFTP, tunnels, and shell history to the tab. The lightweight AI agent (the `crabport-agent` crate) drives that same session: its tools run off the UI thread, and every call waits for an approval in the panel before anything happens.
 
 ## Download
 
@@ -151,7 +162,7 @@ Contents:
 
 <p align="center">
   <img src="./assets/readme/roadmap.svg" width="100%"
-       alt="Roadmap: done — settings, themes, connections, SFTP, tunnels, proxy, history; planned — session sync, plugins">
+       alt="Roadmap: done — settings, themes, connections, SFTP, tunnels, proxy, history, the lightweight built-in AI agent; planned — session sync, plugins">
 </p>
 
 ## License

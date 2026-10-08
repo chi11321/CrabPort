@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg"
      width="1200" height="360" viewBox="0 0 1200 360"
      role="img" aria-labelledby="hero-title hero-desc">
-  <title id="hero-title">CrabPort —— 基于 Rust + GPUI 的 SSH / Telnet / 串口 / SFTP / 隧道 / 代理 终端</title>
+  <title id="hero-title">CrabPort —— 基于 Rust + GPUI 的 SSH / Telnet / 串口 / SFTP / 隧道 / 代理 / 内置轻量 AI Agent 终端</title>
   <desc id="hero-desc">左侧：项目类别、名称、一句话价值、端口节点连接示意与平台 / Rust / 许可证元数据。右侧：使用项目 modern-dark 配色的终端 + SFTP 分栏示意。</desc>
 
   <rect width="1200" height="360" rx="26" fill="#14161c"/>
@@ -34,13 +34,13 @@
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
           font-size="24" font-weight="500"
           fill="#8b90a0">
-      把 SSH、Telnet、串口、SFTP、隧道
+      把 SSH、Telnet、串口、SFTP、隧道、代理
     </text>
     <text x="0" y="160"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
           font-size="24" font-weight="500"
           fill="#8b90a0">
-      与代理收进一个窗口 —— 用 Rust 构建。
+      与内置轻量 AI 助手收进一个窗口 —— 用 Rust 构建。
     </text>
 
     <!-- 端口节点连接示意 -->
