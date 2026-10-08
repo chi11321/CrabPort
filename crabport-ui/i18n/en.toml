@@ -539,6 +539,9 @@ tool_sftp_transfer_timeout = "Transfer still running after %{mins} min."
 compacting = "Compacting context…"
 compact_failed = "Context compaction failed"
 context_summary = "Earlier conversation compacted into a summary"
+table_more = "… %{more} more not shown"
+tool_wait_stopped = "Stopped waiting — the operation may still be running in the background."
+tool_cancelled_by_run = "Skipped — the user cancelled this turn."
 
 [window.settings.general]
 section_startup = "Startup"

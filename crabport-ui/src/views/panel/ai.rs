@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_broadcast::Receiver;
 use gpui::prelude::FluentBuilder;
@@ -47,7 +47,7 @@ use rust_i18n::t;
 use crabport_agent::limits::EXEC_CAPTURE_TIMEOUT;
 use crabport_agent::{
     Agent, AgentSession, COMPACTED_HEADER, COMPACTION_PROMPT, CompactCall, CompactTurn, Executed,
-    RegistryTunnel, ToolKind, ToolOutcome, TurnRole, agent_tools, compaction_cut,
+    RegistryTunnel, ToolKind, ToolOutcome, ToolTable, TurnRole, agent_tools, compaction_cut,
     compaction_transcript, system_prompt,
 };
 use crabport_ai::{
@@ -132,6 +132,10 @@ struct ToolCallState {
     /// Result text: tool output, or why it was refused. `None` while the call
     /// is still running (or still waiting for a decision).
     result: Option<String>,
+    /// Native table the card renders instead of the code fence, when the
+    /// result is an enumerable list (tunnel list, directory listing). The
+    /// same cells went to the model as `text` in JSON.
+    table: Option<ToolTable>,
     /// True between approving an execution and its output settling — the card
     /// shows a running state and the loop waits instead of continuing.
     running: bool,
@@ -145,6 +149,16 @@ struct ToolCallState {
     /// Token that stops the running execution — the card's stop button
     /// flips it. A fresh token per call, harmless once the call is done.
     cancel: ExecCancel,
+    /// Whether the card shows its body (fields, result) or folds to just the
+    /// header line, like the thinking section. Ignored while the card needs
+    /// attention (pending approval, running) — those always stay expanded.
+    expanded: bool,
+    /// When execution started; feeds the card's elapsed readout while the
+    /// call runs. `None` for a call that never got to run (refused, denied).
+    started_at: Option<Instant>,
+    /// How long the run took, once it settled — shown on the card when the
+    /// wait was nontrivial. `None` for refusals, denials and instant results.
+    ran_for: Option<Duration>,
     /// True when the user stopped this call while it was running.
     cancelled: bool,
 }
@@ -172,7 +186,7 @@ impl ToolCallState {
         if self.cancelled {
             let note = match ToolKind::of(&self.call.name) {
                 ToolKind::ExecCapture => "[stopped by the user; output so far]",
-                _ => "[stopped waiting; the command may still be running in the terminal]",
+                _ => "[stopped waiting; the operation may still be running in the background]",
             };
             return format!("{note}\n{body}");
         }
@@ -543,6 +557,13 @@ pub struct AiPanel {
     /// so the user lands on the new content — scrolling at the moment of the
     /// rewrite would be a no-op, the list still holds the old row count.
     scroll_to_end_pending: bool,
+    /// Messages typed while the assistant was busy (streaming, compacting
+    /// or awaiting tool decisions), oldest first. Drained one per idle
+    /// break — when a reply finishes, the head goes out on its own. The tail
+    /// (last entry) is the only one the user can edit; any entry can be
+    /// deleted; pressing Enter on an empty input while a message is queued
+    /// cancels what is in flight and sends the head immediately.
+    queue: Vec<String>,
 }
 
 impl AiPanel {
@@ -573,6 +594,7 @@ impl AiPanel {
             compaction: None,
             status: None,
             scroll_to_end_pending: false,
+            queue: Vec::new(),
         }
     }
 
@@ -658,10 +680,9 @@ impl AiPanel {
 
     /// A plain Enter in the input area. The editor inserts the newline
     /// *before* emitting `PressEnter`, so Enter on a box with nothing to
-    /// send would leave that newline sitting there — a real send clears the
-    /// box anyway, but an empty one has nothing to clear, so drop it here
-    /// (`pending_clear` is applied on the next `set_state`, which has the
-    /// window the clear needs).
+    /// send would leave that newline sitting there. With messages queued,
+    /// the bare Enter instead means "stop what is running, send the queue"
+    /// (see [`Self::send_queued_cancel_run`]).
     fn submit(&mut self, cx: &mut Context<Self>) {
         let empty = self
             .input
@@ -669,11 +690,38 @@ impl AiPanel {
             .map(|state| state.read(cx).value().trim().is_empty())
             .unwrap_or(true);
         if empty {
-            self.pending_clear = true;
-            cx.notify();
+            if self.queue.is_empty() {
+                self.pending_clear = true;
+                cx.notify();
+            } else {
+                self.send_queued_cancel_run(cx);
+            }
+            return;
+        }
+        // The agent is busy working (streaming, compacting, or waiting on
+        // tools): the draft joins the queue instead of interrupting anything,
+        // and goes out on its own once the panel is idle again.
+        if self.is_busy() {
+            let text = self
+                .input
+                .as_ref()
+                .map(|state| state.read(cx).value().trim().to_string())
+                .unwrap_or_default();
+            if !text.is_empty() {
+                self.queue.push(text);
+                self.pending_clear = true;
+                cx.notify();
+            }
             return;
         }
         self.send(cx);
+    }
+
+    /// Whether the agent is mid-task: streaming, compacting, or waiting for
+    /// a tool's approval or result — the states into which a fresh send
+    /// either queues or is refused.
+    fn is_busy(&self) -> bool {
+        self.stream.is_some() || self.compaction.is_some() || self.pending_tool_calls() > 0
     }
 
     fn ensure_combo_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -715,6 +763,16 @@ impl AiPanel {
         // the wire request, so it is included exactly once. Sending always
         // lands the view on the newest content — their message and the reply
         // streaming in under it — even if they had scrolled up to read.
+        self.commit_and_send(text, cx);
+
+        self.pending_clear = true;
+    }
+
+    /// Commit a user turn and start the turn for it — the identical path the
+    /// first send and every queued hand-off walk, compaction included.
+    /// A send always lands the view on the newest content (the user's own
+    /// message), even if they had scrolled up to read.
+    fn commit_and_send(&mut self, text: String, cx: &mut Context<Self>) {
         self.messages.push(DisplayMessage {
             role: DisplayRole::User,
             content: text,
@@ -722,11 +780,102 @@ impl AiPanel {
             reasoning_expanded: false,
             tool_calls: Vec::new(),
         });
-        self.scroll_list_to_end();
-
-        self.pending_clear = true;
+        // Deferred to render (see `settle_tool`): the new row's height is
+        // measured next layout; scrolling now would land just short.
+        self.scroll_to_end_pending = true;
         // Compacts first when the request would be too large, then sends.
         self.continue_after_tools(cx);
+    }
+
+    /// Send one queued message when the panel is idle again — the normal
+    /// hand-off after a reply (or a turn's tool chain) completes. One at a
+    /// time: the next goes out when the reply to this one finishes.
+    fn send_queued(&mut self, cx: &mut Context<Self>) {
+        if self.queue.is_empty() || self.is_busy() {
+            return;
+        }
+        let text = self.queue.remove(0);
+        self.commit_and_send(text, cx);
+        cx.notify();
+    }
+
+    /// Enter on an empty input while messages are queued: cancel everything
+    /// in flight — the reply stream, a compaction, and every running or
+    /// still-unapproved tool call — then send the queue head immediately.
+    /// The queue keeps its remaining entries; they go out one per turn as
+    /// usual.
+    fn send_queued_cancel_run(&mut self, cx: &mut Context<Self>) {
+        if self.queue.is_empty() {
+            return;
+        }
+        if let Some(stream) = &self.stream {
+            stream.cancel();
+        }
+        if let Some(plan) = &self.compaction {
+            plan.stream.cancel();
+        }
+        // The cancelled pieces finalize through generation-guarded updates
+        // that get dropped once the new turn starts; close them out in the
+        // panel state here so the send below is not blocked.
+        self.stream = None;
+        self.compaction = None;
+        self.status = None;
+        self.generation += 1;
+        // Every unresolved tool call is skipped: running ones record
+        // "stopped waiting" (what the card's stop button does), unapproved
+        // ones are refused with a note — the wire history can only carry
+        // calls with resolved results.
+        for msg_index in 0..self.messages.len() {
+            for call_index in 0..self.messages[msg_index].tool_calls.len() {
+                let Some(state) = self.tool_state_mut(msg_index, call_index) else {
+                    continue;
+                };
+                let changed = state.running
+                    || (state.decision == ToolDecision::Pending && state.result.is_none());
+                if state.running {
+                    state.cancel.cancel();
+                    state.cancelled = true;
+                    state.table = None;
+                    state.result = Some(t!("ai_panel.tool_wait_stopped").to_string());
+                    state.running = false;
+                    state.ran_for = state.started_at.map(|started| started.elapsed());
+                } else if state.decision == ToolDecision::Pending && state.result.is_none() {
+                    state.decision = ToolDecision::Denied;
+                    state.result = Some(t!("ai_panel.tool_cancelled_by_run").to_string());
+                }
+                if changed {
+                    // The card's look changed (buttons or loader gone);
+                    // let the list re-measure it.
+                    let row = self.list_row_of_tool_call(msg_index, call_index);
+                    if row < self.list_state.item_count() {
+                        self.list_state.splice(row..row + 1, 1);
+                    }
+                }
+            }
+        }
+        self.refresh_context_used();
+        let text = self.queue.remove(0);
+        self.commit_and_send(text, cx);
+        cx.notify();
+    }
+
+    /// Put a queued entry back into the input for editing; only the queue's
+    /// tail offers this (the entries go out head-first, so the tail is the
+    /// one still waiting). The entry leaves the queue while edited; a
+    /// re-submit while busy re-queues it.
+    fn edit_queued(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.queue.len() {
+            return;
+        }
+        let text = self.queue.remove(index);
+        if let Some(input) = self.input.clone()
+            && !text.is_empty()
+        {
+            input.update(cx, |state, cx| state.set_value(text.clone(), window, cx));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_empty = text.trim().is_empty();
+        }
+        cx.notify();
     }
 
     /// Spawn the worker for one request and pump its events into the panel.
@@ -747,6 +896,11 @@ impl AiPanel {
         self.stream_buf.clear();
         self.stream_reasoning.clear();
         self.error = None;
+        // The "responding" row appears now; when the user was already pinned
+        // to the bottom, keep them there. The scroll must wait for render's
+        // splice (the row count only changes there) — `scroll_to_end_pending`
+        // is exactly that deferred scroll.
+        self.scroll_to_end_pending = self.is_list_at_bottom();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -827,6 +981,9 @@ impl AiPanel {
         // The turn changed the history; keep the context chip honest.
         self.refresh_context_used();
         cx.notify();
+        // The panel is idle again (unless tool calls just opened): hand off
+        // the queue head now, or leave it for the next idle break.
+        self.send_queued(cx);
     }
 
     /// Attach the tool calls from one assistant turn to the conversation.
@@ -859,10 +1016,14 @@ impl AiPanel {
                     args,
                     decision: ToolDecision::Pending,
                     result: None,
+                    table: None,
                     running: false,
                     exit_code: None,
                     timed_out: false,
                     cancel: ExecCancel::default(),
+                    started_at: None,
+                    ran_for: None,
+                    expanded: true,
                     cancelled: false,
                 };
                 if let Some(reason) = blocked(&state.call.name) {
@@ -892,11 +1053,12 @@ impl AiPanel {
         // The last row grew (or a new one appeared); make sure the list
         // re-measures it, and bring it into view when the user is at the
         // bottom — there is something to approve. Scrolled-up readers keep
-        // their place.
+        // their place. Deferred to render (see `settle_tool`), so the scroll
+        // lands after the new card rows are measured.
         let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
         if stick {
-            self.scroll_list_to_end();
+            self.scroll_to_end_pending = true;
         }
 
         // Calls the Agent settings already decided: `Allow` runs them now,
@@ -1067,6 +1229,12 @@ impl AiPanel {
             );
             return;
         };
+        // The card's elapsed readout starts with the run (also applies to
+        // synchronously-completing calls, so long waits like `tunnel_list`'s
+        // network work read honestly).
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.started_at = Some(Instant::now());
+        }
         match self.agent.run(&session, &name, &args) {
             Executed::Done(outcome) => self.finish_tool(msg_index, call_index, outcome, cx),
             Executed::Refused(reason) => {
@@ -1084,9 +1252,12 @@ impl AiPanel {
                 let stick = self.is_list_at_bottom();
                 self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
                 if stick {
-                    self.scroll_list_to_end();
+                    self.scroll_to_end_pending = true;
                 }
                 cx.notify();
+                // The card now shows a running state with an elapsed readout
+                // that has to tick.
+                self.spawn_elapsed_ticker(cx);
                 let entity = cx.entity().downgrade();
                 cx.spawn(async move |_this, cx| {
                     // The agent sends exactly once; a closed channel without
@@ -1104,6 +1275,10 @@ impl AiPanel {
     }
 
     /// Store one finished call's outcome on its card and continue the loop.
+    ///
+    /// A late arrival after the user already stopped waiting for the call is
+    /// ignored — the "stopped waiting" record must not be overwritten, and
+    /// the loop already moved on.
     fn finish_tool(
         &mut self,
         msg_index: usize,
@@ -1112,13 +1287,60 @@ impl AiPanel {
         cx: &mut Context<Self>,
     ) {
         if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            if state.cancelled {
+                return;
+            }
             state.result = Some(outcome.text);
+            state.table = outcome.table;
             state.exit_code = outcome.exit_code;
             state.timed_out = outcome.timed_out;
             state.cancelled = outcome.cancelled;
             state.running = false;
+            state.ran_for = state.started_at.map(|started| started.elapsed());
+            // Synchronously-settling calls finish through here without any
+            // click when the permission preset is `Allow` — the decision must
+            // leave `Pending` or the approval buttons would stay on a card
+            // that already has its result.
+            if state.decision == ToolDecision::Pending {
+                state.decision = ToolDecision::Allowed;
+            }
         }
         self.settle_tool(msg_index, call_index, cx);
+    }
+
+    /// Notify once every 500ms while any card is running, so the elapsed
+    /// readouts tick; the task per run self-terminates in the next tick
+    /// after the last card settles (or when the panel dies). Overlapping
+    /// tasks from concurrent runs no-op onto each other.
+    fn spawn_elapsed_ticker(&self, cx: &Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(Duration::from_millis(500)).await;
+                let alive = this
+                    .update(cx, |panel, cx| {
+                        if panel.running_tool_count() == 0 {
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Tool calls currently awaiting their result (the running cards the
+    /// elapsed readout ticks for).
+    fn running_tool_count(&self) -> usize {
+        self.messages
+            .iter()
+            .flat_map(|msg| msg.tool_calls.iter())
+            .filter(|call| call.running)
+            .count()
     }
 
     /// A cx-free snapshot of this panel's terminal for the agent's tools,
@@ -1178,12 +1400,23 @@ impl AiPanel {
     /// height would otherwise leave a gap below (a shrunk card) or push the
     /// fresh result out of view (a grown one).
     fn settle_tool(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+        // A settled call folds its card to the header line (title + elapsed
+        // + status icon), like the thinking section once a turn commits —
+        // the result is a record now, not the focus; the user expands it
+        // when they need to read the output.
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.expanded = false;
+        }
         // `is_list_at_bottom` reads the bounds the last frame rendered, i.e.
         // the position the user actually had before this change.
         let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        // Deferred, not immediate: the row's new height is only measured
+        // during the next layout pass, and a scroll issued now would land at
+        // the *old* bottom — just short of the fresh result. The render
+        // applies the scroll after re-splicing, against the new measurements.
         if stick {
-            self.scroll_list_to_end();
+            self.scroll_to_end_pending = true;
         }
         self.refresh_context_used();
         self.maybe_continue_after_tools(cx);
@@ -1400,19 +1633,57 @@ impl AiPanel {
         }
     }
 
-    /// Stop a running tool call — the card's stop button. A captured command
-    /// is closed down (its output so far is kept); a visible run stops being
-    /// waited on, and the command itself keeps running in the terminal,
-    /// which is where the user can interrupt it for real. Either way the
-    /// call settles through the normal path.
-    fn cancel_tool_call(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+    /// Stop a running call — the card's stop button. The command executors
+    /// stop for real through their cancel token: a captured command is closed
+    /// down (its output so far is kept) and a visible run stops being waited
+    /// on, the command itself keeps running in the terminal for the user to
+    /// interrupt. Tools without a stop token (fetch, SFTP waits, tunnel
+    /// lifecycle) settle right here as "stopped waiting" — like a deny, the
+    /// model hears about it and the loop moves on; a late outcome arriving
+    /// through [`Self::finish_tool`]'s guard must not overwrite the record.
+    fn stop_tool_call(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
         let Some(state) = self.tool_state_mut(msg_index, call_index) else {
             return;
         };
         if !state.running {
             return;
         }
+        let cancellable = matches!(
+            ToolKind::of(&state.call.name),
+            ToolKind::ExecCapture | ToolKind::Run
+        );
         state.cancel.cancel();
+        if cancellable {
+            // The executors' worker settles the card itself (kept output, the
+            // cancelled marker); the card just shows its stop until then.
+            cx.notify();
+            return;
+        }
+        state.cancelled = true;
+        state.table = None;
+        state.result = Some(t!("ai_panel.tool_wait_stopped").to_string());
+        state.running = false;
+        state.ran_for = state.started_at.map(|started| started.elapsed());
+        self.settle_tool(msg_index, call_index, cx);
+    }
+
+    /// Fold/unfold one tool card (the header row is the click target, like
+    /// the thinking block). A card that still needs attention — pending
+    /// approval or running — cannot fold: its buttons and status are the
+    /// whole point.
+    fn toggle_tool_card(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+        let Some(state) = self.tool_state_mut(msg_index, call_index) else {
+            return;
+        };
+        if state.running || state.decision == ToolDecision::Pending {
+            return;
+        }
+        state.expanded = !state.expanded;
+        let stick = self.is_list_at_bottom();
+        self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        if stick {
+            self.scroll_to_end_pending = true;
+        }
         cx.notify();
     }
 
@@ -1448,11 +1719,12 @@ impl AiPanel {
         // The committed block (Markdown) replaces the streaming tail (plain
         // text) at the same list index, usually with a different height —
         // drop the cached row measurement so the list re-measures it, and
-        // keep the view pinned when the user was at the bottom.
+        // keep the view pinned when the user was at the bottom (deferred to
+        // render — see `settle_tool`).
         let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
         if stick {
-            self.scroll_list_to_end();
+            self.scroll_to_end_pending = true;
         }
     }
 
@@ -1475,7 +1747,9 @@ impl AiPanel {
     fn list_row_count(&self) -> usize {
         self.messages.len()
             + self.total_tool_calls()
-            + usize::from(!self.stream_reasoning.is_empty() || !self.stream_buf.is_empty())
+            // One row for the whole live stream — the "responding" spinner
+            // before the first token, the streaming tail after it.
+            + usize::from(self.stream.is_some())
     }
 
     /// Total tool calls across the conversation (one card row each).
@@ -1612,7 +1886,7 @@ impl AiPanel {
                 });
             }
         }
-        if !self.stream_reasoning.is_empty() || !self.stream_buf.is_empty() {
+        if self.stream.is_some() {
             items.push(MessageItem::Streaming {
                 reasoning: self.stream_reasoning.clone(),
                 content: self.stream_buf.clone(),
@@ -1803,9 +2077,8 @@ impl Render for AiPanel {
             })),
             code_block: StyleRefinement::default().p_2().text_size(px(12.)),
         };
-        let has_conversation = !self.messages.is_empty()
-            || !self.stream_reasoning.is_empty()
-            || !self.stream_buf.is_empty();
+        let has_conversation =
+            !self.messages.is_empty() || self.stream.is_some() || !self.queue.is_empty();
         let not_configured = !ai::configured(cx);
 
         // --- Virtualized conversation ---
@@ -1867,6 +2140,75 @@ impl Render for AiPanel {
         // separately would be a few pixels off the caret, and would have to
         // duplicate the "hide while composing" rule by hand.
         let input_empty = self.input_empty;
+        // Queued messages between the controls and the input: one muted row
+        // each, in send order. The tail (last entry) gets an edit button;
+        // every row can be dropped.
+        let queue_rows: AnyElement = if self.queue.is_empty() {
+            div().into_any_element()
+        } else {
+            let count = self.queue.len();
+            let mut col = div().flex().flex_col().gap_0p5();
+            for (index, text) in self.queue.iter().enumerate() {
+                // The tail (last entry — the one that can be edited back into
+                // the input) sits right over the input; every row can be
+                // dropped from the queue.
+                let is_tail = index + 1 == count;
+                let h_edit = handle.clone();
+                let h_del = handle.clone();
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        svg()
+                            .path("icons/clock.svg")
+                            .size(px(12.0))
+                            .text_color(rgb(text_muted()))
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(CONVERSATION_TEXT_SIZE - 1.0))
+                            .text_color(rgb(text_primary()))
+                            .child(text.clone()),
+                    );
+                if is_tail {
+                    row = row.child(
+                        Button::new(ElementId::Name(format!("ai-queue-edit-{index}").into()))
+                            .icon("icons/square-pen.svg")
+                            .icon_color(text_muted())
+                            .flex_shrink_0()
+                            .size_6()
+                            .centered(true)
+                            .on_click(move |_e, win, cx| {
+                                h_edit.update(cx, |panel, cx| panel.edit_queued(index, win, cx));
+                            }),
+                    );
+                }
+                row = row.child(
+                    Button::new(ElementId::Name(format!("ai-queue-del-{index}").into()))
+                        .icon("icons/x.svg")
+                        .icon_color(text_muted())
+                        .flex_shrink_0()
+                        .size_6()
+                        .centered(true)
+                        .on_click(move |_e, _win, cx| {
+                            h_del.update(cx, |panel, cx| {
+                                if index < panel.queue.len() {
+                                    panel.queue.remove(index);
+                                    cx.notify();
+                                }
+                            });
+                        }),
+                );
+                col = col.child(row);
+            }
+            col.into_any_element()
+        };
         let input_area = div()
             // With no conversation the input area *is* the panel: it takes
             // every pixel the controls row doesn't need, and the editor
@@ -1875,11 +2217,19 @@ impl Render for AiPanel {
             // height — 6 rows, auto-growing to 12.
             .when(!has_conversation, |el| el.flex_1().min_h_0())
             .child(input_el);
-        // Send / Stop. One slot, icon-only: while a reply streams the action
-        // is cancel (the only way to stop — Esc isn't wired), otherwise
-        // send, which stays disabled until there is something to send. Enter
-        // in the input sends; Cmd/Ctrl+Enter inserts a newline.
-        let action_btn: AnyElement = if busy {
+        // Send / Stop. One slot, icon-only, three states:
+        //
+        // - idle → send (disabled until there is something to send);
+        // - busy with no messages queued → stop (the only way to stop — Esc
+        //   isn't wired);
+        // - busy with a queue → send-as-advance: the click cancels what is
+        //   running and sends the queue head, mirroring the bare-Enter rule.
+        //   Typing while busy queues via Enter; getting the stop slot back
+        //   is a matter of emptying the queue.
+        // A busy agent with pending tool calls but nothing queued still gets
+        // the stop slot — `busy_tools` doesn't change the button, the queue
+        // head cannot go out while a card waits anyway.
+        let action_btn: AnyElement = if busy && self.queue.is_empty() {
             // Stop reads as a danger action: the theme's red (`term_red`,
             // the same accent the danger alerts use) as a translucent fill +
             // tinted border, mirroring the accent chips used by the list
@@ -1899,6 +2249,18 @@ impl Render for AiPanel {
                 .centered(true)
                 .on_click(move |_e, _w, cx| {
                     h.update(cx, |panel, _cx| panel.stop());
+                })
+                .into_any_element()
+        } else if busy {
+            let h = handle.clone();
+            Button::new("ai-panel-send-queued")
+                .icon("icons/send-horizontal.svg")
+                .primary()
+                .size_6()
+                .flex_shrink_0()
+                .centered(true)
+                .on_click(move |_e, _w, cx| {
+                    h.update(cx, |panel, cx| panel.send_queued_cancel_run(cx));
                 })
                 .into_any_element()
         } else {
@@ -1981,6 +2343,7 @@ impl Render for AiPanel {
                                 .child(t!("ai_panel.not_configured").to_string()),
                         )
                     })
+                    .child(queue_rows)
                     .child(input_area)
                     .child(
                         div()
@@ -2014,6 +2377,10 @@ impl Drop for AiPanel {
 /// One row of the virtualized conversation list. Snapshotted from the
 /// panel's messages once per frame: `List`'s render closure gets no access
 /// to the view, so rows must be self-contained.
+///
+/// The `Tool` row deliberately carries the whole [`ToolCallState`] — the
+/// snapshot must be self-contained, so the size warning is by design.
+#[allow(clippy::large_enum_variant)]
 enum MessageItem {
     User {
         content: String,
@@ -2198,8 +2565,115 @@ fn tool_card(
     let title = tool_title(&name);
     let accent = tool_accent(&name);
     let is_execute = matches!(kind, ToolKind::ExecCapture | ToolKind::Run);
+    // The elapsed readout: live while running (the card ticks), frozen to
+    // the final duration once settled — but only when the wait was long
+    // enough to mean something ("0.0s" on instant calls is noise).
+    let elapsed: Option<String> = if state.running {
+        state
+            .started_at
+            .map(|started| format_elapsed(started.elapsed()))
+    } else {
+        state
+            .ran_for
+            .filter(|ran| *ran >= Duration::from_secs(1))
+            .map(format_elapsed)
+    };
 
-    let mut card = div()
+    // Collapsible like the thinking section: while the card needs attention
+    // (awaiting a click, or running) it stays expanded no matter what the
+    // flag says; once the result has settled the header folds the rest away.
+    let collapsible = !state.running && state.decision != ToolDecision::Pending;
+    let expanded = state.expanded || !collapsible;
+    let chevron_group: SharedString = format!("ai-tool-group-{message_ix}-{call_ix}").into();
+    let header = div()
+        .id(ElementId::Name(
+            format!("ai-tool-header-{message_ix}-{call_ix}").into(),
+        ))
+        .group(chevron_group.clone())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .when(collapsible, |el| {
+            el.cursor_pointer().on_click({
+                let entity = entity.clone();
+                move |_event, _window, cx| {
+                    let _ = entity.update(cx, |panel, cx| {
+                        panel.toggle_tool_card(message_ix, call_ix, cx)
+                    });
+                }
+            })
+        })
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    svg()
+                        .path("icons/sparkles.svg")
+                        .size(px(12.0))
+                        .text_color(rgb(accent)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(accent))
+                        .child(title),
+                ),
+        )
+        // The elapsed readout ticks while the call runs (a 500ms ticker
+        // notifies the panel) and freezes at the final duration once
+        // settled; long waits — the kind a user asks "is it stuck?" about —
+        // are what makes it worth having.
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .children(elapsed.map(|label| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .font_family(TerminalView::mono_font_family())
+                        .child(label)
+                }))
+                .when(!state.running, |el| {
+                    el.when_some(state_icon(&state.decision, false), |el, (path, color)| {
+                        el.child(svg().path(path).size(px(14.0)).text_color(rgb(color)))
+                    })
+                })
+                .when(state.running, |el| {
+                    el.child(loading_spinner(
+                        ElementId::Name(format!("ai-tool-loader-{message_ix}-{call_ix}").into()),
+                        14.0,
+                        text_muted(),
+                    ))
+                })
+                .when(collapsible, |el| {
+                    el.child(
+                        div()
+                            .id(ElementId::Name(
+                                format!("ai-tool-chevron-{message_ix}-{call_ix}").into(),
+                            ))
+                            .opacity(0.5)
+                            .group_hover(chevron_group, |style| style.opacity(1.0))
+                            .child(
+                                svg()
+                                    .path("icons/chevron-down.svg")
+                                    .size(px(12.0))
+                                    .text_color(rgb(text_muted()))
+                                    .with_transformation(Transformation::rotate(radians(
+                                        if expanded { std::f32::consts::PI } else { 0.0 },
+                                    ))),
+                            ),
+                    )
+                }),
+        );
+    let card = div()
         .w_full()
         .rounded(RADIUS_MD)
         .border_1()
@@ -2210,62 +2684,27 @@ fn tool_card(
         .flex_col()
         .gap_1()
         .text_size(px(CONVERSATION_TEXT_SIZE))
-        // Header: which terminal tool is asking, and — once the user has
-        // decided — a check or a cross in the corner. The decision is not
-        // spelled out in words: the card already carries the outcome below.
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            svg()
-                                .path("icons/sparkles.svg")
-                                .size(px(12.0))
-                                .text_color(rgb(accent)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(accent))
-                                .child(title),
-                        ),
-                )
-                .when_some(
-                    state_icon(&state.decision, state.running),
-                    |el, (path, color)| {
-                        el.child(svg().path(path).size(px(14.0)).text_color(rgb(color)))
-                    },
-                ),
-        );
+        .child(header);
+    let mut body = div().flex().flex_col().gap_1().w_full();
 
     // Body: the fields the user asked for, per tool — the arguments spell out
     // exactly what a click would do.
     if is_execute {
         let command = state.arg_str("command").unwrap_or("");
         let expected = state.arg_str("expected").unwrap_or("");
-        card = card
+        body = body
             .child(tool_card_field(
                 t!("ai_panel.tool_field_path").as_ref(),
                 cwd.map(str::to_string)
                     .unwrap_or_else(|| t!("ai_panel.tool_field_path_unknown").to_string()),
                 false,
             ))
-            .child(tool_card_field(
-                t!("ai_panel.tool_field_command").as_ref(),
+            .child(command_block(
+                format!("ai-tool-{message_ix}-{call_ix}"),
                 command.to_string(),
-                true,
             ));
         if !expected.is_empty() {
-            card = card.child(tool_card_field(
+            body = body.child(tool_card_field(
                 t!("ai_panel.tool_field_expected").as_ref(),
                 expected.to_string(),
                 false,
@@ -2276,7 +2715,7 @@ fn tool_card(
         match kind {
             ToolKind::TerminalRead => {
                 let lines = state.arg_u64("lines").unwrap_or(200);
-                card = card.child(tool_card_field(
+                body = body.child(tool_card_field(
                     t!("ai_panel.tool_field_read").as_ref(),
                     t!("ai_panel.tool_field_read_lines", lines = lines).to_string(),
                     false,
@@ -2284,13 +2723,13 @@ fn tool_card(
             }
             ToolKind::Fetch => {
                 let url = state.arg_str("url").unwrap_or("");
-                card = card.child(tool_card_field(
+                body = body.child(tool_card_field(
                     t!("ai_panel.tool_field_url").as_ref(),
                     url.to_string(),
                     true,
                 ));
                 if let Some(proxy) = state.arg_str("proxy") {
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_proxy").as_ref(),
                         proxy.to_string(),
                         true,
@@ -2299,23 +2738,23 @@ fn tool_card(
                 if let Some(method) = state.arg_str("method")
                     && !method.eq_ignore_ascii_case("GET")
                 {
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_method").as_ref(),
                         method.to_string(),
                         false,
                     ));
                 }
-                if let Some(body) = state.arg_str("body") {
-                    card = card.child(tool_card_field(
+                if let Some(request_body) = state.arg_str("body") {
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_body").as_ref(),
-                        body.to_string(),
+                        request_body.to_string(),
                         true,
                     ));
                 }
                 if let Some(expected) = state.arg_str("expected")
                     && !expected.is_empty()
                 {
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_expected").as_ref(),
                         expected.to_string(),
                         false,
@@ -2328,7 +2767,7 @@ fn tool_card(
                 } else {
                     t!("ai_panel.tool_field_local_dir")
                 };
-                card = card.child(tool_card_field(
+                body = body.child(tool_card_field(
                     label.as_ref(),
                     state.arg_str("path").unwrap_or("").to_string(),
                     true,
@@ -2336,7 +2775,7 @@ fn tool_card(
             }
             ToolKind::Tunnel => {
                 if let Some(tunnel) = tunnel {
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_tunnel").as_ref(),
                         tunnel.to_string(),
                         false,
@@ -2344,7 +2783,7 @@ fn tool_card(
                 }
                 if name == "tunnel_create" {
                     let kind_arg = state.arg_str("kind").unwrap_or("dynamic");
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_tunnel_kind").as_ref(),
                         kind_arg.to_string(),
                         false,
@@ -2355,7 +2794,7 @@ fn tool_card(
                         .to_string()
                         + ":"
                         + &state.arg_u64("bind_port").unwrap_or(0).to_string();
-                    card = card.child(tool_card_field(
+                    body = body.child(tool_card_field(
                         t!("ai_panel.tool_field_bind").as_ref(),
                         bind,
                         true,
@@ -2366,7 +2805,7 @@ fn tool_card(
                             state.arg_str("target_host").unwrap_or("?"),
                             state.arg_u64("target_port").unwrap_or(0)
                         );
-                        card = card.child(tool_card_field(
+                        body = body.child(tool_card_field(
                             t!("ai_panel.tool_field_target").as_ref(),
                             target,
                             true,
@@ -2375,7 +2814,7 @@ fn tool_card(
                     if let Some(expected) = state.arg_str("expected")
                         && !expected.is_empty()
                     {
-                        card = card.child(tool_card_field(
+                        body = body.child(tool_card_field(
                             t!("ai_panel.tool_field_expected").as_ref(),
                             expected.to_string(),
                             false,
@@ -2398,7 +2837,7 @@ fn tool_card(
                         state.arg_str("local_path").unwrap_or("").to_string(),
                     ),
                 };
-                card = card.child(tool_card_field(label.as_ref(), value, true));
+                body = body.child(tool_card_field(label.as_ref(), value, true));
                 let second = match name.as_str() {
                     "sftp_download" => Some((
                         t!("ai_panel.tool_field_local_path"),
@@ -2411,13 +2850,13 @@ fn tool_card(
                     _ => None,
                 };
                 if let Some((label, value)) = second {
-                    card = card.child(tool_card_field(label.as_ref(), value, true));
+                    body = body.child(tool_card_field(label.as_ref(), value, true));
                 }
             }
             ToolKind::ExecCapture | ToolKind::Run | ToolKind::Unknown => {}
         }
         if !purpose.is_empty() {
-            card = card.child(tool_card_field(
+            body = body.child(tool_card_field(
                 t!("ai_panel.tool_field_purpose").as_ref(),
                 purpose.to_string(),
                 false,
@@ -2428,7 +2867,7 @@ fn tool_card(
     // Malformed arguments: say so instead of offering a decision that would
     // do nothing.
     if state.args.is_none() {
-        card = card.child(
+        body = body.child(
             div()
                 .text_xs()
                 .text_color(rgb(input_border_error()))
@@ -2444,9 +2883,9 @@ fn tool_card(
             ToolKind::ExecCapture => t!("ai_panel.tool_capture_cancelled").to_string(),
             _ => t!("ai_panel.tool_run_cancelled").to_string(),
         };
-        card = card.child(div().text_xs().text_color(rgb(text_muted())).child(caption));
+        body = body.child(div().text_xs().text_color(rgb(text_muted())).child(caption));
     } else if state.timed_out {
-        card = card.child(
+        body = body.child(
             div().text_xs().text_color(rgb(term_yellow())).child(
                 t!(
                     "ai_panel.tool_capture_timed_out",
@@ -2456,7 +2895,7 @@ fn tool_card(
             ),
         );
     } else if let Some(code) = state.exit_code.filter(|code| *code != 0) {
-        card = card.child(
+        body = body.child(
             div()
                 .text_xs()
                 .text_color(rgb(term_red()))
@@ -2468,7 +2907,7 @@ fn tool_card(
         ToolDecision::Pending => {
             let h_allow = entity.clone();
             let h_deny = entity.clone();
-            card = card.child(
+            body = body.child(
                 div()
                     .flex()
                     .flex_row()
@@ -2514,46 +2953,55 @@ fn tool_card(
                 .result
                 .clone()
                 .unwrap_or_else(|| t!("ai_panel.tool_exec_running").to_string());
-            let result_view: AnyElement = if result.trim().is_empty() {
-                div().into_any_element()
-            } else {
-                let border_color = match state.decision {
-                    ToolDecision::Allowed => rgb(border()),
-                    _ => rgba((term_red() << 8) | 0x66),
-                };
-                div()
-                    .w_full()
-                    .text_size(px(CONVERSATION_TEXT_SIZE))
-                    .border_l_1()
-                    .border_color(border_color)
-                    .pl_2()
-                    .child(
-                        TextView::markdown(
-                            ElementId::Name(
-                                format!("ai-tool-result-{message_ix}-{call_ix}").into(),
-                            ),
-                            {
-                                let fence = code_fence(&result);
-                                format!("{fence}\n{}\n{fence}", result.trim())
-                            },
-                            window,
-                            cx,
+            // A list-style result renders as the native table the outcome
+            // carried (the model got the same cells as JSON); everything else
+            // stays a code fence.
+            let result_view: AnyElement = match &state.table {
+                Some(table) if !table.rows.is_empty() => {
+                    tool_result_table(table, format!("ai-tool-table-{message_ix}-{call_ix}"))
+                }
+                _ if result.trim().is_empty() => div().into_any_element(),
+                _ => {
+                    let border_color = match state.decision {
+                        ToolDecision::Allowed => rgb(border()),
+                        _ => rgba((term_red() << 8) | 0x66),
+                    };
+                    div()
+                        .w_full()
+                        .text_size(px(CONVERSATION_TEXT_SIZE))
+                        .border_l_1()
+                        .border_color(border_color)
+                        .pl_2()
+                        .child(
+                            TextView::markdown(
+                                ElementId::Name(
+                                    format!("ai-tool-result-{message_ix}-{call_ix}").into(),
+                                ),
+                                {
+                                    let fence = code_fence(&result);
+                                    format!("{fence}\n{}\n{fence}", result.trim())
+                                },
+                                window,
+                                cx,
+                            )
+                            .selectable(true)
+                            .h_auto()
+                            .style(md_style.clone()),
                         )
-                        .selectable(true)
-                        .h_auto()
-                        .style(md_style.clone()),
-                    )
-                    .into_any_element()
+                        .into_any_element()
+                }
             };
-            card = card.child(result_view);
-            if state.running && is_execute {
-                // Stop: the only control while a *cancellable* call runs —
-                // the two command executors. Other async tools (fetch, local
-                // reads, SFTP transfers) show just the loader; they cannot be
-                // stopped yet.
+            body = body.child(result_view);
+            if state.running {
+                // Stop is on every running card now: the command executors
+                // stop for real (their worker settles the card with the kept
+                // output), tools without a stop token of their own — fetch,
+                // SFTP waits, tunnel lifecycle — settle right here as
+                // "stopped waiting", like a deny; the work may still finish
+                // in the background.
                 let red = term_red();
                 let h = entity.clone();
-                card = card.child(
+                body = body.child(
                     div().flex().flex_row().justify_end().child(
                         Button::new(ElementId::Name(
                             format!("ai-tool-stop-{message_ix}-{call_ix}").into(),
@@ -2568,7 +3016,7 @@ fn tool_card(
                         .centered(true)
                         .on_click(move |_e, _w, cx| {
                             let _ = h.update(cx, |panel, cx| {
-                                panel.cancel_tool_call(message_ix, call_ix, cx)
+                                panel.stop_tool_call(message_ix, call_ix, cx)
                             });
                         }),
                     ),
@@ -2577,7 +3025,7 @@ fn tool_card(
         }
     }
 
-    card.into_any_element()
+    card.when(expanded, |el| el.child(body)).into_any_element()
 }
 
 /// The corner glyph for a card: a check once the call ran, a cross when the
@@ -2594,6 +3042,159 @@ fn state_icon(decision: &ToolDecision, running: bool) -> Option<(&'static str, u
         ToolDecision::Denied => Some(("icons/x.svg", term_red())),
         ToolDecision::Unavailable => Some(("icons/circle-alert.svg", text_muted())),
     }
+}
+
+/// A rotating loader icon — the shared "this is working" glyph for the
+/// streaming-tail's responding row and a running tool card's corner. gpui's
+/// animation keeps it spinning (one full turn per 0.9s).
+fn loading_spinner(id: impl Into<ElementId>, size: f32, color: u32) -> AnyElement {
+    svg()
+        .path("icons/loader-circle.svg")
+        .size(px(size))
+        .text_color(rgb(color))
+        .with_animation(
+            id.into(),
+            Animation::new(Duration::from_millis(900)).repeat(),
+            move |icon, delta| {
+                icon.with_transformation(Transformation::rotate(radians(
+                    delta * std::f32::consts::PI * 2.0,
+                )))
+            },
+        )
+        .into_any_element()
+}
+
+/// Elapsed-time label for a running/settled tool card: `3.2s`, `1m 05s`.
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f32();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m{:02}s", secs as u64 / 60, (secs % 60.0) as u64)
+    }
+}
+
+/// The command an approval card asks about, as a mono block with a copy
+/// button — the one thing the user might want verbatim (paste it into the
+/// terminal themselves, or hand it to a snippet).
+fn command_block(base_id: String, command: String) -> AnyElement {
+    if command.trim().is_empty() {
+        return div().into_any_element();
+    }
+    let h = command.clone();
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(t!("ai_panel.tool_field_command").to_string()),
+        )
+        .child(
+            div()
+                .w_full()
+                .mt_0p5()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .rounded(RADIUS_MD)
+                .border_1()
+                .border_color(rgb(border()))
+                .bg(rgb(surface_hover()))
+                .pl_2()
+                .pr_1()
+                .py_1p5()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(TerminalView::mono_font_family())
+                        .text_size(px(12.0))
+                        .text_color(rgb(text_primary()))
+                        .child(command),
+                )
+                .child(
+                    Button::new(ElementId::Name(format!("{base_id}-copy").into()))
+                        .icon("icons/copy.svg")
+                        .icon_color(text_muted())
+                        .flex_shrink_0()
+                        .size_5()
+                        .centered(true)
+                        .on_click(move |_e, _w, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(h.clone()));
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+/// How many rows of a result table the card shows before the "…more" note —
+/// the card sits inside a scrollable list; five hundred rows would push
+/// everything else out of the viewport.
+const TOOL_TABLE_MAX_ROWS: usize = 60;
+
+/// A native table for a list-style tool result. Header row muted; cells in
+/// the mono face (ids, paths and addresses are what these tables carry);
+/// overflowing rows collapse into a muted "…more" note.
+fn tool_result_table(table: &ToolTable, base_id: String) -> AnyElement {
+    let mut body = div().flex().flex_col().gap_1().w_full().child(
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .pb_1()
+            .border_b_1()
+            .border_color(rgb(border()))
+            .children(table.headers.iter().map(|header| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(rgb(text_muted()))
+                    .child(header.clone())
+            })),
+    );
+    for (ix, row) in table.rows.iter().take(TOOL_TABLE_MAX_ROWS).enumerate() {
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .id(ElementId::Name(format!("{base_id}-row-{ix}").into()))
+                .children(row.iter().map(|cell| {
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(rgb(text_primary()))
+                        .font_family(TerminalView::mono_font_family())
+                        .child(cell.clone())
+                })),
+        );
+    }
+    let more = table.rows.len().saturating_sub(TOOL_TABLE_MAX_ROWS);
+    if more > 0 {
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(t!("ai_panel.table_more", more = more.to_string()).to_string()),
+        );
+    }
+    div()
+        .w_full()
+        .rounded(RADIUS_MD)
+        .border_1()
+        .border_color(rgb(border()))
+        .bg(rgb(surface_hover()))
+        .p_2()
+        .child(body)
+        .into_any_element()
 }
 
 /// Fence long enough to survive the output itself containing backticks: a
@@ -2889,6 +3490,14 @@ fn thinking_header_label() -> AnyElement {
 /// stream is active.
 fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyElement {
     let mut col = div().flex().flex_col().gap_2().w_full();
+    if reasoning.is_empty() && content.is_empty() {
+        // Nothing streamed yet — a lone spinning loader, so the turn visibly
+        // starts moving from the moment the request goes out (and not only
+        // when the first token lands).
+        return col
+            .child(loading_spinner("ai-respond-spinner", 12.0, text_muted()))
+            .into_any_element();
+    }
     if !reasoning.is_empty() {
         let text = if streaming && content.is_empty() {
             format!("{reasoning}▍")

@@ -31,6 +31,11 @@ use crate::tunnel::{AgentTunnel, AgentTunnelState};
 pub struct ToolOutcome {
     /// The text handed back to the model (the approval card renders it too).
     pub text: String,
+    /// The tabular view of the result, when the result is an enumerable
+    /// list. The model's copy (in `text`) is the same cells as JSON; the card
+    /// renders the table natively instead of letting the model re-render
+    /// markdown over it.
+    pub table: Option<ToolTable>,
     /// Exit status of a captured command, when the backend reported one.
     pub exit_code: Option<u32>,
     /// A captured command outlived its deadline; the output is what was
@@ -38,6 +43,15 @@ pub struct ToolOutcome {
     pub timed_out: bool,
     /// The user stopped the call while it ran.
     pub cancelled: bool,
+}
+
+/// A list-style tool result as labelled cells: what the panel renders as a
+/// native table, and what the model receives as JSON objects keyed by the
+/// headers.
+#[derive(Clone, Debug)]
+pub struct ToolTable {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }
 
 impl ToolOutcome {
@@ -48,6 +62,35 @@ impl ToolOutcome {
             ..Default::default()
         }
     }
+
+    /// A list result: the model's text is the rows as a JSON array of
+    /// objects (headers as keys), the panel renders the table.
+    pub fn table(headers: &[&str], rows: Vec<Vec<String>>) -> Self {
+        let headers: Vec<String> = headers.iter().map(|header| header.to_string()).collect();
+        let text = table_json(&headers, &rows);
+        Self {
+            text,
+            table: Some(ToolTable { headers, rows }),
+            ..Default::default()
+        }
+    }
+}
+
+/// Serialize labelled rows as a compact JSON array of objects, one per row.
+/// Derived from the same cells the card's table renders, so what the model
+/// reasons over and what the user sees cannot drift.
+fn table_json(headers: &[String], rows: &[Vec<String>]) -> String {
+    let objects: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut object = serde_json::Map::new();
+            for (header, cell) in headers.iter().zip(row) {
+                object.insert(header.clone(), Value::String(cell.clone()));
+            }
+            Value::Object(object)
+        })
+        .collect();
+    serde_json::to_string(&objects).unwrap_or_default()
 }
 
 /// How a tool call is running.
@@ -189,6 +232,7 @@ impl Agent {
                     exit_code: out.exit_code,
                     timed_out: out.timed_out,
                     cancelled: out.cancelled,
+                    ..Default::default()
                 });
             }),
         );
@@ -261,6 +305,7 @@ impl Agent {
                     exit_code: None,
                     timed_out,
                     cancelled,
+                    ..Default::default()
                 })
                 .await;
         })
@@ -317,7 +362,7 @@ impl Agent {
         let is_file = name == "read_file";
         let (tx, rx) = bounded(1);
         smol::spawn(async move {
-            let text = smol::unblock(move || {
+            let outcome = smol::unblock(move || {
                 if is_file {
                     crate::local_fs::read_local_file(&path)
                 } else {
@@ -325,7 +370,7 @@ impl Agent {
                 }
             })
             .await;
-            let _ = tx.send(ToolOutcome::text(text)).await;
+            let _ = tx.send(outcome).await;
         })
         .detach();
         Executed::Pending {
@@ -354,12 +399,12 @@ impl Agent {
         let (tx, rx) = bounded(1);
         smol::spawn(async move {
             let started = Instant::now();
-            let mut text = None;
+            let mut outcome = None;
             while started.elapsed() < SFTP_LIST_TIMEOUT {
                 smol::Timer::after(OUTPUT_POLL).await;
                 // The backend logs a failed navigation silently; the timeout
                 // below is what reports it.
-                let Some((cwd, entries)) = session.sftp_listing() else {
+                let Some((_cwd, entries)) = session.sftp_listing() else {
                     continue;
                 };
                 let fresh = match &before {
@@ -367,12 +412,13 @@ impl Agent {
                     Some(old) => !Arc::ptr_eq(old, &entries),
                 };
                 if fresh {
-                    text = Some(format_remote_listing(&cwd, &entries));
+                    outcome = Some(format_remote_listing(&entries));
                     break;
                 }
             }
-            let text = text.unwrap_or_else(|| t!("ai_panel.tool_sftp_list_timeout").to_string());
-            let _ = tx.send(ToolOutcome::text(text)).await;
+            let outcome =
+                outcome.unwrap_or_else(|| ToolOutcome::text(t!("ai_panel.tool_sftp_list_timeout")));
+            let _ = tx.send(outcome).await;
         })
         .detach();
         Executed::Pending {
@@ -477,7 +523,7 @@ impl Agent {
         args: &Value,
     ) -> Executed {
         match name {
-            "tunnel_list" => Executed::Done(ToolOutcome::text(self.tunnel_list_text(session))),
+            "tunnel_list" => Executed::Done(self.tunnel_list_outcome(session)),
             "tunnel_create" => self.tunnel_create(args),
             "tunnel_open" | "tunnel_close" | "tunnel_delete" => {
                 let Some(token) = args.get("tunnel_id").and_then(|id| id.as_str()) else {
@@ -501,62 +547,49 @@ impl Agent {
     }
 
     /// The tunnel list: the agent's own first (their ids are the actionable
-    /// ones), then the Tunnels-page configs for this host.
-    fn tunnel_list_text(&self, session: &Arc<dyn AgentSession>) -> String {
+    /// ones), then the Tunnels-page configs for this host. The model receives
+    /// the rows as JSON (a `tool` message), the card renders the same cells
+    /// as a table — see [`ToolOutcome::table`].
+    fn tunnel_list_outcome(&self, session: &Arc<dyn AgentSession>) -> ToolOutcome {
         let manager = session.tunnel_manager();
-        let mut lines: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
         {
             let tunnels = self.tunnels.lock().unwrap_or_else(|e| e.into_inner());
-            if !tunnels.is_empty() {
-                lines.push(t!("ai_panel.tool_tunnel_list_mine").to_string());
-                lines.extend(
-                    tunnels
-                        .iter()
-                        .map(|tunnel| tunnel.describe(manager.as_ref())),
-                );
+            rows.extend(
+                tunnels
+                    .iter()
+                    .map(|tunnel| tunnel.list_row(manager.as_ref())),
+            );
+        }
+        for view in session.registry_tunnels() {
+            let source = if view.borrowed {
+                t!("ai_panel.tunnel_source_borrowed")
+            } else {
+                t!("ai_panel.tunnel_source_owned")
+            };
+            // Both ends of a local/remote tunnel go into one cell — the model
+            // needs host *and* port to use or talk about it.
+            let mut address = format!("{}:{}", view.bind_addr, view.bind_port);
+            if !view.target_host.is_empty() && view.target_port != 0 {
+                address.push_str(&format!(" -> {}:{}", view.target_host, view.target_port));
             }
+            let status = if view.running {
+                t!("ai_panel.tunnel_state_running")
+            } else {
+                t!("ai_panel.tunnel_state_stopped")
+            };
+            rows.push(vec![
+                format!("t{}", view.id),
+                view.name,
+                view.kind.as_str().to_string(),
+                address,
+                format!("{status} · {source}"),
+            ]);
         }
-        let configured: Vec<String> = session
-            .registry_tunnels()
-            .into_iter()
-            .map(|view| {
-                let source = if view.borrowed {
-                    t!("ai_panel.tunnel_source_borrowed")
-                } else {
-                    t!("ai_panel.tunnel_source_owned")
-                };
-                // Both ends of a local/remote tunnel go into the result — the
-                // model needs host *and* port to use or talk about it.
-                let mut addresses = format!("{}:{}", view.bind_addr, view.bind_port);
-                if !view.target_host.is_empty() && view.target_port != 0 {
-                    addresses.push_str(&format!(" -> {}:{}", view.target_host, view.target_port));
-                }
-                let state = if view.running {
-                    t!("ai_panel.tunnel_running_at", bind = addresses)
-                } else {
-                    t!("ai_panel.tunnel_stopped_at", bind = addresses)
-                };
-                // The id token leads the line: it is what the open / close /
-                // delete calls take.
-                format!(
-                    "t{} {} ({}, {}) — {}",
-                    view.id,
-                    view.name,
-                    view.kind.as_str(),
-                    source,
-                    state
-                )
-            })
-            .collect();
-        if !configured.is_empty() {
-            lines.push(t!("ai_panel.tool_tunnel_list_host").to_string());
-            lines.extend(configured);
+        if rows.is_empty() {
+            return ToolOutcome::text(t!("ai_panel.tool_tunnel_list_empty"));
         }
-        if lines.is_empty() {
-            t!("ai_panel.tool_tunnel_list_empty").to_string()
-        } else {
-            lines.join("\n")
-        }
+        ToolOutcome::table(&["id", "name", "kind", "address", "status"], rows)
     }
 
     /// Define a session-local tunnel. Not started, never persisted.
@@ -933,4 +966,24 @@ fn split_token(token: &str) -> (char, Option<u64>) {
         token.chars().next().unwrap_or(' '),
         token[1..].parse::<u64>().ok(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A list result reaches the model as a JSON array of objects keyed by
+    /// the headers — the same cells the card renders as a table.
+    #[test]
+    fn table_outcome_serializes_rows_as_objects() {
+        let outcome =
+            ToolOutcome::table(&["id", "status"], vec![vec!["a1".into(), "running".into()]]);
+        assert_eq!(outcome.text, r#"[{"id":"a1","status":"running"}]"#);
+        let table = outcome.table.expect("table present");
+        assert_eq!(table.headers, ["id", "status"]);
+        assert_eq!(
+            table.rows,
+            vec![vec!["a1".to_string(), "running".to_string()]]
+        );
+    }
 }
