@@ -1,0 +1,14 @@
+[package]
+name = "crabport-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-channel = "2.5"
+async-openai = { version = "0.42", features = ["chat-completion", "model", "byot"] }
+futures-util = "0.3"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "net"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }

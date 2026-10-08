@@ -71,7 +71,60 @@ pub struct AppearanceConfig {
 }
 
 fn default_panel_width() -> f32 {
-    220.0
+    300.0
+}
+
+/// Which right-hand panel page a terminal shows by default.
+///
+/// Serialized as a single lowercase string (`panel_page = "ai"`) so the
+/// config stays hand-editable. The default is the AI assistant page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PanelPage {
+    Sftp,
+    Tunnels,
+    History,
+    Snippets,
+    #[default]
+    Ai,
+}
+
+impl PanelPage {
+    /// The string form written to `config.toml`.
+    pub fn to_id(self) -> String {
+        match self {
+            PanelPage::Sftp => "sftp",
+            PanelPage::Tunnels => "tunnels",
+            PanelPage::History => "history",
+            PanelPage::Snippets => "snippets",
+            PanelPage::Ai => "ai",
+        }
+        .to_string()
+    }
+
+    /// Parse the string form. An unknown id falls back to the default page
+    /// rather than failing the load: a hand-edited typo should cost the user
+    /// this one setting, not the whole config.
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "sftp" => PanelPage::Sftp,
+            "tunnels" => PanelPage::Tunnels,
+            "history" => PanelPage::History,
+            "snippets" => PanelPage::Snippets,
+            _ => PanelPage::default(),
+        }
+    }
+}
+
+impl serde::Serialize for PanelPage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_id())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PanelPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_id(&String::deserialize(d)?))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +379,17 @@ pub struct TerminalConfig {
     #[serde(default = "default_expand_panel_on_connect")]
     pub expand_panel_on_connect: bool,
 
+    /// Which right-hand panel page a terminal shows by default — the page a
+    /// tab's panel opens on until the user picks a page for that tab (which
+    /// then wins, exactly like [`Self::expand_panel_on_connect`] is a default
+    /// for the panel's visibility).
+    ///
+    /// Defaults to the AI assistant page. A page that isn't available on the
+    /// tab's backend (e.g. Tunnels on a Telnet session, or AI while it is
+    /// disabled) falls back to the first page that is.
+    #[serde(default)]
+    pub panel_page: PanelPage,
+
     /// Per-slot visibility for the bottom toolbar, stored under
     /// `[appearance.terminal.toolbar]`. Each field defaults to `true` so a
     /// fresh install shows every available chip; the user toggles them
@@ -386,6 +450,7 @@ impl Default for TerminalConfig {
             font_family: String::new(),
             font_size: default_terminal_font_size(),
             expand_panel_on_connect: default_expand_panel_on_connect(),
+            panel_page: PanelPage::default(),
             toolbar: ToolbarVisibilityConfig::default(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             auto_reconnect: false,
@@ -810,6 +875,238 @@ impl Default for ThemeConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AI assistant config
+// ---------------------------------------------------------------------------
+
+/// One configured AI provider endpoint (`[[ai.providers]]` in
+/// `config.toml`). Non-secret only — the API key lives AES-256-GCM
+/// encrypted in the store's `ai_secrets` table, keyed by [`Self::id`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiProviderConfig {
+    /// Stable id generated when the entry is added (`p<unix_millis`),
+    /// never reused; built-in entries keep their fixed id (see
+    /// [`BUILTIN_PROVIDER_IDS`]). FK for the encrypted key in `ai_secrets`.
+    pub id: String,
+    /// Protocol backend, serialized as `type`: `"openai"` means
+    /// OpenAI-compatible chat completions (`{base}/chat/completions`,
+    /// `{base}/models`). `"anthropic"` is planned, not implemented yet.
+    #[serde(rename = "type")]
+    pub provider_type: String,
+    /// Display name shown in the provider list and switchers, e.g.
+    /// `"DeepSeek"` or `"My Gateway"`.
+    pub name: String,
+    /// API base URL, e.g. `https://api.openai.com/v1`.
+    pub base_url: String,
+    /// When set, this entry borrows the API key stored for another entry
+    /// instead of owning one — see [`Self::effective_key_id`].
+    ///
+    /// Gateways that put several endpoints behind a single credential share
+    /// one secret this way: OpenCode's Zen and Go endpoints are one account
+    /// with two base URLs, so the settings pane shows them as a single
+    /// "OpenCode" entry whose key is the account's, while each endpoint
+    /// keeps its own base URL, model list and `active` pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+/// Stable id of the built-in DeepSeek entry. It is seeded into a fresh
+/// `config.toml` and is the default `active` pointer. Built-in entries keep
+/// their id forever (ids are FKs for the encrypted key), so it's a constant
+/// rather than a generated `p<millis>`.
+pub const DEFAULT_PROVIDER_ID: &str = "deepseek";
+
+/// Stable id of the built-in OpenCode Zen entry (OpenCode's curated model
+/// gateway, <https://opencode.ai/docs/zen>).
+pub const OPENCODE_ZEN_PROVIDER_ID: &str = "opencode-zen";
+
+/// Stable id of the built-in OpenCode Go entry (OpenCode's subscription
+/// tier for open coding models, <https://opencode.ai/docs/go>).
+pub const OPENCODE_GO_PROVIDER_ID: &str = "opencode-go";
+
+/// Ids of the built-in provider entries, in display order. The settings
+/// pane renders these without the editable type / name / endpoint fields
+/// (the product fixes those) and marks them unremovable.
+pub const BUILTIN_PROVIDER_IDS: &[&str] = &[
+    DEFAULT_PROVIDER_ID,
+    OPENCODE_ZEN_PROVIDER_ID,
+    OPENCODE_GO_PROVIDER_ID,
+];
+
+/// Whether `id` names a built-in provider entry (see
+/// [`BUILTIN_PROVIDER_IDS`]).
+pub fn is_builtin_provider(id: &str) -> bool {
+    BUILTIN_PROVIDER_IDS.contains(&id)
+}
+
+impl AiProviderConfig {
+    /// Id under which this entry's API key is stored: the id of the entry it
+    /// borrows from when [`Self::key_id`] is set, its own id otherwise. The
+    /// store's `ai_api_key` / `set_ai_api_key` calls always go through this.
+    pub fn effective_key_id(&self) -> &str {
+        self.key_id.as_deref().unwrap_or(self.id.as_str())
+    }
+
+    /// The built-in entries seeded into a fresh config — and re-seeded by
+    /// [`normalize`] into configs that lost them (older builds persisted an
+    /// explicit `providers = []`, which skips serde defaults). Return order
+    /// is the canonical display order.
+    fn builtin_providers() -> Vec<Self> {
+        vec![
+            Self {
+                id: DEFAULT_PROVIDER_ID.into(),
+                provider_type: "openai".into(),
+                name: "DeepSeek".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                key_id: None,
+            },
+            // OpenCode's two gateways. Both speak OpenAI-compatible chat
+            // completions at `{base}/chat/completions` and list their
+            // models at `{base}/models` — one entry per endpoint, because
+            // each serves its own model list and is billed separately, but
+            // they share the account's single API key, so the settings pane
+            // folds them into one "OpenCode" section (Zen owns the key, Go
+            // borrows it) and the model picker labels their models "Zen:"
+            // / "Go:".
+            Self {
+                id: OPENCODE_ZEN_PROVIDER_ID.into(),
+                provider_type: "openai".into(),
+                name: "OpenCode".into(),
+                base_url: "https://opencode.ai/zen/v1".into(),
+                key_id: None,
+            },
+            Self {
+                id: OPENCODE_GO_PROVIDER_ID.into(),
+                provider_type: "openai".into(),
+                name: "OpenCode".into(),
+                base_url: "https://opencode.ai/zen/go/v1".into(),
+                key_id: Some(OPENCODE_ZEN_PROVIDER_ID.into()),
+            },
+        ]
+    }
+}
+
+/// AI assistant preferences. Stored under `[ai]` in `config.toml`.
+///
+/// Providers are a list of endpoint entries with an `active` pointer, so
+/// several endpoints can coexist (each with its own encrypted key) and the
+/// AI panel can switch between them by only flipping `active`.
+///
+/// The model is deliberately NOT part of a provider entry: model lists are
+/// fetched from the endpoint's `/models` API (see
+/// [`crabport_ai::OpenAiProvider::list_models`]) or hand-configured in a
+/// toml/json file; [`Self::model`] persists the model selected for the
+/// active entry and is validated/reset by the UI when the provider changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    /// Master switch for the AI assistant surface. On by default — the
+    /// settings pane phrases the toggle as “禁用 AI” (disable), not
+    /// “enable”.
+    pub enabled: bool,
+    /// Id of the provider entry in use. A stale/empty pointer (entry was
+    /// deleted) falls back to the first entry at resolve time.
+    pub active: String,
+    /// Model selected for the active provider (free text, e.g.
+    /// `deepseek-chat`). Empty = not configured yet.
+    pub model: String,
+    /// Configured provider endpoints, display order = list order.
+    pub providers: Vec<AiProviderConfig>,
+    /// What the agent may do with each tool without asking. Stored under
+    /// `[ai.agent]`; skipped while it holds no overrides, so a config that
+    /// never touched the agent page doesn't grow an empty table.
+    #[serde(skip_serializing_if = "AiAgentConfig::is_empty")]
+    pub agent: AiAgentConfig,
+}
+
+impl Default for AiConfig {
+    /// AI is enabled out of the box with the built-in endpoints pre-seeded
+    /// (see [`BUILTIN_PROVIDER_IDS`]), so the first-run flow is just “paste
+    /// an API key”. “Add Provider” in the settings pane is for *additional*
+    /// endpoints.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            active: DEFAULT_PROVIDER_ID.into(),
+            model: String::new(),
+            providers: AiProviderConfig::builtin_providers(),
+            agent: AiAgentConfig::default(),
+        }
+    }
+}
+
+impl AiConfig {
+    /// The provider entry the `active` pointer selects; a stale or empty
+    /// pointer falls back to the first entry. `None` when no entries exist.
+    pub fn active_provider(&self) -> Option<&AiProviderConfig> {
+        self.providers
+            .iter()
+            .find(|p| p.id == self.active)
+            .or_else(|| self.providers.first())
+    }
+}
+
+/// What the agent is allowed to do with one tool without asking the user
+/// first. Serialized lowercase (`"confirm"`, `"allow"`, `"deny"`) so
+/// `config.toml` stays hand-editable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPermission {
+    /// Ask for approval on every call. The default: an unconfigured tool
+    /// always asks.
+    #[default]
+    Confirm,
+    /// Run the call without asking. Its card still appears, showing the
+    /// command and what came back.
+    Allow,
+    /// Refuse the call; the model is told the user's policy denied it.
+    Deny,
+}
+
+/// Per-tool permissions for the AI agent. Stored under `[ai.agent]`.
+///
+/// Only tools the user has changed away from [`ToolPermission::Confirm`]
+/// are stored — a missing entry means “ask”, which keeps the file (and the
+/// meaning of a fresh install) minimal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiAgentConfig {
+    /// Tool name → permission, e.g. `terminal_exec = "allow"`. The names are
+    /// the agent's wire names; unknown ones are ignored by the agent.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, ToolPermission>,
+}
+
+impl AiAgentConfig {
+    /// The permission configured for `tool`. Unlisted tools — including
+    /// names no tool ever uses — resolve to [`ToolPermission::Confirm`].
+    pub fn permission(&self, tool: &str) -> ToolPermission {
+        self.tools.get(tool).copied().unwrap_or_default()
+    }
+
+    /// Set one tool's permission. `Confirm` is the default, so it is stored
+    /// as “no entry” rather than an explicit value.
+    pub fn set_permission(&mut self, tool: &str, permission: ToolPermission) {
+        if permission == ToolPermission::default() {
+            self.tools.remove(tool);
+        } else {
+            self.tools.insert(tool.to_string(), permission);
+        }
+    }
+
+    /// Drop every override, so every tool asks again.
+    pub fn reset(&mut self) {
+        self.tools.clear();
+    }
+
+    /// Whether any tool has an override. Used to keep the `[ai.agent]`
+    /// table out of a config that never changed a permission.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
 /// Top-level config root, serialized to `config.toml` and reachable via the
 /// [`CONFIG`] `LazyLock`.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -820,6 +1117,10 @@ pub struct CrabPortConfig {
     /// User-configurable keyboard shortcuts. Stored under `[keybinds]`.
     #[serde(default)]
     pub keybinds: KeybindConfig,
+
+    /// AI assistant settings, stored under `[ai]`.
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -901,8 +1202,39 @@ pub fn load() -> Result<CrabPortConfig, ConfigError> {
         return Ok(CrabPortConfig::default());
     }
     let text = fs::read_to_string(&path).map_err(|e| ConfigError::Io(e.to_string()))?;
-    let cfg: CrabPortConfig = toml::from_str(&text)?;
+    let mut cfg: CrabPortConfig = toml::from_str(&text)?;
+    normalize(&mut cfg);
     Ok(cfg)
+}
+
+/// Repair loaded configs so built-in pieces survive older or hand-edited
+/// files.
+///
+/// The built-in entries ([`BUILTIN_PROVIDER_IDS`]) are part of the product
+/// surface (“默认就有”) and product-owned: their type, name, endpoint and
+/// key-sharing (`key_id`) are not user settings, and a config that predates
+/// one of those fields must not keep the stale value. So a missing entry is
+/// inserted at its canonical index (keeping the built-ins grouped at the
+/// front in [`BUILTIN_PROVIDER_IDS`] order) and an existing one is rewritten
+/// from the current definition — which is how a config written before
+/// OpenCode Go started sharing Zen's key picks that up. Re-seeding is
+/// idempotent, and user entries plus their `active` choice are untouched.
+fn normalize(cfg: &mut CrabPortConfig) {
+    for (ix, builtin) in AiProviderConfig::builtin_providers()
+        .into_iter()
+        .enumerate()
+    {
+        match cfg.ai.providers.iter().position(|p| p.id == builtin.id) {
+            Some(at) => cfg.ai.providers[at] = builtin,
+            None => {
+                let at = ix.min(cfg.ai.providers.len());
+                cfg.ai.providers.insert(at, builtin);
+            }
+        }
+    }
+    if cfg.ai.active.is_empty() {
+        cfg.ai.active = DEFAULT_PROVIDER_ID.into();
+    }
 }
 
 /// Serialize and atomically write `cfg` to `config.toml`. Creates the parent
@@ -1010,6 +1342,40 @@ bg = "#111111"
         );
     }
 
+    /// The default panel page is the AI assistant, and it round-trips
+    /// through `config.toml` as a plain string; an unknown id (a hand-edit
+    /// typo) falls back to the default instead of failing the load.
+    #[test]
+    fn panel_page_defaults_to_ai_and_roundtrips() {
+        assert_eq!(TerminalConfig::default().panel_page, PanelPage::Ai);
+        assert_eq!(PanelPage::default(), PanelPage::Ai);
+
+        let toml = toml::to_string(&TerminalConfig {
+            panel_page: PanelPage::Tunnels,
+            ..TerminalConfig::default()
+        })
+        .unwrap();
+        assert!(toml.contains("panel_page = \"tunnels\""), "{toml}");
+        let back: TerminalConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.panel_page, PanelPage::Tunnels);
+
+        // Missing field → the default; unknown value → the default too.
+        let partial: TerminalConfig = toml::from_str("font_size = 14.0").unwrap();
+        assert_eq!(partial.panel_page, PanelPage::Ai);
+        let typo: TerminalConfig = toml::from_str("panel_page = \"typo\"").unwrap();
+        assert_eq!(typo.panel_page, PanelPage::Ai);
+
+        for page in [
+            PanelPage::Sftp,
+            PanelPage::Tunnels,
+            PanelPage::History,
+            PanelPage::Snippets,
+            PanelPage::Ai,
+        ] {
+            assert_eq!(PanelPage::from_id(&page.to_id()), page);
+        }
+    }
+
     /// `StartupPage` serializes into a single tagged string in `config.toml`,
     /// keeping the file readable and round-tripping through `to_id`/`from_id`.
     #[test]
@@ -1036,5 +1402,289 @@ bg = "#111111"
 
         let back: StartupConfig = toml::from_str("page = \"whatever\"").unwrap();
         assert_eq!(back.page, StartupPage::Home);
+    }
+
+    /// The `[ai]` section round-trips through TOML (`type` is the serde
+    /// name for the protocol field), and a config written before the
+    /// section existed parses with the seeded default instead of erroring.
+    #[test]
+    fn ai_section_roundtrip_and_missing_defaults() {
+        let cfg = AiConfig {
+            enabled: false,
+            active: "p1".into(),
+            model: "deepseek-chat".into(),
+            providers: vec![AiProviderConfig {
+                id: "p1".into(),
+                provider_type: "openai".into(),
+                name: "My Gateway".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                key_id: None,
+            }],
+            agent: AiAgentConfig::default(),
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("type = \"openai\""));
+        // No permission overrides → no `[ai.agent]` table is written at all.
+        assert!(!text.contains("[agent]"));
+        let back: AiConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+
+        let empty: AiConfig = toml::from_str("").unwrap();
+        assert_eq!(empty, AiConfig::default());
+    }
+
+    /// Tool permissions: unset tools ask, overrides round-trip through
+    /// `[ai.agent.tools]`, and setting a tool back to `confirm` clears its
+    /// entry instead of storing the default.
+    #[test]
+    fn agent_tool_permissions_roundtrip_and_default_to_confirm() {
+        let mut agent = AiAgentConfig::default();
+        assert_eq!(agent.permission("terminal_exec"), ToolPermission::Confirm);
+        assert_eq!(
+            agent.permission("never-heard-of-it"),
+            ToolPermission::Confirm
+        );
+
+        agent.set_permission("terminal_exec", ToolPermission::Allow);
+        agent.set_permission("sftp_download", ToolPermission::Deny);
+        let text = toml::to_string(&AiConfig {
+            agent: agent.clone(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+        assert!(text.contains("terminal_exec = \"allow\""), "{text}");
+        assert!(text.contains("sftp_download = \"deny\""), "{text}");
+
+        let back: AiConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.agent, agent);
+        assert_eq!(
+            back.agent.permission("terminal_exec"),
+            ToolPermission::Allow
+        );
+        assert_eq!(
+            back.agent.permission("terminal_run"),
+            ToolPermission::Confirm
+        );
+
+        // Back to the default → the key goes away again.
+        agent.set_permission("terminal_exec", ToolPermission::Confirm);
+        assert!(!agent.tools.contains_key("terminal_exec"));
+        agent.reset();
+        assert!(agent.tools.is_empty());
+    }
+
+    /// A config written before `[ai.agent]` existed parses with every tool
+    /// asking for confirmation, and an unknown permission value in the file
+    /// fails the parse rather than silently granting access.
+    #[test]
+    fn agent_section_missing_defaults_and_rejects_unknown_permissions() {
+        let ai: AiConfig = toml::from_str("[agent]\n").unwrap();
+        assert_eq!(
+            ai.agent.permission("terminal_exec"),
+            ToolPermission::Confirm
+        );
+
+        let bad = toml::from_str::<AiConfig>("[agent.tools]\nterminal_exec = \"whatever\"\n");
+        assert!(bad.is_err());
+    }
+
+    /// A fresh default enables AI and seeds the built-in endpoints (DeepSeek
+    /// plus the OpenCode gateways), so the first-run flow is just “paste an
+    /// API key”.
+    #[test]
+    fn ai_defaults_enable_and_seed_builtin_providers() {
+        let ai = AiConfig::default();
+        assert!(ai.enabled);
+        assert_eq!(ai.active, DEFAULT_PROVIDER_ID);
+        let ids: Vec<&str> = ai.providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, BUILTIN_PROVIDER_IDS);
+
+        let entry = ai.active_provider().expect("seeded provider");
+        assert_eq!(entry.id, DEFAULT_PROVIDER_ID);
+        assert_eq!(entry.provider_type, "openai");
+        assert_eq!(entry.base_url, "https://api.deepseek.com/v1");
+
+        // Both OpenCode gateways are OpenAI-compatible: one base URL each,
+        // Zen and Go sharing the `/zen` prefix.
+        let zen = ai
+            .providers
+            .iter()
+            .find(|p| p.id == OPENCODE_ZEN_PROVIDER_ID)
+            .expect("seeded zen provider");
+        assert_eq!(zen.provider_type, "openai");
+        assert_eq!(zen.base_url, "https://opencode.ai/zen/v1");
+        let go = ai
+            .providers
+            .iter()
+            .find(|p| p.id == OPENCODE_GO_PROVIDER_ID)
+            .expect("seeded go provider");
+        assert_eq!(go.provider_type, "openai");
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+
+        // Zen and Go are one OpenCode account behind two endpoints, so both
+        // resolve the same stored key (Zen owns it, Go borrows it) and share
+        // one display name — the settings pane renders the pair as a single
+        // "OpenCode" section.
+        assert_eq!(zen.effective_key_id(), OPENCODE_ZEN_PROVIDER_ID);
+        assert_eq!(go.effective_key_id(), OPENCODE_ZEN_PROVIDER_ID);
+        assert_eq!(zen.name, "OpenCode");
+        assert_eq!(go.name, "OpenCode");
+        assert_eq!(entry.effective_key_id(), DEFAULT_PROVIDER_ID);
+    }
+
+    /// `effective_key_id` follows a `key_id` borrow, and a borrowed key is
+    /// the only thing it changes — ids and endpoints stay per entry.
+    #[test]
+    fn effective_key_id_falls_back_to_own_id() {
+        let own = AiProviderConfig {
+            id: "p1".into(),
+            provider_type: "openai".into(),
+            name: "Solo".into(),
+            base_url: "https://example.com/v1".into(),
+            key_id: None,
+        };
+        assert_eq!(own.effective_key_id(), "p1");
+
+        let borrowing = AiProviderConfig {
+            key_id: Some("p1".into()),
+            ..own.clone()
+        };
+        assert_eq!(borrowing.effective_key_id(), "p1");
+        assert_eq!(borrowing.id, "p1");
+
+        // `key_id` is optional in TOML: configs written before it existed
+        // parse with `None`, and `None` never serializes.
+        let text = toml::to_string(&own).unwrap();
+        assert!(!text.contains("key_id"));
+        let back: AiProviderConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, own);
+    }
+
+    /// A config persisted by an older build (explicit `providers = []`),
+    /// written before one of the built-ins existed, or hand-trimmed still
+    /// gets every built-in entry re-seeded at its canonical index, and an
+    /// empty `active` pointer is repaired — while user entries and their
+    /// `active` choice survive untouched.
+    #[test]
+    fn normalize_reseeds_builtin_providers_idempotently() {
+        let mut cfg: CrabPortConfig =
+            toml::from_str("[ai]\nenabled = true\nactive = \"\"\nproviders = []\n").unwrap();
+        normalize(&mut cfg);
+        let ids: Vec<&str> = cfg.ai.providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, BUILTIN_PROVIDER_IDS);
+        assert_eq!(cfg.ai.active, DEFAULT_PROVIDER_ID);
+
+        // Idempotent: running again adds nothing.
+        normalize(&mut cfg);
+        assert_eq!(cfg.ai.providers.len(), BUILTIN_PROVIDER_IDS.len());
+
+        // A dropped built-in comes back at its canonical index, ahead of
+        // user entries, and the user's `active` pick is left alone.
+        let mut cfg = CrabPortConfig::default();
+        cfg.ai
+            .providers
+            .retain(|p| p.id != OPENCODE_ZEN_PROVIDER_ID);
+        cfg.ai.providers.push(AiProviderConfig {
+            id: "p1".into(),
+            provider_type: "openai".into(),
+            name: "My Gateway".into(),
+            base_url: String::new(),
+            key_id: None,
+        });
+        cfg.ai.active = "p1".into();
+        normalize(&mut cfg);
+        let ids: Vec<&str> = cfg.ai.providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                DEFAULT_PROVIDER_ID,
+                OPENCODE_ZEN_PROVIDER_ID,
+                OPENCODE_GO_PROVIDER_ID,
+                "p1",
+            ]
+        );
+        assert_eq!(cfg.ai.active, "p1");
+    }
+
+    /// Built-in entries are product-owned: a config written before Go
+    /// started borrowing Zen's key (so it carries a stale/empty `key_id`) is
+    /// repaired, while user entries are never touched.
+    #[test]
+    fn normalize_repairs_builtin_fields_but_not_user_entries() {
+        let mut cfg = CrabPortConfig::default();
+        let go = cfg
+            .ai
+            .providers
+            .iter_mut()
+            .find(|p| p.id == OPENCODE_GO_PROVIDER_ID)
+            .expect("seeded go provider");
+        go.key_id = None;
+        go.base_url = "https://example.com/stale".into();
+
+        normalize(&mut cfg);
+
+        let go = cfg
+            .ai
+            .providers
+            .iter()
+            .find(|p| p.id == OPENCODE_GO_PROVIDER_ID)
+            .expect("repaired go provider");
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(go.effective_key_id(), OPENCODE_ZEN_PROVIDER_ID);
+
+        // User entries keep whatever they were saved with.
+        cfg.ai.providers.push(AiProviderConfig {
+            id: "p1".into(),
+            provider_type: "openai".into(),
+            name: "My Gateway".into(),
+            base_url: "https://example.com/v1".into(),
+            key_id: Some("p2".into()),
+        });
+        normalize(&mut cfg);
+        let user = cfg
+            .ai
+            .providers
+            .iter()
+            .find(|p| p.id == "p1")
+            .expect("user entry kept");
+        assert_eq!(user.base_url, "https://example.com/v1");
+        assert_eq!(user.key_id.as_deref(), Some("p2"));
+    }
+
+    /// Built-in entries are recognised by id, and only by id.
+    #[test]
+    fn builtin_provider_ids_are_recognised() {
+        assert!(is_builtin_provider(DEFAULT_PROVIDER_ID));
+        assert!(is_builtin_provider(OPENCODE_ZEN_PROVIDER_ID));
+        assert!(is_builtin_provider(OPENCODE_GO_PROVIDER_ID));
+        assert!(!is_builtin_provider("p1723000000000"));
+        assert!(!is_builtin_provider(""));
+    }
+
+    /// `active_provider` resolves the pointer, falls back to the first
+    /// entry on a stale id, and is `None` when no entries exist.
+    #[test]
+    fn active_provider_falls_back_to_first_entry() {
+        let mut cfg = AiConfig {
+            providers: Vec::new(),
+            ..AiConfig::default()
+        };
+        assert!(cfg.active_provider().is_none());
+
+        let entry = |id: &str, name: &str| AiProviderConfig {
+            id: id.into(),
+            provider_type: "openai".into(),
+            name: name.into(),
+            base_url: String::new(),
+            key_id: None,
+        };
+        cfg.providers = vec![entry("a", "A"), entry("b", "B")];
+
+        cfg.active = "b".into();
+        assert_eq!(cfg.active_provider().map(|p| p.id.as_str()), Some("b"));
+
+        // Stale pointer (entry deleted) → first entry.
+        cfg.active = "deleted".into();
+        assert_eq!(cfg.active_provider().map(|p| p.id.as_str()), Some("a"));
     }
 }

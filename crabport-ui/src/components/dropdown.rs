@@ -19,6 +19,8 @@ const CHEVRON_OPEN_ROTATION: f32 = PI;
 // ---------------------------------------------------------------------------
 
 const ITEM_HEIGHT: Pixels = px(32.0);
+/// Menu-row height for compact dropdowns (`.compact()`).
+const ITEM_HEIGHT_COMPACT: Pixels = px(24.0);
 
 /// Shared chrome for menu rows (regular items and the create row): a
 /// fixed-height full-width row with an eased transparent→surface_active
@@ -26,17 +28,21 @@ const ITEM_HEIGHT: Pixels = px(32.0);
 /// (the create row injects its accent text color there).
 fn menu_row(
     id: ElementId,
+    height: Pixels,
+    compact: bool,
     pre: impl FnOnce(Stateful<Div>) -> Stateful<Div>,
 ) -> gpui_animation::animation::AnimatedWrapper<Stateful<Div>> {
     let base = div()
         .id(id.clone())
         .flex()
         .items_center()
-        .h(ITEM_HEIGHT)
+        .h(height)
         .px_3()
         .w_full()
-        .rounded(RADIUS_XS)
-        .text_sm();
+        .min_w_0()
+        .truncate()
+        .when_else(compact, |el| el.text_xs(), |el| el.text_sm())
+        .rounded(RADIUS_XS);
     pre(base)
         .bg(rgba(0x00000000))
         .with_transition(id)
@@ -120,6 +126,13 @@ pub struct Dropdown {
     /// When `Some`, the menu renders a "Create \"<query>\"" button at the
     /// bottom when the search query doesn't match an existing item label.
     on_create: Option<Rc<dyn Fn(String, &mut Window, &mut App) + 'static>>,
+    /// Open the menu above the trigger instead of below. For dropdowns
+    /// anchored near the window bottom (e.g. the AI panel's model picker)
+    /// where a downward menu would be clipped by the viewport edge.
+    menu_up: bool,
+    /// Compact trigger: shorter (24px vs 36px) with a smaller label
+    /// (text_xs vs text_sm). For dense spots like the AI panel footer.
+    compact: bool,
 }
 
 impl Styled for Dropdown {
@@ -145,6 +158,8 @@ impl Dropdown {
             on_toggle: None,
             search_input: None,
             on_create: None,
+            menu_up: false,
+            compact: false,
         }
     }
 
@@ -210,6 +225,21 @@ impl Dropdown {
         self.on_create = Some(Rc::new(f));
         self
     }
+
+    /// Open the menu above the trigger instead of below. Use for dropdowns
+    /// anchored near the window bottom, where a downward menu would be
+    /// clipped by the viewport edge.
+    pub fn open_upward(mut self) -> Self {
+        self.menu_up = true;
+        self
+    }
+
+    /// Compact trigger: 24px-tall box with a text_xs label instead of the
+    /// default 36px/text_sm. For dense layouts like the AI panel footer.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
+    }
 }
 
 impl RenderOnce for Dropdown {
@@ -227,6 +257,8 @@ impl RenderOnce for Dropdown {
             on_toggle,
             search_input,
             on_create,
+            menu_up,
+            compact,
         } = self;
 
         // A disabled dropdown never shows its menu, regardless of `is_open`.
@@ -248,6 +280,7 @@ impl RenderOnce for Dropdown {
         let chevron = svg()
             .path("icons/chevron-down.svg")
             .size_4()
+            .flex_shrink_0()
             .text_color(rgb(text_muted()))
             .with_animation(
                 chevron_anim_id,
@@ -269,7 +302,7 @@ impl RenderOnce for Dropdown {
             .items_center()
             .justify_between()
             .w_full()
-            .h_9()
+            .when_else(compact, |el| el.h_6(), |el| el.h_9())
             .px_3()
             .rounded(RADIUS_MD)
             .bg(rgb(if disabled {
@@ -282,7 +315,10 @@ impl RenderOnce for Dropdown {
             .when(disabled, |el| el.opacity(0.5))
             .child(
                 div()
-                    .text_sm()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when_else(compact, |el| el.text_xs(), |el| el.text_sm())
                     .text_color(rgb(if disabled {
                         input_text_disabled()
                     } else {
@@ -306,8 +342,18 @@ impl RenderOnce for Dropdown {
             )
             .when_some(on_toggle.clone(), |this, cb| {
                 this.when(!disabled, |this| {
+                    // Opening the menu puts the caret in its search box, so a
+                    // searchable dropdown is type-to-filter the moment it
+                    // opens (the click that opened it must not land on the
+                    // search field as a focus change). `is_open` here is the
+                    // state *before* `cb` flips it.
+                    let search = search_input.clone();
+                    let was_open = is_open;
                     this.on_click(move |_e, w, cx| {
                         cb(w, cx);
+                        if !was_open && let Some(search) = &search {
+                            search.update(cx, |state, cx| state.focus(w, cx));
+                        }
                     })
                 })
             });
@@ -363,18 +409,24 @@ impl RenderOnce for Dropdown {
         // off its direct element and moves it to a wrapper, so any
         // gap/padding on the scrolled element itself is lost. Keeping
         // them on a nested child preserves them.
+        // Menu rows shrink with the trigger in compact mode.
+        let item_h = if compact {
+            ITEM_HEIGHT_COMPACT
+        } else {
+            ITEM_HEIGHT
+        };
         let content_item_count = filtered.len();
         let has_search_el = search_input.is_some();
         let has_create_el = can_create;
         let has_empty_el = _has_empty;
 
         let search_h = if has_search_el {
-            f32::from(ITEM_HEIGHT)
+            f32::from(item_h)
         } else {
             0.0
         };
         let create_h = if has_create_el {
-            f32::from(ITEM_HEIGHT)
+            f32::from(item_h)
         } else {
             0.0
         };
@@ -382,7 +434,7 @@ impl RenderOnce for Dropdown {
         // Items that live inside the scrollable inner div.
         let items_child_count = content_item_count + has_empty_el as usize;
         let items_gap = items_child_count.saturating_sub(1) as f32 * 4.0; // gap_1
-        let items_inner_h = f32::from(ITEM_HEIGHT) * items_child_count as f32 + items_gap + 8.0; // p_1 padding (top + bottom = 4 + 4)
+        let items_inner_h = f32::from(item_h) * items_child_count as f32 + items_gap + 8.0; // p_1 padding (top + bottom = 4 + 4)
 
         let natural_total = 2.0 // border_1 (top + bottom, included in h())
             + search_h
@@ -413,7 +465,7 @@ impl RenderOnce for Dropdown {
                 let selected_color = text_primary();
                 let unselected_color = text_muted();
 
-                menu_row(item_id, |d| d)
+                menu_row(item_id, item_h, compact, |d| d)
                     .transition_when_else(
                         is_selected,
                         duration_fast(),
@@ -438,7 +490,7 @@ impl RenderOnce for Dropdown {
                 .flex()
                 .items_center()
                 .gap_1()
-                .h(ITEM_HEIGHT)
+                .h(item_h)
                 .px_3()
                 .w_full()
                 .border_b_1()
@@ -466,16 +518,18 @@ impl RenderOnce for Dropdown {
             let on_toggle_close = on_toggle.clone();
             let create_id = ElementId::Name(format!("{id_str}-create").into());
             Some(
-                menu_row(create_id, |d| d.text_color(rgb(term_blue())))
-                    .child(t!("groups.create", name = query_str.as_str()).to_string())
-                    .on_click(move |_e, w, cx| {
-                        on_create(query_str.clone(), w, cx);
-                        // Close the menu after creating.
-                        if let Some(ref cb) = on_toggle_close {
-                            cb(w, cx);
-                        }
-                    })
-                    .into_any_element(),
+                menu_row(create_id, item_h, compact, |d| {
+                    d.text_color(rgb(term_blue()))
+                })
+                .child(t!("groups.create", name = query_str.as_str()).to_string())
+                .on_click(move |_e, w, cx| {
+                    on_create(query_str.clone(), w, cx);
+                    // Close the menu after creating.
+                    if let Some(ref cb) = on_toggle_close {
+                        cb(w, cx);
+                    }
+                })
+                .into_any_element(),
             )
         } else {
             None
@@ -489,7 +543,7 @@ impl RenderOnce for Dropdown {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .h(ITEM_HEIGHT)
+                        .h(item_h)
                         .text_sm()
                         .text_color(rgb(text_muted()))
                         .child(t!("groups.no_results").to_string())
@@ -499,10 +553,16 @@ impl RenderOnce for Dropdown {
         let menu = div()
             .id(menu_id.clone())
             .absolute()
-            .top_full()
             .left_0()
-            .mt_1()
             .w_full()
+            // Open below by default; upward when the caller opts in (see
+            // `open_upward`) — e.g. the AI panel's picker sits at the
+            // window bottom where a downward menu would be clipped.
+            .when_else(
+                menu_up,
+                |el| el.bottom_full().mb_1(),
+                |el| el.top_full().mt_1(),
+            )
             .overflow_hidden()
             .rounded(RADIUS_MD)
             .border_1()

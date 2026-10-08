@@ -165,6 +165,52 @@ pub enum SftpTransferStage {
     CleanUp,
 }
 
+/// Result of an out-of-band command execution started via
+/// [`CrabPortTerminal::exec_capture`].
+#[derive(Debug, Clone, Default)]
+pub struct ExecOutput {
+    /// Combined stdout + stderr, in arrival order.
+    pub output: String,
+    /// Process exit status, when the backend got one. `None` means "no
+    /// status was reported" — a timed-out command, a killed channel, or a
+    /// backend that couldn't start the command at all (the `output` then
+    /// carries the explanation).
+    pub exit_code: Option<u32>,
+    /// True when the backend stopped waiting before the command finished;
+    /// `output` carries whatever was captured so far.
+    pub timed_out: bool,
+    /// True when the caller's [`ExecCancel`] stopped the command; `output`
+    /// carries whatever was captured before that.
+    pub cancelled: bool,
+}
+
+/// Completion callback for [`CrabPortTerminal::exec_capture`]. Invoked
+/// exactly once, on a backend-owned thread or runtime task.
+pub type ExecCallback = std::sync::Arc<dyn Fn(ExecOutput) + Send + Sync>;
+
+/// Token that stops a running captured command.
+///
+/// Cloned into the backend and kept by the caller — the agent's tool card
+/// keeps one so its stop button can end a command that is still running.
+/// Flipping it makes the backend stop what it started (close the SSH
+/// channel, kill the local child) and report the output captured so far
+/// with [`ExecOutput::cancelled`] set. Cheap to clone: one shared flag.
+#[derive(Clone, Default)]
+pub struct ExecCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ExecCancel {
+    /// Ask the backend to stop the command. Idempotent and safe to call
+    /// after the command already finished (it is then ignored).
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 pub trait CrabPortTerminal: Send + Sync {
     fn write(&self, data: &[u8]);
     fn resize(&self, cols: u16, rows: u16);
@@ -287,6 +333,44 @@ pub trait CrabPortTerminal: Send + Sync {
         _rows: u16,
     ) -> Option<std::sync::Arc<dyn CrabPortTerminal>> {
         None
+    }
+
+    /// Whether this backend can run commands out of band — see
+    /// [`Self::exec_capture`]. True for backends that can open an
+    /// independent command channel or spawn an extra child process (SSH,
+    /// local PTY); false for connection types whose only stream is the
+    /// interactive session (Telnet, Serial).
+    fn allow_exec_capture(&self) -> bool {
+        false
+    }
+
+    /// Run `command` out of band — **not** through the interactive shell —
+    /// and report the result through `done`, exactly once.
+    ///
+    /// This is what the AI agent's implicit execution mode is built on: the
+    /// command never appears in the user's terminal, stdout/stderr are
+    /// captured directly, and no tty is involved (so anything that prompts
+    /// for input fails or times out instead of hanging the session).
+    ///
+    /// `timeout` bounds the wait: when it elapses the backend stops reading
+    /// and reports the output so far with [`ExecOutput::timed_out`].
+    /// `cancel` stops it earlier — the user ending a running tool call —
+    /// with [`ExecOutput::cancelled`] set instead.
+    ///
+    /// Backends for which [`Self::allow_exec_capture`] is false never have
+    /// this called; the default implementation answers with an explanatory
+    /// error instead of hanging should one ever be.
+    fn exec_capture(
+        &self,
+        _command: &str,
+        _timeout: std::time::Duration,
+        _cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
+        done(ExecOutput {
+            output: "captured execution is not supported on this connection".to_string(),
+            ..Default::default()
+        });
     }
 }
 
@@ -520,6 +604,48 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{MAX_COMMAND_HISTORY, merge_history_entries, strip_prompt_prefix};
+
+    /// `dump_text` is what the AI agent's `terminal_read` tool hands to the
+    /// model, so it has to be plain, trimmed text: no trailing blanks per
+    /// line, no padding cells of the grid, and the *last* lines when the
+    /// session has more output than asked for.
+    #[test]
+    fn dump_text_returns_recent_lines_trimmed() {
+        let backend = std::sync::Arc::new(crate::pty::FailedPtyBackend::new("test".into()));
+        let session = super::TerminalSession::new(backend, 40, 5);
+        // Feed two lines of output; `\r\n` is what a shell emits.
+        session.feed_escape(b"hello\r\nworld\r\n");
+
+        let text = session.dump_text(10);
+        assert_eq!(text, "hello\nworld");
+
+        // A one-line request keeps the most recent line, not the oldest.
+        let text = session.dump_text(1);
+        assert_eq!(text, "world");
+
+        // Blank rows (the rest of a short screen) never leak into the dump.
+        assert!(!session.dump_text(50).contains("\n\n"));
+    }
+
+    /// The AI agent's implicit execution mode goes through
+    /// `TerminalSession::exec_capture`; a backend that can't run commands
+    /// out of band must say so — and answer with exactly one outcome —
+    /// rather than leaving the tool call hanging forever.
+    #[test]
+    fn exec_capture_answers_unsupported_backends() {
+        let backend = std::sync::Arc::new(crate::pty::FailedPtyBackend::new("test".into()));
+        let session = super::TerminalSession::new(backend, 40, 5);
+        assert!(!session.allow_exec_capture());
+        let rx = session.exec_capture(
+            "echo hi",
+            std::time::Duration::from_secs(1),
+            super::ExecCancel::default(),
+        );
+        let out = smol::block_on(rx.recv()).expect("exactly one outcome");
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, None);
+        assert!(out.output.contains("not supported"), "{}", out.output);
+    }
 
     // Regression for issue #69: macOS zsh default PS1 `%n@%m %1~ %#`
     // renders as `weed@MacBook-Pro ~ %` — no trailing space after the
@@ -1299,6 +1425,35 @@ impl TerminalSession {
         self.backend.refresh_history();
     }
 
+    /// Whether the backend can run commands out of band — the AI agent's
+    /// implicit execution mode. See [`CrabPortTerminal::exec_capture`].
+    pub fn allow_exec_capture(&self) -> bool {
+        self.backend.allow_exec_capture()
+    }
+
+    /// Run `command` out of band and capture its output. The returned
+    /// receiver yields exactly once — when the command finishes, `timeout`
+    /// elapses, or `cancel` is flipped. The session's terminal is never
+    /// touched: this is an extra channel/process, not a write to the
+    /// interactive shell.
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: ExecCancel,
+    ) -> async_channel::Receiver<ExecOutput> {
+        let (tx, rx) = async_channel::bounded(1);
+        self.backend.exec_capture(
+            command,
+            timeout,
+            cancel,
+            std::sync::Arc::new(move |out| {
+                let _ = tx.try_send(out);
+            }),
+        );
+        rx
+    }
+
     pub fn allow_snippets(&self) -> bool {
         self.backend.allow_snippets()
     }
@@ -1528,6 +1683,55 @@ impl TerminalSession {
         // Nothing was emitted (e.g. legacy format coordinate overflow) —
         // report `false` so the caller falls back to its local handling.
         false
+    }
+
+    // -----------------------------------------------------------------
+    /// Plain-text dump of the terminal's last `max_lines` lines (scrollback
+    /// plus the visible screen), for callers that need to *read* the session
+    /// rather than render it — the AI agent's `terminal_read` tool, and any
+    /// future "summarize what just happened" features.
+    ///
+    /// Trailing whitespace is trimmed per line and the result is trimmed at
+    /// the end, so a screen full of short prompts costs little. `max_lines`
+    /// is clamped to a sane range (1..=2000) to keep a chatty session from
+    /// dumping megabytes into a request.
+    pub fn dump_text(&self, max_lines: usize) -> String {
+        let max_lines = max_lines.clamp(1, 2000);
+        let term = self.term.lock();
+        Self::dump_grid_text(&term, max_lines)
+    }
+
+    /// Non-blocking [`Self::dump_text`]: `None` when the reader thread holds
+    /// the terminal lock right now. Callers that poll (the agent's command
+    /// output wait) use this so they never stall on the lock.
+    pub fn try_dump_text(&self, max_lines: usize) -> Option<String> {
+        let max_lines = max_lines.clamp(1, 2000);
+        let term = self.term.try_lock_unfair()?;
+        Some(Self::dump_grid_text(&term, max_lines))
+    }
+
+    /// Format the last `max_lines` non-blank lines of a terminal grid.
+    fn dump_grid_text(term: &Term<EventProxy>, max_lines: usize) -> String {
+        let grid = term.grid();
+        // Every row of the grid, blank trailing rows of the screen included —
+        // they are trimmed off below, so "the last N lines" means the last N
+        // lines *of output* rather than the empty bottom of the screen.
+        let lines: Vec<String> = (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(|row| {
+                let line = &grid[Line(row)];
+                (0..=grid.last_column().0)
+                    .map(|column| line[Column(column)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let end = lines
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |ix| ix + 1);
+        let start = end.saturating_sub(max_lines);
+        lines[start..end].join("\n")
     }
 
     // -----------------------------------------------------------------

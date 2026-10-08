@@ -122,6 +122,11 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/014_connection_history.sql"),
         on_error: OnError::Fail,
     },
+    Migration {
+        name: "ai_secrets",
+        sql: include_str!("migrations/015_ai_secrets.sql"),
+        on_error: OnError::Fail,
+    },
 ];
 
 /// Bring the database up to the latest schema version.

@@ -58,6 +58,28 @@ mod selection;
 
 // ---- TerminalView ----
 
+/// Cx-free handles into one terminal session, for work that must run off the
+/// UI thread — the AI agent's tools. Both the session and the backend are
+/// shared `Arc`s, so a snapshot taken with [`TerminalView::agent_handles`]
+/// keeps working without an entity read, and keeps pointing at the session
+/// that was current when it was taken.
+pub struct AgentTerminalHandles {
+    /// The session's grid + input/output plumbing (dump, write, exec,
+    /// SFTP).
+    pub session: Arc<TerminalSession>,
+    /// The backend itself — needed for the callback-style
+    /// [`crabport_terminal::terminal::CrabPortTerminal::exec_capture`].
+    pub backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+    /// The SSH connection a tunnel may borrow, when this is an SSH session.
+    pub tunnel_source: Option<Arc<dyn CrabPortTunnel>>,
+    /// Persisted host id, for filtering the Tunnels-page registry.
+    pub host_id: Option<i64>,
+    /// The pane id this view was created with (see [`TerminalView::pane_id`]).
+    pub pane_id: u64,
+    /// Directory the shell last reported (OSC 7), as of the snapshot.
+    pub cwd: Option<String>,
+}
+
 /// Snapshot of an in-flight SFTP transfer, surfaced to the toolbar so the
 /// user can see which stage (compress / transfer / decompress / cleanup)
 /// is currently running and which path it's working on.
@@ -197,6 +219,14 @@ pub struct TerminalView {
     /// new cwd, and the foreground process name (e.g. `zsh`, `cargo`), so
     /// the app can find the right tab to update its title.
     on_cwd_changed: Option<Rc<dyn Fn(u64, std::path::PathBuf, String, &mut App)>>,
+    /// Last cwd the shell reported (OSC 7), kept for the AI agent's tool
+    /// cards — an `execute` call shows the directory it will run in — and
+    /// for anything else that needs the session's location without
+    /// observing the tab-title callback.
+    last_cwd: Option<String>,
+    /// Last foreground process name reported by the shell integration, if
+    /// any (`zsh`, `cargo`, ...). Shown next to the cwd on tool cards.
+    last_process: Option<String>,
     /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
     /// session. Used by the Tunnels panel to start "borrowed" tunnels that
     /// reuse this tab's SSH connection instead of opening a dedicated owned
@@ -612,6 +642,8 @@ impl TerminalView {
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
             on_cwd_changed: None,
+            last_cwd: None,
+            last_process: None,
             reconnect_attempts: Arc::new(AtomicU32::new(0)),
             tunnel_source: None,
             search_state: None,
@@ -838,8 +870,13 @@ impl TerminalView {
                         process_name,
                     } => {
                         // Foreground process changed (cwd and/or name).
-                        // Forward to the app so it can update the tab title.
+                        // Forward to the app so it can update the tab title,
+                        // and remember it here: the AI agent's tool cards show
+                        // the directory a command is about to run in.
+                        let process_name_for_store = process_name.clone();
                         let _ = entity.update(cx, |this, cx| {
+                            this.last_cwd = Some(cwd.display().to_string());
+                            this.last_process = Some(process_name_for_store);
                             let cb = this.on_cwd_changed.clone();
                             let tab_id = this.count;
                             if let Some(cb) = cb {
@@ -1124,6 +1161,70 @@ impl TerminalView {
         self.session.write_raw(data);
     }
 
+    /// Plain-text dump of the session's last `max_lines` lines (scrollback +
+    /// visible screen). Used by the AI agent's `terminal_read` tool.
+    pub fn dump_text(&self, max_lines: usize) -> String {
+        self.session.dump_text(max_lines)
+    }
+
+    /// Like [`Self::dump_text`], but never blocks: `None` when the reader
+    /// thread holds the terminal lock, so the caller can retry on its next
+    /// tick instead of stalling whatever it is doing (the agent's command
+    /// output wait polls this while the UI keeps painting).
+    pub fn try_dump_text(&self, max_lines: usize) -> Option<String> {
+        self.session.try_dump_text(max_lines)
+    }
+
+    /// Subscribe to the backend's event stream — the AI panel's SFTP tools
+    /// await transfer-completion events on it (alongside this view's own
+    /// listener and the session's parser loop; everyone gets every event).
+    pub fn subscribe_backend(
+        &self,
+    ) -> async_broadcast::Receiver<crabport_terminal::terminal::BackendEvent> {
+        self.session.subscribe_backend()
+    }
+
+    /// Whether this session's backend can run commands out of band — the AI
+    /// agent's implicit execution mode (`terminal_exec`). False for
+    /// connection types whose only stream is the interactive session
+    /// (Telnet, Serial), and on platforms without a local captured-exec
+    /// implementation.
+    pub fn allow_exec_capture(&self) -> bool {
+        self.session.allow_exec_capture()
+    }
+
+    /// Run `command` out of band and capture its output — an extra
+    /// channel/process on the same connection, never a write to the shell.
+    /// The receiver yields exactly once: the command's combined output and
+    /// exit status, or the output so far when `timeout` elapses or `cancel`
+    /// is flipped (the tool card's stop button).
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: crabport_terminal::terminal::ExecCancel,
+    ) -> async_channel::Receiver<crabport_terminal::terminal::ExecOutput> {
+        self.session.exec_capture(command, timeout, cancel)
+    }
+
+    /// The font family terminals render with, per the user's settings. Exposed
+    /// so other surfaces can present shell text in the same face — the AI
+    /// panel's tool cards show a command exactly as the terminal will.
+    pub fn mono_font_family() -> String {
+        fonts::font_family()
+    }
+
+    /// Directory the shell last reported (OSC 7), if shell integration is
+    /// active. Tool cards show it so the user knows where a command runs.
+    pub fn cwd(&self) -> Option<&str> {
+        self.last_cwd.as_deref()
+    }
+
+    /// Foreground process name last reported by shell integration.
+    pub fn foreground_process(&self) -> Option<&str> {
+        self.last_process.as_deref()
+    }
+
     /// Copy the current selection (or the whole visible grid if no
     /// selection) to the clipboard. Equivalent to the `TerminalAction::Copy`
     /// keyboard shortcut — sets the `pending_copy` flag, which the next
@@ -1397,6 +1498,20 @@ impl TerminalView {
     /// The tunnel source Arc, if any (for SSH tabs).
     pub fn tunnel_source_arc(&self) -> Option<Arc<dyn CrabPortTunnel>> {
         self.tunnel_source.clone()
+    }
+
+    /// Cx-free handles into this session, snapshotted for work that must run
+    /// off the UI thread (the AI agent's tools — see
+    /// [`crate::views::panel::ai`]).
+    pub fn agent_handles(&self) -> AgentTerminalHandles {
+        AgentTerminalHandles {
+            session: self.session.clone(),
+            backend: self.backend.clone(),
+            tunnel_source: self.tunnel_source.clone(),
+            host_id: self.host_id,
+            pane_id: self.count,
+            cwd: self.last_cwd.clone(),
+        }
     }
 
     /// Set the tunnel source (optional builder, used by split-pane creation

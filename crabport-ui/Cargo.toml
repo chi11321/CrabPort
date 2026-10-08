@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+crabport-agent = { path = "../crabport-agent" }
 crabport-core = { path = "../crabport-core" }
+crabport-ai = { path = "../crabport-ai" }
 crabport-terminal = { path = "../crabport-terminal" }
 crabport-ssh = { path = "../crabport-ssh" }
 crabport-sftp = { path = "../crabport-sftp" }
@@ -14,6 +16,13 @@ gpui = { version = "0.2", default-features = false, features = ["font-kit"] }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 parking_lot = "0.12"
 smol = "2.0.2"
+# Used by the AI panel to await a terminal's captured (out-of-band) command
+# result — `TerminalView::exec_capture` hands back an `async_channel`
+# receiver, same as `crabport-terminal`/`crabport-ssh` use internally.
+async-channel = "2.5"
+# Used by the AI panel's SFTP tools to await a transfer's completion event
+# (the same broadcast the terminal view and session already consume).
+async-broadcast = "0.7"
 gpui-animation = "0.2.63"
 gpui-component = "0.5"
 rust-i18n = "3"
@@ -26,10 +35,13 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # runs in a background `cx.spawn` task so the sync API is fine. `serde`/
 # `serde_json` are used for `#[derive(Deserialize)]` on the GitHub API
 # response subset.
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3", features = ["json", "socks-proxy"] }
 semver = "1"
 serde = { version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
+# Used by `src/ai.rs` to wrap the provider API key before handing it to
+# `crabport-ai`; `crabport-ssh` uses the same crate for its secrets.
+secrecy = "0.10"
 # Used by `src/theme.rs` to parse user-supplied `.toml` theme files from the
 # data dir. `crabport-core` already depends on `toml` for `config.toml`, but
 # each crate must declare its own direct deps — re-exporting would muddy the

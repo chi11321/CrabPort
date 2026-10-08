@@ -13,19 +13,23 @@ identifier = "org.eu.tachibana-kanade.crabport"
 # is the single source of truth — no duplication, no build-time assert.
 copyright = "Copyright © 2026 ch1ll321"
 icon = ["app-icon.icns", "app-icon.png"]
+# macOS-specific settings. cargo-bundle 0.12+ moved the old flat `osx_*`
+# keys into this nested table and rejects unknown keys, so the flat
+# spellings no longer parse.
+[package.metadata.bundle.osx]
 # Register the `crabport://` URL scheme so macOS LaunchServices routes
 # `crabport://...` URLs to this app. Our `on_open_urls` handler in
 # `main.rs` resolves them to a folder path and opens a local-terminal
 # tab cd'd into it. This is the "Open in CrabPort" entry point for
 # the URL-scheme flavour (the other flavour, folder right-click via
 # `CFBundleDocumentTypes`, is wired through `Info.plist.ext` below).
-osx_url_schemes = ["crabport"]
+url_schemes = ["crabport"]
 # Merge `Info.plist.ext` into the generated `Info.plist`. We use this to
 # declare `CFBundleDocumentTypes` for `public.folder` so the app appears
 # in Finder's "Open With" menu for folders — clicking it opens a local-
 # terminal tab in that folder via `application:openURLs:` (Finder passes
 # the folder as a `file://` URL).
-osx_info_plist_exts = ["Info.plist.ext"]
+info_plist_exts = ["Info.plist.ext"]
 
 [dependencies]
 crabport-ui = { path = "crabport-ui" }
@@ -49,6 +53,8 @@ panic = "abort"
 
 [workspace]
 members = [
+    "crabport-agent",
+    "crabport-ai",
     "crabport-core",
     "crabport-ssh",
     "crabport-sftp",
@@ -59,6 +65,18 @@ members = [
     "crabport-telnet",
     "crabport-serial",
 ]
+# The vendored `gpui-component` copy is a dependency (via `[patch.crates-io]`
+# below), not a workspace member — excluding it keeps cargo from treating it
+# as one. See `vendor/gpui-component/PATCHES.md` for what we patch and why.
+exclude = ["vendor/gpui-component"]
+
+# Patched third-party crates. `gpui-component`'s text rendering has a
+# selection-painting path that is O(chars²) per frame, which stalls the AI
+# panel on long messages (see `vendor/gpui-component/PATCHES.md`); upstream
+# has no fix on the gpui 0.2 line, so we build our patched copy. Reverting =
+# delete the `vendor/` directory and this block.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
 
 # Single source of truth for the project version. Every member crate
 # inherits this via `version.workspace = true` in its own `[package]` table,
