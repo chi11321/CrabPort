@@ -19,6 +19,9 @@ smol = "2.0.2"
 # result — `TerminalView::exec_capture` hands back an `async_channel`
 # receiver, same as `crabport-terminal`/`crabport-ssh` use internally.
 async-channel = "2.5"
+# Used by the AI panel's SFTP tools to await a transfer's completion event
+# (the same broadcast the terminal view and session already consume).
+async-broadcast = "0.7"
 gpui-animation = "0.2.63"
 gpui-component = "0.5"
 rust-i18n = "3"

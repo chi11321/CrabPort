@@ -668,6 +668,8 @@ impl CrabportApp {
         let session = crate::views::panel::ai::AiSession {
             pane_id,
             terminal: view.downgrade(),
+            tunnels: self.app_ctx.tunnels.clone(),
+            app: cx.entity().downgrade(),
         };
         let panel = cx.new(|_cx| crate::views::panel::ai::AiPanel::new(session));
         self.ai_panels.insert(pane_id, panel.clone());

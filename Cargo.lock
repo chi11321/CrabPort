@@ -1545,6 +1545,7 @@ name = "crabport-ui"
 version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
+ "async-broadcast",
  "async-channel 2.5.0",
  "chrono",
  "crabport-ai",

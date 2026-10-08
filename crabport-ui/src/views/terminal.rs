@@ -1153,6 +1153,15 @@ impl TerminalView {
         self.session.try_dump_text(max_lines)
     }
 
+    /// Subscribe to the backend's event stream — the AI panel's SFTP tools
+    /// await transfer-completion events on it (alongside this view's own
+    /// listener and the session's parser loop; everyone gets every event).
+    pub fn subscribe_backend(
+        &self,
+    ) -> async_broadcast::Receiver<crabport_terminal::terminal::BackendEvent> {
+        self.session.subscribe_backend()
+    }
+
     /// Whether this session's backend can run commands out of band — the AI
     /// agent's implicit execution mode (`terminal_exec`). False for
     /// connection types whose only stream is the interactive session
