@@ -34,7 +34,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # runs in a background `cx.spawn` task so the sync API is fine. `serde`/
 # `serde_json` are used for `#[derive(Deserialize)]` on the GitHub API
 # response subset.
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3", features = ["json", "socks-proxy"] }
 semver = "1"
 serde = { version = "1", features = ["derive"], default-features = false }
 serde_json = "1"
