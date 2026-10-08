@@ -18,6 +18,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use russh::client;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::AbortHandle;
 
 use crabport_terminal::terminal::RemoteStatus;
 
@@ -30,6 +31,7 @@ use crate::keys::decode_private_key;
 use crate::known_hosts::KnownHosts;
 use crate::session::SshConnectionInfo;
 use ::crabport_tunnel::ReverseForwardRegistry;
+use secrecy::ExposeSecret;
 
 /// A standalone SSH connection owned by the tunnel layer.
 ///
@@ -45,6 +47,11 @@ pub struct OwnedSession {
     status: Arc<RwLock<RemoteStatus>>,
     /// Reverse-forward registry shared with the `SshHandler`.
     reverse_registry: ReverseForwardRegistry,
+    /// Abort handle for the parked connect task (see `connect`). Aborting it
+    /// in [`Self::shutdown`] releases that task's `Arc` clones — without
+    /// this, the task blocks forever holding the handle and the SSH TCP
+    /// connection never closes.
+    task: AbortHandle,
 }
 
 impl OwnedSession {
@@ -78,7 +85,7 @@ impl OwnedSession {
         // returns cleanly once authentication finishes (or fails).
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-        TOKIO.spawn(async move {
+        let task = TOKIO.spawn(async move {
             // Open the known_hosts store (non-fatal on failure — fall back to
             // prompting, same as SshBackend).
             let known_hosts = match KnownHosts::open() {
@@ -97,7 +104,15 @@ impl OwnedSession {
                 reverse_registry: reverse_registry_for_handler,
             };
 
-            let config = Arc::new(client::Config::default());
+            let mut config = client::Config::default();
+            // Enable protocol-level keepalive so long-idle tunnel
+            // connections stay alive. This session has no PTY, so the
+            // `keepalive@openssh.com` GLOBAL_REQUEST is side-effect free.
+            config.keepalive_interval = crabport_core::config::snapshot()
+                .appearance
+                .terminal
+                .effective_keepalive();
+            let config = Arc::new(config);
             // Direct or through the jump-host chain (mirrors
             // `SshBackend::new`). The returned guard keeps the intermediate
             // hop sessions alive; it's parked on this task below.
@@ -130,8 +145,15 @@ impl OwnedSession {
 
             // Authenticate — key auth if a private key is set, else password.
             if info.uses_key_auth() {
-                let key_str = info.private_key.as_deref().unwrap_or("");
-                let key_pair = match decode_private_key(key_str, info.passphrase.as_deref()) {
+                let key_str = info
+                    .private_key
+                    .as_ref()
+                    .map(|s| s.expose_secret())
+                    .unwrap_or("");
+                let key_pair = match decode_private_key(
+                    key_str,
+                    info.passphrase.as_ref().map(|s| s.expose_secret()),
+                ) {
                     Ok(kp) => kp,
                     Err(e) => {
                         tracing::error!("SSH: owned session — failed to decode private key: {e}");
@@ -159,7 +181,7 @@ impl OwnedSession {
                 }
             } else {
                 match sh
-                    .authenticate_password(&info.username, &info.password)
+                    .authenticate_password(&info.username, info.password.expose_secret())
                     .await
                 {
                     Ok(true) => {}
@@ -203,11 +225,14 @@ impl OwnedSession {
             std::future::pending::<()>().await;
         });
 
+        let task = task.abort_handle();
+
         match rx.await {
             Ok(Ok(())) => Ok(Arc::new(Self {
                 handle: handle_ret,
                 status: status_ret,
                 reverse_registry,
+                task,
             })),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("owned session connect task panicked".into()),
@@ -223,6 +248,32 @@ impl CrabPortTunnel for OwnedSession {
 
     fn status(&self) -> RemoteStatus {
         *self.status.read()
+    }
+
+    async fn shutdown(&self) {
+        *self.status.write() = RemoteStatus::Disconnected;
+        // Take the handle out of the slot so any later tunnel work sees
+        // "session down", then say goodbye gracefully (bounded, so a dead
+        // transport can never hang `stop`).
+        let shared = self.handle.lock().await.take();
+        if let Some(shared) = shared {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                let h = shared.lock().await;
+                if let Err(e) = h
+                    .disconnect(russh::Disconnect::ByApplication, "tunnel stopped", "en")
+                    .await
+                {
+                    tracing::debug!("SSH: owned session graceful disconnect failed: {e}");
+                }
+            })
+            .await;
+        }
+        // Release the parked connect task's clones of the handle. When the
+        // last `Arc<Handle>` drops, russh closes the TCP connection — and
+        // sshd then frees any remote `-R` listeners that survived a failed
+        // or raced `cancel_tcpip_forward`. Without this abort the task
+        // blocks forever and the connection (plus its listeners) leaks.
+        self.task.abort();
     }
 
     fn reverse_registry(&self) -> Arc<ReverseForwardRegistry> {

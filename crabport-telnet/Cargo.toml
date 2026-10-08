@@ -7,7 +7,7 @@ edition.workspace = true
 crabport-terminal = { path = "../crabport-terminal" }
 crabport-core = { path = "../crabport-core" }
 crabport-proxy = { path = "../crabport-proxy" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }
 async-broadcast = "0.7"
 async-channel = "2.5"
 tracing = { version = "0.1", default-features = false, features = ["std"] }

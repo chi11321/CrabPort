@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use alacritty_terminal::{
@@ -28,6 +28,7 @@ use crabport_terminal::terminal::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use parking_lot::Mutex;
+use rust_i18n::t;
 
 use crate::app::{
     CrabPortTab, TerminalDecreaseFont, TerminalIncreaseFont, TerminalResetFont, TerminalShiftTab,
@@ -44,6 +45,7 @@ use crate::views::terminal::runs::build_runs;
 use crate::views::terminal::selection::*;
 
 pub mod connection_overlay;
+pub mod search;
 pub mod split;
 pub mod toolbar;
 
@@ -55,6 +57,28 @@ mod scrollbar_handle;
 mod selection;
 
 // ---- TerminalView ----
+
+/// Cx-free handles into one terminal session, for work that must run off the
+/// UI thread — the AI agent's tools. Both the session and the backend are
+/// shared `Arc`s, so a snapshot taken with [`TerminalView::agent_handles`]
+/// keeps working without an entity read, and keeps pointing at the session
+/// that was current when it was taken.
+pub struct AgentTerminalHandles {
+    /// The session's grid + input/output plumbing (dump, write, exec,
+    /// SFTP).
+    pub session: Arc<TerminalSession>,
+    /// The backend itself — needed for the callback-style
+    /// [`crabport_terminal::terminal::CrabPortTerminal::exec_capture`].
+    pub backend: Arc<dyn crabport_terminal::terminal::CrabPortTerminal>,
+    /// The SSH connection a tunnel may borrow, when this is an SSH session.
+    pub tunnel_source: Option<Arc<dyn CrabPortTunnel>>,
+    /// Persisted host id, for filtering the Tunnels-page registry.
+    pub host_id: Option<i64>,
+    /// The pane id this view was created with (see [`TerminalView::pane_id`]).
+    pub pane_id: u64,
+    /// Directory the shell last reported (OSC 7), as of the snapshot.
+    pub cwd: Option<String>,
+}
 
 /// Snapshot of an in-flight SFTP transfer, surfaced to the toolbar so the
 /// user can see which stage (compress / transfer / decompress / cleanup)
@@ -77,6 +101,9 @@ pub struct SftpProgress {
 }
 
 pub struct TerminalView {
+    /// Stable per-instance id, used only for debug logging to tell apart
+    /// multiple terminal panels in the same window.
+    id: u64,
     session: Arc<TerminalSession>,
     /// Cloned `Arc` to the underlying backend, kept so this view can call
     /// trait methods (`sftp_rename`, `sftp_open_in_editor`, …) that
@@ -94,6 +121,10 @@ pub struct TerminalView {
     /// `None` until the first render finishes setup.
     applied_font_signature: Option<(String, f32)>,
     last_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// Last grid size (cols, rows) we actually told the PTY about.
+    /// Used to throttle / debounce resizes so a layout feedback loop
+    /// (e.g. opencode inside tmux) cannot oscillate the terminal size.
+    last_resized_grid: Arc<Mutex<Option<(usize, usize)>>>,
     selection: Arc<Mutex<Option<Selection>>>,
     render_cache: SharedRenderCache,
     /// Set by data/status; consumed by the ~120Hz frame pump.
@@ -188,11 +219,195 @@ pub struct TerminalView {
     /// new cwd, and the foreground process name (e.g. `zsh`, `cargo`), so
     /// the app can find the right tab to update its title.
     on_cwd_changed: Option<Rc<dyn Fn(u64, std::path::PathBuf, String, &mut App)>>,
+    /// Last cwd the shell reported (OSC 7), kept for the AI agent's tool
+    /// cards — an `execute` call shows the directory it will run in — and
+    /// for anything else that needs the session's location without
+    /// observing the tab-title callback.
+    last_cwd: Option<String>,
+    /// Last foreground process name reported by the shell integration, if
+    /// any (`zsh`, `cargo`, ...). Shown next to the cwd on tool cards.
+    last_process: Option<String>,
     /// A `CrabPortTunnel` view of the backend, when the backend is an SSH
     /// session. Used by the Tunnels panel to start "borrowed" tunnels that
     /// reuse this tab's SSH connection instead of opening a dedicated owned
     /// session. `None` for local PTY backends.
     tunnel_source: Option<Arc<dyn crabport_ssh::CrabPortTunnel>>,
+    /// Reconnect attempt counter for exponential backoff. Reset to 0 on a
+    /// successful `Connected` status. Incremented each time an auto-reconnect
+    /// fires, so the delay grows (1 → 2 → 4 → … → 30s cap) across repeated
+    /// failures.
+    reconnect_attempts: Arc<AtomicU32>,
+    /// Terminal search overlay state.
+    search_state: Option<Entity<gpui_component::input::InputState>>,
+    /// Whether the search overlay is currently visible.
+    search_visible: bool,
+    /// Current search query (kept in sync with the InputState).
+    search_query: String,
+    /// Cached list of matches for `search_query`. Recomputed when the query
+    /// changes or the terminal grid is invalidated (resize, new output
+    /// that changes line count, …).
+    search_matches: Vec<crabport_terminal::terminal::SearchMatch>,
+    /// Index into `search_matches` of the currently-active (highlighted)
+    /// match, or `None` if none is active.
+    search_active: Option<usize>,
+}
+
+/// Encode a key event into the kitty keyboard protocol's `CSI u` form, or one
+/// of its fixed-function-key escape sequences when the key has no Unicode
+/// scalar (arrows, F-keys, …). Returns `None` for keys we cannot encode (in
+/// which case the caller should fall back to the legacy IME/byte path).
+///
+/// `CSI u` layout: `\e[<unicode>;<mods>u`, where `mods` is the kitty modifier
+/// mask (shift=1, alt=2, ctrl=4, super/cmd=8) **plus 1** — the +1 is part of
+/// the protocol so that "no modifiers" is reported as `1`, not `0`.
+///
+/// NOTE: when the kitty keyboard protocol is active we route *every* key
+/// through this encoder and bypass the IME text path. That trades away CJK
+/// input-method composition under kitty-enabled TUIs (e.g. opencode), which is
+/// an acceptable trade-off: those TUIs are English-first and need unambiguous
+/// key reporting far more than they need an IME.
+fn encode_kitty_key(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let modifiers = &keystroke.modifiers;
+    let mut mods = 0u8;
+    if modifiers.shift {
+        mods |= 1;
+    }
+    if modifiers.alt {
+        mods |= 2;
+    }
+    if modifiers.control {
+        mods |= 4;
+    }
+    // On macOS the `platform` modifier is ⌘ (Command); kitty maps it to super.
+    if modifiers.platform {
+        mods |= 8;
+    }
+    let reported = mods + 1;
+
+    // Function / non-character keys get dedicated escape sequences.
+    // `keystroke.key` uses gpui's naming ("up", "down", "enter", "f1", …).
+    let seq = match keystroke.key.as_str() {
+        "up" => format!("\x1b[1;{}A", reported),
+        "down" => format!("\x1b[1;{}B", reported),
+        "right" => format!("\x1b[1;{}C", reported),
+        "left" => format!("\x1b[1;{}D", reported),
+        "home" => format!("\x1b[1;{}H", reported),
+        "end" => format!("\x1b[1;{}F", reported),
+        "pageup" => format!("\x1b[5;{}~", reported),
+        "pagedown" => format!("\x1b[6;{}~", reported),
+        "insert" => format!("\x1b[2;{}~", reported),
+        "delete" => format!("\x1b[3;{}~", reported),
+        "f1" => format!("\x1b[1;{}P", reported),
+        "f2" => format!("\x1b[1;{}Q", reported),
+        "f3" => format!("\x1b[1;{}R", reported),
+        "f4" => format!("\x1b[1;{}S", reported),
+        "f5" => format!("\x1b[15;{}~", reported),
+        "f6" => format!("\x1b[17;{}~", reported),
+        "f7" => format!("\x1b[18;{}~", reported),
+        "f8" => format!("\x1b[19;{}~", reported),
+        "f9" => format!("\x1b[20;{}~", reported),
+        "f10" => format!("\x1b[21;{}~", reported),
+        "f11" => format!("\x1b[23;{}~", reported),
+        "f12" => format!("\x1b[24;{}~", reported),
+        _ => {
+            // Character keys and the "named" control keys (enter/tab/…).
+            let cp: u32 = match keystroke.key.as_str() {
+                "enter" => 13,
+                "tab" => 9,
+                "backspace" => 127,
+                "escape" => 27,
+                "space" => 32,
+                // Regular character: take its first Unicode scalar value.
+                s if !s.is_empty() => s.chars().next()? as u32,
+                _ => return None,
+            };
+            format!("\x1b[{};{}u", cp, reported)
+        }
+    };
+    Some(seq.into_bytes())
+}
+
+/// Resize the PTY grid to match the *current* canvas bounds, issuing the
+/// resize only when the computed grid actually changed.
+///
+/// Shared by the prepaint and paint callbacks of the terminal canvas. The
+/// frame pump drives repaints through `cx.notify()` without re-running
+/// layout, so a bounds change that happens without a relayout would
+/// otherwise leave the PTY grid stale — the prepaint-time resize alone is
+/// not enough, hence the same check also runs on every painted frame.
+///
+/// Resizing eagerly (no debounce) is deliberate: during split-drag or panel
+/// animations the bounds shrink transiently to an intermediate size, and a
+/// debounce can lock the PTY grid onto that small size. Once locked, even
+/// after the bounds grow back the grid stays small and text collapses to
+/// the top-left corner while the surrounding (stale) frame buffer is never
+/// repainted. Following bounds every frame keeps the grid in sync with what
+/// is actually on screen.
+///
+/// Returns `true` when a resize was issued (callers use this to invalidate
+/// derived caches).
+fn sync_pty_grid(
+    bounds: Bounds<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    last_grid: &Mutex<Option<(usize, usize)>>,
+    session: &TerminalSession,
+    selection: &Mutex<Option<Selection>>,
+    window: &mut Window,
+    view_id: u64,
+) -> bool {
+    // `Pixels / Pixels` yields an f32 column/row count.
+    let cols = (bounds.size.width / cell_width).floor().max(2.0) as usize;
+    let rows = (bounds.size.height / line_height).floor().max(1.0) as usize;
+
+    // Guard against degenerate sizes: a 0/very small grid would shrink the
+    // PTY (and a multiplexer such as tmux) to almost nothing, which looks
+    // like the terminal "collapsing". This can happen if the size is
+    // computed from a not-yet-laid-out view or an overlay bounds.
+    if cols < 10 || rows < 4 {
+        tracing::debug!(
+            "[grid-sync #{}] SKIP tiny bounds {:?} (cell {}x{}, prev {:?})",
+            view_id,
+            bounds.size,
+            cell_width,
+            line_height,
+            *last_grid.lock()
+        );
+        return false;
+    }
+
+    let prev_grid = *last_grid.lock();
+    let grid_changed = match prev_grid {
+        Some((lc, lr)) => lc != cols || lr != rows,
+        None => true,
+    };
+    if !grid_changed {
+        return false;
+    }
+
+    session.resize(cols as u16, rows as u16);
+    *selection.lock() = None;
+    *last_grid.lock() = Some((cols, rows));
+
+    // Force the whole window to repaint on the next frame. Without this,
+    // when the canvas bounds shrink (e.g. opencode exits its TUI and the
+    // grid collapses) GPUI only repaints the new, smaller dirty rectangle —
+    // the pixels that used to sit in the now-vacated region are never
+    // cleared and stay as stale residue until the user manually resizes the
+    // window. Refreshing the window marks it fully dirty so the surrounding
+    // area repaints and the ghost is gone.
+    window.refresh();
+    tracing::debug!(
+        "[grid-sync #{}] {}x{} (bounds {:?}, cell {}x{}, prev {:?})",
+        view_id,
+        cols,
+        rows,
+        bounds.size,
+        cell_width,
+        line_height,
+        prev_grid
+    );
+    true
 }
 
 impl TerminalView {
@@ -314,9 +529,23 @@ impl TerminalView {
         };
         session.start();
 
-        // Wire command-history persistence: when the session captures a new
-        // command, persist it to the Store for this host (if any). Local
-        // terminals (host_id = None) keep history in-memory only.
+        // NOTE: kitty keyboard protocol is *not* enabled unconditionally here.
+        // Doing so makes plain shells (bash/zsh) mis-parse `CSI u` sequences as
+        // garbage. Instead, `TerminalSession` negotiates on demand: when the
+        // program (e.g. a TUI like opencode/Ink) sends a kitty keyboard request
+        // (`\e[>u` / `\e[?u`), the session enables `CSI u` input encoding and
+        // focus events for that session only.
+
+        // Pre-seed the in-memory command-history buffer from the Store so
+        // the History panel has something to show before the first TTY
+        // history-file read lands. We still install a command-capture
+        // callback, but the capture path is now the Enter-byte-triggered
+        // *grid read-back* in [`TerminalSession::snapshot_command_from_grid`]
+        // — it reads the rendered prompt line from the alacritty grid
+        // instead of byte-streaming the user's keystrokes, so prompts like
+        // `sudo -i` never leak the typed password into the command list
+        // (issue #69). Local terminals (host_id = None) keep history
+        // in-memory only.
         //
         // When sharing history (split panes), skip the Store pre-seed — the
         // source pane already populated the shared buffer, and re-seeding
@@ -369,6 +598,7 @@ impl TerminalView {
         );
 
         Self {
+            id: count,
             session,
             backend,
             focus_handle,
@@ -377,6 +607,7 @@ impl TerminalView {
             cell_width,
             applied_font_signature: None,
             last_bounds: Arc::new(Mutex::new(None)),
+            last_resized_grid: Arc::new(Mutex::new(None)),
             selection: Arc::new(Mutex::new(None)),
             render_cache: Arc::new(Mutex::new(RenderCache::default())),
             needs_repaint,
@@ -411,7 +642,15 @@ impl TerminalView {
             on_sftp_progress_changed: None,
             on_sftp_transfer_finished: None,
             on_cwd_changed: None,
+            last_cwd: None,
+            last_process: None,
+            reconnect_attempts: Arc::new(AtomicU32::new(0)),
             tunnel_source: None,
+            search_state: None,
+            search_visible: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_active: None,
         }
     }
 
@@ -446,6 +685,12 @@ impl TerminalView {
         let overlay_c = overlay.clone();
         let entity = cx.entity().downgrade();
         let conn_recorded_ev = conn_recorded.clone();
+        // Captured for the auto-reconnect stale-session guard inside the
+        // `Closed` arm — this is the session this listener set belongs to, so
+        // a later `Arc::ptr_eq` against `view.session` detects manual
+        // reconnects (which swap in a fresh session) and aborts the pending
+        // auto-reconnect.
+        let session_for_reconnect = session.clone();
         cx.spawn(async move |_this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 match event {
@@ -465,6 +710,7 @@ impl TerminalView {
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::Closed => {
+                        let entity_for_reconnect = entity.clone();
                         let _ = entity.update(cx, |this, cx| {
                             // A close before the first `Connected` (and with
                             // no prior error) is a silent connect failure.
@@ -478,6 +724,56 @@ impl TerminalView {
                                     .log(ConnectionLogLevel::Warning, "Connection closed");
                             }
                             cx.notify();
+
+                            // Auto-reconnect on an unexpected mid-session
+                            // drop (config-gated). We only fire when the
+                            // overlay status was still `Connected` at close
+                            // time — a close while `Connecting` is a connect
+                            // failure (don't loop), and a user-initiated tab
+                            // close is caught by the `WeakEntity` going stale
+                            // during the backoff window. The `Arc::ptr_eq`
+                            // guard inside the spawned task also aborts if the
+                            // user manually reconnected (replacing
+                            // `this.session`) while we were waiting.
+                            if crabport_core::config::snapshot()
+                                .appearance
+                                .terminal
+                                .auto_reconnect
+                            {
+                                let was_connected =
+                                    this.overlay.lock().status == RemoteStatus::Connected;
+                                if was_connected {
+                                    let attempts = this.reconnect_attempts.clone();
+                                    let overlay_for_reconnect = this.overlay.clone();
+                                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                                    // Exponential backoff: 1, 2, 4, 8, 16, 30,
+                                    // 30, … (cap at 30s). `n.min(5)` avoids a
+                                    // shift overflow panic on pathological
+                                    // consecutive-failure counts.
+                                    let delay_secs = (1u64 << n.min(5)).min(30);
+                                    let session_ref = session_for_reconnect.clone();
+                                    cx.spawn(async move |_this, cx| {
+                                        overlay_for_reconnect.lock().log(
+                                            ConnectionLogLevel::Info,
+                                            format!("Reconnecting in {delay_secs}s..."),
+                                        );
+                                        smol::Timer::after(std::time::Duration::from_secs(
+                                            delay_secs,
+                                        ))
+                                        .await;
+                                        let _ = entity_for_reconnect.update(cx, |view, cx| {
+                                            // Guard: don't reconnect if the
+                                            // session was replaced (manual
+                                            // reconnect) or the view is gone.
+                                            if !Arc::ptr_eq(&session_ref, &view.session) {
+                                                return;
+                                            }
+                                            view.reconnect(cx);
+                                        });
+                                    })
+                                    .detach();
+                                }
+                            }
                         });
                     }
                     crabport_terminal::terminal::BackendEvent::SftpTransferFinished {
@@ -574,8 +870,13 @@ impl TerminalView {
                         process_name,
                     } => {
                         // Foreground process changed (cwd and/or name).
-                        // Forward to the app so it can update the tab title.
+                        // Forward to the app so it can update the tab title,
+                        // and remember it here: the AI agent's tool cards show
+                        // the directory a command is about to run in.
+                        let process_name_for_store = process_name.clone();
                         let _ = entity.update(cx, |this, cx| {
+                            this.last_cwd = Some(cwd.display().to_string());
+                            this.last_process = Some(process_name_for_store);
                             let cb = this.on_cwd_changed.clone();
                             let tab_id = this.count;
                             if let Some(cb) = cb {
@@ -629,7 +930,37 @@ impl TerminalView {
                             // First `Connected` resolves the attempt as a
                             // success in the connection history.
                             if new_status == RemoteStatus::Connected {
+                                this.reconnect_attempts.store(0, Ordering::SeqCst);
                                 this.fire_connection_result(&conn_recorded_wk, true, None, cx);
+                                // Force a window-size sync right after the PTY is
+                                // up. The initial PTY was allocated at a default
+                                // size (80x24) before the grid was measured, so a
+                                // program like tmux that lays out its panes from
+                                // the PTY size would otherwise render truncated
+                                // and never refresh.
+                                //
+                                // IMPORTANT: do NOT snap the grid to
+                                // `last_bounds` here. This callback runs on a
+                                // spawned async task, and for an SSH connection
+                                // the round-trip delay means the window may not
+                                // have been laid out (or `last_bounds` may still
+                                // hold a stale/transitional value) by the time we
+                                // get here. Snapping to that value would lock the
+                                // PTY grid at the wrong size, and since the layout
+                                // would then never change again the terminal would
+                                // stay shrunk in the top-left corner until the user
+                                // manually resizes the window.
+                                //
+                                // Instead we just invalidate the recorded grid
+                                // size. The per-frame resize sync in `paint` (and
+                                // `prepaint`) will then re-measure the *current*
+                                // real bounds on the next painted frame and resize
+                                // to that — self-correcting once layout is stable.
+                                *this.last_resized_grid.lock() = None;
+                                tracing::debug!(
+                                    "post-connect #{}: invalidated last_resized_grid, will re-sync to real bounds next frame (last_bounds was {:?})",
+                                    this.id, *this.last_bounds.lock()
+                                );
                             }
                             // Trigger an initial TTY-history read when the
                             // connection first reaches a ready state.
@@ -828,6 +1159,70 @@ impl TerminalView {
     /// historical command into the input line doesn't re-record it.
     pub fn write_raw(&self, data: &[u8]) {
         self.session.write_raw(data);
+    }
+
+    /// Plain-text dump of the session's last `max_lines` lines (scrollback +
+    /// visible screen). Used by the AI agent's `terminal_read` tool.
+    pub fn dump_text(&self, max_lines: usize) -> String {
+        self.session.dump_text(max_lines)
+    }
+
+    /// Like [`Self::dump_text`], but never blocks: `None` when the reader
+    /// thread holds the terminal lock, so the caller can retry on its next
+    /// tick instead of stalling whatever it is doing (the agent's command
+    /// output wait polls this while the UI keeps painting).
+    pub fn try_dump_text(&self, max_lines: usize) -> Option<String> {
+        self.session.try_dump_text(max_lines)
+    }
+
+    /// Subscribe to the backend's event stream — the AI panel's SFTP tools
+    /// await transfer-completion events on it (alongside this view's own
+    /// listener and the session's parser loop; everyone gets every event).
+    pub fn subscribe_backend(
+        &self,
+    ) -> async_broadcast::Receiver<crabport_terminal::terminal::BackendEvent> {
+        self.session.subscribe_backend()
+    }
+
+    /// Whether this session's backend can run commands out of band — the AI
+    /// agent's implicit execution mode (`terminal_exec`). False for
+    /// connection types whose only stream is the interactive session
+    /// (Telnet, Serial), and on platforms without a local captured-exec
+    /// implementation.
+    pub fn allow_exec_capture(&self) -> bool {
+        self.session.allow_exec_capture()
+    }
+
+    /// Run `command` out of band and capture its output — an extra
+    /// channel/process on the same connection, never a write to the shell.
+    /// The receiver yields exactly once: the command's combined output and
+    /// exit status, or the output so far when `timeout` elapses or `cancel`
+    /// is flipped (the tool card's stop button).
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: crabport_terminal::terminal::ExecCancel,
+    ) -> async_channel::Receiver<crabport_terminal::terminal::ExecOutput> {
+        self.session.exec_capture(command, timeout, cancel)
+    }
+
+    /// The font family terminals render with, per the user's settings. Exposed
+    /// so other surfaces can present shell text in the same face — the AI
+    /// panel's tool cards show a command exactly as the terminal will.
+    pub fn mono_font_family() -> String {
+        fonts::font_family()
+    }
+
+    /// Directory the shell last reported (OSC 7), if shell integration is
+    /// active. Tool cards show it so the user knows where a command runs.
+    pub fn cwd(&self) -> Option<&str> {
+        self.last_cwd.as_deref()
+    }
+
+    /// Foreground process name last reported by shell integration.
+    pub fn foreground_process(&self) -> Option<&str> {
+        self.last_process.as_deref()
     }
 
     /// Copy the current selection (or the whole visible grid if no
@@ -1105,6 +1500,20 @@ impl TerminalView {
         self.tunnel_source.clone()
     }
 
+    /// Cx-free handles into this session, snapshotted for work that must run
+    /// off the UI thread (the AI agent's tools — see
+    /// [`crate::views::panel::ai`]).
+    pub fn agent_handles(&self) -> AgentTerminalHandles {
+        AgentTerminalHandles {
+            session: self.session.clone(),
+            backend: self.backend.clone(),
+            tunnel_source: self.tunnel_source.clone(),
+            host_id: self.host_id,
+            pane_id: self.count,
+            cwd: self.last_cwd.clone(),
+        }
+    }
+
     /// Set the tunnel source (optional builder, used by split-pane creation
     /// to share the SSH tunnel source with the new pane).
     pub fn with_tunnel_source_opt(mut self, source: Option<Arc<dyn CrabPortTunnel>>) -> Self {
@@ -1226,9 +1635,15 @@ impl TerminalView {
         ));
         session.start();
 
+        // Kitty keyboard protocol is negotiated on demand by `TerminalSession`
+        // when the program requests it (see note in `new_with_cwd`).
+
         // Re-install command-history persistence: the callback lives on the
         // session, so without this the fresh session would capture commands
-        // in memory but never write them to the Store again.
+        // in memory but never write them to the Store again. The capture
+        // path is the Enter-byte-triggered grid read-back (see
+        // `with_backend_and_host_and_overlay_and_history`), which is
+        // password-safe.
         if let Some(hid) = self.host_id {
             let store_for_cb = crate::app_state::AppState::store(cx);
             session.set_on_command(Some(std::sync::Arc::new(move |cmd: &str| {
@@ -1345,10 +1760,180 @@ impl TerminalView {
             // Invalidate last_bounds so the prepaint step re-runs the
             // cols/rows resize with the new cell metrics.
             *self.last_bounds.lock() = None;
+            *self.last_resized_grid.lock() = None;
             self.needs_repaint
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------
+
+    /// Toggle the search overlay open/closed. When opening, lazily creates
+    /// the `InputState` entity (bound to the current window) and focuses
+    /// it so the user can start typing immediately.
+    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_visible {
+            self.close_search(window, cx);
+        } else {
+            self.open_search(window, cx);
+        }
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_state.is_none() {
+            let state = cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .placeholder(t!("terminal.search.placeholder"))
+            });
+            // Subscribe to query changes + Enter key so we recompute matches
+            // and navigate on Enter / Shift+Enter.
+            cx.subscribe(
+                &state,
+                |this, input, event: &gpui_component::input::InputEvent, cx| match event {
+                    gpui_component::input::InputEvent::Change { .. } => {
+                        let new_query = input.read(cx).value().to_string();
+                        this.on_search_query_changed(&new_query, cx);
+                    }
+                    gpui_component::input::InputEvent::PressEnter { secondary } => {
+                        let dir = if *secondary {
+                            search::SearchDirection::Prev
+                        } else {
+                            search::SearchDirection::Next
+                        };
+                        this.advance_match(dir, cx);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            self.search_state = Some(state);
+        }
+        self.search_visible = true;
+        // Clear any selection so the search highlights are the only overlay.
+        *self.selection.lock() = None;
+        if let Some(state) = &self.search_state {
+            // Focus the search input so typing goes straight into the query.
+            state.focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_visible = false;
+        // Clear matches so highlights disappear.
+        self.search_matches.clear();
+        self.search_active = None;
+        self.search_query.clear();
+        // Return keyboard focus to the terminal pane so the user can
+        // resume typing immediately after closing the search.
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Recompute matches for a new query, then select the first match
+    /// closest to the current cursor position.
+    fn on_search_query_changed(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search_query = query.to_string();
+        self.recompute_matches();
+        self.search_active = self.compute_initial_active();
+        if let Some(idx) = self.search_active {
+            self.activate_match(idx, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Re-run the search against the current terminal grid. Called when
+    /// the query changes or when the grid is invalidated (resize, new
+    /// output). Safe to call even when the search overlay is closed.
+    fn recompute_matches(&mut self) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.search_active = None;
+            return;
+        }
+        // Escape regex metacharacters so the query is treated as a literal
+        // substring. We don't expose a regex toggle in the UI yet; this keeps
+        // it simple and matches the common Ctrl+F expectation.
+        let escaped = escape_regex(&self.search_query);
+        self.search_matches = self.session.search_matches(&escaped);
+        // Clamp the active index.
+        if let Some(idx) = self.search_active {
+            if idx >= self.search_matches.len() {
+                self.search_active = if self.search_matches.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+            }
+        }
+    }
+
+    /// Pick the initial active match: the first match whose start line is at
+    /// or after the cursor line (searching forward), or 0 if none qualify.
+    fn compute_initial_active(&self) -> Option<usize> {
+        if self.search_matches.is_empty() {
+            return None;
+        }
+        let (cursor_line, _) = self.session.cursor_point();
+        // Find the first match at or after the cursor.
+        let idx = self
+            .search_matches
+            .iter()
+            .position(|m| m.start_line >= cursor_line)
+            .unwrap_or(0);
+        Some(idx)
+    }
+
+    /// Advance the active match in the given direction, wrapping around.
+    pub fn advance_match(&mut self, dir: search::SearchDirection, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let len = self.search_matches.len();
+        let new_idx = match (self.search_active, dir) {
+            (Some(i), search::SearchDirection::Next) => Some((i + 1) % len),
+            (Some(i), search::SearchDirection::Prev) => Some((i + len - 1) % len),
+            (None, _) => Some(0),
+        };
+        if let Some(idx) = new_idx {
+            self.search_active = Some(idx);
+            self.activate_match(idx, cx);
+        }
+    }
+
+    /// Scroll the terminal to the match at `index` and request a repaint.
+    fn activate_match(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.search_matches.get(index) {
+            self.session.scroll_to_match(m);
+            self.needs_repaint
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Search accessors (read by `render_content` to render the search bar
+    // as a layout-level row that pushes the toolbar down)
+    // -----------------------------------------------------------------
+
+    pub fn search_visible(&self) -> bool {
+        self.search_visible
+    }
+
+    pub fn search_state(&self) -> Option<&Entity<gpui_component::input::InputState>> {
+        self.search_state.as_ref()
+    }
+
+    pub fn search_active(&self) -> Option<usize> {
+        self.search_active
+    }
+
+    pub fn search_match_count(&self) -> usize {
+        self.search_matches.len()
     }
 }
 // ---- GPUI Render ----
@@ -1418,16 +2003,22 @@ impl Render for TerminalView {
             let focused_cb = self.on_focused.clone();
             let pane_id = self.count;
             let fh = self.focus_handle.clone();
+            let session_focus = self.session.clone();
             let sub_f = cx.on_focus(&fh, _window, move |_this, _window, cx| {
                 is_focused.store(true, Ordering::Release);
+                // Kitty keyboard protocol: notify the program it gained focus.
+                session_focus.report_focus(true);
                 if let Some(cb) = &focused_cb {
                     let cb = cb.clone();
                     cx.defer(move |cx| cb(pane_id, cx));
                 }
             });
             let is_focused_b = self.is_focused.clone();
+            let session_blur = self.session.clone();
             let sub_b = cx.on_blur(&fh, _window, move |_this, _window, _cx| {
                 is_focused_b.store(false, Ordering::Release);
+                // Kitty keyboard protocol: notify the program it lost focus.
+                session_blur.report_focus(false);
             });
             // Re-fetch focus state immediately so the first frame after a
             // focus change (e.g. switching tabs via the app's
@@ -1439,15 +2030,26 @@ impl Render for TerminalView {
 
         let session_c = self.session.clone();
         let session = session_c.clone();
+        let view_id = self.id;
         let font_size = self.font_size;
         let line_height = self.line_height;
         let cell_width = self.cell_width;
         let focus_handle = self.focus_handle.clone();
         let last_bounds_c = self.last_bounds.clone();
         let last_bounds = last_bounds_c.clone();
+        let last_resized_grid = self.last_resized_grid.clone();
         let selection = self.selection.clone();
         let selection_prepaint = selection.clone();
         let selection_c = selection.clone();
+        // Paint-closure clones: the resize sync below must run on *every*
+        // painted frame (not just on layout), because the frame pump only
+        // triggers repaints via `cx.notify()`, which does not re-run layout.
+        // Without this, a bounds that shrank without a subsequent relayout
+        // would leave the PTY grid locked at the small size forever (text
+        // collapses to the top-left corner) until the user resizes the window.
+        let session_paint = session_c.clone();
+        let last_resized_grid_paint = self.last_resized_grid.clone();
+        let selection_paint_resize = selection.clone();
         let render_cache = self.render_cache.clone();
         let render_cache_paint = render_cache.clone();
         let needs_repaint = self.needs_repaint.clone();
@@ -1477,6 +2079,11 @@ impl Render for TerminalView {
         // global `ContextMenuController`.
         let on_context_menu = self.on_context_menu.clone();
         let pane_id_for_ctx = self.count;
+        // Search matches snapshot for the paint callback. Cloned by value so
+        // the paint closure has an immutable copy that doesn't fight the
+        // render thread for the Vec.
+        let search_matches_paint = self.search_matches.clone();
+        let search_active_paint = self.search_active;
 
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
@@ -1548,7 +2155,66 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::app::TerminalSearch, window, cx| {
+                    this.toggle_search(window, cx);
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                // Kitty keyboard protocol: when active, every key is encoded as
+                // `CSI u` (or its function-key escape) and routed straight to the
+                // PTY, bypassing the IME text path. This is what lets TUI tools
+                // such as opencode bind unambiguous keys and react to focus
+                // changes. Falls back to the legacy path when the protocol is off.
+                if this.session.kitty_keyboard_enabled() {
+                    // macOS convention: leave ⌘ (platform) shortcuts to the
+                    // app layer (copy/paste, scroll, search…). Only keys
+                    // without ⌘ are encoded as `CSI u` — TUI tools bind
+                    // ctrl/alt/shift combinations, not ⌘. This also keeps the
+                    // app's copy/paste working while a kitty-aware TUI (e.g.
+                    // opencode) is active.
+                    if !event.keystroke.modifiers.platform {
+                        if let Some(bytes) = encode_kitty_key(&event.keystroke) {
+                            this.session.write(&bytes);
+                            this.session.scroll_to_bottom();
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                }
+                // Key-repeat bypass for plain printable characters. macOS
+                // swallows `isARepeat` keydowns for character keys by routing
+                // them to the press-and-hold accent picker (gpui's
+                // `apple_press_and_hold_enabled` defaults to true and
+                // ElementInputHandler in gpui 0.2 offers no override), so
+                // holding a key (e.g. `D` in vim normal mode) would only fire
+                // once. When no IME composition is active, write the repeated
+                // character straight to the PTY here — the same thing the
+                // platform would do via insertText:, minus the swallow.
+                // Composition keys still fall through to the IME path below.
+                let composing = this
+                    .marked_text
+                    .lock()
+                    .as_ref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                let m = &event.keystroke.modifiers;
+                if !composing
+                    && event.is_held
+                    && !m.control
+                    && !m.alt
+                    && !m.platform
+                    && !m.function
+                    && let Some(ch) = event.keystroke.key_char.as_deref()
+                    && !ch.is_empty()
+                {
+                    this.session.write(ch.as_bytes());
+                    this.session.scroll_to_bottom();
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 match Self::resolve_keystroke(&event.keystroke, &this.bindings) {
                     Some(KeyAction::Action(TerminalAction::Copy)) => {
                         this.pending_copy = true;
@@ -1558,7 +2224,32 @@ impl Render for TerminalView {
                         this.pending_paste = true;
                         cx.notify();
                     }
+                    Some(KeyAction::Action(TerminalAction::Search)) => {
+                        this.toggle_search(_window, cx);
+                    }
                     Some(KeyAction::Bytes(bytes)) => {
+                        // While the IME is actively composing (preedit text
+                        // is non-empty), editing keys — Backspace / Delete —
+                        // must reach the platform's input context so it can
+                        // edit the in-progress composition (e.g. delete a
+                        // pinyin letter in the candidate window). If we wrote
+                        // the raw control byte to the PTY and called
+                        // `stop_propagation`, the IME would never see the
+                        // key and the Backspace would silently leak into the
+                        // terminal as a DEL (#58). So: when preedit is active
+                        // AND the matched byte is an editing key, fall through
+                        // to the platform instead of writing.
+                        let is_editing_key =
+                            matches!(bytes.as_slice(), [0x08] | [0x7f] | [0x1b, b'[', b'3', b'~']);
+                        let composing = this
+                            .marked_text
+                            .lock()
+                            .as_ref()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if composing && is_editing_key {
+                            return;
+                        }
                         this.session.write(&bytes);
                         this.session.scroll_to_bottom();
                         cx.notify();
@@ -1575,31 +2266,21 @@ impl Render for TerminalView {
             .child(
                 canvas(
                     // ---- prepaint: resize + try-lock incremental snapshot ----
-                    move |bounds, _window, _cx| {
+                    move |bounds, window, _cx| {
                         let mut last = last_bounds.lock();
-                        let (cols, rows) = {
-                            let c = (bounds.size.width / cell_width).floor() as usize;
-                            let r = (bounds.size.height / line_height).floor() as usize;
-                            (c.max(2), r.max(1))
-                        };
+                        // Keep the PTY grid in sync with the current bounds
+                        // (see `sync_pty_grid` for why we resize eagerly).
+                        let resized = sync_pty_grid(
+                            bounds,
+                            cell_width,
+                            line_height,
+                            &last_resized_grid,
+                            &session,
+                            &selection_prepaint,
+                            window,
+                            view_id,
+                        );
 
-                        let mut resized = false;
-                        if let Some(ref lb) = *last {
-                            let (lc, lr) = {
-                                let c = (lb.size.width / cell_width).floor() as usize;
-                                let r = (lb.size.height / line_height).floor() as usize;
-                                (c.max(2), r.max(1))
-                            };
-                            if lc != cols || lr != rows {
-                                session.resize(cols as u16, rows as u16);
-                                resized = true;
-                                *selection_prepaint.lock() = None;
-                            }
-                        } else {
-                            session.resize(cols as u16, rows as u16);
-                            resized = true;
-                            *selection_prepaint.lock() = None;
-                        }
                         *last = Some(bounds);
 
                         let pal = palette();
@@ -1701,6 +2382,26 @@ impl Render for TerminalView {
                     move |bounds, lines, window, cx| {
                         let (cursor, num_cols, _num_lines, display_offset, _history_size) = lines;
                         // cursor is Option<(Point, CursorShape)>
+
+                        // Keep the PTY grid in sync with the *current* paint
+                        // bounds on every frame. The frame pump drives repaints
+                        // through `cx.notify()` without re-running layout, so the
+                        // prepaint-time resize alone would miss any size change
+                        // that happened without a relayout — e.g. the canvas
+                        // bounds spontaneously shrinking (or a detached/split
+                        // layout) would lock the grid at the wrong size. By
+                        // resizing here we self-correct every painted frame.
+                        sync_pty_grid(
+                            bounds,
+                            cell_width,
+                            line_height,
+                            &last_resized_grid_paint,
+                            &session_paint,
+                            &selection_paint_resize,
+                            window,
+                            view_id,
+                        );
+
                         let text_system = window.text_system().clone();
 
                         let sel_guard = selection.lock();
@@ -1773,10 +2474,14 @@ impl Render for TerminalView {
                                     let is_inv = cell.flags.contains(Flags::INVERSE);
                                     let wide = cell.flags.contains(Flags::WIDE_CHAR);
 
+                                    let is_dim = cell.flags.contains(Flags::DIM);
                                     let bg_color: Option<Hsla> = if is_sel {
                                         Some(rgb(selection_bg()).into())
                                     } else if is_inv {
-                                        Some(rgb(cell.fg).into())
+                                        Some(
+                                            rgb(if is_dim { dim_color(cell.fg) } else { cell.fg })
+                                                .into(),
+                                        )
                                     } else if cell.custom_bg {
                                         Some(rgb(cell.bg).into())
                                     } else {
@@ -1795,6 +2500,59 @@ impl Render for TerminalView {
                                     }
                                 }
                                 for (col, n, color) in rects {
+                                    let cell_x = bounds.origin.x + col as f32 * cell_width;
+                                    window.paint_quad(fill(
+                                        Bounds::new(
+                                            point(cell_x, y),
+                                            size(cell_width * n as f32, line_height),
+                                        ),
+                                        color,
+                                    ));
+                                }
+                            }
+
+                            // Search match highlights. Drawn after the cell
+                            // background layer but before the text so the text
+                            // remains visible on top of the match highlight.
+                            // Each match is converted from grid line to
+                            // viewport row via `display_offset`, the same as
+                            // selection highlighting.
+                            //
+                            // The active match gets a brighter highlight so
+                            // the user can see which one they're on.
+                            if !search_matches_paint.is_empty() {
+                                let vp_row = row_idx as i32 - display_offset;
+                                let mut search_rects: Vec<(usize, usize, Hsla)> = Vec::new();
+                                for (mi, m) in search_matches_paint.iter().enumerate() {
+                                    let is_active = Some(mi) == search_active_paint;
+                                    if m.start_line == m.end_line {
+                                        // Single-row match.
+                                        if vp_row == m.start_line {
+                                            let lo = m.start_col.min(num_cols);
+                                            let hi = (m.end_col + 1).min(num_cols).max(lo + 1);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((lo, hi - lo, color));
+                                        }
+                                    } else {
+                                        // Multi-row match.
+                                        if vp_row == m.start_line {
+                                            let lo = m.start_col.min(num_cols);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((lo, num_cols - lo, color));
+                                        } else if vp_row > m.start_line && vp_row < m.end_line {
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((0, num_cols, color));
+                                        } else if vp_row == m.end_line {
+                                            let hi = (m.end_col + 1).min(num_cols);
+                                            let color = search_match_color(is_active);
+                                            search_rects.push((0, hi, color));
+                                        }
+                                    }
+                                }
+                                for (col, n, color) in search_rects {
+                                    if n == 0 {
+                                        continue;
+                                    }
                                     let cell_x = bounds.origin.x + col as f32 * cell_width;
                                     window.paint_quad(fill(
                                         Bounds::new(
@@ -1996,23 +2754,57 @@ impl Render for TerminalView {
                         let line_height = line_height;
                         let display_offset_mouse = display_offset_mouse.clone();
                         let session_for_dblclick = session_c.clone();
+                        let session_for_mouse = session_c.clone();
                         move |event, _window, _cx| {
-                            if let Some(bounds) = *last_bounds.lock() {
-                                // Skip if click is in the scrollbar region
-                                // (rightmost WIDTH px). The `Scrollbar`
-                                // widget overlays that strip and calls
-                                // `cx.stop_propagation()` on its own click
-                                // handler, but we also guard here in case the
-                                // scrollbar is hidden (no history) — in which
-                                // case the strip is empty and we want normal
-                                // selection. Scrollbar::WIDTH is private, so we
-                                // hardcode the gpui-component value
-                                // (THUMB_ACTIVE_INSET*2 + THUMB_ACTIVE_WIDTH).
-                                let in_scrollbar = event.position.x
-                                    > bounds.origin.x + bounds.size.width - px(16.0);
-                                if in_scrollbar {
-                                    return;
+                            // Scrollbar strip guard — runs BEFORE the
+                            // mouse-mode report so a click on the scrollbar
+                            // neither starts a local selection nor gets
+                            // forwarded to the PTY as a grid-located press.
+                            // Without this, a TUI in mouse-reporting mode
+                            // (vim / less / htop) would receive a phantom
+                            // "press at column 50" when the user just meant
+                            // to drag the scrollbar, and the press would
+                            // never be paired with a release (we also early
+                            // return on `on_mouse_up` for the same strip).
+                            // Scrollbar::WIDTH is private, so we hardcode the
+                            // gpui-component value
+                            // (THUMB_ACTIVE_INSET*2 + THUMB_ACTIVE_WIDTH).
+                            let in_scrollbar = match *last_bounds.lock() {
+                                Some(bounds) => {
+                                    event.position.x
+                                        > bounds.origin.x + bounds.size.width - px(16.0)
                                 }
+                                None => false,
+                            };
+                            if in_scrollbar {
+                                return;
+                            }
+                            // If the program is in mouse-reporting mode and
+                            // Shift is NOT held, forward the click to the PTY
+                            // instead of doing a local text selection. This is
+                            // what lets TUI tools (e.g. opencode) handle clicks.
+                            if !event.modifiers.shift {
+                                if let Some(bounds) = *last_bounds.lock() {
+                                    let offset = display_offset_mouse.load(Ordering::Relaxed);
+                                    if let Some((col, row)) = mouse_to_grid(
+                                        event.position,
+                                        bounds,
+                                        cell_width,
+                                        line_height,
+                                        offset,
+                                    ) {
+                                        if session_for_mouse.report_mouse_button(
+                                            0,
+                                            (col as usize, row as usize),
+                                            true,
+                                            false,
+                                        ) {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(bounds) = *last_bounds.lock() {
                                 let offset = display_offset_mouse.load(Ordering::Relaxed);
                                 if let Some((col, row)) = mouse_to_grid(
                                     event.position,
@@ -2053,8 +2845,33 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse_move = display_offset_mouse_move.clone();
+                        let session_for_mouse_move = session_c.clone();
                         move |event, _window, _cx| {
                             if event.dragging() {
+                                // Forward drag motions to the PTY in mouse mode
+                                // (Shift bypasses to allow local selection).
+                                if !event.modifiers.shift {
+                                    if let Some(bounds) = *last_bounds.lock() {
+                                        let offset =
+                                            display_offset_mouse_move.load(Ordering::Relaxed);
+                                        if let Some((col, row)) = mouse_to_grid(
+                                            event.position,
+                                            bounds,
+                                            cell_width,
+                                            line_height,
+                                            offset,
+                                        ) {
+                                            if session_for_mouse_move.report_mouse_button(
+                                                0,
+                                                (col as usize, row as usize),
+                                                true,
+                                                true,
+                                            ) {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(bounds) = *last_bounds.lock() {
                                     let offset = display_offset_mouse_move.load(Ordering::Relaxed);
                                     if let Some((col, row)) = mouse_to_grid(
@@ -2091,7 +2908,50 @@ impl Render for TerminalView {
                         let cell_width = cell_width;
                         let line_height = line_height;
                         let display_offset_mouse_up = display_offset_mouse_up.clone();
-                        move |event, _window, _cx| {
+                        let session_for_mouse_up = session_c.clone();
+                        move |event, _window, cx| {
+                            // Scrollbar strip guard — symmetric with the
+                            // `on_mouse_down` guard above. A release on the
+                            // scrollbar strip must NOT be forwarded to the
+                            // PTY as a grid-located release (a stray release
+                            // without a matching in-grid press confuses TUIs
+                            // in mouse mode), must NOT finalize a selection
+                            // whose end column would be `mouse_to_grid`'s
+                            // 999-clamp nonsense, and must NOT auto-copy that
+                            // nonsense span into the clipboard. We just bail.
+                            let in_scrollbar = match *last_bounds.lock() {
+                                Some(bounds) => {
+                                    event.position.x
+                                        > bounds.origin.x + bounds.size.width - px(16.0)
+                                }
+                                None => false,
+                            };
+                            if in_scrollbar {
+                                return;
+                            }
+                            // If the press started a mouse-mode drag, just send
+                            // the release to the PTY; skip local selection logic.
+                            if !event.modifiers.shift {
+                                if let Some(bounds) = *last_bounds.lock() {
+                                    let offset = display_offset_mouse_up.load(Ordering::Relaxed);
+                                    if let Some((up_col, up_row)) = mouse_to_grid(
+                                        event.position,
+                                        bounds,
+                                        cell_width,
+                                        line_height,
+                                        offset,
+                                    ) {
+                                        if session_for_mouse_up.report_mouse_button(
+                                            0,
+                                            (up_col as usize, up_row as usize),
+                                            false,
+                                            false,
+                                        ) {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(bounds) = *last_bounds.lock() {
                                 let offset = display_offset_mouse_up.load(Ordering::Relaxed);
                                 if let Some((up_col, up_row)) = mouse_to_grid(
@@ -2124,6 +2984,33 @@ impl Render for TerminalView {
                                     }
                                 }
                             }
+
+                            // Auto-copy on select: once the user finishes a
+                            // drag / double / triple click that yields a real
+                            // selection, copy the selected text to the
+                            // clipboard (no explicit Copy action needed).
+                            // Single clicks clear the selection above, so the
+                            // re-lock below sees `None` and leaves the
+                            // clipboard untouched. We deliberately do *not*
+                            // fall back to the whole visible grid (unlike the
+                            // explicit Copy shortcut) — auto-copy is strictly
+                            // "what was highlighted." The brief selection
+                            // clone is dropped before we touch the term lock
+                            // or the system clipboard so we never hold the
+                            // two locks at once.
+                            let sel_to_copy = {
+                                let sel_guard = selection.lock();
+                                match *sel_guard {
+                                    Some(ref sel) if !sel.is_empty() => Some(sel.clone()),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(sel) = sel_to_copy {
+                                let text =
+                                    TerminalView::copy_selected_text(&session_for_mouse_up, &sel);
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+
                             needs_repaint.store(true, Ordering::Release);
                         }
                     })
@@ -2443,5 +3330,36 @@ fn paint_cursor(
             ));
         }
         CursorShape::Hidden => {}
+    }
+}
+
+/// Escape regex metacharacters in `s` so the resulting string is treated as
+/// a literal substring by [`alacritty_terminal::term::search::RegexSearch`].
+/// Mirrors `regex::escape` without pulling the `regex` crate as a direct dep.
+fn escape_regex(s: &str) -> String {
+    const METACHARS: &[char] = &[
+        '\\', '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '$', '^', '|',
+    ];
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if METACHARS.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Background color for a search-match highlight. The active match gets a
+/// brighter accent-tinted color; non-active matches use a muted version.
+fn search_match_color(active: bool) -> Hsla {
+    // Reuse the accent-ish colors: active = a semi-transparent yellow/orange
+    // that pops over the dark terminal bg; inactive = a dimmer variant.
+    if active {
+        let c: Hsla = rgb(0xFFD668FF).into();
+        c.opacity(0.35)
+    } else {
+        let c: Hsla = rgb(0xFFD668FF).into();
+        c.opacity(0.18)
     }
 }

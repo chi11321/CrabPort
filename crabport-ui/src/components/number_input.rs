@@ -184,7 +184,7 @@ impl RenderOnce for StyledNumberInput {
             .w(height)
             .flex_shrink_0()
             .bg(rgb(btn_bg()))
-            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
+            .when(disabled, |el| el.opacity(0.5))
             .child(
                 svg()
                     .path("icons/minus.svg")
@@ -215,7 +215,7 @@ impl RenderOnce for StyledNumberInput {
             .w(height)
             .flex_shrink_0()
             .bg(rgb(btn_bg()))
-            .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
+            .when(disabled, |el| el.opacity(0.5))
             .child(
                 svg()
                     .path("icons/plus.svg")

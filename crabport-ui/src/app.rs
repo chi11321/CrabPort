@@ -6,6 +6,7 @@ pub mod context;
 pub mod groups;
 pub mod hosts;
 pub mod snippets;
+pub mod ssh_import;
 pub mod tabs;
 pub mod tunnels;
 
@@ -30,6 +31,7 @@ use crate::layouts::sidebar::render_sidebar;
 use crate::views::groups::GroupFormState;
 use crate::views::sessions::ConnectionFormState;
 use crate::views::sessions::ConnectionHost;
+use crate::views::sessions::import::SshImportState;
 use crate::views::sftp::SftpTabView;
 use crate::views::terminal::TerminalView;
 use crabport_core::{config, config::StartupPage};
@@ -73,6 +75,7 @@ actions!(
         TerminalIncreaseFont,
         TerminalDecreaseFont,
         TerminalResetFont,
+        TerminalSearch,
         SplitVertical,
         SplitHorizontal,
     ]
@@ -114,6 +117,11 @@ pub struct CrabportApp {
     /// tunnel-borrow logic in `content.rs` keeps working without per-pane
     /// lookups.
     pub pane_views: HashMap<u64, Entity<TerminalView>>,
+    /// Per-terminal AI assistant panels, keyed by pane id. Each terminal
+    /// session owns its own conversation (and its own agent session), so
+    /// switching panes switches the AI panel with it. Entries are created on
+    /// demand in `render` and dropped when the pane (or its tab) closes.
+    pub ai_panels: HashMap<u64, Entity<crate::views::panel::ai::AiPanel>>,
     /// Monotonic pane-id counter, so pane ids are unique across the whole app
     /// (avoids id collisions in the gpui element-id space when a pane is
     /// moved between tabs in the future).
@@ -135,6 +143,8 @@ pub struct CrabportApp {
     pub split_drag: Option<crate::views::terminal::split::SplitDrag>,
     pub hosts: Vec<ConnectionHost>,
     pub connection_form: Option<ConnectionFormState>,
+    /// OpenSSH import preview state; `None` while the dialog is closed.
+    pub ssh_import: Option<SshImportState>,
     /// Which right-hand panel pane the user last selected, keyed by tab id
     /// so each terminal connection keeps its own panel selection (e.g. one
     /// tab can show SFTP while another shows Tunnels). Stored as a semantic
@@ -308,12 +318,14 @@ impl CrabportApp {
             sftp_view,
             split_trees: HashMap::new(),
             pane_views: HashMap::new(),
+            ai_panels: HashMap::new(),
             next_pane_id: 1,
             last_focused_pane: None,
             pending_focus_pane: None,
             split_drag: None,
             hosts,
             connection_form: None,
+            ssh_import: None,
             panel_active_tab: HashMap::new(),
             panel_open: HashMap::new(),
             panel_drag: None,
@@ -505,11 +517,21 @@ impl Render for CrabportApp {
         let tunnel_form_state = self.tunnel_form.clone();
         let snippet_form_state = self.snippet_form.clone();
         let group_form_state = self.group_form.clone();
+        let ssh_import_state = self.ssh_import.clone();
         let panel_active_tab = self
             .panel_active_tab
             .get(&self.active_tab_id)
             .copied()
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // No pick for this tab yet: fall back to the configured
+                // default page (`appearance.terminal.panel_page`).
+                crate::views::panel::PanelKind::from_config(
+                    crabport_core::config::snapshot()
+                        .appearance
+                        .terminal
+                        .panel_page,
+                )
+            });
         // Panel width: live drag value takes priority; otherwise read the
         // persisted config value (clamped to a sane range). The max is also
         // bounded by 2/3 of the window width so the terminal stays usable.
@@ -540,6 +562,15 @@ impl Render for CrabportApp {
             .get(&self.active_tab_id)
             .copied()
             .unwrap_or(panel_open_default);
+        // The AI panel belongs to a terminal session, so resolve the active
+        // tab's active pane and hand *its* panel to the layout. Created on
+        // first use (and dropped when the pane closes), which keeps the map
+        // free of entries for panes the user never opened the panel on.
+        let active_ai_panel = self
+            .split_trees
+            .get(&self.active_tab_id)
+            .map(|tree| tree.active_pane)
+            .and_then(|pane_id| self.ai_panel_for(pane_id, cx));
 
         let content = crate::layouts::content::render_content(
             self.sidebar_item,
@@ -559,6 +590,7 @@ impl Render for CrabportApp {
             snippet_form_state,
             panel_width,
             panel_dragging,
+            active_ai_panel.as_ref(),
             &self.app_ctx,
             _window,
             cx,
@@ -623,6 +655,13 @@ impl Render for CrabportApp {
             // -- Group form overlay (new / rename group, shared across kinds) --
             .when_some(group_form_state, |el, state| {
                 el.child(crate::views::groups::GroupFormView::new(
+                    &state,
+                    handle.clone(),
+                ))
+            })
+            // -- OpenSSH import preview overlay --
+            .when_some(ssh_import_state, |el, state| {
+                el.child(crate::views::sessions::import::SshImportView::new(
                     &state,
                     handle.clone(),
                 ))

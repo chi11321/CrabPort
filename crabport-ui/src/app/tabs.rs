@@ -594,6 +594,9 @@ impl CrabportApp {
                 if let Some(view) = self.pane_views.remove(&pane_id) {
                     view.update(cx, |v, _cx| v.close());
                 }
+                // Drop the pane's AI panel with it — the conversation belongs
+                // to this terminal session.
+                self.ai_panels.remove(&pane_id);
                 // Clear last-focused record if it pointed at one of these.
                 if self.last_focused_pane == Some(pane_id) {
                     self.last_focused_pane = None;
@@ -645,6 +648,51 @@ impl CrabportApp {
         let pane_id = self.alloc_pane_id();
         self.pane_views.insert(pane_id, view);
         self.split_trees.insert(tab_id, SplitTree::single(pane_id));
+    }
+
+    /// The AI panel bound to `pane_id`, created on first use.
+    ///
+    /// Panels are per terminal session: each pane keeps its own conversation
+    /// (and its own agent session, whose tools act on that terminal only).
+    /// Returns `None` for a pane with no registered view — a tab without a
+    /// terminal, e.g. the Home page.
+    pub fn ai_panel_for(
+        &mut self,
+        pane_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::views::panel::ai::AiPanel>> {
+        if let Some(panel) = self.ai_panels.get(&pane_id) {
+            return Some(panel.clone());
+        }
+        let view = self.pane_views.get(&pane_id)?.clone();
+        // Registry-tunnel mutations an agent tool asks for are drained here,
+        // on the UI thread: the registry itself is context-free, but starting
+        // / stopping / deleting a config goes through the app's own methods,
+        // which own the store and notify the Tunnels page. The task exits when
+        // the panel drops the sender.
+        let (registry_commands, command_rx) = async_channel::unbounded();
+        let app = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            use crate::views::panel::ai::RegistryCommand;
+            while let Ok(command) = command_rx.recv().await {
+                let _ = app.update(cx, |app, cx| match command {
+                    RegistryCommand::Open { config_id, tab_id } => {
+                        app.start_tunnel_borrowed(config_id, tab_id, cx)
+                    }
+                    RegistryCommand::Close(config_id) => app.stop_tunnel(config_id, cx),
+                    RegistryCommand::Delete(config_id) => app.remove_tunnel(config_id, cx),
+                });
+            }
+        })
+        .detach();
+        let session = crate::views::panel::ai::AiSession {
+            terminal: view.downgrade(),
+            tunnels: self.app_ctx.tunnels.clone(),
+            registry_commands,
+        };
+        let panel = cx.new(|_cx| crate::views::panel::ai::AiPanel::new(session));
+        self.ai_panels.insert(pane_id, panel.clone());
+        Some(panel)
     }
 
     /// Resolve the real pane id (the key in `pane_views`) for `view` by
@@ -864,6 +912,8 @@ impl CrabportApp {
         if let Some(view) = self.pane_views.remove(&pane_id) {
             view.update(cx, |v, _cx| v.close());
         }
+        // The pane's AI conversation ends with its terminal.
+        self.ai_panels.remove(&pane_id);
         // If the closed pane was the last focused one, drop the record so
         // `split_active_pane` falls back to the tree's active pane.
         if self.last_focused_pane == Some(pane_id) {

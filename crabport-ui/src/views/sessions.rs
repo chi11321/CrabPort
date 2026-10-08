@@ -9,11 +9,13 @@ use crabport_core::credential::GroupKind;
 
 use crate::app::CrabportApp;
 use crate::color::*;
+use crate::components::button::Button;
 use crate::components::context_menu::{
     ContextMenuController, ContextMenuItem, ContextMenuState, confirm_delete_item,
 };
 use crate::components::dialog::AlertController;
 use crate::components::list_row::{favorite_star, interactive_row};
+use crate::motion::RADIUS_SM;
 use crate::views::collection::{GroupedListView, render_grouped_list};
 use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 
@@ -26,10 +28,25 @@ use crate::views::group_rename::{GroupRenameState, GroupRenameView};
 // the proxy / certificate sub-form components used by the SSH pane.
 
 pub mod form;
+pub mod import;
 pub mod with_certificate;
 pub mod with_proxy;
 
 pub use form::{AuthKind, ConnectionFormState, ConnectionFormView, ConnectionKind};
+
+/// Color accents for the kind badge (subtle tint, not the full primary
+/// blue). Read live from the theme so a preset switch recolors the badges
+/// too. Mirrors `views::tunnels` so the three grouped-list views share the
+/// same row visual language.
+fn kind_ssh_color() -> u32 {
+    term_blue()
+}
+fn kind_telnet_color() -> u32 {
+    term_magenta()
+}
+fn kind_serial_color() -> u32 {
+    term_yellow()
+}
 
 /// A saved connection host entry.
 #[derive(Clone)]
@@ -92,11 +109,16 @@ pub struct SessionsView {
     alert_controller: Option<Entity<AlertController>>,
     // Callbacks
     on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    /// Open the system OpenSSH configuration import preview.
+    on_import: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Connect to a host in SFTP-only mode (right-click → "Connect via SFTP").
     /// Only called for SSH hosts.
     on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+    /// Clone a host: open the form pre-filled from the source host, in create
+    /// mode (a new row will be inserted on save).
+    on_clone: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     /// Per-group collapse state for the grouped list.
     collapsed_groups: HashSet<i64>,
@@ -115,9 +137,11 @@ impl SessionsView {
             context_menu: None,
             alert_controller: None,
             on_new: None,
+            on_import: None,
             on_connect: None,
             on_sftp_connect: None,
             on_edit: None,
+            on_clone: None,
             on_remove: None,
             collapsed_groups: HashSet::new(),
             group_rename: GroupRenameState::new(),
@@ -131,9 +155,11 @@ impl SessionsView {
         hosts: Vec<ConnectionHost>,
         form_state: Option<ConnectionFormState>,
         on_new: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+        on_import: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
         on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_edit: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
+        on_clone: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         on_remove: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
         context_menu: Entity<ContextMenuController>,
         alert_controller: Entity<AlertController>,
@@ -148,9 +174,11 @@ impl SessionsView {
         self.hosts = hosts;
         self.form_state = form_state;
         self.on_new = on_new;
+        self.on_import = on_import;
         self.on_connect = on_connect;
         self.on_sftp_connect = on_sftp_connect;
         self.on_edit = on_edit;
+        self.on_clone = on_clone;
         self.on_remove = on_remove;
         self.context_menu = Some(context_menu);
         self.alert_controller = Some(alert_controller);
@@ -209,6 +237,23 @@ impl GroupedListView for SessionsView {
         self.on_new.clone()
     }
 
+    fn render_header_actions(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let on_import = self.on_import.clone();
+        vec![
+            Button::new("hosts-import-ssh-btn")
+                .icon("icons/download.svg")
+                .w_auto()
+                .px_2()
+                .child(t!("sessions.import_ssh").to_string())
+                .on_click(move |_event, window, cx| {
+                    if let Some(callback) = on_import.as_ref() {
+                        callback(window, cx);
+                    }
+                })
+                .into_any_element(),
+        ]
+    }
+
     fn hover_state(&self) -> Option<(i64, bool)> {
         self.hovered_host_id
     }
@@ -229,6 +274,7 @@ impl GroupedListView for SessionsView {
     ) -> AnyElement {
         let host_id = host.id;
         let on_edit = self.on_edit.clone();
+        let on_clone = self.on_clone.clone();
         let on_remove = self.on_remove.clone();
         host_row(
             host,
@@ -243,6 +289,11 @@ impl GroupedListView for SessionsView {
             self.on_sftp_connect.clone(),
             move |w, cx| {
                 if let Some(ref cb) = on_edit {
+                    cb(host_id, w, cx);
+                }
+            },
+            move |w, cx| {
+                if let Some(ref cb) = on_clone {
                     cb(host_id, w, cx);
                 }
             },
@@ -285,6 +336,7 @@ fn host_row(
     on_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_sftp_connect: Option<Rc<dyn Fn(i64, &mut Window, &mut App)>>,
     on_edit: impl Fn(&mut Window, &mut App) + 'static,
+    on_clone: impl Fn(&mut Window, &mut App) + 'static,
     on_remove: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     // The favorites bucket renders the same host a second time (the item
@@ -309,23 +361,54 @@ fn host_row(
 
     let on_connect_for_dblclick = on_connect.clone();
 
-    // Host info (name + address)
+    // Kind badge label + accent color. Serial uses "R" (serial port)
+    // rather than "S" so it doesn't collide with SSH at a single glance.
+    let (kind_letter, kind_color) = match host.kind {
+        ConnectionKind::SSH => ("S", kind_ssh_color()),
+        ConnectionKind::Telnet => ("T", kind_telnet_color()),
+        ConnectionKind::Serial => ("R", kind_serial_color()),
+    };
+
+    // Host info (kind badge + name + address)
     let info = div()
         .flex()
-        .flex_col()
+        .flex_row()
+        .items_start()
+        .gap_2()
         .min_w_0()
         .flex_1()
+        // Kind badge (single letter, color-coded)
         .child(
             div()
-                .text_sm()
-                .text_color(rgb(text_primary()))
-                .child(host.name.clone()),
+                .flex()
+                .items_center()
+                .justify_center()
+                .size_5()
+                .rounded(RADIUS_SM)
+                .bg(rgba((kind_color << 8) | 0x22))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(kind_color))
+                .child(kind_letter.to_string()),
         )
         .child(
             div()
-                .text_xs()
-                .text_color(rgb(text_muted()))
-                .child(format!("{}@{}:{}", host.username, host.host, host.port)),
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(host.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .child(format!("{}@{}:{}", host.username, host.host, host.port)),
+                ),
         )
         .into_any_element();
 
@@ -363,6 +446,7 @@ fn host_row(
             // triggered the menu so it stays highlighted while it's open.
             .on_mouse_down(MouseButton::Right, {
                 let on_edit = Rc::new(on_edit);
+                let on_clone = Rc::new(on_clone);
                 let on_remove = Rc::new(on_remove);
                 move |event, _w, cx| {
                     let Some(ref cm) = context_menu else {
@@ -376,6 +460,7 @@ fn host_row(
                     });
                     let pos = event.position;
                     let on_edit = on_edit.clone();
+                    let on_clone = on_clone.clone();
                     let on_remove = on_remove.clone();
                     let on_connect = on_connect.clone();
                     let on_sftp_connect = on_sftp_connect.clone();
@@ -436,6 +521,15 @@ fn host_row(
                             let on_edit = on_edit.clone();
                             move |w, cx| {
                                 on_edit(w, cx);
+                            }
+                        }));
+
+                        // Clone (open the form pre-filled from this host,
+                        // in create mode so a new row is inserted on save).
+                        items.push(ContextMenuItem::new(t!("hosts.clone").to_string(), {
+                            let on_clone = on_clone.clone();
+                            move |w, cx| {
+                                on_clone(w, cx);
                             }
                         }));
 

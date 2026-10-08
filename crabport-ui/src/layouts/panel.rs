@@ -6,6 +6,7 @@ use crate::color::*;
 use crate::components::tabs::{TabPane, Tabs};
 use crate::motion::{EASE_STANDARD, duration_instant, duration_slower};
 use crate::views::panel::PanelKind;
+use crate::views::panel::ai::AiPanel;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
 use crate::views::panel::sftp::SftpPanel;
 use crate::views::panel::snippets_panel::SnippetsPanel;
@@ -13,10 +14,10 @@ use crate::views::panel::snippets_panel::SnippetsPanel;
 /// Default panel width for a fresh install / reset.
 pub const PANEL_WIDTH: f32 = 220.0;
 /// Minimum draggable panel width — keeps the panel usable.
-pub const MIN_PANEL_WIDTH: f32 = 200.0;
+pub const MIN_PANEL_WIDTH: f32 = 280.0;
 /// Maximum draggable panel width — prevents the panel from swallowing
 /// the terminal area on very wide windows.
-pub const MAX_PANEL_WIDTH: f32 = 600.0;
+pub const MAX_PANEL_WIDTH: f32 = 900.0;
 
 /// Half-width of the grabbable band around the panel divider, in px.
 pub const PANEL_DIVIDER_HIT: f32 = 3.0;
@@ -49,6 +50,9 @@ pub struct PanelCaps {
     pub history: bool,
     pub snippets: bool,
     pub tunnels: bool,
+    /// AI assistant pane — endpoint-scoped (driven by `config.ai.enabled`),
+    /// not backend-scoped.
+    pub ai: bool,
 }
 
 pub fn render_panel(
@@ -59,6 +63,10 @@ pub fn render_panel(
     snippets_panel: Entity<SnippetsPanel>,
     history_panel: Entity<HistoryCommandPanel>,
     tunnels_panel: Entity<crate::views::panel::tunnels_panel::TunnelsPanel>,
+    // The active terminal pane's AI panel. `None` on tabs without a terminal
+    // session (the Home page): panels are per terminal, so there is nothing
+    // to show. Callers pass `caps.ai` already gated on this being `Some`.
+    ai_panel: Option<Entity<AiPanel>>,
     on_change: Option<std::rc::Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     // Current panel width in px (live drag value or persisted config value).
     width: f32,
@@ -69,15 +77,15 @@ pub fn render_panel(
 ) -> impl IntoElement {
     // Fixed pane order so the positional index is stable for a given
     // capability set. SFTP is first (only on SSH), then History, Snippets,
-    // and Tunnels (only on SSH).
-    let any_visible = caps.sftp || caps.history || caps.snippets || caps.tunnels;
+    // Tunnels (only on SSH), and AI last (any terminal tab while enabled).
+    let any_visible = caps.sftp || caps.history || caps.snippets || caps.tunnels || caps.ai;
     let visible = show && any_visible;
 
     // Derive the positional index the active `PanelKind` maps to in the
     // filtered pane list. Falls back to 0 (first visible pane) when the
     // stored kind isn't available for this backend — e.g. switching from
     // an SSH tab (Tunnels selected) to a Telnet tab.
-    let mut kinds: Vec<PanelKind> = Vec::with_capacity(4);
+    let mut kinds: Vec<PanelKind> = Vec::with_capacity(5);
     if caps.sftp {
         kinds.push(PanelKind::Sftp);
     }
@@ -89,6 +97,9 @@ pub fn render_panel(
     }
     if caps.tunnels {
         kinds.push(PanelKind::Tunnels);
+    }
+    if caps.ai {
+        kinds.push(PanelKind::Ai);
     }
     let active_idx = kinds
         .iter()
@@ -116,8 +127,8 @@ pub fn render_panel(
     // while only 2 panes exist), causing the panel to render clipped /
     // half-width.
     let tabs_id = SharedString::from(format!(
-        "panel-tabs-{}{}{}{}",
-        caps.sftp as u8, caps.history as u8, caps.snippets as u8, caps.tunnels as u8
+        "panel-tabs-{}{}{}{}{}",
+        caps.sftp as u8, caps.history as u8, caps.snippets as u8, caps.tunnels as u8, caps.ai as u8
     ));
     let mut tabs = Tabs::new(tabs_id)
         .ctrl_style(|s| s.rounded_none())
@@ -138,6 +149,11 @@ pub fn render_panel(
     }
     if caps.tunnels {
         tabs = tabs.pane(TabPane::new("", tunnels_panel).icon("icons/waypoints.svg"));
+    }
+    if caps.ai {
+        if let Some(ai_panel) = ai_panel {
+            tabs = tabs.pane(TabPane::new("", ai_panel).icon("icons/sparkles.svg"));
+        }
     }
 
     // Always use the same `with_transition` element so the animation

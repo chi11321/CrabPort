@@ -222,6 +222,7 @@ pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
             el.child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .h(px(TOOLBAR_HEIGHT))
                     .flex()
                     .flex_row()

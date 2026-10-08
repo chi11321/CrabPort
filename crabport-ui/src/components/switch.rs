@@ -172,7 +172,7 @@ impl RenderOnce for Switch {
             .h(TRACK_H)
             .when_else(
                 disabled,
-                |el| el.cursor_not_allowed().opacity(0.6),
+                |el| el.opacity(0.6),
                 |el| {
                     el.when_some(on_change, |el, cb| {
                         el.on_click(move |_e, w, cx| {

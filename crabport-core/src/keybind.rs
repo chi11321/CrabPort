@@ -18,6 +18,7 @@ pub enum KeyAction {
 pub enum TerminalAction {
     Copy,
     Paste,
+    Search,
     // Future: ScrollUp, ScrollDown, etc.
 }
 
@@ -78,6 +79,15 @@ pub fn default_bindings() -> Vec<Binding> {
             modifiers: platform,
             key: "v",
             action: KeyAction::Action(TerminalAction::Paste),
+        },
+        // ---- Search (platform key) ----
+        // Cmd+F on macOS, Ctrl+F on Linux/Windows. This overrides the
+        // Ctrl+F → 0x06 control-byte binding below so the search overlay
+        // opens instead of sending ACK to the PTY.
+        Binding {
+            modifiers: platform,
+            key: "f",
+            action: KeyAction::Action(TerminalAction::Search),
         },
         // ---- Ctrl+Shift alternates ----
         Binding {

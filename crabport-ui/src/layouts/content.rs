@@ -16,6 +16,7 @@ use crate::layouts::panel::{
 use crate::layouts::tabbar::render_tab_bar;
 use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_fast};
 use crate::views::panel::PanelKind;
+use crate::views::panel::ai::AiPanel;
 use crate::views::panel::sftp::SftpDragValue;
 use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
@@ -112,12 +113,18 @@ pub fn render_content(
     panel_width: f32,
     // Whether a panel resize drag is in progress.
     panel_dragging: bool,
+    // The active terminal pane's AI assistant panel, if that pane has one.
+    // One panel exists per terminal session (see `CrabportApp::ai_panels`),
+    // so switching panes switches the conversation with it; `None` on tabs
+    // without a terminal (the Home page).
+    ai_panel: Option<&Entity<AiPanel>>,
     ctx: &AppCtx,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
     // Unpack the shared context once — every field is a cheap handle/Arc.
     let sftp_panel = &ctx.sftp_panel;
+    let ai_panel = ai_panel.cloned();
     let snippets_panel = &ctx.snippets_panel;
     let history_panel = &ctx.history_panel;
     let tunnels_panel = &ctx.tunnels_panel;
@@ -158,6 +165,9 @@ pub fn render_content(
                             Some(app_cb0(handle, |app, w, cx| {
                                 app.open_connection_form(w, cx)
                             })),
+                            Some(app_cb0(handle, |app, window, cx| {
+                                app.open_ssh_import(window, cx)
+                            })),
                             Some(app_cb1(handle, |app, id, _w, cx| {
                                 app.connect_to_host(id, cx)
                             })),
@@ -165,6 +175,7 @@ pub fn render_content(
                                 app.switch_sftp_panel_host(id, w, cx)
                             })),
                             Some(app_cb1(handle, |app, id, w, cx| app.edit_host(id, w, cx))),
+                            Some(app_cb1(handle, |app, id, w, cx| app.clone_host(id, w, cx))),
                             Some(app_cb1(handle, |app, id, _w, cx| app.remove_host(id, cx))),
                             context_menu.clone(),
                             alert_controller.clone(),
@@ -279,6 +290,20 @@ pub fn render_content(
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
                 let handle_panel = handle.clone();
+                // Read the active terminal view's search state so the search
+                // bar can float above the split/panel buttons.
+                let term_view = terminal_views.get(&tab_id).cloned();
+                let (search_visible, search_state, search_active, search_total) = match &term_view {
+                    Some(entity) => entity.read_with(cx, |view, _cx| {
+                        (
+                            view.search_visible(),
+                            view.search_state().cloned(),
+                            view.search_active(),
+                            view.search_match_count(),
+                        )
+                    }),
+                    None => (false, None, None, 0),
+                };
                 // Clone the download callback + terminal entity so the
                 // on_drop handler can trigger a download when the user
                 // drags an SFTP file row onto the terminal area.
@@ -326,7 +351,8 @@ pub fn render_content(
                                 .top_2()
                                 .right_2()
                                 .flex()
-                                .flex_row()
+                                .flex_col()
+                                .items_end()
                                 .gap_1()
                                 // Occlude so mouse-down on the split buttons
                                 // doesn't fall through to the terminal pane
@@ -334,54 +360,97 @@ pub fn render_content(
                                 // and make `split_active_pane` target the
                                 // wrong pane).
                                 .occlude()
-                                .child(render_split_button(
-                                    "term-split-right",
-                                    "icons/columns-2.svg",
-                                    t!("terminal.split_right").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_split_r.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.split_active_pane(
-                                                    crate::views::terminal::split::SplitDir::Vertical,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    },
-                                ))
-                                .child(render_split_button(
-                                    "term-split-down",
-                                    "icons/rows-2.svg",
-                                    t!("terminal.split_down").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_split_d.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.split_active_pane(
-                                                    crate::views::terminal::split::SplitDir::Horizontal,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    },
-                                ))
-                                .child(render_split_button(
-                                    "term-toggle-panel",
-                                    "icons/panel-right.svg",
-                                    t!("terminal.toggle_panel").to_string(),
-                                    ctx.tooltip.clone(),
-                                    {
-                                        let handle = handle_panel.clone();
-                                        move |_w, cx| {
-                                            handle.update(cx, |app, cx| {
-                                                app.toggle_right_panel(active_tab_id, cx);
-                                            });
-                                        }
-                                    },
-                                )),
+                                // Search bar — right-aligned, slides down
+                                // from the top-right corner with a height
+                                // animation. Only the split/panel buttons
+                                // below are displaced.
+                                .when_some(search_state, |el, state| {
+                                    let handle = handle.clone();
+                                    el.child(crate::views::terminal::search::render_search_bar(
+                                        &state,
+                                        search_visible,
+                                        search_active,
+                                        search_total,
+                                        {
+                                            let handle = handle.clone();
+                                            move |dir, _w, cx| {
+                                                handle.update(cx, |app, cx| {
+                                                    if let Some(view) = app.terminal_views.get(&tab_id) {
+                                                        view.update(cx, |v, cx| {
+                                                            v.advance_match(*dir, cx);
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        },
+                                        {
+                                            let handle = handle.clone();
+                                            move |_w, cx| {
+                                                handle.update(cx, |app, cx| {
+                                                    if let Some(view) = app.terminal_views.get(&tab_id) {
+                                                        view.update(cx, |v, cx| {
+                                                            v.close_search(_w, cx);
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1()
+                                        .child(render_split_button(
+                                            "term-split-right",
+                                            "icons/columns-2.svg",
+                                            t!("terminal.split_right").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_split_r.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.split_active_pane(
+                                                            crate::views::terminal::split::SplitDir::Vertical,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                        ))
+                                        .child(render_split_button(
+                                            "term-split-down",
+                                            "icons/rows-2.svg",
+                                            t!("terminal.split_down").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_split_d.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.split_active_pane(
+                                                            crate::views::terminal::split::SplitDir::Horizontal,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                        ))
+                                        .child(render_split_button(
+                                            "term-toggle-panel",
+                                            "icons/panel-right.svg",
+                                            t!("terminal.toggle_panel").to_string(),
+                                            ctx.tooltip.clone(),
+                                            {
+                                                let handle = handle_panel.clone();
+                                                move |_w, cx| {
+                                                    handle.update(cx, |app, cx| {
+                                                        app.toggle_right_panel(active_tab_id, cx);
+                                                    });
+                                                }
+                                            },
+                                        )),
+                                ),
                         )
                     })
                     .into_any_element()
@@ -536,6 +605,11 @@ pub fn render_content(
             })
         })
         .unwrap_or((false, false, false, false));
+    // AI assistant panel capability — endpoint-scoped, not backend-scoped:
+    // available on any terminal tab while AI is enabled in settings. A pane
+    // must exist too: panels are per terminal session, so the Home page (and
+    // any tab without a terminal) has none.
+    let cap_ai = crabport_core::config::snapshot().ai.enabled && ai_panel.is_some();
     // SFTP panel visibility follows the backend's capability (`cap_sftp`),
     // used directly below — no separate `has_sftp` alias needed.
     sftp_panel.update(cx, |panel, cx| {
@@ -660,6 +734,18 @@ pub fn render_content(
         );
     });
 
+    // ---- AI assistant panel ----
+    //
+    // The panel reads config/store directly; `set_state` only ensures the
+    // lazily-created input exists, clears the box after a send, and
+    // triggers the once-per-endpoint model-list fetch. Each terminal pane
+    // owns its own panel, so this only touches the active pane's.
+    if let Some(ai_panel) = &ai_panel {
+        ai_panel.update(cx, |panel, cx| {
+            panel.set_state(window, cx);
+        });
+    }
+
     // ---- Host-key prompt ----
     //
     // If the active terminal view has a pending host-key prompt (pushed by
@@ -728,6 +814,13 @@ pub fn render_content(
 
     div()
         .flex_1()
+        // Without this the column's min-content width (the toolbar's slot
+        // row, dominated by the progress chip's long path) is its flex floor:
+        // once a chip's natural width exceeds the window, the whole column —
+        // side panel included — gets pushed out to the right. Letting the
+        // column shrink hands the overflow to the toolbar's own
+        // `overflow_hidden` instead.
+        .min_w_0()
         .h_full()
         .bg(rgb(bg_base()))
         .flex()
@@ -748,7 +841,8 @@ pub fn render_content(
                 .relative()
                 .child(view)
                 .when(
-                    panel_show && (cap_sftp || cap_history || cap_snippets || cap_tunnels),
+                    panel_show
+                        && (cap_sftp || cap_history || cap_snippets || cap_tunnels || cap_ai),
                     |el| el.child(render_panel_divider(handle, panel_width)),
                 )
                 .child({
@@ -762,6 +856,7 @@ pub fn render_content(
                     let c_history = cap_history;
                     let c_snippets = cap_snippets;
                     let c_tunnels = cap_tunnels;
+                    let c_ai = cap_ai;
                     render_panel(
                         panel_show,
                         panel_active_tab,
@@ -770,15 +865,17 @@ pub fn render_content(
                             history: c_history,
                             snippets: c_snippets,
                             tunnels: c_tunnels,
+                            ai: c_ai,
                         },
                         sftp_panel.clone(),
                         snippets_panel.clone(),
                         history_panel.clone(),
                         tunnels_panel.clone(),
+                        ai_panel.clone(),
                         Some(std::rc::Rc::new(move |idx, _w, cx| {
                             // Rebuild the visible-kind list in the same fixed
                             // order as `render_panel` so the index aligns.
-                            let mut kinds: Vec<PanelKind> = Vec::with_capacity(4);
+                            let mut kinds: Vec<PanelKind> = Vec::with_capacity(5);
                             if c_sftp {
                                 kinds.push(PanelKind::Sftp);
                             }
@@ -790,6 +887,9 @@ pub fn render_content(
                             }
                             if c_tunnels {
                                 kinds.push(PanelKind::Tunnels);
+                            }
+                            if c_ai {
+                                kinds.push(PanelKind::Ai);
                             }
                             handle_for_panel.update(cx, |app, cx| {
                                 if let Some(k) = kinds.get(idx).copied() {

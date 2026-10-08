@@ -75,6 +75,11 @@ pub trait GroupedListView: GroupRenameView + Render + Sized + 'static {
     fn alert_handle(&self) -> Option<Entity<AlertController>>;
     fn on_new_cb(&self) -> Option<Rc<dyn Fn(&mut Window, &mut App)>>;
 
+    /// Optional actions rendered before the shared New button.
+    fn render_header_actions(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+        Vec::new()
+    }
+
     fn hover_state(&self) -> Option<(i64, bool)>;
     fn menu_row_state(&mut self) -> &mut Option<(i64, bool)>;
     fn collapsed_groups(&mut self) -> &mut HashSet<i64>;
@@ -239,6 +244,7 @@ pub fn render_grouped_list<V: GroupedListView>(
     let context_menu = view.context_menu_handle();
     let alert = view.alert_handle();
     let on_new = view.on_new_cb();
+    let header_actions = view.render_header_actions(cx);
     let entity = cx.entity().downgrade();
 
     // Load this view's groups once per render so newly-created groups
@@ -378,31 +384,60 @@ pub fn render_grouped_list<V: GroupedListView>(
                 .pb_2()
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(text_primary()))
-                        .child(t!(V::TITLE_KEY).to_string()),
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(text_primary()))
+                                .child(t!(V::TITLE_KEY).to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_muted()))
+                                .child(format!("· {}", items.len())),
+                        ),
                 )
                 .child(
-                    Button::new(V::NEW_BUTTON_ID)
-                        .primary()
-                        .icon("icons/plus.svg")
-                        .w_auto()
-                        .px_2()
-                        .child(t!(V::NEW_BUTTON_KEY).to_string())
-                        .on_click(move |_e, w, cx| {
-                            if let Some(ref cb) = on_new {
-                                cb(w, cx);
-                            }
-                        }),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .children(header_actions)
+                        .child(
+                            Button::new(V::NEW_BUTTON_ID)
+                                .primary()
+                                .icon("icons/plus.svg")
+                                .w_auto()
+                                .px_2()
+                                .child(t!(V::NEW_BUTTON_KEY).to_string())
+                                .on_click(move |_e, w, cx| {
+                                    if let Some(ref cb) = on_new {
+                                        cb(w, cx);
+                                    }
+                                }),
+                        ),
                 ),
         )
         // --- Separator ---
         .child(div().h_px().bg(rgb(border())).mx_4())
         // --- List (or empty state) ---
+        //
+        // `min_h_0` is load-bearing: gpui's `flex_1` only sets
+        // grow/shrink/basis, and a flex item refuses to shrink below its
+        // content height by default. Without it a long list grows past the
+        // panel bounds, pushing the bottom rows — and the scrollbar — off
+        // the visible area (matching the bug where the list's tail could
+        // never be reached). All other scroll regions in this crate pair
+        // `flex_1` with `min_h_0` for the same reason.
         .child(
             div()
                 .flex_1()
+                .min_h_0()
                 .overflow_y_scrollbar()
                 .px_4()
                 .py_2()
@@ -411,9 +446,23 @@ pub fn render_grouped_list<V: GroupedListView>(
                     |el| {
                         el.flex().items_center().justify_center().child(
                             div()
-                                .text_color(rgb(text_muted()))
-                                .text_sm()
-                                .child(t!(V::EMPTY_KEY).to_string()),
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    svg()
+                                        .path("icons/folder.svg")
+                                        .size_8()
+                                        .text_color(rgb(text_muted()))
+                                        .opacity(0.5),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(text_muted()))
+                                        .child(t!(V::EMPTY_KEY).to_string()),
+                                ),
                         )
                     },
                     |el| {

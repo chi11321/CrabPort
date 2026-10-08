@@ -20,6 +20,7 @@ use crate::views::sftp::pane::{
     build_entry_rows, cmp_remote_listing, join_remote_path, remote_target_path,
     render_drag_exit_canvas, render_scrollbar_overlay, render_selection_bar,
 };
+use crate::views::sftp::upload_picker_options;
 
 /// Drag payload for an SFTP row being dragged within the app.
 /// Dropped onto a terminal area to trigger a download.
@@ -1424,16 +1425,15 @@ fn trigger_upload(
     };
     let cwd = cwd.as_str().to_string();
 
-    // Multi-select picker allowing both files and directories. The backend's
-    // `sftp_upload` stats each path and dispatches to the file or directory
-    // upload flow accordingly — directories get tar+gz'd locally, uploaded,
-    // then extracted remotely via `tar xzf`.
-    let rx = cx.prompt_for_paths(PathPromptOptions {
-        files: true,
-        directories: true,
-        multiple: true,
-        prompt: Some(t!("sftp.upload_prompt").to_string().into()),
-    });
+    // Multi-select picker. On macOS both files and directories can be
+    // chosen; on Windows/Linux the native dialog is an either-or toggle,
+    // so we request files only — directories still upload via drag & drop.
+    // The backend's `sftp_upload` stats each path and dispatches to the
+    // file or directory upload flow accordingly — directories get tar+gz'd
+    // locally, uploaded, then extracted remotely via `tar xzf`.
+    let rx = cx.prompt_for_paths(upload_picker_options(
+        t!("sftp.upload_prompt").to_string().into(),
+    ));
 
     cx.spawn(async move |cx| {
         let picked = match rx.await {

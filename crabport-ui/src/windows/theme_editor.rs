@@ -354,23 +354,24 @@ impl ThemeEditorWindow {
                         ),
                     )
                     .child(
-                        Button::new("theme-editor-save")
-                            .primary()
-                            .w_auto()
-                            .centered(true)
-                            .child(t!("window.theme_editor.save").to_string())
-                            .on_click(move |_e, _w, cx| {
-                                save_handle.update(cx, |view, cx| view.save(cx));
-                            }),
+                        // Same action-button shape as the Settings window.
+                        Button::action(
+                            "theme-editor-save",
+                            t!("window.theme_editor.save").to_string(),
+                        )
+                        .primary()
+                        .on_click(move |_e, _w, cx| {
+                            save_handle.update(cx, |view, cx| view.save(cx));
+                        }),
                     )
                     .child(
-                        Button::new("theme-editor-reset")
-                            .w_auto()
-                            .centered(true)
-                            .child(t!("window.theme_editor.reset").to_string())
-                            .on_click(move |_e, w, cx| {
-                                reset_handle.update(cx, |view, cx| view.reset(w, cx));
-                            }),
+                        Button::action(
+                            "theme-editor-reset",
+                            t!("window.theme_editor.reset").to_string(),
+                        )
+                        .on_click(move |_e, w, cx| {
+                            reset_handle.update(cx, |view, cx| view.reset(w, cx));
+                        }),
                     ),
             )
             .child(

@@ -92,8 +92,7 @@ sudo apt-get install -y \
   libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev \
   libfontconfig1-dev libfreetype6-dev \
   libasound2-dev libpulse-dev libdbus-1-dev \
-  libssl-dev pkg-config \
-  squashfs-tools   # mksquashfs, required for .AppImage bundling
+  libssl-dev pkg-config
 ```
 
 **Windows** — MSVC toolchain (ships with Visual Studio Build Tools).
@@ -110,7 +109,8 @@ cargo build --release     # release binary
 
 ### Bundle platform installers
 
-Install [cargo-bundle](https://github.com/burtonageo/cargo-bundle) first:
+Install [cargo-bundle](https://github.com/burtonageo/cargo-bundle) first — the
+bundle config uses v0.12's metadata schema, so 0.12 or newer is required:
 
 ```bash
 cargo install cargo-bundle --locked
@@ -118,7 +118,7 @@ cargo install cargo-bundle --locked
 
 | Platform | Command | Output |
 |----------|---------|--------|
-| macOS | `cargo bundle --release --format dmg` | `target/release/bundle/dmg/CrabPort_*.dmg` |
+| macOS | `cargo bundle --release --format dmg` | `target/release/bundle/dmg/CrabPort.dmg` |
 | Linux | `cargo bundle --release --format appimage` | `target/release/bundle/appimage/CrabPort_*.AppImage` |
 | Windows | `cargo build --release`, then zip the `.exe` manually | `CrabPort.exe` (`.zip`) |
 

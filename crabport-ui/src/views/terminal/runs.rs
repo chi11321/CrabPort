@@ -2,6 +2,7 @@ use alacritty_terminal::term::cell::Flags;
 use gpui::{TextRun, UnderlineStyle, px, rgb};
 
 use crate::color::theme;
+use crate::views::terminal::color::dim_color;
 use crate::views::terminal::fonts::pick_font;
 use crate::views::terminal::render_cache::CellSnap;
 
@@ -47,6 +48,7 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
     let mut cur_italic = false;
     let mut cur_underline = false;
     let mut cur_inverse = false;
+    let mut cur_dim = false;
 
     for cell in cells.iter() {
         // Note: we intentionally do NOT skip `WIDE_CHAR_SPACER` /
@@ -62,8 +64,9 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
         // (~1.7-1.8x cell_width) starting at column N, fitting inside the
         // 2-cell slot, and the invisible space at column N+1 reserves
         // the slot so the following glyph lands at column N+2.
-        let ef = cell.fg;
-        let eb = cell.bg;
+        let is_dim = cell.flags.contains(Flags::DIM);
+        let ef = if is_dim { dim_color(cell.fg) } else { cell.fg };
+        let eb = if is_dim { dim_color(cell.bg) } else { cell.bg };
         let is_b = cell.flags.contains(Flags::BOLD);
         let is_i = cell.flags.contains(Flags::ITALIC);
         let is_u = cell.flags.contains(Flags::UNDERLINE);
@@ -74,7 +77,8 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
             || is_b != cur_bold
             || is_i != cur_italic
             || is_u != cur_underline
-            || is_inv != cur_inverse;
+            || is_inv != cur_inverse
+            || is_dim != cur_dim;
 
         if new_run {
             let rl = line_text.len() - run_start;
@@ -96,6 +100,7 @@ pub(crate) fn build_runs(cells: &[CellSnap], num_cols: usize) -> (String, Vec<Te
             cur_italic = is_i;
             cur_underline = is_u;
             cur_inverse = is_inv;
+            cur_dim = is_dim;
         }
 
         if cell.c == '\t' {

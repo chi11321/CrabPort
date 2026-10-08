@@ -71,7 +71,7 @@ pub(crate) fn labeled_error_column(
         .flex_col()
         .gap_1()
         .w_full()
-        .when(disabled, |el| el.cursor_not_allowed().opacity(0.5))
+        .when(disabled, |el| el.opacity(0.5))
         .when_some(label, |el, label| {
             el.child(
                 div()
@@ -188,7 +188,7 @@ impl StyledInput {
     /// Disable keyboard editing of the underlying `Input` widget but leave
     /// the shell visually enabled. See [`Self::input_disabled`] field docs.
     /// Implies the same effect as `disabled(true)` on the `Input` component
-    /// without the `opacity(0.5)` / `cursor_not_allowed()` dimming.
+    /// without the `opacity(0.5)` dimming.
     pub fn input_disabled(mut self, v: bool) -> Self {
         self.input_disabled = v;
         self

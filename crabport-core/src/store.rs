@@ -24,6 +24,7 @@
 //! module's docs for the append-only rule and the per-migration error
 //! policy.
 
+mod ai;
 mod commands;
 mod credentials;
 mod groups;
@@ -32,6 +33,7 @@ mod hosts;
 mod migrations;
 mod proxies;
 mod snippets;
+mod ssh_import;
 mod tunnels;
 
 pub use history::{ConnectionEvent, ConnectionStatus};

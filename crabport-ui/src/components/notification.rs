@@ -31,6 +31,7 @@
 //! cx.new(|_| NotificationController::new(NotificationPosition::TopCenter));
 //! ```
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -183,6 +184,11 @@ struct NotificationEntry {
     /// Monotonic id used when no explicit id was supplied. Ensures unique
     /// transition ids across auto-generated notifications.
     slot: u64,
+    /// Last measured card height (border box), recorded during prepaint while
+    /// the toast is open. Used on dismiss to animate the card's height to
+    /// zero so neighboring toasts slide smoothly into the freed space instead
+    /// of jumping when the entry is dropped after the out-animation.
+    measured_height: Rc<Cell<f32>>,
 }
 
 impl NotificationEntry {
@@ -252,6 +258,7 @@ impl NotificationController {
             open: true,
             generation: slot,
             slot,
+            measured_height: Rc::new(Cell::new(0.0)),
         };
 
         // Enforce the simultaneous cap. Drop the oldest entry without an
@@ -447,6 +454,14 @@ fn render_notification_stack(
     // and must let the underlying UI receive pointer events. We use a
     // pointer-events-none container and re-enable pointer events on each
     // card so the gap between cards doesn't swallow clicks.
+    // Record each open card's height during prepaint. Dismissing cards are
+    // skipped so the mid-collapse height doesn't overwrite the resting value
+    // their own collapse animation started from.
+    let height_writers: Vec<(bool, Rc<Cell<f32>>)> = entries
+        .iter()
+        .map(|(e, _)| (e.open, e.measured_height.clone()))
+        .collect();
+
     let mut layer = div()
         .absolute()
         .top_0()
@@ -454,7 +469,14 @@ fn render_notification_stack(
         .size_full()
         .flex()
         .p_4()
-        .gap_2();
+        .gap_2()
+        .on_children_prepainted(move |bounds, _w, _cx| {
+            for ((open, cell), b) in height_writers.iter().zip(bounds.iter()) {
+                if *open {
+                    cell.set(f32::from(b.size.height));
+                }
+            }
+        });
 
     match position {
         NotificationPosition::BottomRight => {
@@ -496,6 +518,10 @@ fn render_notification_card(
 
     let has_action = action_label.is_some() && action.is_some();
 
+    // Height recorded by the stack's prepaint listener. 0.0 until the first
+    // frame has painted, in which case the dismiss falls back to fade-only.
+    let measured_height = entry.measured_height.get();
+
     // The card itself. Initial hidden state (opacity 0 + slight upward
     // translate) is animated to visible by the transition below.
     let mut card = div()
@@ -513,6 +539,8 @@ fn render_notification_card(
         .items_start()
         .gap_3()
         .p_3()
+        // Clip content while the dismiss animation collapses the card height.
+        .overflow_hidden()
         // Initial hidden state — transition animates these to visible.
         .opacity(0.0)
         .mt(px(-8.0))
@@ -521,8 +549,29 @@ fn render_notification_card(
             open,
             Duration::from_millis(NOTIFICATION_DISMISS_MS),
             EASE_OUT,
-            |el| el.opacity(1.0).mt_0(),
-            |el| el.opacity(0.0).mt(px(-8.0)),
+            // Pin the measured height while open so the dismiss leg has a
+            // definite start value to interpolate from (auto → 0 would snap).
+            move |el| {
+                let el = el.opacity(1.0).mt_0();
+                if measured_height > 0.0 {
+                    el.h(px(measured_height))
+                } else {
+                    el
+                }
+            },
+            // Collapse the card's occupied space (height + vertical padding +
+            // border) alongside the fade. The existing -8px margin cancels the
+            // stack gap, so by the end of the animation the card occupies no
+            // space at all — dropping the entry afterwards causes no jump and
+            // neighboring toasts slide smoothly the whole way.
+            move |el| {
+                let el = el.opacity(0.0).mt(px(-8.0));
+                if measured_height > 0.0 {
+                    el.h(px(0.0)).py(px(0.0)).border_0()
+                } else {
+                    el
+                }
+            },
         );
 
     // Stop clicks on the card from doing anything unexpected (the layer is

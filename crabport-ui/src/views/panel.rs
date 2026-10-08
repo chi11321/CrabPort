@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod history_command_panel;
 pub mod scaffold;
 pub mod sftp;
@@ -17,4 +18,23 @@ pub enum PanelKind {
     Snippets,
     Sftp,
     Tunnels,
+    /// AI assistant. Endpoint-scoped (not backend-scoped): shown on any
+    /// terminal tab while `config.ai.enabled` is true.
+    Ai,
+}
+
+impl PanelKind {
+    /// The page a tab's panel shows until the user picks one there, per the
+    /// `appearance.terminal.panel_page` setting. A page the tab doesn't offer
+    /// is clamped by [`crate::layouts::panel::render_panel`] to the first one
+    /// it does.
+    pub fn from_config(page: crabport_core::config::PanelPage) -> Self {
+        match page {
+            crabport_core::config::PanelPage::Sftp => Self::Sftp,
+            crabport_core::config::PanelPage::Tunnels => Self::Tunnels,
+            crabport_core::config::PanelPage::History => Self::History,
+            crabport_core::config::PanelPage::Snippets => Self::Snippets,
+            crabport_core::config::PanelPage::Ai => Self::Ai,
+        }
+    }
 }
