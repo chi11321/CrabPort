@@ -460,8 +460,13 @@ tool_exec_no_output_timeout = "(still running after 12s — output so far was em
 tool_exec_unsupported = "This connection cannot run captured (out-of-band) commands; use terminal_run to run it in the terminal instead."
 tool_exec_capture_failed = "The captured command never reported back — the session went away."
 tool_capture_timed_out = "Still running after %{secs}s — the output below is what was captured so far"
+tool_capture_cancelled = "Stopped — the output below is what was captured so far"
+tool_run_cancelled = "Stopped waiting — the command is still running in the terminal"
 tool_exit_code = "exit code %{code}"
 tool_unknown = "Unknown tool: %{name}"
+compacting = "Compacting context…"
+compact_failed = "Context compaction failed"
+context_summary = "Earlier conversation compacted into a summary"
 
 [window.settings.general]
 section_startup = "Startup"

@@ -1165,13 +1165,15 @@ impl TerminalView {
     /// Run `command` out of band and capture its output — an extra
     /// channel/process on the same connection, never a write to the shell.
     /// The receiver yields exactly once: the command's combined output and
-    /// exit status, or the output so far when `timeout` elapses.
+    /// exit status, or the output so far when `timeout` elapses or `cancel`
+    /// is flipped (the tool card's stop button).
     pub fn exec_capture(
         &self,
         command: &str,
         timeout: std::time::Duration,
+        cancel: crabport_terminal::terminal::ExecCancel,
     ) -> async_channel::Receiver<crabport_terminal::terminal::ExecOutput> {
-        self.session.exec_capture(command, timeout)
+        self.session.exec_capture(command, timeout, cancel)
     }
 
     /// The font family terminals render with, per the user's settings. Exposed

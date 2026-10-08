@@ -31,11 +31,11 @@ use std::sync::Arc;
 use async_channel::Receiver;
 
 pub use error::AiError;
-pub use openai::OpenAiProvider;
+pub use openai::{ModelInfo, OpenAiProvider};
 pub use provider::ChatProvider;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, FinishReason, Role, StreamEvent, TokenUsage, ToolCall,
-    ToolSpec,
+    ChatMessage, ChatRequest, ChatResponse, FinishReason, MESSAGE_OVERHEAD_TOKENS, Role,
+    StreamEvent, TOOL_CALL_OVERHEAD_TOKENS, TokenUsage, ToolCall, ToolSpec, estimate_tokens,
 };
 
 /// Live handle to a completion running on the worker thread.

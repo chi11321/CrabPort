@@ -69,8 +69,8 @@ use async_channel::{Sender as MpscSender, unbounded};
 use parking_lot::{Mutex, RwLock};
 
 use crate::terminal::{
-    BackendEvent, CpuStats, CrabPortMonitor, CrabPortTerminal, DiskStats, ExecCallback, ExecOutput,
-    MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
+    BackendEvent, CpuStats, CrabPortMonitor, CrabPortTerminal, DiskStats, ExecCallback, ExecCancel,
+    ExecOutput, MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
 };
 
 // ===========================================================================
@@ -1041,10 +1041,11 @@ impl PtyBackend {
 /// callers that care about the directory prefix the command themselves.
 ///
 /// stdin is `/dev/null`, so anything that tries to read it sees EOF
-/// instead of stealing the user's input. On timeout the child is killed and
-/// the output captured so far is reported with `timed_out` set.
+/// instead of stealing the user's input. On timeout or cancel the child is
+/// killed and the output captured so far is reported with `timed_out` /
+/// `cancelled` set.
 #[cfg(unix)]
-fn capture_via_shell(command: &str, timeout: Duration, done: ExecCallback) {
+fn capture_via_shell(command: &str, timeout: Duration, cancel: ExecCancel, done: ExecCallback) {
     let command = command.to_string();
     // Spawn off-thread: the caller is the UI thread (a tool-card click) and
     // must not block on fork/exec, pipe reads, or the wait loop.
@@ -1086,10 +1087,19 @@ fn capture_via_shell(command: &str, timeout: Duration, done: ExecCallback) {
 
         let deadline = std::time::Instant::now() + timeout;
         let mut timed_out = false;
+        let mut cancelled = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
+                    if cancel.is_cancelled() {
+                        // The user ended the tool call: stop the command
+                        // rather than leaving it running unobserved.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cancelled = true;
+                        break None;
+                    }
                     if std::time::Instant::now() >= deadline {
                         // Same policy as the SSH backend: stop the command
                         // rather than leaving it running unobserved.
@@ -1123,6 +1133,7 @@ fn capture_via_shell(command: &str, timeout: Duration, done: ExecCallback) {
             output,
             exit_code: status.and_then(|s| s.code()).map(|code| code as u32),
             timed_out,
+            cancelled,
         });
     });
 }
@@ -1131,7 +1142,12 @@ fn capture_via_shell(command: &str, timeout: Duration, done: ExecCallback) {
 /// local Windows shells (PowerShell / cmd) don't share those semantics.
 /// `allow_exec_capture` reports false there, so this is only a safety net.
 #[cfg(not(unix))]
-fn capture_via_shell(_command: &str, _timeout: std::time::Duration, done: ExecCallback) {
+fn capture_via_shell(
+    _command: &str,
+    _timeout: std::time::Duration,
+    _cancel: ExecCancel,
+    done: ExecCallback,
+) {
     done(ExecOutput {
         output: "captured execution is not supported on this platform".to_string(),
         ..Default::default()
@@ -1189,8 +1205,14 @@ impl CrabPortTerminal for PtyBackend {
         cfg!(unix)
     }
 
-    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
-        capture_via_shell(command, timeout, done);
+    fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
+        capture_via_shell(command, timeout, cancel, done);
     }
 }
 
@@ -1517,13 +1539,19 @@ impl CrabPortTerminal for PendingPtyBackend {
         }
     }
 
-    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
+    fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
         // Captured execution never touches the PTY — it spawns its own
         // child — so it works even while the shell is still being
         // constructed, and while the real backend isn't installed yet.
         match self.state.backend.get() {
-            Some(backend) => backend.exec_capture(command, timeout, done),
-            None => capture_via_shell(command, timeout, done),
+            Some(backend) => backend.exec_capture(command, timeout, cancel, done),
+            None => capture_via_shell(command, timeout, cancel, done),
         }
     }
 }
@@ -1654,10 +1682,15 @@ mod tests {
     use super::*;
 
     fn capture(command: &str, timeout: Duration) -> ExecOutput {
+        capture_with(command, timeout, ExecCancel::default())
+    }
+
+    fn capture_with(command: &str, timeout: Duration, cancel: ExecCancel) -> ExecOutput {
         let (tx, rx) = async_channel::bounded(1);
         capture_via_shell(
             command,
             timeout,
+            cancel,
             Arc::new(move |out| {
                 let _ = tx.try_send(out);
             }),
@@ -1689,6 +1722,24 @@ mod tests {
     fn capture_via_shell_times_out_and_keeps_partial_output() {
         let out = capture("echo started; sleep 30", Duration::from_millis(400));
         assert!(out.timed_out);
+        assert!(!out.cancelled);
+        assert_eq!(out.exit_code, None);
+        assert!(out.output.contains("started"), "{}", out.output);
+    }
+
+    /// Stopping a running command (the tool card's stop button) kills the
+    /// child and still hands over what it had printed.
+    #[test]
+    fn capture_via_shell_cancels_a_running_command() {
+        let cancel = ExecCancel::default();
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stopper.cancel();
+        });
+        let out = capture_with("echo started; sleep 30", Duration::from_secs(30), cancel);
+        assert!(out.cancelled);
+        assert!(!out.timed_out);
         assert_eq!(out.exit_code, None);
         assert!(out.output.contains("started"), "{}", out.output);
     }

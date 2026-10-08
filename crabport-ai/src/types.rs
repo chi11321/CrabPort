@@ -192,6 +192,82 @@ impl ChatRequest {
     }
 }
 
+/// Rough token count for `text` — for context budgeting, not billing.
+///
+/// No tokenizer ships with the app: real ones are model-specific, large, and
+/// would need updating as models change. The heuristic below is what
+/// budgeting actually needs — it errs **high**, because over-estimating makes
+/// a conversation compact slightly early while under-estimating overflows the
+/// model's window:
+///
+/// - ASCII text runs about 4 characters per token (English prose, code,
+///   JSON, shell output).
+/// - Non-ASCII runs about one token per character (CJK, emoji, accented
+///   scripts), so it is counted as such.
+///
+/// Per-message and per-tool framing overhead is added by
+/// [`ChatRequest::estimated_tokens`], not here.
+pub fn estimate_tokens(text: &str) -> usize {
+    let mut ascii: usize = 0;
+    let mut wide: usize = 0;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    ascii.div_ceil(4) + wide
+}
+
+/// Fixed per-message overhead, in tokens: role marker, separators, and the
+/// chat-format bookkeeping every server wraps around a message.
+pub const MESSAGE_OVERHEAD_TOKENS: usize = 4;
+
+/// Fixed per-tool-call overhead, in tokens: id, name wrapper and JSON
+/// punctuation.
+pub const TOOL_CALL_OVERHEAD_TOKENS: usize = 8;
+
+impl ChatRequest {
+    /// Rough size of this request in tokens, including the tool schemas —
+    /// what context budgeting compares against the model's window.
+    ///
+    /// Tool schemas ride along on every request, so their (fixed) cost is
+    /// counted too; without it a tool-heavy agent would believe it has more
+    /// room than it does.
+    pub fn estimated_tokens(&self) -> usize {
+        let mut total: usize = self
+            .messages
+            .iter()
+            .map(|msg| {
+                MESSAGE_OVERHEAD_TOKENS
+                    + estimate_tokens(&msg.content)
+                    + msg
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            TOOL_CALL_OVERHEAD_TOKENS
+                                + estimate_tokens(&call.id)
+                                + estimate_tokens(&call.name)
+                                + estimate_tokens(&call.arguments)
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        total += self
+            .tools
+            .iter()
+            .map(|tool| {
+                MESSAGE_OVERHEAD_TOKENS
+                    + estimate_tokens(&tool.name)
+                    + estimate_tokens(&tool.description)
+                    + estimate_tokens(&tool.parameters.to_string())
+            })
+            .sum::<usize>();
+        total
+    }
+}
+
 /// Final result of a streamed completion: the fully-assembled assistant
 /// message plus bookkeeping info.
 #[derive(Clone, Debug)]
@@ -224,4 +300,51 @@ pub enum StreamEvent {
     ToolCallArguments { index: usize, delta: String },
     /// Token accounting, usually emitted once at the very end.
     Usage(TokenUsage),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_tokens_rounds_up_and_counts_wide_chars() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        // The ASCII share rounds up: budgeting should err high.
+        assert_eq!(estimate_tokens("abcde"), 2);
+        // Non-ASCII is counted per character (CJK, emoji, accented scripts).
+        assert_eq!(estimate_tokens("你好"), 2);
+        assert_eq!(estimate_tokens("hi你好"), 3);
+        assert_eq!(estimate_tokens("⇒⇒⇒"), 3);
+    }
+
+    /// Tool schemas ride along on every request, so they must be budgeted
+    /// alongside the messages — a tool-heavy request that forgets them
+    /// overflows without warning.
+    #[test]
+    fn request_estimate_covers_messages_and_tools() {
+        let bare: usize = 10 * MESSAGE_OVERHEAD_TOKENS + estimate_tokens("hello");
+        let request = ChatRequest::new("m")
+            .with_messages((0..10).map(|_| ChatMessage::user("hello")).collect())
+            .with_tools(vec![ToolSpec::new(
+                "terminal_exec",
+                "Run a command.",
+                serde_json::json!({ "type": "object" }),
+            )]);
+        assert!(request.estimated_tokens() > bare);
+
+        // A tool call's arguments and the result that answers it are part of
+        // the size too.
+        let with_call = ChatRequest::new("m").with_messages(vec![ChatMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "terminal_exec".into(),
+                arguments: r#"{"command":"ls -la /var/log"}"#.into(),
+            }],
+            ..Default::default()
+        }]);
+        assert!(with_call.estimated_tokens() > MESSAGE_OVERHEAD_TOKENS + TOOL_CALL_OVERHEAD_TOKENS);
+    }
 }

@@ -8,7 +8,8 @@ use russh::{
 use tokio::sync::Mutex as TokioMutex;
 
 use crabport_terminal::terminal::{
-    CpuStats, DiskStats, ExecOutput, MemoryStats, NetworkStats, RemoteMetrics, RemoteStatus,
+    CpuStats, DiskStats, ExecCancel, ExecOutput, MemoryStats, NetworkStats, RemoteMetrics,
+    RemoteStatus,
 };
 
 use crate::backend::MonitorState;
@@ -390,31 +391,55 @@ pub(crate) async fn start_exec_capture(
     Ok(ch)
 }
 
-/// Read a started exec channel to completion, giving up after `timeout`.
+/// How often [`drain_exec_capture`] re-checks the cancel token while it
+/// waits for more output. Bounds how long a stopped command keeps running.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Read a started exec channel to completion, giving up after `timeout` or
+/// as soon as `cancel` is flipped.
 ///
 /// stdout and stderr share the output buffer (in arrival order), matching
-/// [`exec_with_status`]. On timeout the channel is closed — sshd terminates
-/// the remote process when its channel goes away — and the output captured
-/// so far is returned with [`ExecOutput::timed_out`] set.
+/// [`exec_with_status`]. On timeout or cancel the channel is closed — sshd
+/// terminates the remote process when its channel goes away — and the
+/// output captured so far is returned with [`ExecOutput::timed_out`] /
+/// [`ExecOutput::cancelled`] set.
 pub(crate) async fn drain_exec_capture(
     mut ch: Channel<Msg>,
     timeout: std::time::Duration,
+    cancel: ExecCancel,
 ) -> ExecOutput {
     let mut output = Vec::new();
     let mut exit_code = None;
     let mut saw_exit_status = false;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let msg = match tokio::time::timeout_at(deadline, ch.wait()).await {
+        if cancel.is_cancelled() {
+            let _ = ch.close().await;
+            return ExecOutput {
+                output: String::from_utf8_lossy(&output).into_owned(),
+                exit_code: None,
+                timed_out: false,
+                cancelled: true,
+            };
+        }
+        // Wake up regularly while waiting so a stopped command ends within a
+        // poll tick instead of at its next (possibly never arriving)
+        // message. Dropping `ch.wait()` is cancel-safe: it is a
+        // `tokio::mpsc` receive underneath.
+        let tick = (tokio::time::Instant::now() + CANCEL_POLL).min(deadline);
+        let msg = match tokio::time::timeout_at(tick, ch.wait()).await {
             Ok(msg) => msg,
-            Err(_) => {
+            Err(_) if tokio::time::Instant::now() >= deadline => {
                 let _ = ch.close().await;
                 return ExecOutput {
                     output: String::from_utf8_lossy(&output).into_owned(),
                     exit_code: None,
                     timed_out: true,
+                    cancelled: false,
                 };
             }
+            // Poll tick: loop around to re-check the cancel token.
+            Err(_) => continue,
         };
         match msg {
             // russh delivers stdout and stderr on separate message variants
@@ -437,6 +462,7 @@ pub(crate) async fn drain_exec_capture(
         output: String::from_utf8_lossy(&output).into_owned(),
         exit_code,
         timed_out: false,
+        cancelled: false,
     }
 }
 

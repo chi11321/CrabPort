@@ -179,11 +179,37 @@ pub struct ExecOutput {
     /// True when the backend stopped waiting before the command finished;
     /// `output` carries whatever was captured so far.
     pub timed_out: bool,
+    /// True when the caller's [`ExecCancel`] stopped the command; `output`
+    /// carries whatever was captured before that.
+    pub cancelled: bool,
 }
 
 /// Completion callback for [`CrabPortTerminal::exec_capture`]. Invoked
 /// exactly once, on a backend-owned thread or runtime task.
 pub type ExecCallback = std::sync::Arc<dyn Fn(ExecOutput) + Send + Sync>;
+
+/// Token that stops a running captured command.
+///
+/// Cloned into the backend and kept by the caller — the agent's tool card
+/// keeps one so its stop button can end a command that is still running.
+/// Flipping it makes the backend stop what it started (close the SSH
+/// channel, kill the local child) and report the output captured so far
+/// with [`ExecOutput::cancelled`] set. Cheap to clone: one shared flag.
+#[derive(Clone, Default)]
+pub struct ExecCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ExecCancel {
+    /// Ask the backend to stop the command. Idempotent and safe to call
+    /// after the command already finished (it is then ignored).
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 pub trait CrabPortTerminal: Send + Sync {
     fn write(&self, data: &[u8]);
@@ -328,11 +354,19 @@ pub trait CrabPortTerminal: Send + Sync {
     ///
     /// `timeout` bounds the wait: when it elapses the backend stops reading
     /// and reports the output so far with [`ExecOutput::timed_out`].
+    /// `cancel` stops it earlier — the user ending a running tool call —
+    /// with [`ExecOutput::cancelled`] set instead.
     ///
     /// Backends for which [`Self::allow_exec_capture`] is false never have
     /// this called; the default implementation answers with an explanatory
     /// error instead of hanging should one ever be.
-    fn exec_capture(&self, _command: &str, _timeout: std::time::Duration, done: ExecCallback) {
+    fn exec_capture(
+        &self,
+        _command: &str,
+        _timeout: std::time::Duration,
+        _cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
         done(ExecOutput {
             output: "captured execution is not supported on this connection".to_string(),
             ..Default::default()
@@ -602,7 +636,11 @@ mod tests {
         let backend = std::sync::Arc::new(crate::pty::FailedPtyBackend::new("test".into()));
         let session = super::TerminalSession::new(backend, 40, 5);
         assert!(!session.allow_exec_capture());
-        let rx = session.exec_capture("echo hi", std::time::Duration::from_secs(1));
+        let rx = session.exec_capture(
+            "echo hi",
+            std::time::Duration::from_secs(1),
+            super::ExecCancel::default(),
+        );
         let out = smol::block_on(rx.recv()).expect("exactly one outcome");
         assert!(!out.timed_out);
         assert_eq!(out.exit_code, None);
@@ -1394,18 +1432,21 @@ impl TerminalSession {
     }
 
     /// Run `command` out of band and capture its output. The returned
-    /// receiver yields exactly once — when the command finishes or
-    /// `timeout` elapses. The session's terminal is never touched: this is
-    /// an extra channel/process, not a write to the interactive shell.
+    /// receiver yields exactly once — when the command finishes, `timeout`
+    /// elapses, or `cancel` is flipped. The session's terminal is never
+    /// touched: this is an extra channel/process, not a write to the
+    /// interactive shell.
     pub fn exec_capture(
         &self,
         command: &str,
         timeout: std::time::Duration,
+        cancel: ExecCancel,
     ) -> async_channel::Receiver<ExecOutput> {
         let (tx, rx) = async_channel::bounded(1);
         self.backend.exec_capture(
             command,
             timeout,
+            cancel,
             std::sync::Arc::new(move |out| {
                 let _ = tx.try_send(out);
             }),

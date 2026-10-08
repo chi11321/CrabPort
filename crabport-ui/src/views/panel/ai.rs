@@ -35,10 +35,11 @@ use gpui_component::{Sizable as _, Size};
 use rust_i18n::t;
 
 use crabport_ai::{
-    AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent, ToolCall, ToolSpec,
+    AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, MESSAGE_OVERHEAD_TOKENS,
+    StreamEvent, TOOL_CALL_OVERHEAD_TOKENS, ToolCall, ToolSpec, estimate_tokens,
 };
 use crabport_core::config;
-use crabport_terminal::terminal::ExecOutput;
+use crabport_terminal::terminal::{ExecCancel, ExecOutput};
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
 
@@ -218,6 +219,11 @@ struct ToolCallState {
     /// True when a captured command outlived its deadline; the card says so
     /// and the model is told the output was cut short.
     timed_out: bool,
+    /// Token that stops the running execution — the card's stop button
+    /// flips it. A fresh token per call, harmless once the call is done.
+    cancel: ExecCancel,
+    /// True when the user stopped this call while it was running.
+    cancelled: bool,
 }
 
 impl ToolCallState {
@@ -240,6 +246,13 @@ impl ToolCallState {
     /// the same.
     fn result_for_model(&self) -> String {
         let body = self.result.clone().unwrap_or_default();
+        if self.cancelled {
+            let note = match ToolKind::of(&self.call.name) {
+                ToolKind::ExecCapture => "[stopped by the user; output so far]",
+                _ => "[stopped waiting; the command may still be running in the terminal]",
+            };
+            return format!("{note}\n{body}");
+        }
         if self.timed_out {
             return format!("[timed out; output so far]\n{body}");
         }
@@ -281,6 +294,43 @@ const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 /// wedge the conversation forever.
 const EXEC_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Context window assumed when the endpoint's `/models` response doesn't
+/// advertise one. Most current endpoints are at least this large, and
+/// compacting a little early is much better than overflowing the window.
+const FALLBACK_CONTEXT_WINDOW: usize = 128 * 1024;
+
+/// Share of the window at which the next request triggers compaction
+/// (automatic, before the request is sent).
+const COMPACT_AT: f32 = 0.75;
+
+/// Share of the window kept verbatim as the recent tail after compaction —
+/// the summary replaces everything older.
+const COMPACT_KEEP: f32 = 0.4;
+
+/// Longest single tool result fed into a compaction transcript, in bytes.
+/// The transcript is the *input* of the summarizer, so a handful of huge
+/// command outputs must not blow up the very request meant to shrink the
+/// conversation; `compaction_transcript` keeps the tail of a longer result,
+/// where a command's errors and summary usually are.
+const COMPACT_RESULT_CAP: usize = 4 * 1024;
+
+/// Instruction for the compaction round: what the summary must preserve so
+/// the work can continue without the original messages.
+const COMPACTION_PROMPT: &str = "\
+You maintain the working memory of a terminal-operating agent. Summarize the \
+conversation transcript below into notes for yourself, so the work can \
+continue without the original messages. Preserve: the user's goals and \
+constraints (and anything they asked you to remember), decisions made, the \
+commands that ran with their key output (paths, errors, numbers), the state \
+of anything still running, and open questions. Be specific and terse — no \
+pleasantries, no restating the obvious. Reply with the summary only, as \
+Markdown.";
+
+/// Preamble for a compaction summary in the wire history. Spelled out so
+/// the model reads it as context rather than as a fresh instruction.
+const COMPACTED_HEADER: &str =
+    "Summary of the earlier conversation, compacted to save context:\n\n";
+
 /// Terminal session an AI panel is bound to.
 ///
 /// One panel instance exists per terminal pane (see
@@ -309,6 +359,10 @@ struct ComboItem {
 enum DisplayRole {
     User,
     Assistant,
+    /// One summary turn standing in for everything older that was compacted
+    /// away (see [`COMPACTED_HEADER`]). Replayed to the model as a user
+    /// message so every OpenAI-compatible gateway accepts it.
+    Summary,
 }
 
 /// One committed chat turn for display. `reasoning` (reasoning models'
@@ -326,6 +380,16 @@ struct DisplayMessage {
     /// message is only sent back to the model with its calls and results
     /// once every call has been resolved by the user.
     tool_calls: Vec<ToolCallState>,
+}
+
+/// One in-flight compaction round.
+struct CompactionPlan {
+    /// Index of the first message to keep verbatim; `0..cut` become the
+    /// summary.
+    cut: usize,
+    /// The summarization stream — cancelling it (the composer's stop
+    /// button) skips compaction and lets the held-up turn run as-is.
+    stream: ChatStream,
 }
 
 /// AI assistant panel view.
@@ -355,10 +419,11 @@ pub struct AiPanel {
     /// Set by `send`, consumed by the next `set_state` (which has a
     /// `Window`) to clear the input box.
     pending_clear: bool,
-    /// Whether the message input currently has keyboard focus. Drives the
-    /// custom placeholder overlay, which is hidden while focused so the
-    /// caret sits on clean space instead of on top of the hint text.
-    input_focused: bool,
+    /// Whether the message input is empty — the send button stays disabled
+    /// until it isn't. Cached rather than recomputed per frame: the
+    /// library's `value()` copies the whole draft, and this only changes on
+    /// [`InputEvent::Change`].
+    input_empty: bool,
     /// Inline error line (not-configured, API errors, fetch failures).
     error: Option<String>,
     /// Model ids per provider entry id, fetched from `{base}/models`
@@ -381,6 +446,25 @@ pub struct AiPanel {
     session_id: String,
     /// The terminal this panel (and its agent) belongs to.
     session: AiSession,
+    /// Context windows learned from the endpoints' `/models` responses,
+    /// keyed `"{provider_id}|{model}"`. A missing entry falls back to
+    /// [`FALLBACK_CONTEXT_WINDOW`].
+    model_windows: HashMap<String, usize>,
+    /// Cached token estimate for the next request, shown in the composer's
+    /// context chip. Recomputed when the conversation changes — building it
+    /// walks the whole history, so it is deliberately not per-frame work.
+    context_used: usize,
+    /// In-flight compaction round, if any. Non-`None` means "busy": the
+    /// held-up turn starts as soon as the summary lands.
+    compaction: Option<CompactionPlan>,
+    /// Transient status line above the composer (currently only
+    /// "compacting"), cleared when the round ends.
+    status: Option<String>,
+    /// Set when the conversation was rewritten from the top (compaction):
+    /// the next render, after re-splicing the row count, scrolls to the end
+    /// so the user lands on the new content — scrolling at the moment of the
+    /// rewrite would be a no-op, the list still holds the old row count.
+    scroll_to_end_pending: bool,
 }
 
 impl AiPanel {
@@ -396,7 +480,7 @@ impl AiPanel {
             input: None,
             combo_search: None,
             pending_clear: false,
-            input_focused: false,
+            input_empty: true,
             error: None,
             models_by_provider: HashMap::new(),
             fetch_attempts: HashSet::new(),
@@ -404,6 +488,11 @@ impl AiPanel {
             combo_open: false,
             session_id: new_session_id(),
             session,
+            model_windows: HashMap::new(),
+            context_used: 0,
+            compaction: None,
+            status: None,
+            scroll_to_end_pending: false,
         }
     }
 
@@ -453,12 +542,17 @@ impl AiPanel {
             return;
         }
         let state = cx.new(|cx| {
-            // Placeholder intentionally left empty: the library renders
-            // placeholders without wrapping, so the panel draws its own
-            // wrapping overlay instead (see `render`).
-            InputState::new(window, cx).auto_grow(6, 12)
+            // The placeholder is the library's own: it is laid out and painted
+            // with the text (same origin and font), so it lines up with the
+            // caret instead of sitting under it, and it disappears the moment
+            // the box holds anything — including IME composition text, which
+            // lands in the editor's text while it is being composed. Keep it
+            // short: the library never wraps a placeholder.
+            InputState::new(window, cx)
+                .auto_grow(6, 12)
+                .placeholder(t!("ai_panel.placeholder").to_string())
         });
-        cx.subscribe(&state, |this, _input, event: &InputEvent, cx| {
+        cx.subscribe(&state, |this, input, event: &InputEvent, cx| {
             match event {
                 // Plain Enter sends; Cmd/Ctrl+Enter (`secondary`) keeps
                 // the newline the multi-line editor just inserted.
@@ -467,12 +561,12 @@ impl AiPanel {
                         this.submit(cx);
                     }
                 }
-                InputEvent::Focus => {
-                    this.input_focused = true;
-                    cx.notify();
-                }
-                InputEvent::Blur => {
-                    this.input_focused = false;
+                // Keep the emptiness cache in step: it drives the send
+                // button's disabled state, and this is the only place the
+                // draft can change (typing, paste, IME composition,
+                // programmatic clears).
+                InputEvent::Change => {
+                    this.input_empty = input.read(cx).value().trim().is_empty();
                     cx.notify();
                 }
                 _ => {}
@@ -511,9 +605,10 @@ impl AiPanel {
         }));
     }
 
-    /// Send the current input text. No-op while a reply streams.
+    /// Send the current input text. No-op while a reply streams or a
+    /// compaction round is in flight.
     fn send(&mut self, cx: &mut Context<Self>) {
-        if self.stream.is_some() {
+        if self.stream.is_some() || self.compaction.is_some() {
             return;
         }
         let Some(input) = self.input.clone() else {
@@ -531,12 +626,11 @@ impl AiPanel {
             cx.notify();
             return;
         }
-        let Some(provider) = ai::resolve_provider_session(cx, &self.session_id) else {
+        if ai::resolve_provider_session(cx, &self.session_id).is_none() {
             self.error = Some(t!("ai_panel.not_configured").to_string());
             cx.notify();
             return;
-        };
-
+        }
         // Commit the user turn for display (and history) before building
         // the wire request, so it is included exactly once. Follow it down
         // if the view was already at the bottom.
@@ -552,14 +646,9 @@ impl AiPanel {
             self.scroll_list_to_end();
         }
 
-        let model = config::snapshot().ai.model;
-        let wire = self.wire_history();
-        let request = ChatRequest::new(model)
-            .with_messages(wire)
-            .with_tools(agent_tools());
-
         self.pending_clear = true;
-        self.start_stream(provider, request, cx);
+        // Compacts first when the request would be too large, then sends.
+        self.continue_after_tools(cx);
     }
 
     /// Spawn the worker for one request and pump its events into the panel.
@@ -613,10 +702,14 @@ impl AiPanel {
     }
 
     /// Called from the Stop button: closes the stream's channels; the pump
-    /// task observes it and finishes the turn with `Cancelled`.
+    /// task observes it and finishes the turn with `Cancelled`. A compaction
+    /// in flight is cancelled too — the held-up turn then runs without it.
     fn stop(&mut self) {
         if let Some(stream) = &self.stream {
             stream.cancel();
+        }
+        if let Some(plan) = &self.compaction {
+            plan.stream.cancel();
         }
     }
 
@@ -653,6 +746,8 @@ impl AiPanel {
                 self.error = Some(err.to_string());
             }
         }
+        // The turn changed the history; keep the context chip honest.
+        self.refresh_context_used();
         cx.notify();
     }
 
@@ -688,6 +783,8 @@ impl AiPanel {
                     running: false,
                     exit_code: None,
                     timed_out: false,
+                    cancel: ExecCancel::default(),
+                    cancelled: false,
                 };
                 if ToolKind::of(&state.call.name) == ToolKind::ExecCapture {
                     if let Some(reason) = &capture_block {
@@ -745,6 +842,10 @@ impl AiPanel {
     /// results, which is the shape OpenAI-compatible servers require (a
     /// `tool` message must answer the `tool_calls` of the message before it).
     ///
+    /// A [`DisplayRole::Summary`] turn (automatic compaction) is sent as one
+    /// user message carrying the summarized history, so every
+    /// OpenAI-compatible gateway accepts it.
+    ///
     /// Turns with unresolved calls are skipped entirely: they cannot be
     /// replayed, and [`Self::send`] refuses to build a request while any call
     /// is pending.
@@ -754,6 +855,10 @@ impl AiPanel {
         for msg in &self.messages {
             match msg.role {
                 DisplayRole::User => wire.push(ChatMessage::user(msg.content.clone())),
+                DisplayRole::Summary => wire.push(ChatMessage::user(format!(
+                    "{COMPACTED_HEADER}{}",
+                    msg.content
+                ))),
                 DisplayRole::Assistant => {
                     if msg.tool_calls.iter().any(|c| c.result.is_none()) {
                         continue;
@@ -892,6 +997,7 @@ impl AiPanel {
     /// the results once every call of the turn has one.
     fn settle_tool(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        self.refresh_context_used();
         self.maybe_continue_after_tools(cx);
         cx.notify();
     }
@@ -933,13 +1039,17 @@ impl AiPanel {
         }
         let cwd = terminal.read(cx).cwd().map(str::to_string);
         let effective = with_cwd(&command, cwd.as_deref());
+        // The token the card's stop button flips; the backend then reports
+        // the output captured up to that moment.
+        let cancel = ExecCancel::default();
         let rx = terminal
             .read(cx)
-            .exec_capture(&effective, EXEC_CAPTURE_TIMEOUT);
+            .exec_capture(&effective, EXEC_CAPTURE_TIMEOUT, cancel.clone());
 
         if let Some(state) = self.tool_state_mut(msg_index, call_index) {
             state.decision = ToolDecision::Allowed;
             state.running = true;
+            state.cancel = cancel;
         }
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
         cx.notify();
@@ -984,9 +1094,14 @@ impl AiPanel {
         // what appears after this point, so the model gets the command's own
         // output instead of a round trip through `terminal_read`.
         let before = terminal.read(cx).dump_text(AGENT_READ_LINES);
+        // The card's stop button ends the *wait* — the command itself keeps
+        // running in the user's terminal, which is where they can interrupt
+        // it for real.
+        let cancel = ExecCancel::default();
         if let Some(state) = self.tool_state_mut(msg_index, call_index) {
             state.decision = ToolDecision::Allowed;
             state.running = true;
+            state.cancel = cancel.clone();
         }
         // Same path the snippets panel uses: the line, then a carriage
         // return, so the shell runs it as if it had been typed.
@@ -994,18 +1109,30 @@ impl AiPanel {
         bytes.push(b'\r');
         terminal.read(cx).write_raw(&bytes);
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
-        self.await_command_output(msg_index, call_index, before, cx);
+        self.await_command_output(msg_index, call_index, before, cancel, cx);
         cx.notify();
     }
 
     /// Send the resolved tool results back to the model, so it can act on
-    /// them.
+    /// them — compacting the history first when the next request would eat
+    /// too much of the model's context window.
     ///
     /// There is deliberately no cap on how many rounds a turn may take: every
     /// call is approved by the user before it runs, so the loop only continues
     /// while they keep saying yes — and they can stop it at any point with the
     /// composer's stop button.
     fn continue_after_tools(&mut self, cx: &mut Context<Self>) {
+        self.refresh_context_used();
+        if self.needs_compaction() && self.start_compaction(cx) {
+            // The compaction round sends the held-up request itself once the
+            // summary lands.
+            return;
+        }
+        self.start_turn(cx);
+    }
+
+    /// Build the request from the current history and start streaming it.
+    fn start_turn(&mut self, cx: &mut Context<Self>) {
         let Some(provider) = ai::resolve_provider_session(cx, &self.session_id) else {
             self.error = Some(t!("ai_panel.not_configured").to_string());
             cx.notify();
@@ -1016,6 +1143,153 @@ impl AiPanel {
             .with_messages(self.wire_history())
             .with_tools(agent_tools());
         self.start_stream(provider, request, cx);
+    }
+
+    /// The context window to budget against: what the endpoint advertised
+    /// for the active model, or [`FALLBACK_CONTEXT_WINDOW`].
+    fn context_window(&self) -> usize {
+        let ai = config::snapshot().ai;
+        ai.active_provider()
+            .and_then(|entry| {
+                self.model_windows
+                    .get(&format!("{}|{}", entry.id, ai.model))
+            })
+            .copied()
+            .unwrap_or(FALLBACK_CONTEXT_WINDOW)
+    }
+
+    /// Recompute [`Self::context_used`] — walks the whole history, so it runs
+    /// when the conversation changes (per turn / per tool result), never per
+    /// frame.
+    fn refresh_context_used(&mut self) {
+        let model = config::snapshot().ai.model;
+        let request = ChatRequest::new(model)
+            .with_messages(self.wire_history())
+            .with_tools(agent_tools());
+        self.context_used = request.estimated_tokens();
+    }
+
+    /// Whether the next request would eat too much of the model's window.
+    fn needs_compaction(&self) -> bool {
+        self.context_used as f32 >= self.context_window() as f32 * COMPACT_AT
+    }
+
+    /// Summarize the older part of the conversation in place, then send the
+    /// request that was waiting on it. This is the automatic context
+    /// compaction that lets a long session keep going without the user ever
+    /// managing history.
+    ///
+    /// Returns `true` once a round is in flight; `false` when there is
+    /// nothing worth compacting (the caller should just run the turn).
+    fn start_compaction(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(provider) = ai::resolve_provider_session(cx, &self.session_id) else {
+            self.error = Some(t!("ai_panel.not_configured").to_string());
+            cx.notify();
+            return false;
+        };
+        let keep = (self.context_window() as f32 * COMPACT_KEEP) as usize;
+        let cut = compaction_cut(&self.messages, keep);
+        if cut == 0 {
+            // Everything is recent enough to keep — nothing to summarize.
+            return false;
+        }
+        let transcript = compaction_transcript(&self.messages[..cut]);
+        let model = config::snapshot().ai.model;
+        let request = ChatRequest::new(model).with_messages(vec![
+            ChatMessage::system(COMPACTION_PROMPT),
+            ChatMessage::user(transcript),
+        ]);
+        let stream = crabport_ai::spawn_chat_stream(Arc::new(provider), request);
+
+        self.generation += 1;
+        let generation = self.generation;
+        self.compaction = Some(CompactionPlan {
+            cut,
+            stream: stream.clone(),
+        });
+        self.status = Some(t!("ai_panel.compacting").to_string());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            // Drain the events: the summary is in the final response, and an
+            // unread channel would stall the worker thread.
+            while stream.next_event().await.is_some() {}
+            let outcome = stream.result().await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.generation == generation {
+                    panel.finish_compaction(outcome, cx);
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
+    /// Apply a finished compaction round and start the turn it was holding
+    /// up. A failed or stopped round leaves the history as it was — the turn
+    /// then runs (and fails loudly) rather than being silently dropped.
+    fn finish_compaction(
+        &mut self,
+        outcome: Result<ChatResponse, AiError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plan) = self.compaction.take() else {
+            return;
+        };
+        self.status = None;
+        match outcome {
+            Ok(response) => {
+                let summary = response.message.content.trim().to_string();
+                if summary.is_empty() {
+                    self.error = Some(t!("ai_panel.compact_failed").to_string());
+                } else {
+                    self.apply_summary(plan.cut, summary, cx);
+                }
+            }
+            Err(AiError::Cancelled) => {
+                // A stop while compacting cancels the round *and* the turn it
+                // was holding up: the user asked for nothing to happen. Their
+                // message stays in the transcript, unanswered.
+                cx.notify();
+                return;
+            }
+            Err(err) => {
+                self.error = Some(format!("{}: {err}", t!("ai_panel.compact_failed")));
+            }
+        }
+        self.start_turn(cx);
+    }
+
+    /// Replace `messages[..cut]` with one summary turn. The transcript keeps
+    /// its place — as a collapsed block at the top of the conversation — so
+    /// the user can always see that history was compacted, and what it became.
+    fn apply_summary(&mut self, cut: usize, summary: String, cx: &mut Context<Self>) {
+        self.messages.drain(..cut);
+        self.messages.insert(
+            0,
+            DisplayMessage {
+                role: DisplayRole::Summary,
+                content: summary,
+                reasoning: String::new(),
+                // Reused as the block's disclosure flag.
+                reasoning_expanded: false,
+                tool_calls: Vec::new(),
+            },
+        );
+        // Every row shifted and the first one changed identity: drop the
+        // cached measurements and let render re-splice to the new count.
+        self.list_state.reset(0);
+        self.scroll_to_end_pending = true;
+        self.refresh_context_used();
+        cx.notify();
+    }
+
+    /// Flip the compacted-history block's disclosure.
+    fn toggle_summary(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(msg) = self.messages.get_mut(index) {
+            msg.reasoning_expanded = !msg.reasoning_expanded;
+            cx.notify();
+        }
     }
 
     /// Run one approved tool call that answers inline against this panel's
@@ -1061,6 +1335,7 @@ impl AiPanel {
         msg_index: usize,
         call_index: usize,
         before: String,
+        cancel: ExecCancel,
         cx: &mut Context<Self>,
     ) {
         let Some(terminal) = self.session.terminal.upgrade() else {
@@ -1079,8 +1354,13 @@ impl AiPanel {
             let mut last = before.clone();
             let mut quiet_since = std::time::Instant::now();
             let mut timed_out = false;
+            let mut cancelled = false;
             loop {
                 cx.background_executor().timer(OUTPUT_POLL).await;
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 let Ok(now) =
                     terminal.read_with(cx, |view, _cx| view.try_dump_text(AGENT_READ_LINES))
                 else {
@@ -1102,7 +1382,11 @@ impl AiPanel {
             }
             let result = new_since(&before, &last);
             let result = if result.trim().is_empty() {
-                if timed_out {
+                if cancelled {
+                    // The caption under the fields already says it was
+                    // stopped; an empty body is honest.
+                    String::new()
+                } else if timed_out {
                     t!("ai_panel.tool_exec_no_output_timeout").to_string()
                 } else {
                     t!("ai_panel.tool_exec_no_output").to_string()
@@ -1111,7 +1395,7 @@ impl AiPanel {
                 result
             };
             let _ = entity.update(cx, |panel, cx| {
-                panel.settle_tool_result(msg_index, call_index, result, ToolDecision::Allowed, cx);
+                panel.finish_tool_run(msg_index, call_index, result, cancelled, cx);
             });
         })
         .detach();
@@ -1137,9 +1421,44 @@ impl AiPanel {
             state.result = Some(text);
             state.exit_code = out.exit_code;
             state.timed_out = out.timed_out;
+            state.cancelled = out.cancelled;
             state.running = false;
         }
         self.settle_tool(msg_index, call_index, cx);
+    }
+
+    /// Store a visible run's result: the output the screen gained, plus
+    /// whether the user ended the wait before it settled.
+    fn finish_tool_run(
+        &mut self,
+        msg_index: usize,
+        call_index: usize,
+        result: String,
+        cancelled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.tool_state_mut(msg_index, call_index) {
+            state.result = Some(result);
+            state.cancelled = cancelled;
+            state.running = false;
+        }
+        self.settle_tool(msg_index, call_index, cx);
+    }
+
+    /// Stop a running tool call — the card's stop button. A captured command
+    /// is closed down (its output so far is kept); a visible run stops being
+    /// waited on, and the command itself keeps running in the terminal,
+    /// which is where the user can interrupt it for real. Either way the
+    /// call settles through the normal path.
+    fn cancel_tool_call(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+        let Some(state) = self.tool_state_mut(msg_index, call_index) else {
+            return;
+        };
+        if !state.running {
+            return;
+        }
+        state.cancel.cancel();
+        cx.notify();
     }
 
     /// Continue the loop when every tool call has produced a result; wait
@@ -1277,6 +1596,11 @@ impl AiPanel {
                 DisplayRole::User => MessageItem::User {
                     content: msg.content.clone(),
                 },
+                DisplayRole::Summary => MessageItem::Summary {
+                    message_ix,
+                    text: msg.content.clone(),
+                    expanded: msg.reasoning_expanded,
+                },
                 DisplayRole::Assistant => MessageItem::Assistant {
                     message_ix,
                     reasoning: msg.reasoning.clone(),
@@ -1327,10 +1651,22 @@ impl AiPanel {
             let _ = this.update(cx, |panel, cx| {
                 panel.fetching_count = panel.fetching_count.saturating_sub(1);
                 match result {
-                    Ok(mut models) => {
-                        models.sort();
-                        models.dedup();
-                        panel.models_by_provider.insert(provider_id, models);
+                    Ok(models) => {
+                        // Remember each model's advertised context window —
+                        // the budget automatic compaction runs against.
+                        for model in &models {
+                            if let Some(window) = model.context_window {
+                                panel
+                                    .model_windows
+                                    .insert(format!("{provider_id}|{}", model.id), window);
+                            }
+                        }
+                        let mut ids: Vec<String> =
+                            models.into_iter().map(|model| model.id).collect();
+                        ids.sort();
+                        ids.dedup();
+                        panel.models_by_provider.insert(provider_id, ids);
+                        panel.refresh_context_used();
                     }
                     Err(err) => {
                         panel.error = Some(format!("{}: {err}", t!("ai_panel.fetch_failed")));
@@ -1347,7 +1683,9 @@ impl Render for AiPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let handle = cx.entity().clone();
         let ai_cfg = config::snapshot().ai;
-        let busy = self.stream.is_some();
+        // Compaction counts as busy: the held-up turn can only start once it
+        // lands, and the stop button must be able to call it off.
+        let busy = self.stream.is_some() || self.compaction.is_some();
 
         // --- Combined provider·model items ---
         //
@@ -1493,6 +1831,12 @@ impl Render for AiPanel {
         } else if known > item_count {
             self.list_state.splice(item_count..known, 0);
         }
+        // A compaction rewrote the conversation from the top; now that the
+        // row count matches the new history, put the view at the end.
+        if self.scroll_to_end_pending {
+            self.scroll_to_end_pending = false;
+            self.scroll_list_to_end();
+        }
         // The list's render closure cannot borrow the view, so rows are
         // built from a per-frame snapshot plus a weak handle (used by the
         // thinking disclosures).
@@ -1527,38 +1871,19 @@ impl Render for AiPanel {
                 .into_any_element(),
             None => div().into_any_element(),
         };
-        // The library's built-in placeholder never wraps in multi-line
-        // inputs, so the panel overlays its own wrapping placeholder while
-        // the box is empty and unfocused — while focused it hides so the
-        // caret gets clean space. The overlay has no hitbox — clicks fall
-        // through to the input underneath.
-        let input_empty = self
-            .input
-            .as_ref()
-            .map(|state| state.read(cx).value().trim().is_empty())
-            .unwrap_or(true);
-        let show_placeholder = !self.input_focused && input_empty;
+        // The input draws its own placeholder at the text origin (see
+        // `ensure_input`), so the panel adds no overlay here: anything drawn
+        // separately would be a few pixels off the caret, and would have to
+        // duplicate the "hide while composing" rule by hand.
+        let input_empty = self.input_empty;
         let input_area = div()
-            .relative()
             // With no conversation the input area *is* the panel: it takes
             // every pixel the controls row doesn't need, and the editor
             // element (`height: 100%` + `flex_grow` in the library) fills
             // it. Once there are messages it goes back to its natural
             // height — 6 rows, auto-growing to 12.
             .when(!has_conversation, |el| el.flex_1().min_h_0())
-            .child(input_el)
-            .when(show_placeholder, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .text_xs()
-                        .text_color(rgb(text_muted()))
-                        .child(t!("ai_panel.placeholder").to_string()),
-                )
-            });
+            .child(input_el);
         // Send / Stop. One slot, icon-only: while a reply streams the action
         // is cancel (the only way to stop — Esc isn't wired), otherwise
         // send, which stays disabled until there is something to send. Enter
@@ -1600,6 +1925,10 @@ impl Render for AiPanel {
                 .into_any_element()
         };
 
+        // Context accounting is deliberately invisible: the panel compacts
+        // on its own and never asks the user to watch a number. The estimate
+        // still feeds `needs_compaction` — it just isn't rendered.
+
         let mut root = div().size_full().flex().flex_col().min_h_0();
         if has_conversation {
             // --- Conversation viewport ---
@@ -1629,6 +1958,16 @@ impl Render for AiPanel {
                         .child(err),
                 )
             })
+            .when_some(self.status.clone(), |el, status| {
+                el.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .child(status),
+                )
+            })
             // --- Composer ---
             //
             // Zed's agent-panel pattern: the editor area sits on the toolbar
@@ -1642,8 +1981,6 @@ impl Render for AiPanel {
                     .gap_1()
                     .p_2()
                     .bg(rgb(bg_tab_bar()))
-                    .border_t_1()
-                    .border_color(rgb(border()))
                     .when(!has_conversation, |el| el.flex_1().min_h_0())
                     .when(!has_conversation && not_configured, |el| {
                         el.child(
@@ -1674,6 +2011,13 @@ impl Render for AiPanel {
 enum MessageItem {
     User {
         content: String,
+    },
+    /// The compacted-history marker: one dim block where the summarized turns
+    /// used to be, clicked to show the summary text.
+    Summary {
+        message_ix: usize,
+        text: String,
+        expanded: bool,
     },
     Assistant {
         /// Index into `AiPanel::messages` — the thinking toggle needs the
@@ -1761,6 +2105,97 @@ fn quote_shell(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// Rough token size of one display turn, matching what its wire form costs:
+/// the content plus every tool call's arguments and result. Reasoning is not
+/// counted — it is display-only and never replayed.
+fn message_tokens(msg: &DisplayMessage) -> usize {
+    let mut total = MESSAGE_OVERHEAD_TOKENS + estimate_tokens(&msg.content);
+    for call in &msg.tool_calls {
+        total += TOOL_CALL_OVERHEAD_TOKENS
+            + estimate_tokens(&call.call.name)
+            + estimate_tokens(&call.call.arguments)
+            + call.result.as_deref().map(estimate_tokens).unwrap_or(0);
+    }
+    total
+}
+
+/// Index of the first message to keep verbatim when compacting a
+/// conversation.
+///
+/// Walks backwards, keeping messages until roughly `keep_tokens` is reached,
+/// then snaps the cut back to the user turn that opened that block: an
+/// assistant's tool calls and their results must travel together, and the
+/// kept tail reads best starting with the user's ask. `0` means "nothing old
+/// enough to summarize" — the caller then leaves the history alone.
+fn compaction_cut(messages: &[DisplayMessage], keep_tokens: usize) -> usize {
+    let mut used = 0usize;
+    for (ix, msg) in messages.iter().enumerate().rev() {
+        used += message_tokens(msg);
+        if used >= keep_tokens {
+            return messages[..=ix]
+                .iter()
+                .rposition(|msg| msg.role == DisplayRole::User)
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Plain-text transcript of the turns being compacted, for the summarizer.
+///
+/// Tool results are capped ([`COMPACT_RESULT_CAP`], tail kept) so a few huge
+/// command outputs can't make the compaction request larger than the
+/// conversation it is meant to shrink.
+fn compaction_transcript(messages: &[DisplayMessage]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        match msg.role {
+            DisplayRole::User => {
+                out.push_str("USER: ");
+                out.push_str(msg.content.trim());
+                out.push('\n');
+            }
+            DisplayRole::Summary => {
+                out.push_str("SUMMARY SO FAR: ");
+                out.push_str(msg.content.trim());
+                out.push('\n');
+            }
+            DisplayRole::Assistant => {
+                if !msg.content.trim().is_empty() {
+                    out.push_str("ASSISTANT: ");
+                    out.push_str(msg.content.trim());
+                    out.push('\n');
+                }
+                for call in &msg.tool_calls {
+                    out.push_str("  [");
+                    out.push_str(&call.call.name);
+                    out.push_str("] ");
+                    out.push_str(call.call.arguments.trim());
+                    if let Some(result) = &call.result {
+                        out.push_str(" -> ");
+                        out.push_str(cap_for_summary(result.trim()));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `text` shortened to [`COMPACT_RESULT_CAP`] from the front (keeping the
+/// tail, where a command's errors and summary usually are) when it is longer.
+fn cap_for_summary(text: &str) -> &str {
+    if text.len() <= COMPACT_RESULT_CAP {
+        return text;
+    }
+    let mut cut = text.len() - COMPACT_RESULT_CAP;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    &text[cut..]
+}
+
 /// Fresh id for a conversation's session header. Only needs to be unique
 /// among a gateway's clients and stable for the conversation's lifetime, so
 /// process id + start time in hex is plenty — no RNG or uuid dependency.
@@ -1807,6 +2242,21 @@ fn render_list_item(
             .child(user_bubble(
                 content.clone(),
                 format!("ai-user-{ix}"),
+                md_style,
+                window,
+                cx,
+            ))
+            .into_any_element(),
+        Some(MessageItem::Summary {
+            message_ix,
+            text,
+            expanded,
+        }) => row
+            .child(summary_block(
+                *message_ix,
+                text.clone(),
+                *expanded,
+                entity,
                 md_style,
                 window,
                 cx,
@@ -1995,10 +2445,16 @@ fn tool_card(
         );
     }
 
-    // How a captured command ended, in the same muted register as the field
-    // labels: the green check in the corner already says "it ran", so only a
-    // non-zero status (and a timeout) is worth spelling out.
-    if state.timed_out {
+    // How the call ended, in the same muted register as the field labels:
+    // the green check in the corner already says "it ran", so only a stop, a
+    // timeout or a non-zero status is worth spelling out.
+    if state.cancelled {
+        let caption = match kind {
+            ToolKind::ExecCapture => t!("ai_panel.tool_capture_cancelled").to_string(),
+            _ => t!("ai_panel.tool_run_cancelled").to_string(),
+        };
+        card = card.child(div().text_xs().text_color(rgb(text_muted())).child(caption));
+    } else if state.timed_out {
         card = card.child(
             div().text_xs().text_color(rgb(term_yellow())).child(
                 t!(
@@ -2099,6 +2555,32 @@ fn tool_card(
                     .into_any_element()
             };
             card = card.child(result_view);
+            if state.running {
+                // Stop: the only control while a call runs. Red square,
+                // matching the composer's stop-stream button.
+                let red = term_red();
+                let h = entity.clone();
+                card = card.child(
+                    div().flex().flex_row().justify_end().child(
+                        Button::new(ElementId::Name(
+                            format!("ai-tool-stop-{message_ix}-{call_ix}").into(),
+                        ))
+                        .icon("icons/square.svg")
+                        .icon_color(red)
+                        .bg((red << 8) | 0x33)
+                        .bg_hover((red << 8) | 0x4d)
+                        .bg_selected((red << 8) | 0x66)
+                        .border_color((red << 8) | 0x99)
+                        .size_6()
+                        .centered(true)
+                        .on_click(move |_e, _w, cx| {
+                            let _ = h.update(cx, |panel, cx| {
+                                panel.cancel_tool_call(message_ix, call_ix, cx)
+                            });
+                        }),
+                    ),
+                );
+            }
         }
     }
 
@@ -2264,6 +2746,69 @@ fn thinking_section(
     col.into_any_element()
 }
 
+/// The compacted-history marker: a dim one-liner where the summarized turns
+/// used to be. The whole header row is the click target (same affordance as
+/// the thinking block) and the summary itself is one click away, so the
+/// transcript stays honest about what happened to the history.
+fn summary_block(
+    ix: usize,
+    text: String,
+    expanded: bool,
+    entity: &WeakEntity<AiPanel>,
+    md_style: &TextViewStyle,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let h = entity.clone();
+    let mut col = div().flex().flex_col().gap_1().w_full().child(
+        div()
+            .id(ElementId::Name(format!("ai-summary-header-{ix}").into()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(move |_e, _w, cx| {
+                let _ = h.update(cx, |panel, cx| panel.toggle_summary(ix, cx));
+            })
+            .child(
+                svg()
+                    .path("icons/history.svg")
+                    .size(px(12.0))
+                    .text_color(rgb(text_muted())),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_muted()))
+                    .child(t!("ai_panel.context_summary").to_string()),
+            ),
+    );
+    if expanded {
+        col = col.child(
+            div()
+                .ml_1p5()
+                .pl_3()
+                .border_l_1()
+                .border_color(rgb(border()))
+                .text_xs()
+                .text_color(rgb(text_muted()))
+                .child(
+                    TextView::markdown(
+                        ElementId::Name(format!("ai-summary-{ix}").into()),
+                        text,
+                        window,
+                        cx,
+                    )
+                    .selectable(true)
+                    .h_auto()
+                    .style(md_style.clone()),
+                ),
+        );
+    }
+    col.into_any_element()
+}
+
 /// Zed-style user bubble: a bordered box on the raised surface so user
 /// turns read as distinct from the assistant's unlabeled content. Own
 /// selectable Markdown view.
@@ -2393,7 +2938,21 @@ fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyEl
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOOL_RESULT_BYTES, ToolKind, cap_tool_result, quote_shell, with_cwd};
+    use super::{
+        COMPACT_RESULT_CAP, DisplayMessage, DisplayRole, MAX_TOOL_RESULT_BYTES, ToolCallState,
+        ToolDecision, ToolKind, cap_tool_result, compaction_cut, compaction_transcript,
+        message_tokens, quote_shell, with_cwd,
+    };
+
+    fn msg(role: DisplayRole, content: &str) -> DisplayMessage {
+        DisplayMessage {
+            role,
+            content: content.to_string(),
+            reasoning: String::new(),
+            reasoning_expanded: false,
+            tool_calls: Vec::new(),
+        }
+    }
 
     #[test]
     fn tool_kind_maps_wire_names() {
@@ -2435,5 +2994,60 @@ mod tests {
         assert!(capped.len() < long.len());
         assert!(capped.starts_with("(earlier output omitted"));
         assert!(capped.ends_with("⇒"));
+    }
+
+    /// Compaction keeps the recent tail and snaps its cut back to a user
+    /// turn, so an assistant's tool calls never get separated from the
+    /// results that answer them.
+    #[test]
+    fn compaction_cut_keeps_recent_turns_and_snaps_to_user() {
+        let messages = vec![
+            msg(DisplayRole::User, "u1"),
+            msg(DisplayRole::Assistant, "a1"),
+            msg(DisplayRole::User, "u2"),
+            msg(DisplayRole::Assistant, "a2"),
+            msg(DisplayRole::User, "u3"),
+        ];
+        // A tiny budget keeps only the newest user turn.
+        assert_eq!(compaction_cut(&messages, 1), 4);
+        // A budget covering `u3` and `a2` snaps back to the turn that opened
+        // the block: `a2` must not travel without `u2`.
+        let keep = message_tokens(&messages[4]) + message_tokens(&messages[3]);
+        assert_eq!(compaction_cut(&messages, keep), 2);
+        // Everything fits: nothing old enough to summarize.
+        assert_eq!(compaction_cut(&messages, usize::MAX), 0);
+        assert_eq!(compaction_cut(&[], 10), 0);
+    }
+
+    /// The transcript fed to the summarizer labels roles, carries tool calls
+    /// with their results, and caps huge results so the compaction request
+    /// cannot be bigger than the history it is shrinking.
+    #[test]
+    fn compaction_transcript_labels_roles_and_caps_results() {
+        let long_result = "x".repeat(COMPACT_RESULT_CAP * 2);
+        let mut assistant = msg(DisplayRole::Assistant, "done");
+        assistant.tool_calls.push(ToolCallState {
+            call: crabport_ai::ToolCall {
+                id: "c1".into(),
+                name: "terminal_exec".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            },
+            args: None,
+            decision: ToolDecision::Allowed,
+            result: Some(long_result.clone()),
+            running: false,
+            exit_code: Some(0),
+            timed_out: false,
+            cancel: crabport_terminal::terminal::ExecCancel::default(),
+            cancelled: false,
+        });
+        let text = compaction_transcript(&[msg(DisplayRole::User, "hi"), assistant]);
+        assert!(text.contains("USER: hi"), "{text}");
+        assert!(
+            text.contains("[terminal_exec] {\"command\":\"ls\"} -> "),
+            "{text}"
+        );
+        // The capped result must not carry more than one cap of text.
+        assert!(!text.contains(&"x".repeat(COMPACT_RESULT_CAP + 1)));
     }
 }

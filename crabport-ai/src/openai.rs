@@ -150,9 +150,9 @@ impl OpenAiProvider {
     /// library's strict `ListModelResponse`: OpenAI-compatible endpoints
     /// frequently deviate from the official schema (e.g. DeepSeek omits
     /// `Model::created` and adds `name` / `context_window` fields), so only
-    /// `data[].id` is extracted from the raw JSON and everything else is
-    /// ignored.
-    pub fn list_models(&self) -> Result<Vec<String>, AiError> {
+    /// `data[].id` and an optional context window are extracted from the raw
+    /// JSON and everything else is ignored.
+    pub fn list_models(&self) -> Result<Vec<ModelInfo>, AiError> {
         let runtime = RuntimeBuilder::new_current_thread()
             .enable_all()
             .build()
@@ -164,7 +164,7 @@ impl OpenAiProvider {
                 .list_byot()
                 .await
                 .map_err(map_openai_error)?;
-            Ok(extract_model_ids(&value))
+            Ok(extract_models(&value))
         })
     }
 
@@ -546,19 +546,44 @@ fn map_openai_error(err: OpenAIError) -> AiError {
     }
 }
 
-/// Extract model ids from a raw `/models` response.
+/// One entry from `GET {base}/models`.
+///
+/// Only what the app uses is kept: the id (picker + requests) and, when the
+/// endpoint advertises it, the context window — OpenAI-compatible vendors
+/// disagree on the field name, so `context_window` and `context_length` are
+/// both read. `None` means the endpoint didn't say, and the caller falls
+/// back to its own default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub context_window: Option<usize>,
+}
+
+/// Extract models from a raw `/models` response.
 ///
 /// Tolerant by design — see [`OpenAiProvider::list_models`]: only
-/// `data[].id` is read, missing/malformed shapes degrade to an empty list.
-fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {
+/// `data[].id` (and a context window, when present) is read, and
+/// missing/malformed shapes degrade to an empty list.
+fn extract_models(value: &serde_json::Value) -> Vec<ModelInfo> {
     value
         .get("data")
         .and_then(|data| data.as_array())
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
-                .map(str::to_owned)
+                .filter_map(|entry| {
+                    let id = entry.get("id").and_then(|id| id.as_str())?;
+                    let context_window = entry
+                        .get("context_window")
+                        .or_else(|| entry.get("context_length"))
+                        .and_then(|window| window.as_u64())
+                        .map(|window| window as usize)
+                        .filter(|window| *window > 0);
+                    Some(ModelInfo {
+                        id: id.to_owned(),
+                        context_window,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -804,8 +829,9 @@ mod tests {
 
     /// The exact shape that broke the strict `Model` deserialization: a
     /// DeepSeek `/models` response omits `created` and adds extra fields
-    /// (`name`, `context_window`, …). Ids must still come through, and
-    /// malformed shapes must degrade to an empty list, not an error.
+    /// (`name`, `context_window`, …). Ids must still come through, the
+    /// advertised window is picked up, and malformed shapes must degrade to
+    /// an empty list, not an error.
     #[test]
     fn model_list_parses_vendor_extensions() {
         let payload: serde_json::Value = serde_json::from_str(
@@ -813,12 +839,27 @@ mod tests {
         )
         .expect("payload parses as json");
         assert_eq!(
-            extract_model_ids(&payload),
-            vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
+            extract_models(&payload),
+            vec![
+                ModelInfo {
+                    id: "deepseek-flash".to_string(),
+                    context_window: Some(1_048_576),
+                },
+                ModelInfo {
+                    id: "deepseek-v4-pro".to_string(),
+                    context_window: None,
+                }
+            ]
         );
 
-        assert!(extract_model_ids(&serde_json::json!({})).is_empty());
-        assert!(extract_model_ids(&serde_json::json!({"data": "nope"})).is_empty());
-        assert!(extract_model_ids(&serde_json::json!({"data": [{"name": "no-id"}]})).is_empty());
+        assert!(extract_models(&serde_json::json!({})).is_empty());
+        assert!(extract_models(&serde_json::json!({"data": "nope"})).is_empty());
+        assert!(extract_models(&serde_json::json!({"data": [{"name": "no-id"}]})).is_empty());
+        // A zero window is treated as "not reported".
+        assert_eq!(
+            extract_models(&serde_json::json!({"data": [{"id": "m", "context_window": 0}]}))[0]
+                .context_window,
+            None
+        );
     }
 }

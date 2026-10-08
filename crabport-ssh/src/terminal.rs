@@ -4,8 +4,8 @@ use async_broadcast::Receiver as BroadcastReceiver;
 
 use crabport_sftp::CrabPortSftp;
 use crabport_terminal::terminal::{
-    BackendEvent, CrabPortMonitor, CrabPortTerminal, ExecCallback, ExecOutput, RemoteMetrics,
-    RemoteStatus, SftpTransferKind,
+    BackendEvent, CrabPortMonitor, CrabPortTerminal, ExecCallback, ExecCancel, ExecOutput,
+    RemoteMetrics, RemoteStatus, SftpTransferKind,
 };
 
 use crate::TOKIO;
@@ -356,7 +356,13 @@ impl CrabPortTerminal for SshBackend {
         true
     }
 
-    fn exec_capture(&self, command: &str, timeout: std::time::Duration, done: ExecCallback) {
+    fn exec_capture(
+        &self,
+        command: &str,
+        timeout: std::time::Duration,
+        cancel: ExecCancel,
+        done: ExecCallback,
+    ) {
         let handle = self.handle.clone();
         let command = command.to_string();
         TOKIO.spawn(async move {
@@ -392,7 +398,7 @@ impl CrabPortTerminal for SshBackend {
                 }
                 Some(Ok(ch)) => ch,
             };
-            done(crate::monitor::drain_exec_capture(ch, timeout).await);
+            done(crate::monitor::drain_exec_capture(ch, timeout, cancel).await);
         });
     }
 }

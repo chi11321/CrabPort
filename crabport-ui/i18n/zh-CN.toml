@@ -461,8 +461,13 @@ tool_exec_no_output_timeout = "（12 秒后仍在运行，暂无输出）"
 tool_exec_unsupported = "当前连接不支持捕获执行（隐式），请改用 terminal_run 在终端中执行。"
 tool_exec_capture_failed = "命令尚未结束，会话已断开。"
 tool_capture_timed_out = "超过 %{secs} 秒仍未结束，以下为已捕获的输出"
+tool_capture_cancelled = "已终止，以下为已捕获的输出"
+tool_run_cancelled = "已终止等待，命令仍在终端中运行"
 tool_exit_code = "退出码 %{code}"
 tool_unknown = "未知工具：%{name}"
+compacting = "正在压缩上下文…"
+compact_failed = "上下文压缩失败"
+context_summary = "较早的对话已压缩为摘要"
 
 [window.settings.general]
 section_startup = "启动"
