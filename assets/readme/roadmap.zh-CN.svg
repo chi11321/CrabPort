@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="1200" height="420" viewBox="0 0 1200 420"
+     width="1200" height="460" viewBox="0 0 1200 460"
      role="img" aria-labelledby="roadmap-title roadmap-desc">
   <title id="roadmap-title">CrabPort 路线图</title>
-  <desc id="roadmap-desc">已完成：设置面板、可配置主题、SSH/Telnet/串口/本地终端连接、SFTP 文件管理、端口转发/SSH 隧道、代理连接、命令历史与片段。待办：终端会话同步、插件系统。</desc>
+  <desc id="roadmap-desc">已完成：设置面板、可配置主题、SSH/Telnet/串口/本地终端连接、SFTP 文件管理、端口转发/SSH 隧道、代理连接、命令历史与片段、内置 AI Agent。待办：终端会话同步、插件系统。</desc>
 
-  <rect width="1200" height="420" rx="26" fill="#14161c"/>
-  <rect x="1" y="1" width="1198" height="418" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+  <rect width="1200" height="460" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="458" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
 
   <defs>
     <symbol id="check" viewBox="0 0 16 16">
@@ -46,10 +46,12 @@
       <text x="28" y="224">代理连接</text>
       <use href="#check" x="0" y="248" width="16" height="16"/>
       <text x="28" y="262">命令历史与代码片段</text>
+      <use href="#check" x="0" y="286" width="16" height="16"/>
+      <text x="28" y="300">内置 AI Agent</text>
     </g>
   </g>
 
-  <line x1="740" y1="120" x2="740" y2="380" stroke="#23262f" stroke-width="1"/>
+  <line x1="740" y1="120" x2="740" y2="420" stroke="#23262f" stroke-width="1"/>
 
   <!-- 右列：待办 -->
   <g transform="translate(792 120)">

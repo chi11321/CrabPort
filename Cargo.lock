@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "CrabPort"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crabport-core",
  "crabport-ui",
@@ -1406,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-agent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-ai"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-channel 2.5.0",
  "async-openai",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-proxy"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crabport-core",
  "rustls-pki-types",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-serial"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-sftp"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-ssh"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-telnet"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-terminal"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "alacritty_terminal",
  "async-broadcast",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-tunnel"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crabport-core",
  "parking_lot",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "crabport-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "alacritty_terminal",
  "async-broadcast",

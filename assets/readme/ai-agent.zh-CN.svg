@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="540" viewBox="0 0 1200 540"
+     role="img" aria-labelledby="agent-title agent-desc">
+  <title id="agent-title">CrabPort 内置轻量 AI Agent</title>
+  <desc id="agent-desc">左侧：一张待确认的工具调用卡片（写明工作目录、命令与目的，右下角是拒绝与允许按钮），以及允许之后显示退出码与输出的结果卡片。右侧：Agent 的工具清单（终端、本地文件、网络、隧道、SFTP），以及按工具设置权限的分段控件（询问 / 允许 / 拒绝）。</desc>
+
+  <rect width="1200" height="540" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="538" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
+
+  <defs>
+    <marker id="agent-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6b7080"/>
+    </marker>
+    <symbol id="agent-check" viewBox="0 0 16 16">
+      <circle cx="8" cy="8" r="7" fill="#4ade80"/>
+      <path d="M4.5 8.5 l2.5 2.5 l4.5 -5" fill="none" stroke="#0f1116" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+
+  <text x="64" y="56"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="16" letter-spacing="3" fill="#6366f1" font-weight="600">
+    内置轻量 AI AGENT
+  </text>
+  <text x="64" y="88"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+        font-size="26" font-weight="600" fill="#e6e9ef">
+    先确认，再执行
+  </text>
+
+  <!-- 左列：审批卡片 -->
+  <g transform="translate(64 120)">
+    <rect width="490" height="180" rx="10" fill="#6366f1" fill-opacity="0.08" stroke="#6366f1" stroke-opacity="0.4"/>
+    <path d="M24 20 c1.2 6.4 3.2 8.4 9.6 9.6 c-6.4 1.2 -8.4 3.2 -9.6 9.6 c-1.2 -6.4 -3.2 -8.4 -9.6 -9.6 c6.4 -1.2 8.4 -3.2 9.6 -9.6 z" fill="none" stroke="#818cf8" stroke-width="1.6" stroke-linejoin="round"/>
+    <text x="42" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="12" font-weight="600" fill="#818cf8">执行命令</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+      <text x="20" y="64" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#6b7080">工作目录</text>
+      <text x="88" y="64" font-size="12" fill="#c1c5d0">/var/www</text>
+      <text x="20" y="92" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#6b7080">命令</text>
+      <text x="60" y="92" font-size="13" fill="#e6e9ef">systemctl restart nginx</text>
+      <text x="20" y="120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#6b7080">期望</text>
+      <text x="60" y="120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#8b90a0">让新配置生效</text>
+    </g>
+
+    <rect x="336" y="140" width="64" height="24" rx="6" fill="none" stroke="#2e333f"/>
+    <text x="368" y="156" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#8b90a0">拒绝</text>
+    <rect x="406" y="140" width="64" height="24" rx="6" fill="#6366f1"/>
+    <text x="438" y="156" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" font-weight="600" fill="#0f1116">允许</text>
+  </g>
+
+  <!-- 连接：允许之后 -->
+  <line x1="309" y1="308" x2="309" y2="342" stroke="#6b7080" stroke-width="1.5" marker-end="url(#agent-arrow)"/>
+  <text x="325" y="330"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="11" fill="#6b7080">允许之后</text>
+
+  <!-- 结果卡片 -->
+  <g transform="translate(64 352)">
+    <rect width="490" height="150" rx="10" fill="#6366f1" fill-opacity="0.08" stroke="#6366f1" stroke-opacity="0.4"/>
+    <use href="#agent-check" x="446" y="16" width="18" height="18"/>
+    <text x="24" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="12" font-weight="600" fill="#818cf8">执行命令</text>
+    <rect x="24" y="52" width="442" height="74" rx="6" fill="#0f1116" stroke="#23262f"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">
+      <text x="38" y="76" fill="#6b7080">[exit code: 0]</text>
+      <text x="38" y="98" fill="#4ade80">Active: active (running) since 03:14</text>
+    </g>
+  </g>
+
+  <!-- 右列：工具清单 -->
+  <g transform="translate(620 120)">
+    <text x="0" y="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#8b90a0" font-weight="600">工具清单</text>
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif">
+      <text x="0" y="44" font-size="12" fill="#6b7080">终端</text>
+      <text x="200" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">terminal_read · terminal_exec · terminal_run</text>
+      <text x="0" y="72" font-size="12" fill="#6b7080">本地</text>
+      <text x="200" y="72" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">read_file · read_directory</text>
+      <text x="0" y="100" font-size="12" fill="#6b7080">网络</text>
+      <text x="200" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">fetch（可走隧道代理）</text>
+      <text x="0" y="128" font-size="12" fill="#6b7080">隧道</text>
+      <text x="200" y="128" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">tunnel_list / create / open / close / delete</text>
+      <text x="0" y="156" font-size="12" fill="#6b7080">SFTP</text>
+      <text x="200" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">sftp_list · sftp_download · sftp_upload</text>
+    </g>
+
+    <!-- 按工具设置权限 -->
+    <text x="0" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" letter-spacing="2" fill="#8b90a0" font-weight="600">按工具设置权限</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#c1c5d0">
+      <text x="0" y="244">terminal_exec</text>
+      <text x="0" y="296">terminal_run</text>
+    </g>
+
+    <!-- 分段控件 mock：询问 | 允许 | 拒绝 -->
+    <g transform="translate(180 224)">
+      <rect width="336" height="32" rx="8" fill="#1c1f27"/>
+      <rect x="112" y="4" width="112" height="24" rx="5" fill="#0f1116"/>
+      <g text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="12">
+        <text x="56" y="21" fill="#8b90a0">询问</text>
+        <text x="168" y="21" fill="#e6e9ef" font-weight="600">允许</text>
+        <text x="280" y="21" fill="#8b90a0">拒绝</text>
+      </g>
+    </g>
+    <g transform="translate(180 276)">
+      <rect width="336" height="32" rx="8" fill="#1c1f27"/>
+      <rect x="4" y="4" width="112" height="24" rx="5" fill="#0f1116"/>
+      <g text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="12">
+        <text x="60" y="21" fill="#e6e9ef" font-weight="600">询问</text>
+        <text x="168" y="21" fill="#8b90a0">允许</text>
+        <text x="280" y="21" fill="#8b90a0">拒绝</text>
+      </g>
+    </g>
+
+    <text x="0" y="344" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#8b90a0">
+      信得过的不再询问；危险操作保持每次确认。
+    </text>
+  </g>
+
+  <text x="64" y="524"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif"
+        font-size="13" fill="#6b7080">
+    工具在后台线程运行，不会写进你正在看的终端；长对话自动压缩，工作可以一直继续。
+  </text>
+</svg>

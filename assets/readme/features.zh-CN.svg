@@ -1,18 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg"
-     width="1200" height="600" viewBox="0 0 1200 600"
+     width="1200" height="788" viewBox="0 0 1200 788"
      role="img" aria-labelledby="features-title features-desc">
   <title id="features-title">CrabPort 功能特性</title>
-  <desc id="features-desc">3x3 功能卡片：多标签终端、SFTP 文件面板、SSH 隧道、代理路由、串口连接、凭据加密、命令历史与片段、可配置主题、设置面板。</desc>
+  <desc id="features-desc">四行功能网格：置顶通栏是轻量 AI Agent（写明命令与用途的审批卡片，右下角是拒绝与允许按钮），其余九张卡片是多标签终端、SFTP 文件面板、SSH 隧道、代理路由、串口连接、凭据加密、命令历史与片段、可配置主题、设置面板与终端内搜索。</desc>
 
-  <rect width="1200" height="600" rx="26" fill="#14161c"/>
-  <rect x="1" y="1" width="1198" height="598" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
-
-  <defs>
-    <symbol id="port-dot" viewBox="0 0 12 12">
-      <circle cx="6" cy="6" r="5" fill="none" stroke="#6366f1" stroke-width="1.5"/>
-      <circle cx="6" cy="6" r="2" fill="#6366f1"/>
-    </symbol>
-  </defs>
+  <rect width="1200" height="788" rx="26" fill="#14161c"/>
+  <rect x="1" y="1" width="1198" height="786" rx="25" fill="none" stroke="#23262f" stroke-width="1"/>
 
   <text x="48" y="50"
         font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
@@ -25,8 +18,30 @@
     它能做什么
   </text>
 
-  <!-- 行 0 -->
+  <!-- Featured: the lightweight AI agent -->
   <g transform="translate(48 110)">
+    <rect width="720" height="150" rx="10" fill="#6366f1" fill-opacity="0.06" stroke="#6366f1" stroke-opacity="0.35"/>
+    <path d="M40 26 c1.44 7.92 3.96 10.44 12 12 c-7.92 1.44 -10.44 3.96 -12 12 c-1.44 -7.92 -3.96 -10.44 -12 -12 c7.92 -1.44 10.44 -3.96 12 -12 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">轻量 AI Agent</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">读终端、跑命令、传文件、开隧道——</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">每次工具调用都先弹卡等你确认。</text>
+
+    <!-- approval card mock -->
+    <g transform="translate(376 15)">
+      <rect width="328" height="120" rx="8" fill="#0f1116" stroke="#6366f1" stroke-opacity="0.45"/>
+      <path d="M18 19 c0.84 4.62 2.31 6.09 7 7 c-4.62 0.84 -6.09 2.31 -7 7 c-0.84 -4.62 -2.31 -6.09 -7 -7 c4.62 -0.84 6.09 -2.31 7 -7 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
+      <text x="30" y="30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" font-weight="600" fill="#818cf8">执行命令</text>
+      <text x="16" y="60" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#e6e9ef">tail -n 50 /var/log/nginx/error.log</text>
+      <text x="16" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#8b90a0">看看刚才的报错</text>
+      <rect x="184" y="92" width="60" height="18" rx="5" fill="none" stroke="#2e333f"/>
+      <text x="214" y="105" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" fill="#8b90a0">拒绝</text>
+      <rect x="250" y="92" width="60" height="18" rx="5" fill="#6366f1"/>
+      <text x="280" y="105" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="11" font-weight="600" fill="#0f1116">允许</text>
+    </g>
+  </g>
+
+  <!-- 3x3 grid: card 352x150, gap 16 -->
+  <g transform="translate(784 110)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <rect x="20" y="22" width="44" height="32" rx="6" fill="none" stroke="#6366f1" stroke-width="1.8"/>
     <text x="30" y="43" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700" fill="#4ade80">&gt;_</text>
@@ -34,16 +49,14 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">SSH、Telnet、串口、本地终端，</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">单窗口多会话。</text>
   </g>
-
-  <g transform="translate(416 110)">
+  <g transform="translate(48 276)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <path d="M20 30 h18 l6 8 h20 v20 h-44 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
     <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">SFTP 文件面板</text>
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">可视化目录浏览，批量</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">上传与下载。</text>
   </g>
-
-  <g transform="translate(784 110)">
+  <g transform="translate(416 276)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <path d="M24 50 h24 M36 38 l12 12 l-12 12" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M48 50 h24 M60 38 l12 12 l-12 12" fill="none" stroke="#818cf8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
@@ -51,9 +64,7 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">Local、Remote、Dynamic</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">端口转发。</text>
   </g>
-
-  <!-- 行 1 -->
-  <g transform="translate(48 276)">
+  <g transform="translate(784 276)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <path d="M42 22 l16 16 l-16 16 l-16 -16 z" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linejoin="round"/>
     <circle cx="42" cy="38" r="3" fill="#6366f1"/>
@@ -61,8 +72,7 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">直连、SOCKS5、HTTP(S)，</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">按主机独立配置。</text>
   </g>
-
-  <g transform="translate(416 276)">
+  <g transform="translate(48 442)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <rect x="26" y="24" width="28" height="14" rx="3" fill="none" stroke="#6366f1" stroke-width="1.8"/>
     <path d="M34 38 v8 M40 38 v8 M46 38 v8" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
@@ -70,8 +80,7 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">选端口，配波特率、数据位、</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">校验位、停止位、流控。</text>
   </g>
-
-  <g transform="translate(784 276)">
+  <g transform="translate(416 442)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <rect x="26" y="34" width="28" height="20" rx="4" fill="none" stroke="#6366f1" stroke-width="1.8"/>
     <path d="M31 34 v-6 a9 9 0 0 1 18 0 v6" fill="none" stroke="#6366f1" stroke-width="1.8"/>
@@ -80,9 +89,7 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">本地强加密存储，</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">密钥不离开本机。</text>
   </g>
-
-  <!-- 行 2 -->
-  <g transform="translate(48 442)">
+  <g transform="translate(784 442)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <circle cx="40" cy="38" r="15" fill="none" stroke="#6366f1" stroke-width="1.8"/>
     <path d="M40 30 v8 l6 4" fill="none" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
@@ -90,8 +97,7 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">自动捕获、可搜索、</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">一键重跑。</text>
   </g>
-
-  <g transform="translate(416 442)">
+  <g transform="translate(48 608)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <rect x="26" y="28" width="16" height="20" rx="3" fill="#6366f1"/>
     <rect x="44" y="28" width="16" height="20" rx="3" fill="#4ade80"/>
@@ -100,13 +106,20 @@
     <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">多套内置预设，</text>
     <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">由 config.toml 驱动。</text>
   </g>
-
-  <g transform="translate(784 442)">
+  <g transform="translate(416 608)">
     <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
     <circle cx="40" cy="38" r="10" fill="none" stroke="#6366f1" stroke-width="1.8"/>
     <path d="M40 22 v6 M40 54 v6 M24 38 h6 M54 38 h6 M29 27 l4 4 M51 49 l-4 -4 M51 27 l-4 4 M29 49 l4 -4" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
     <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">设置面板</text>
-    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">语言、主题、外观，</text>
-    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">均可调节。</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">语言、主题、面板、连接、</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">快捷键与 AI，均可调节。</text>
+  </g>
+  <g transform="translate(784 608)">
+    <rect width="352" height="150" rx="10" fill="#0f1116" stroke="#23262f"/>
+    <circle cx="38" cy="36" r="14" fill="none" stroke="#6366f1" stroke-width="1.8"/>
+    <path d="M48 46 l12 12" stroke="#6366f1" stroke-width="1.8" stroke-linecap="round"/>
+    <text x="80" y="44" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="21" font-weight="600" fill="#e6e9ef">终端内搜索</text>
+    <text x="80" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">回滚缓冲全文检索，</text>
+    <text x="80" y="94" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif" font-size="15" fill="#8b90a0">高亮与逐条跳转。</text>
   </g>
 </svg>
