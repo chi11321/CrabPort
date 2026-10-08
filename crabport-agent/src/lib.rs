@@ -34,4 +34,4 @@ pub use compaction::{
 };
 pub use prompt::system_prompt;
 pub use session::{AgentSession, RegistryTunnel};
-pub use tools::{ToolKind, agent_tools};
+pub use tools::{TOOL_NAMES, ToolKind, agent_tools};

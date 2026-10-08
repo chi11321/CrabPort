@@ -53,7 +53,7 @@ use crabport_agent::{
 use crabport_ai::{
     AiError, ChatMessage, ChatRequest, ChatResponse, ChatStream, StreamEvent, ToolCall,
 };
-use crabport_core::config;
+use crabport_core::config::{self, ToolPermission};
 use crabport_sftp::FileEntry;
 use crabport_ssh::TunnelManager;
 use crabport_terminal::terminal::{BackendEvent, ExecCallback, ExecCancel};
@@ -83,7 +83,7 @@ enum ToolDecision {
 }
 
 /// The card's title for one tool.
-fn tool_title(name: &str) -> String {
+pub(crate) fn tool_title(name: &str) -> String {
     match name {
         "terminal_read" => t!("ai_panel.tool_read_title").to_string(),
         "terminal_exec" | "terminal_run" => t!("ai_panel.tool_exec_title").to_string(),
@@ -896,6 +896,36 @@ impl AiPanel {
         // approve.
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
         self.scroll_list_to_end();
+
+        // Calls the Agent settings already decided: `Allow` runs them now,
+        // `Deny` refuses them now, both without a click — the card still
+        // records what happened, and the loop continues once every call of
+        // the turn has a result. `Confirm` (the default, and anything not
+        // configured) leaves the card waiting for the user.
+        let msg_index = self.messages.len() - 1;
+        let agent_cfg = config::snapshot().ai.agent;
+        let preset: Vec<(usize, ToolPermission)> = self.messages[msg_index]
+            .tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.decision == ToolDecision::Pending)
+            .map(|(call_ix, state)| (call_ix, agent_cfg.permission(&state.call.name)))
+            .filter(|(_, permission)| *permission != ToolPermission::Confirm)
+            .collect();
+        for (call_ix, permission) in preset {
+            auto_resolved = true;
+            match permission {
+                ToolPermission::Allow => self.run_tool(msg_index, call_ix, cx),
+                _ => self.settle_tool_result(
+                    msg_index,
+                    call_ix,
+                    t!("ai_panel.tool_denied_policy").to_string(),
+                    ToolDecision::Denied,
+                    cx,
+                ),
+            }
+        }
+
         cx.notify();
         // Some calls were answered without the user: let the model react to
         // the refusal instead of waiting for a click nobody needs to make.
@@ -1150,6 +1180,12 @@ impl AiPanel {
     /// while they keep saying yes — and they can stop it at any point with the
     /// composer's stop button.
     fn continue_after_tools(&mut self, cx: &mut Context<Self>) {
+        // One turn at a time. Settling a chain of calls asks to continue once
+        // per call, and the first request already carries every result that
+        // exists — starting a second stream here would send a duplicate.
+        if self.stream.is_some() || self.compaction.is_some() {
+            return;
+        }
         self.refresh_context_used();
         if self.needs_compaction() && self.start_compaction(cx) {
             // The compaction round sends the held-up request itself once the

@@ -1,6 +1,7 @@
 //! Settings window.
 //!
-//! Renders a sidebar (General / Appearance) on the left and a scrollable
+//! Renders a sidebar on the left (General / Appearance / Keybinds, plus the
+//! AI providers and agent pages under an “AI” heading) and a scrollable
 //! content pane on the right. Every control reads from and writes to the
 //! process-wide [`crabport_core::config::CONFIG`] `LazyLock`, so changes are
 //! persisted to `config.toml` immediately and visible to every other window
@@ -11,11 +12,11 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::label::Label;
 use rust_i18n::t;
 
+use crabport_agent::{TOOL_NAMES, ToolKind};
 use crabport_core::config::{
-    self, AiProviderConfig, AnimationSpeed, StartupPage, is_builtin_provider,
+    self, AiProviderConfig, AnimationSpeed, StartupPage, ToolPermission, is_builtin_provider,
 };
 use crabport_core::credential::HostEntry;
 
@@ -26,12 +27,13 @@ use crate::components::button::Button;
 use crate::components::dropdown::Dropdown;
 use crate::components::input::StyledInput;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
+use crate::components::segmented_control::{Segment, SegmentedControl};
 use crate::components::settings_section::Section;
 use crate::components::window_controls::{HAS_CLIENT_CONTROLS, WindowControls};
 use crate::components::window_layout::{
     SidebarTabEntry, render_sidebar_window, render_tab_sidebar,
 };
-use crate::motion::RADIUS_MD;
+use crate::views::panel::ai::tool_title;
 
 // ---------------------------------------------------------------------------
 // Tab enum
@@ -41,14 +43,20 @@ use crate::motion::RADIUS_MD;
 pub enum SettingsTab {
     General,
     Appearance,
+    /// The right-hand panel's behavior (visibility on connect, default page).
+    Panels,
+    /// Session liveness: keepalive probes and auto-reconnect.
+    Connection,
     Keybinds,
     Ai,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 4] = [
+    const ALL: [SettingsTab; 6] = [
         SettingsTab::General,
         SettingsTab::Appearance,
+        SettingsTab::Panels,
+        SettingsTab::Connection,
         SettingsTab::Keybinds,
         SettingsTab::Ai,
     ];
@@ -57,6 +65,8 @@ impl SettingsTab {
         match self {
             SettingsTab::General => t!("window.settings.tab.general").into(),
             SettingsTab::Appearance => t!("window.settings.tab.appearance").into(),
+            SettingsTab::Panels => t!("window.settings.tab.panels").into(),
+            SettingsTab::Connection => t!("window.settings.tab.connection").into(),
             SettingsTab::Keybinds => t!("window.settings.tab.keybinds").into(),
             SettingsTab::Ai => t!("window.settings.tab.ai").into(),
         }
@@ -75,6 +85,164 @@ impl SettingsTab {
     }
 }
 
+/// One of the AI tab's second-level pages.
+///
+/// The AI tab is a landing page: the assistant's switch, then one row per
+/// sub-page (Zed-settings style — a title, a description and a chevron that
+/// opens the page, with a back arrow in its header). The provider entries and
+/// the agent's tool permissions live on those pages instead of crowding the
+/// landing page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AiSubPage {
+    /// Provider endpoints and their API keys.
+    Providers,
+    /// Per-tool permissions for the agent.
+    Agent,
+}
+
+impl AiSubPage {
+    fn label(self) -> SharedString {
+        match self {
+            AiSubPage::Providers => t!("window.settings.ai.sub_providers").into(),
+            AiSubPage::Agent => t!("window.settings.ai.sub_agent").into(),
+        }
+    }
+
+    fn description(self) -> SharedString {
+        match self {
+            AiSubPage::Providers => t!("window.settings.ai.sub_providers_desc").into(),
+            AiSubPage::Agent => t!("window.settings.ai.sub_agent_desc").into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default panel page
+// ---------------------------------------------------------------------------
+
+/// The panel pages the “default panel page” dropdown offers, in display
+/// order (AI last, matching the panel's own tab order).
+const PANEL_PAGES: [crabport_core::config::PanelPage; 5] = [
+    crabport_core::config::PanelPage::Sftp,
+    crabport_core::config::PanelPage::Tunnels,
+    crabport_core::config::PanelPage::History,
+    crabport_core::config::PanelPage::Snippets,
+    crabport_core::config::PanelPage::Ai,
+];
+
+/// Label for one panel page.
+fn panel_page_label(page: crabport_core::config::PanelPage) -> String {
+    use crabport_core::config::PanelPage;
+    let key = match page {
+        PanelPage::Sftp => "window.settings.panels.page_sftp",
+        PanelPage::Tunnels => "window.settings.panels.page_tunnels",
+        PanelPage::History => "window.settings.panels.page_history",
+        PanelPage::Snippets => "window.settings.panels.page_snippets",
+        PanelPage::Ai => "window.settings.panels.page_ai",
+    };
+    t!(key).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// AI second-level pages
+// ---------------------------------------------------------------------------
+
+/// The AI tab's second-level pages, in the order their rows are listed.
+const AI_SUB_PAGES: [AiSubPage; 2] = [AiSubPage::Providers, AiSubPage::Agent];
+
+/// One second-level page's row on the AI landing page, in the shape Zed's
+/// settings use: the title and its muted description on the left, a button
+/// on the right that opens the page.
+fn sub_page_row(sub_page: AiSubPage, handle: &Entity<SettingsWindow>) -> AnyElement {
+    let h = handle.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .gap_4()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(sub_page.label()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .child(sub_page.description()),
+                ),
+        )
+        .child(
+            // The chevron rides along in the content so it trails the label.
+            Button::action(
+                ElementId::Name(format!("settings-ai-open-{sub_page:?}").into()),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(t!("window.settings.ai.open_page").to_string())
+                    .child(
+                        svg()
+                            .path("icons/chevron-right.svg")
+                            .size_4()
+                            .flex_shrink_0()
+                            .text_color(rgb(text_muted())),
+                    ),
+            )
+            .flex_shrink_0()
+            .on_click(move |_e, _w, cx| {
+                h.update(cx, |view, cx| {
+                    view.ai_sub_page = Some(sub_page);
+                    cx.notify();
+                });
+            }),
+        )
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Agent tool permissions
+// ---------------------------------------------------------------------------
+
+/// The permission choices, in the order the agent page renders them.
+/// `Confirm` first because it is the default: reading left-to-right, the
+/// least autonomous choice comes first.
+const PERMISSION_ORDER: [ToolPermission; 3] = [
+    ToolPermission::Confirm,
+    ToolPermission::Allow,
+    ToolPermission::Deny,
+];
+
+/// i18n key for one permission's label.
+fn permission_label_key(permission: ToolPermission) -> &'static str {
+    match permission {
+        ToolPermission::Confirm => "window.settings.ai.permission_confirm",
+        ToolPermission::Allow => "window.settings.ai.permission_allow",
+        ToolPermission::Deny => "window.settings.ai.permission_deny",
+    }
+}
+
+/// Row label for one tool on the agent page. Mostly the card title; the two
+/// command executors share one title (the cards tell them apart by their
+/// fields), so they get labels that say which is which.
+fn agent_tool_label(tool: &str) -> String {
+    match tool {
+        "terminal_exec" => t!("window.settings.ai.agent_tool_exec").to_string(),
+        "terminal_run" => t!("window.settings.ai.agent_tool_run").to_string(),
+        _ => tool_title(tool),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Root view
 // ---------------------------------------------------------------------------
@@ -82,12 +250,17 @@ impl SettingsTab {
 /// Root view for the Settings window.
 pub struct SettingsWindow {
     tab: SettingsTab,
+    /// Second-level page open on the AI tab, if any. `None` shows the tab's
+    /// landing page.
+    ai_sub_page: Option<AiSubPage>,
     // Dropdown open states (Dropdown is uncontrolled — caller manages it).
     locale_dropdown_open: bool,
     theme_dropdown_open: bool,
     font_family_dropdown_open: bool,
     startup_dropdown_open: bool,
     animation_speed_dropdown_open: bool,
+    /// Open flag for the default-panel-page dropdown.
+    panel_page_dropdown_open: bool,
     /// AI preset dropdown currently open — the entry id, or `None` when all
     /// are closed (only one dropdown open at a time).
     ai_open_dropdown: Option<String>,
@@ -225,11 +398,13 @@ impl SettingsWindow {
         });
         Self {
             tab: SettingsTab::General,
+            ai_sub_page: None,
             locale_dropdown_open: false,
             theme_dropdown_open: false,
             font_family_dropdown_open: false,
             startup_dropdown_open: false,
             animation_speed_dropdown_open: false,
+            panel_page_dropdown_open: false,
             font_search_input,
             font_size_input,
             font_size_focused: false,
@@ -380,21 +555,25 @@ impl SettingsWindow {
                         .header(t!("window.settings.general.section_data"))
                         .desc(t!("window.settings.general.open_data_dir_desc"))
                         .bare(
+                            // A long path shrinks (rather than pushing the row
+                            // wider) and ellipsizes.
                             div()
+                                .min_w_0()
+                                .truncate()
                                 .text_xs()
                                 .text_color(rgb(text_muted()))
-                                .child(Label::new(store_path)),
+                                .child(store_path),
                         )
                         .bare(
-                            Button::new("settings-open-data-dir")
-                                .child(t!("window.settings.general.open_data_dir").to_string())
-                                .w_auto()
-                                .centered(true)
-                                .on_click(move |_e, _w, cx| {
-                                    let _ = crabport_core::store::default_data_dir().map(|p| {
-                                        let _ = open_path(&p, cx);
-                                    });
-                                }),
+                            Button::action(
+                                "settings-open-data-dir",
+                                t!("window.settings.general.open_data_dir").to_string(),
+                            )
+                            .on_click(move |_e, _w, cx| {
+                                let _ = crabport_core::store::default_data_dir().map(|p| {
+                                    let _ = open_path(&p, cx);
+                                });
+                            }),
                         ),
                 )
                 // --- Reset config section ---
@@ -404,32 +583,147 @@ impl SettingsWindow {
                         .desc(t!("window.settings.general.reset_config_desc"))
                         .bare({
                             let h = handle.clone();
-                            Button::new("settings-reset-config")
-                                .child(t!("window.settings.general.reset_config").to_string())
-                                .w_auto()
-                                .centered(true)
-                                .on_click(move |_e, _w, cx| {
-                                    let _ = config::update(|cfg| {
-                                        cfg.appearance = Default::default();
-                                    });
-                                    // Resetting appearance also resets the theme,
-                                    // so repaint every window with the default
-                                    // palette.
-                                    crate::refresh_theme_with(cx);
-                                    h.update(cx, |_, cx| {
-                                        cx.notify();
-                                    });
-                                })
+                            Button::action(
+                                "settings-reset-config",
+                                t!("window.settings.general.reset_config").to_string(),
+                            )
+                            .on_click(move |_e, _w, cx| {
+                                let _ = config::update(|cfg| {
+                                    cfg.appearance = Default::default();
+                                });
+                                // Resetting appearance also resets the theme,
+                                // so repaint every window with the default
+                                // palette.
+                                crate::refresh_theme_with(cx);
+                                h.update(cx, |_, cx| {
+                                    cx.notify();
+                                });
+                            })
                         }),
                 ),
         )
     }
 
     // -------------------------------------------------------------------
-    // AI pane (provider entry management)
+    // AI tab: landing page + second-level pages
     // -------------------------------------------------------------------
 
+    /// The AI tab's landing page: the assistant's master switch, then one row
+    /// per second-level page (providers, agent). The pages themselves hold the
+    /// settings — a row here only opens one.
     fn render_ai_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ai = config::snapshot().ai;
+        let handle = cx.entity().clone();
+
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-ai-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                // --- Enabled section (phrased as a *disable* toggle: AI is
+                // on by default) ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.ai.section_ai"))
+                        .desc(t!("window.settings.ai.disable_desc"))
+                        .field(
+                            t!("window.settings.ai.disable").to_string(),
+                            div().w(px(180.0)).flex().justify_end().child(
+                                crate::components::switch::Switch::new("settings-ai-enabled")
+                                    .checked(!ai.enabled)
+                                    .on_change({
+                                        let h = handle.clone();
+                                        move |checked, _w, cx| {
+                                            let _ =
+                                                config::update(|cfg| cfg.ai.enabled = !*checked);
+                                            h.update(cx, |_, cx| cx.notify());
+                                        }
+                                    }),
+                            ),
+                        ),
+                )
+                // --- One row per second-level page ---
+                .child(AI_SUB_PAGES.iter().fold(
+                    Section::new().header(t!("window.settings.ai.section_sections")),
+                    |section, sub_page| section.bare(sub_page_row(*sub_page, &handle)),
+                )),
+        )
+    }
+
+    /// One of the AI tab's second-level pages: its own header (back arrow +
+    /// breadcrumb) above the page body.
+    fn render_ai_sub_page(&self, sub_page: AiSubPage, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let body: AnyElement = match sub_page {
+            AiSubPage::Providers => self.render_ai_providers_page(cx).into_any_element(),
+            AiSubPage::Agent => self.render_ai_agent_pane(cx).into_any_element(),
+        };
+
+        // Navigation stays on the AI tab (the sidebar keeps highlighting it);
+        // this header is how the user gets back to the landing page.
+        let back = Button::new("settings-ai-sub-page-back")
+            .icon("icons/arrow-left.svg")
+            .size_6()
+            .centered(true)
+            .flex_shrink_0()
+            .on_click({
+                let h = handle.clone();
+                move |_e, _w, cx| {
+                    h.update(cx, |view, cx| {
+                        view.ai_sub_page = None;
+                        cx.notify();
+                    });
+                }
+            });
+        let breadcrumb = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .text_sm()
+            .child(
+                div()
+                    .text_color(rgb(text_muted()))
+                    .child(t!("window.settings.tab.ai").to_string()),
+            )
+            .child(div().text_color(rgb(text_muted())).child("/"))
+            .child(
+                div()
+                    .truncate()
+                    .text_color(rgb(text_primary()))
+                    .child(sub_page.label()),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_6()
+                    .pt_6()
+                    .child(back)
+                    .child(breadcrumb),
+            )
+            .child(body)
+    }
+
+    /// The providers page: one section per configured endpoint plus the
+    /// “Add Provider” action.
+    ///
+    /// The root flexes to the height the sub-page header leaves, so the page
+    /// scrolls inside that space instead of stretching the window content.
+    fn render_ai_providers_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ai = config::snapshot().ai;
         let handle = cx.entity().clone();
 
@@ -451,58 +745,151 @@ impl SettingsWindow {
             })
             .collect();
 
-        div().size_full().flex().flex_col().p_6().gap_6().child(
-            div()
-                .id("settings-ai-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_6()
-                // --- Enabled section (phrased as a *disable* toggle: AI is
-                // on by default) ---
-                .child(
-                    Section::new()
-                        .header(t!("window.settings.ai.section_ai"))
-                        .desc(t!("window.settings.ai.disable_desc"))
-                        .field(
-                            t!("window.settings.ai.disable").to_string(),
-                            div().w(px(180.0)).child(
-                                crate::components::switch::Switch::new("settings-ai-enabled")
-                                    .checked(!ai.enabled)
-                                    .on_change({
-                                        let h = handle.clone();
-                                        move |checked, _w, cx| {
-                                            let _ =
-                                                config::update(|cfg| cfg.ai.enabled = !*checked);
-                                            h.update(cx, |_, cx| cx.notify());
-                                        }
-                                    }),
-                            ),
-                        ),
-                )
-                // --- One section per configured provider entry ---
-                .children(entry_sections)
-                // --- Add entry ---
-                .child(
-                    Section::new()
-                        .header(t!("window.settings.ai.section_providers"))
-                        .desc(t!("window.settings.ai.add_desc"))
-                        .bare(
-                            Button::new("settings-ai-add")
-                                .child(t!("window.settings.ai.add_provider").to_string())
-                                .w_auto()
-                                .centered(true)
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .p_6()
+            .gap_6()
+            .child(
+                div()
+                    .id("settings-ai-providers-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .child(
+                        Section::new()
+                            .header(t!("window.settings.ai.section_providers"))
+                            .desc(t!("window.settings.ai.add_desc"))
+                            .bare(
+                                Button::action(
+                                    "settings-ai-add",
+                                    t!("window.settings.ai.add_provider").to_string(),
+                                )
                                 .on_click({
                                     let h = handle.clone();
                                     move |_e, w, cx| {
                                         h.update(cx, |view, cx| view.ai_add_provider(w, cx));
                                     }
                                 }),
+                            ),
+                    )
+                    // --- One section per configured provider entry ---
+                    .children(entry_sections),
+            )
+    }
+
+    /// The AI agent page: one permission control per tool.
+    ///
+    /// `Confirm` (the default) asks on every call; `Allow` runs a tool without
+    /// asking — its card still shows the command and the result; `Deny`
+    /// refuses it, and the model is told the user's policy declined. The
+    /// tools come from the agent itself ([`TOOL_NAMES`]), grouped the way the
+    /// panel colors their cards, and are labeled with the same titles the
+    /// approval cards use.
+    fn render_ai_agent_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let agent_cfg = config::snapshot().ai.agent;
+
+        // Group the advertised tools the way the panel colors their cards:
+        // terminal, then local files, network, tunnels and SFTP. Iterating
+        // the agent's own name list (rather than a copy here) means a tool
+        // added to the crate shows up in this page without any change.
+        let mut groups: Vec<(&str, Vec<&'static str>)> = vec![
+            ("window.settings.ai.agent_group_terminal", Vec::new()),
+            ("window.settings.ai.agent_group_local", Vec::new()),
+            ("window.settings.ai.agent_group_network", Vec::new()),
+            ("window.settings.ai.agent_group_tunnel", Vec::new()),
+            ("window.settings.ai.agent_group_sftp", Vec::new()),
+        ];
+        for &tool in TOOL_NAMES {
+            let group = match ToolKind::of(tool) {
+                ToolKind::TerminalRead | ToolKind::ExecCapture | ToolKind::Run => 0,
+                ToolKind::LocalFs => 1,
+                ToolKind::Fetch => 2,
+                ToolKind::Tunnel => 3,
+                ToolKind::Sftp => 4,
+                // Unreachable for the advertised names; a hypothetical new
+                // tool lands at the top rather than vanishing.
+                ToolKind::Unknown => 0,
+            };
+            groups[group].1.push(tool);
+        }
+
+        let mut sections: Vec<AnyElement> = Vec::with_capacity(groups.len() + 1);
+        sections.push(
+            Section::new()
+                .header(t!("window.settings.ai.section_agent"))
+                .desc(t!("window.settings.ai.agent_desc"))
+                .bare(
+                    Button::action(
+                        "settings-ai-agent-reset",
+                        t!("window.settings.ai.agent_reset").to_string(),
+                    )
+                    .on_click({
+                        let h = handle.clone();
+                        move |_e, _w, cx| {
+                            let _ = config::update(|cfg| cfg.ai.agent.reset());
+                            h.update(cx, |_, cx| cx.notify());
+                        }
+                    }),
+                )
+                .into_any_element(),
+        );
+
+        for (header_key, tools) in groups {
+            let mut section = Section::new().header(t!(header_key));
+            for tool in tools {
+                let current = agent_cfg.permission(tool);
+                let active = PERMISSION_ORDER
+                    .iter()
+                    .position(|p| *p == current)
+                    .unwrap_or(0);
+                let mut control = SegmentedControl::new(ElementId::Name(
+                    format!("settings-ai-permission-{tool}").into(),
+                ))
+                .active(active);
+                for permission in PERMISSION_ORDER {
+                    let h = handle.clone();
+                    let tool = tool.to_string();
+                    control = control.segment(
+                        Segment::new(t!(permission_label_key(permission)).to_string()).on_select(
+                            move |_w, cx| {
+                                let _ = config::update(|cfg| {
+                                    cfg.ai.agent.set_permission(&tool, permission);
+                                });
+                                h.update(cx, |_, cx| cx.notify());
+                            },
                         ),
-                ),
-        )
+                    );
+                }
+                section = section.field(agent_tool_label(tool), div().w(px(240.0)).child(control));
+            }
+            sections.push(section.into_any_element());
+        }
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .p_6()
+            .gap_6()
+            .child(
+                div()
+                    .id("settings-ai-agent-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_6()
+                    .children(sections),
+            )
     }
 
     /// One provider entry. User-added entries show the full form (type /
@@ -646,12 +1033,10 @@ impl SettingsWindow {
                 key_field,
             )
             .bare(
-                Button::new(ElementId::Name(
-                    format!("settings-ai-remove-{}", entry.id).into(),
-                ))
-                .child(t!("window.settings.ai.remove_provider").to_string())
-                .w_auto()
-                .centered(true)
+                Button::action(
+                    ElementId::Name(format!("settings-ai-remove-{}", entry.id).into()),
+                    t!("window.settings.ai.remove_provider").to_string(),
+                )
                 .on_click(move |_e, _w, cx| {
                     h.update(cx, |view, cx| view.ai_remove_provider(&eid, cx));
                 }),
@@ -806,6 +1191,7 @@ impl SettingsWindow {
 
         // --- Language dropdown ---
         let locale_dropdown = {
+            let h_for_change = handle.clone();
             Dropdown::new("settings-locale")
                 .item(t!("window.settings.appearance.language_en"))
                 .item(t!("window.settings.appearance.language_zh_cn"))
@@ -821,6 +1207,7 @@ impl SettingsWindow {
                     });
                     crate::set_locale(locale);
                     cx.refresh_windows();
+                    Self::close_dropdown(&h_for_change, |v| &mut v.locale_dropdown_open, cx);
                 })
         };
 
@@ -909,15 +1296,6 @@ impl SettingsWindow {
                 .focused(self.font_size_focused)
                 .min(8)
                 .max(32)
-                .step(1);
-
-        // --- Keepalive interval stepper ---
-        // Mirrors font-size: `min 0` lets the user disable keepalive by
-        // clearing the field down to 0 (matches `effective_keepalive`).
-        let keepalive_stepper =
-            StyledNumberInput::new("settings-term-keepalive", self.keepalive_input.clone())
-                .min(0)
-                .max(3600)
                 .step(1);
 
         // --- Animation speed dropdown ---
@@ -1027,16 +1405,16 @@ impl SettingsWindow {
                         // Opens the Theme Editor window seeded from the theme
                         // that's currently applied.
                         .bare(
-                            Button::new("settings-edit-theme")
-                                .child(t!("window.settings.appearance.edit_theme").to_string())
-                                .w_auto()
-                                .centered(true)
-                                .on_click(|_e, _w, cx| {
-                                    crate::windows::registry::focus_or_open(
-                                        crate::windows::AuxWindowKind::ThemeEditor,
-                                        cx,
-                                    );
-                                }),
+                            Button::action(
+                                "settings-edit-theme",
+                                t!("window.settings.appearance.edit_theme").to_string(),
+                            )
+                            .on_click(|_e, _w, cx| {
+                                crate::windows::registry::focus_or_open(
+                                    crate::windows::AuxWindowKind::ThemeEditor,
+                                    cx,
+                                );
+                            }),
                         ),
                 )
                 // --- Terminal font ---
@@ -1051,17 +1429,77 @@ impl SettingsWindow {
                         .field(
                             t!("window.settings.appearance.terminal_font_size").to_string(),
                             div().w(px(180.0)).child(font_size_stepper),
-                        )
+                        ),
+                )
+                // --- Animation speed ---
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.appearance.section_animation"))
+                        .desc(t!("window.settings.appearance.animation_speed_desc"))
                         .field(
-                            t!("window.settings.appearance.terminal_keepalive_interval")
-                                .to_string(),
-                            div().w(px(180.0)).child(keepalive_stepper),
-                        )
+                            t!("window.settings.appearance.animation_speed_label").to_string(),
+                            div().w(px(180.0)).child(animation_speed_dropdown),
+                        ),
+                ),
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Panels pane (right-hand panel behavior)
+    // -------------------------------------------------------------------
+
+    /// How the right-hand panel behaves for a terminal tab.
+    ///
+    /// Both controls are *defaults*: the panel's own tab strip and the
+    /// toolbar's toggle record a per-tab choice, and that choice wins — these
+    /// only decide what a tab shows before it has one.
+    fn render_panels_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let term_cfg = config::snapshot().appearance.terminal;
+
+        // --- Default panel page ---
+        let panel_page_idx = PANEL_PAGES
+            .iter()
+            .position(|p| *p == term_cfg.panel_page)
+            .unwrap_or(PANEL_PAGES.len() - 1);
+        let panel_page_dropdown = {
+            let h_for_change = handle.clone();
+            let mut dd = Dropdown::new("settings-panel-page")
+                .is_open(self.panel_page_dropdown_open)
+                .selected(panel_page_idx);
+            for page in PANEL_PAGES {
+                dd = dd.item(panel_page_label(page));
+            }
+            dd.on_toggle(Self::dropdown_toggle(&handle, |v| {
+                &mut v.panel_page_dropdown_open
+            }))
+            .on_change(move |idx, _w, cx| {
+                let page = PANEL_PAGES.get(idx).copied().unwrap_or_default();
+                let _ = config::update(|cfg| {
+                    cfg.appearance.terminal.panel_page = page;
+                });
+                Self::close_dropdown(&h_for_change, |v| &mut v.panel_page_dropdown_open, cx);
+            })
+        };
+
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-panels-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
+                .child(
+                    Section::new()
+                        .header(t!("window.settings.panels.section"))
+                        .desc(t!("window.settings.panels.desc"))
                         .field(
-                            t!("window.settings.appearance.terminal_expand_panel").to_string(),
-                            div().w(px(180.0)).child(
+                            t!("window.settings.panels.expand_panel").to_string(),
+                            div().w(px(180.0)).flex().justify_end().child(
                                 crate::components::switch::Switch::new(
-                                    "settings-term-expand-panel",
+                                    "settings-panel-expand-on-connect",
                                 )
                                 .checked(term_cfg.expand_panel_on_connect)
                                 .on_change({
@@ -1080,32 +1518,64 @@ impl SettingsWindow {
                             ),
                         )
                         .field(
-                            t!("window.settings.appearance.terminal_auto_reconnect").to_string(),
-                            div().w(px(180.0)).child(
-                                crate::components::switch::Switch::new(
-                                    "settings-term-auto-reconnect",
-                                )
-                                .checked(term_cfg.auto_reconnect)
-                                .on_change({
-                                    let h = handle.clone();
-                                    move |checked, _w, cx| {
-                                        let _ = config::update(|cfg| {
-                                            cfg.appearance.terminal.auto_reconnect = *checked;
-                                        });
-                                        let _ = h.update(cx, |_, cx| cx.notify());
-                                    }
-                                }),
-                            ),
+                            t!("window.settings.panels.page").to_string(),
+                            div().w(px(180.0)).child(panel_page_dropdown),
                         ),
-                )
-                // --- Animation speed ---
+                ),
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Connection pane (liveness)
+    // -------------------------------------------------------------------
+
+    /// Keepalive probes and auto-reconnect: how a session survives idle
+    /// periods and what happens when it drops anyway.
+    fn render_connection_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let handle = cx.entity().clone();
+        let term_cfg = config::snapshot().appearance.terminal;
+
+        // Keepalive interval stepper — `min 0` lets the user disable
+        // keepalive by clearing the field down to 0 (matches
+        // `effective_keepalive`).
+        let keepalive_stepper =
+            StyledNumberInput::new("settings-conn-keepalive", self.keepalive_input.clone())
+                .min(0)
+                .max(3600)
+                .step(1);
+
+        div().size_full().flex().flex_col().p_6().gap_6().child(
+            div()
+                .id("settings-connection-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_6()
                 .child(
                     Section::new()
-                        .header(t!("window.settings.appearance.section_animation"))
-                        .desc(t!("window.settings.appearance.animation_speed_desc"))
+                        .header(t!("window.settings.connection.section"))
+                        .desc(t!("window.settings.connection.desc"))
                         .field(
-                            t!("window.settings.appearance.animation_speed_label").to_string(),
-                            div().w(px(180.0)).child(animation_speed_dropdown),
+                            t!("window.settings.connection.keepalive").to_string(),
+                            div().w(px(180.0)).child(keepalive_stepper),
+                        )
+                        .field(
+                            t!("window.settings.connection.auto_reconnect").to_string(),
+                            div().w(px(180.0)).flex().justify_end().child(
+                                crate::components::switch::Switch::new("settings-auto-reconnect")
+                                    .checked(term_cfg.auto_reconnect)
+                                    .on_change({
+                                        let h = handle.clone();
+                                        move |checked, _w, cx| {
+                                            let _ = config::update(|cfg| {
+                                                cfg.appearance.terminal.auto_reconnect = *checked;
+                                            });
+                                            let _ = h.update(cx, |_, cx| cx.notify());
+                                        }
+                                    }),
+                            ),
                         ),
                 ),
         )
@@ -1193,55 +1663,11 @@ impl SettingsWindow {
                             },
                         ),
                 )
-                // Clickable Kbd chip (left-click = rebind, right-click = clear)
+                // Clickable Kbd chip (left-click = rebind, right-click = clear):
+                // the shared button shape, with the right-click carried by the
+                // wrapper — the Button component models left clicks only.
                 .child(
                     div()
-                        .id(SharedString::from(format!("keybind-chip-{action_id}")))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .min_w(px(72.0))
-                        .h(px(28.0))
-                        .px_3()
-                        .rounded(RADIUS_MD)
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(rgb(if is_recording {
-                            text_primary()
-                        } else {
-                            border()
-                        }))
-                        .bg(rgb(if is_recording {
-                            surface_active()
-                        } else {
-                            surface_hover()
-                        }))
-                        .hover(|s| {
-                            s.bg(rgb(if is_recording {
-                                surface_active()
-                            } else {
-                                border()
-                            }))
-                        })
-                        .child(chip_child)
-                        // Left-click: start recording a new binding
-                        .on_click({
-                            let h = handle.clone();
-                            let aid = action_id.to_string();
-                            move |_e, w, cx| {
-                                h.update(cx, |view, cx| {
-                                    view.keybind_error = None;
-                                    if view.recording_action.as_deref() == Some(&aid) {
-                                        view.recording_action = None;
-                                    } else {
-                                        view.recording_action = Some(aid.clone());
-                                        view.focus_handle.focus(w);
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        })
-                        // Right-click: clear binding (set to empty = disabled)
                         .on_mouse_down(MouseButton::Right, {
                             let h = handle.clone();
                             let aid = action_id.to_string();
@@ -1254,7 +1680,32 @@ impl SettingsWindow {
                                     cx.notify();
                                 });
                             }
-                        }),
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("keybind-chip-{action_id}")))
+                                .child(chip_child)
+                                .min_w(px(72.0))
+                                .px_3()
+                                // Recording is the button's selected state.
+                                .selected(is_recording)
+                                .cursor_pointer()
+                                .on_click({
+                                    let h = handle.clone();
+                                    let aid = action_id.to_string();
+                                    move |_e, w, cx| {
+                                        h.update(cx, |view, cx| {
+                                            view.keybind_error = None;
+                                            if view.recording_action.as_deref() == Some(&aid) {
+                                                view.recording_action = None;
+                                            } else {
+                                                view.recording_action = Some(aid.clone());
+                                                view.focus_handle.focus(w);
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
                 );
 
             section = section.bare(row);
@@ -1264,21 +1715,21 @@ impl SettingsWindow {
             .header(t!("window.settings.keybinds.reset_all"))
             .desc(t!("window.settings.keybinds.reset_all_desc"))
             .bare(
-                Button::new("settings-reset-all-keybinds")
-                    .child(t!("window.settings.keybinds.reset_all").to_string())
-                    .w_auto()
-                    .centered(true)
-                    .on_click({
-                        let h = handle.clone();
-                        move |_e, _w, cx| {
-                            h.update(cx, |view, cx| {
-                                crate::keybinds::reset_all_bindings(cx);
-                                view.recording_action = None;
-                                view.keybind_error = None;
-                                cx.notify();
-                            });
-                        }
-                    }),
+                Button::action(
+                    "settings-reset-all-keybinds",
+                    t!("window.settings.keybinds.reset_all").to_string(),
+                )
+                .on_click({
+                    let h = handle.clone();
+                    move |_e, _w, cx| {
+                        h.update(cx, |view, cx| {
+                            crate::keybinds::reset_all_bindings(cx);
+                            view.recording_action = None;
+                            view.keybind_error = None;
+                            cx.notify();
+                        });
+                    }
+                }),
             );
 
         div().size_full().flex().flex_col().p_6().gap_6().child(
@@ -1349,7 +1800,14 @@ impl Render for SettingsWindow {
         let content: AnyElement = match self.tab {
             SettingsTab::General => self.render_general_pane(cx).into_any_element(),
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
-            SettingsTab::Ai => self.render_ai_pane(cx).into_any_element(),
+            SettingsTab::Panels => self.render_panels_pane(cx).into_any_element(),
+            SettingsTab::Connection => self.render_connection_pane(cx).into_any_element(),
+            // The AI tab is either its landing page or one of its
+            // second-level pages.
+            SettingsTab::Ai => match self.ai_sub_page {
+                Some(sub_page) => self.render_ai_sub_page(sub_page, cx).into_any_element(),
+                None => self.render_ai_pane(cx).into_any_element(),
+            },
             SettingsTab::Keybinds => self.render_keybinds_pane(cx).into_any_element(),
         };
 
@@ -1372,6 +1830,9 @@ impl Render for SettingsWindow {
                 move |idx, _w, cx| {
                     handle.update(cx, |view, _| {
                         view.tab = SettingsTab::ALL[idx];
+                        // Switching tabs always lands on the tab's own page,
+                        // never on a sub-page opened earlier.
+                        view.ai_sub_page = None;
                     });
                 },
             ),
@@ -1383,6 +1844,20 @@ impl Render for SettingsWindow {
         .when(self.recording_action.is_some(), |el| {
             el.on_key_down(cx.listener(Self::on_key_recording))
         })
+        // Escape leaves a second-level page. Nothing else is intercepted: the
+        // sub-pages hold ordinary controls, and the back arrow in the page
+        // header is the primary way out.
+        .when(
+            self.tab == SettingsTab::Ai && self.ai_sub_page.is_some(),
+            |el| {
+                el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                    if event.keystroke.key.as_str() == "escape" && this.ai_sub_page.take().is_some()
+                    {
+                        cx.notify();
+                    }
+                }))
+            },
+        )
         .when(HAS_CLIENT_CONTROLS, |el| {
             el.child(
                 div()

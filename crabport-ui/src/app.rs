@@ -522,7 +522,16 @@ impl Render for CrabportApp {
             .panel_active_tab
             .get(&self.active_tab_id)
             .copied()
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // No pick for this tab yet: fall back to the configured
+                // default page (`appearance.terminal.panel_page`).
+                crate::views::panel::PanelKind::from_config(
+                    crabport_core::config::snapshot()
+                        .appearance
+                        .terminal
+                        .panel_page,
+                )
+            });
         // Panel width: live drag value takes priority; otherwise read the
         // persisted config value (clamped to a sane range). The max is also
         // bounded by 2/3 of the window width so the terminal stays usable.

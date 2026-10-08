@@ -342,8 +342,18 @@ impl RenderOnce for Dropdown {
             )
             .when_some(on_toggle.clone(), |this, cb| {
                 this.when(!disabled, |this| {
+                    // Opening the menu puts the caret in its search box, so a
+                    // searchable dropdown is type-to-filter the moment it
+                    // opens (the click that opened it must not land on the
+                    // search field as a focus change). `is_open` here is the
+                    // state *before* `cb` flips it.
+                    let search = search_input.clone();
+                    let was_open = is_open;
                     this.on_click(move |_e, w, cx| {
                         cb(w, cx);
+                        if !was_open && let Some(search) = &search {
+                            search.update(cx, |state, cx| state.focus(w, cx));
+                        }
                     })
                 })
             });

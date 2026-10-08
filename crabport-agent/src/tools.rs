@@ -3,6 +3,28 @@
 
 use crabport_ai::ToolSpec;
 
+/// Every tool name the agent advertises, in definition order.
+///
+/// For surfaces that only need to *enumerate* the tools — the settings
+/// pane's per-tool permission list — without building the JSON schemas.
+/// Kept in sync with [`agent_tools`] by a test.
+pub const TOOL_NAMES: &[&str] = &[
+    "terminal_read",
+    "terminal_exec",
+    "terminal_run",
+    "read_file",
+    "read_directory",
+    "fetch",
+    "tunnel_create",
+    "tunnel_list",
+    "tunnel_open",
+    "tunnel_close",
+    "tunnel_delete",
+    "sftp_list",
+    "sftp_download",
+    "sftp_upload",
+];
+
 /// Tools advertised to the model. Names are stable — the wire history replays
 /// them, and the panel dispatches on them in [`ToolKind::of`].
 pub fn agent_tools() -> Vec<ToolSpec> {
@@ -379,7 +401,16 @@ impl ToolKind {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolKind;
+    use super::{TOOL_NAMES, ToolKind, agent_tools};
+
+    /// The name list the settings pane enumerates matches the advertised
+    /// specs exactly — a tool added to one and not the other would silently
+    /// lose its permission row (or list a tool that doesn't exist).
+    #[test]
+    fn tool_names_match_agent_tools() {
+        let advertised: Vec<String> = agent_tools().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(TOOL_NAMES, advertised.as_slice());
+    }
 
     #[test]
     fn tool_kind_maps_wire_names() {

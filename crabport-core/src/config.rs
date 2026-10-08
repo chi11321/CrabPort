@@ -74,6 +74,59 @@ fn default_panel_width() -> f32 {
     300.0
 }
 
+/// Which right-hand panel page a terminal shows by default.
+///
+/// Serialized as a single lowercase string (`panel_page = "ai"`) so the
+/// config stays hand-editable. The default is the AI assistant page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PanelPage {
+    Sftp,
+    Tunnels,
+    History,
+    Snippets,
+    #[default]
+    Ai,
+}
+
+impl PanelPage {
+    /// The string form written to `config.toml`.
+    pub fn to_id(self) -> String {
+        match self {
+            PanelPage::Sftp => "sftp",
+            PanelPage::Tunnels => "tunnels",
+            PanelPage::History => "history",
+            PanelPage::Snippets => "snippets",
+            PanelPage::Ai => "ai",
+        }
+        .to_string()
+    }
+
+    /// Parse the string form. An unknown id falls back to the default page
+    /// rather than failing the load: a hand-edited typo should cost the user
+    /// this one setting, not the whole config.
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "sftp" => PanelPage::Sftp,
+            "tunnels" => PanelPage::Tunnels,
+            "history" => PanelPage::History,
+            "snippets" => PanelPage::Snippets,
+            _ => PanelPage::default(),
+        }
+    }
+}
+
+impl serde::Serialize for PanelPage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_id())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PanelPage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self::from_id(&String::deserialize(d)?))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Startup config
 // ---------------------------------------------------------------------------
@@ -326,6 +379,17 @@ pub struct TerminalConfig {
     #[serde(default = "default_expand_panel_on_connect")]
     pub expand_panel_on_connect: bool,
 
+    /// Which right-hand panel page a terminal shows by default — the page a
+    /// tab's panel opens on until the user picks a page for that tab (which
+    /// then wins, exactly like [`Self::expand_panel_on_connect`] is a default
+    /// for the panel's visibility).
+    ///
+    /// Defaults to the AI assistant page. A page that isn't available on the
+    /// tab's backend (e.g. Tunnels on a Telnet session, or AI while it is
+    /// disabled) falls back to the first page that is.
+    #[serde(default)]
+    pub panel_page: PanelPage,
+
     /// Per-slot visibility for the bottom toolbar, stored under
     /// `[appearance.terminal.toolbar]`. Each field defaults to `true` so a
     /// fresh install shows every available chip; the user toggles them
@@ -386,6 +450,7 @@ impl Default for TerminalConfig {
             font_family: String::new(),
             font_size: default_terminal_font_size(),
             expand_panel_on_connect: default_expand_panel_on_connect(),
+            panel_page: PanelPage::default(),
             toolbar: ToolbarVisibilityConfig::default(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             auto_reconnect: false,
@@ -948,6 +1013,11 @@ pub struct AiConfig {
     pub model: String,
     /// Configured provider endpoints, display order = list order.
     pub providers: Vec<AiProviderConfig>,
+    /// What the agent may do with each tool without asking. Stored under
+    /// `[ai.agent]`; skipped while it holds no overrides, so a config that
+    /// never touched the agent page doesn't grow an empty table.
+    #[serde(skip_serializing_if = "AiAgentConfig::is_empty")]
+    pub agent: AiAgentConfig,
 }
 
 impl Default for AiConfig {
@@ -961,6 +1031,7 @@ impl Default for AiConfig {
             active: DEFAULT_PROVIDER_ID.into(),
             model: String::new(),
             providers: AiProviderConfig::builtin_providers(),
+            agent: AiAgentConfig::default(),
         }
     }
 }
@@ -973,6 +1044,66 @@ impl AiConfig {
             .iter()
             .find(|p| p.id == self.active)
             .or_else(|| self.providers.first())
+    }
+}
+
+/// What the agent is allowed to do with one tool without asking the user
+/// first. Serialized lowercase (`"confirm"`, `"allow"`, `"deny"`) so
+/// `config.toml` stays hand-editable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPermission {
+    /// Ask for approval on every call. The default: an unconfigured tool
+    /// always asks.
+    #[default]
+    Confirm,
+    /// Run the call without asking. Its card still appears, showing the
+    /// command and what came back.
+    Allow,
+    /// Refuse the call; the model is told the user's policy denied it.
+    Deny,
+}
+
+/// Per-tool permissions for the AI agent. Stored under `[ai.agent]`.
+///
+/// Only tools the user has changed away from [`ToolPermission::Confirm`]
+/// are stored — a missing entry means “ask”, which keeps the file (and the
+/// meaning of a fresh install) minimal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiAgentConfig {
+    /// Tool name → permission, e.g. `terminal_exec = "allow"`. The names are
+    /// the agent's wire names; unknown ones are ignored by the agent.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, ToolPermission>,
+}
+
+impl AiAgentConfig {
+    /// The permission configured for `tool`. Unlisted tools — including
+    /// names no tool ever uses — resolve to [`ToolPermission::Confirm`].
+    pub fn permission(&self, tool: &str) -> ToolPermission {
+        self.tools.get(tool).copied().unwrap_or_default()
+    }
+
+    /// Set one tool's permission. `Confirm` is the default, so it is stored
+    /// as “no entry” rather than an explicit value.
+    pub fn set_permission(&mut self, tool: &str, permission: ToolPermission) {
+        if permission == ToolPermission::default() {
+            self.tools.remove(tool);
+        } else {
+            self.tools.insert(tool.to_string(), permission);
+        }
+    }
+
+    /// Drop every override, so every tool asks again.
+    pub fn reset(&mut self) {
+        self.tools.clear();
+    }
+
+    /// Whether any tool has an override. Used to keep the `[ai.agent]`
+    /// table out of a config that never changed a permission.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
     }
 }
 
@@ -1211,6 +1342,40 @@ bg = "#111111"
         );
     }
 
+    /// The default panel page is the AI assistant, and it round-trips
+    /// through `config.toml` as a plain string; an unknown id (a hand-edit
+    /// typo) falls back to the default instead of failing the load.
+    #[test]
+    fn panel_page_defaults_to_ai_and_roundtrips() {
+        assert_eq!(TerminalConfig::default().panel_page, PanelPage::Ai);
+        assert_eq!(PanelPage::default(), PanelPage::Ai);
+
+        let toml = toml::to_string(&TerminalConfig {
+            panel_page: PanelPage::Tunnels,
+            ..TerminalConfig::default()
+        })
+        .unwrap();
+        assert!(toml.contains("panel_page = \"tunnels\""), "{toml}");
+        let back: TerminalConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.panel_page, PanelPage::Tunnels);
+
+        // Missing field → the default; unknown value → the default too.
+        let partial: TerminalConfig = toml::from_str("font_size = 14.0").unwrap();
+        assert_eq!(partial.panel_page, PanelPage::Ai);
+        let typo: TerminalConfig = toml::from_str("panel_page = \"typo\"").unwrap();
+        assert_eq!(typo.panel_page, PanelPage::Ai);
+
+        for page in [
+            PanelPage::Sftp,
+            PanelPage::Tunnels,
+            PanelPage::History,
+            PanelPage::Snippets,
+            PanelPage::Ai,
+        ] {
+            assert_eq!(PanelPage::from_id(&page.to_id()), page);
+        }
+    }
+
     /// `StartupPage` serializes into a single tagged string in `config.toml`,
     /// keeping the file readable and round-tripping through `to_id`/`from_id`.
     #[test]
@@ -1255,14 +1420,72 @@ bg = "#111111"
                 base_url: "https://api.deepseek.com/v1".into(),
                 key_id: None,
             }],
+            agent: AiAgentConfig::default(),
         };
         let text = toml::to_string(&cfg).unwrap();
         assert!(text.contains("type = \"openai\""));
+        // No permission overrides → no `[ai.agent]` table is written at all.
+        assert!(!text.contains("[agent]"));
         let back: AiConfig = toml::from_str(&text).unwrap();
         assert_eq!(back, cfg);
 
         let empty: AiConfig = toml::from_str("").unwrap();
         assert_eq!(empty, AiConfig::default());
+    }
+
+    /// Tool permissions: unset tools ask, overrides round-trip through
+    /// `[ai.agent.tools]`, and setting a tool back to `confirm` clears its
+    /// entry instead of storing the default.
+    #[test]
+    fn agent_tool_permissions_roundtrip_and_default_to_confirm() {
+        let mut agent = AiAgentConfig::default();
+        assert_eq!(agent.permission("terminal_exec"), ToolPermission::Confirm);
+        assert_eq!(
+            agent.permission("never-heard-of-it"),
+            ToolPermission::Confirm
+        );
+
+        agent.set_permission("terminal_exec", ToolPermission::Allow);
+        agent.set_permission("sftp_download", ToolPermission::Deny);
+        let text = toml::to_string(&AiConfig {
+            agent: agent.clone(),
+            ..AiConfig::default()
+        })
+        .unwrap();
+        assert!(text.contains("terminal_exec = \"allow\""), "{text}");
+        assert!(text.contains("sftp_download = \"deny\""), "{text}");
+
+        let back: AiConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.agent, agent);
+        assert_eq!(
+            back.agent.permission("terminal_exec"),
+            ToolPermission::Allow
+        );
+        assert_eq!(
+            back.agent.permission("terminal_run"),
+            ToolPermission::Confirm
+        );
+
+        // Back to the default → the key goes away again.
+        agent.set_permission("terminal_exec", ToolPermission::Confirm);
+        assert!(!agent.tools.contains_key("terminal_exec"));
+        agent.reset();
+        assert!(agent.tools.is_empty());
+    }
+
+    /// A config written before `[ai.agent]` existed parses with every tool
+    /// asking for confirmation, and an unknown permission value in the file
+    /// fails the parse rather than silently granting access.
+    #[test]
+    fn agent_section_missing_defaults_and_rejects_unknown_permissions() {
+        let ai: AiConfig = toml::from_str("[agent]\n").unwrap();
+        assert_eq!(
+            ai.agent.permission("terminal_exec"),
+            ToolPermission::Confirm
+        );
+
+        let bad = toml::from_str::<AiConfig>("[agent.tools]\nterminal_exec = \"whatever\"\n");
+        assert!(bad.is_err());
     }
 
     /// A fresh default enables AI and seeds the built-in endpoints (DeepSeek

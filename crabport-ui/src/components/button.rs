@@ -93,6 +93,23 @@ impl Button {
         }
     }
 
+    /// The standard action button — the shape dialog and settings actions
+    /// share: a minimum width (so a short label like “Remove” still reads as
+    /// a button rather than a chip), inner horizontal padding so the label
+    /// never touches the border, an auto-sized, centered label.
+    ///
+    /// ```ignore
+    /// Button::action("settings-ai-add", t!("…").to_string()).on_click(…)
+    /// ```
+    pub fn action(id: impl Into<ElementId>, content: impl IntoElement + 'static) -> Self {
+        Self::new(id)
+            .child(content)
+            .min_w(px(140.0))
+            .px_3()
+            .w_auto()
+            .centered(true)
+    }
+
     // -- Color presets --
 
     pub fn tab(self) -> Self {
