@@ -712,9 +712,9 @@ impl AiPanel {
             return;
         }
         // Commit the user turn for display (and history) before building
-        // the wire request, so it is included exactly once. Follow it down
-        // if the view was already at the bottom.
-        let stick = self.is_list_at_bottom();
+        // the wire request, so it is included exactly once. Sending always
+        // lands the view on the newest content — their message and the reply
+        // streaming in under it — even if they had scrolled up to read.
         self.messages.push(DisplayMessage {
             role: DisplayRole::User,
             content: text,
@@ -722,9 +722,7 @@ impl AiPanel {
             reasoning_expanded: false,
             tool_calls: Vec::new(),
         });
-        if stick {
-            self.scroll_list_to_end();
-        }
+        self.scroll_list_to_end();
 
         self.pending_clear = true;
         // Compacts first when the request would be too large, then sends.
@@ -892,10 +890,14 @@ impl AiPanel {
             });
         }
         // The last row grew (or a new one appeared); make sure the list
-        // re-measures it, and bring it into view — the user has something to
-        // approve.
+        // re-measures it, and bring it into view when the user is at the
+        // bottom — there is something to approve. Scrolled-up readers keep
+        // their place.
+        let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
-        self.scroll_list_to_end();
+        if stick {
+            self.scroll_list_to_end();
+        }
 
         // Calls the Agent settings already decided: `Allow` runs them now,
         // `Deny` refuses them now, both without a click — the card still
@@ -1076,7 +1078,14 @@ impl AiPanel {
                     state.running = true;
                     state.cancel = cancel;
                 }
+                // The card is shrinking from buttons to a running state;
+                // keep the view pinned when it was at the bottom (the same
+                // rule `settle_tool` applies when the result lands).
+                let stick = self.is_list_at_bottom();
                 self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+                if stick {
+                    self.scroll_list_to_end();
+                }
                 cx.notify();
                 let entity = cx.entity().downgrade();
                 cx.spawn(async move |_this, cx| {
@@ -1164,8 +1173,18 @@ impl AiPanel {
     /// Re-measure one card's row — it just changed height, from buttons to a
     /// result or from a placeholder to real output — and let the model act on
     /// the results once every call of the turn has one.
+    ///
+    /// When the view was pinned to the bottom, pin it again: the card's new
+    /// height would otherwise leave a gap below (a shrunk card) or push the
+    /// fresh result out of view (a grown one).
     fn settle_tool(&mut self, msg_index: usize, call_index: usize, cx: &mut Context<Self>) {
+        // `is_list_at_bottom` reads the bounds the last frame rendered, i.e.
+        // the position the user actually had before this change.
+        let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_tool_call(msg_index, call_index));
+        if stick {
+            self.scroll_list_to_end();
+        }
         self.refresh_context_used();
         self.maybe_continue_after_tools(cx);
         cx.notify();
@@ -1428,8 +1447,13 @@ impl AiPanel {
         });
         // The committed block (Markdown) replaces the streaming tail (plain
         // text) at the same list index, usually with a different height —
-        // drop the cached row measurement so the list re-measures it.
+        // drop the cached row measurement so the list re-measures it, and
+        // keep the view pinned when the user was at the bottom.
+        let stick = self.is_list_at_bottom();
         self.remeasure_row(self.list_row_of_message(self.messages.len() - 1));
+        if stick {
+            self.scroll_list_to_end();
+        }
     }
 
     /// Flip one turn's thinking disclosure (the whole header row is the
