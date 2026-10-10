@@ -557,6 +557,19 @@ pub struct AiPanel {
     /// so the user lands on the new content — scrolling at the moment of the
     /// rewrite would be a no-op, the list still holds the old row count.
     scroll_to_end_pending: bool,
+    /// Received-but-not-yet-revealed content / reasoning: the reveal ticker
+    /// types these out into `stream_buf` / `stream_reasoning`. Endpoints
+    /// deliver tokens in bursts (sometimes one big chunk), and dumping a
+    /// burst into the tail all at once is the "it just pops in" feel this
+    /// layer avoids.
+    stream_pending: String,
+    stream_pending_reasoning: String,
+    /// A finished turn whose reveal is still draining; `(generation,
+    /// result)`. The markdown commit waits for the drain so the final swap
+    /// doesn't flash a wall of text.
+    finish_pending: Option<(u64, Result<ChatResponse, AiError>)>,
+    /// One reveal ticker at a time (same pattern as the elapsed ticker).
+    reveal_ticking: bool,
     /// Messages typed while the assistant was busy (streaming, compacting
     /// or awaiting tool decisions), oldest first. Drained one per idle
     /// break — when a reply finishes, the head goes out on its own. The tail
@@ -594,6 +607,10 @@ impl AiPanel {
             compaction: None,
             status: None,
             scroll_to_end_pending: false,
+            stream_pending: String::new(),
+            stream_pending_reasoning: String::new(),
+            finish_pending: None,
+            reveal_ticking: false,
             queue: Vec::new(),
         }
     }
@@ -721,7 +738,10 @@ impl AiPanel {
     /// a tool's approval or result — the states into which a fresh send
     /// either queues or is refused.
     fn is_busy(&self) -> bool {
-        self.stream.is_some() || self.compaction.is_some() || self.pending_tool_calls() > 0
+        self.stream.is_some()
+            || self.finish_pending.is_some()
+            || self.compaction.is_some()
+            || self.pending_tool_calls() > 0
     }
 
     fn ensure_combo_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -820,6 +840,9 @@ impl AiPanel {
         self.stream = None;
         self.compaction = None;
         self.status = None;
+        self.stream_pending.clear();
+        self.stream_pending_reasoning.clear();
+        self.finish_pending = None;
         self.generation += 1;
         // Every unresolved tool call is skipped: running ones record
         // "stopped waiting" (what the card's stop button does), unapproved
@@ -895,12 +918,19 @@ impl AiPanel {
         self.stream = Some(stream.clone());
         self.stream_buf.clear();
         self.stream_reasoning.clear();
+        self.stream_pending.clear();
+        self.stream_pending_reasoning.clear();
+        self.finish_pending = None;
         self.error = None;
         // The "responding" row appears now; when the user was already pinned
         // to the bottom, keep them there. The scroll must wait for render's
         // splice (the row count only changes there) — `scroll_to_end_pending`
-        // is exactly that deferred scroll.
-        self.scroll_to_end_pending = self.is_list_at_bottom();
+        // is exactly that deferred scroll. It only ever *sets* the flag: a
+        // send just forced it, and clearing it here would undo the "sending
+        // always follows the message" rule for a scrolled-up user.
+        if self.is_list_at_bottom() {
+            self.scroll_to_end_pending = true;
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -909,18 +939,17 @@ impl AiPanel {
                     if panel.generation != generation {
                         return;
                     }
-                    // Stick to the bottom only while the user is already
-                    // there; scrolling up mid-stream keeps their view put.
-                    let stick = panel.is_list_at_bottom();
+                    // Buffer the chunk; the reveal ticker types it into the
+                    // visible tail at a smooth pace (stick-to-bottom happens
+                    // per reveal step, in `reveal_step`).
                     match event {
-                        StreamEvent::Content(chunk) => panel.stream_buf.push_str(&chunk),
-                        StreamEvent::Reasoning(chunk) => panel.stream_reasoning.push_str(&chunk),
+                        StreamEvent::Content(chunk) => panel.stream_pending.push_str(&chunk),
+                        StreamEvent::Reasoning(chunk) => {
+                            panel.stream_pending_reasoning.push_str(&chunk)
+                        }
                         _ => return,
                     }
-                    if stick {
-                        panel.scroll_list_to_end();
-                    }
-                    cx.notify();
+                    panel.ensure_reveal_ticker(cx);
                 });
             }
             let outcome = stream.result().await;
@@ -945,7 +974,95 @@ impl AiPanel {
         }
     }
 
+    /// The stream ended: commit the turn — after the reveal has drained
+    /// whatever is still buffered, so a burst that arrived in one final
+    /// chunk still types out instead of popping in whole. Cancellation
+    /// finalizes at once: the user asked it to stop, and anything not yet
+    /// revealed is dropped (it never appeared on screen).
     fn finish_turn(&mut self, outcome: Result<ChatResponse, AiError>, cx: &mut Context<Self>) {
+        if matches!(outcome, Err(AiError::Cancelled)) {
+            self.stream_pending.clear();
+            self.stream_pending_reasoning.clear();
+            self.finalize_turn(outcome, cx);
+            return;
+        }
+        if self.stream_pending.is_empty() && self.stream_pending_reasoning.is_empty() {
+            self.finalize_turn(outcome, cx);
+        } else {
+            self.finish_pending = Some((self.generation, outcome));
+            self.ensure_reveal_ticker(cx);
+        }
+    }
+
+    /// One tick of the reveal: type out buffered content (faster when the
+    /// backlog is large — catching up beats literal typing). Returns whether
+    /// the ticker should keep running.
+    fn reveal_step(&mut self, cx: &mut Context<Self>) -> bool {
+        fn reveal_into(pending: &mut String, shown: &mut String) -> bool {
+            if pending.is_empty() {
+                return false;
+            }
+            let steps = (pending.chars().count() / 6).clamp(3, 240);
+            let split = pending
+                .char_indices()
+                .nth(steps)
+                .map(|(index, _)| index)
+                .unwrap_or(pending.len());
+            let head: String = pending.drain(..split).collect();
+            shown.push_str(&head);
+            true
+        }
+
+        // Pin first (reads the last rendered frame), then grow the tail.
+        let stick = self.is_list_at_bottom();
+        let moved = reveal_into(&mut self.stream_pending, &mut self.stream_buf)
+            | reveal_into(
+                &mut self.stream_pending_reasoning,
+                &mut self.stream_reasoning,
+            );
+        if moved {
+            if stick {
+                self.scroll_to_end_pending = true;
+            }
+            cx.notify();
+        }
+        let draining = !self.stream_pending.is_empty() || !self.stream_pending_reasoning.is_empty();
+        if draining {
+            return true;
+        }
+        // Drained: commit the finished turn, if one is waiting.
+        if let Some((generation, outcome)) = self.finish_pending.take()
+            && self.generation == generation
+        {
+            self.finalize_turn(outcome, cx);
+        }
+        false
+    }
+
+    /// Start the reveal ticker unless one is running. The task stops itself
+    /// once both buffers are drained (and after committing a waiting turn).
+    fn ensure_reveal_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.reveal_ticking {
+            return;
+        }
+        self.reveal_ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                smol::Timer::after(Duration::from_millis(16)).await;
+                let keep = this
+                    .update(cx, |panel, cx| panel.reveal_step(cx))
+                    .unwrap_or(false);
+                if !keep {
+                    let _ = this.update(cx, |panel, _cx| panel.reveal_ticking = false);
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Commit the finished turn (the reveal has drained or was cancelled).
+    fn finalize_turn(&mut self, outcome: Result<ChatResponse, AiError>, cx: &mut Context<Self>) {
         self.stream = None;
         let partial = std::mem::take(&mut self.stream_buf);
         let partial_reasoning = std::mem::take(&mut self.stream_reasoning);
@@ -1748,8 +1865,9 @@ impl AiPanel {
         self.messages.len()
             + self.total_tool_calls()
             // One row for the whole live stream — the "responding" spinner
-            // before the first token, the streaming tail after it.
-            + usize::from(self.stream.is_some())
+            // before the first token, the streaming tail after it (and while
+            // a finished turn's reveal is still draining).
+            + usize::from(self.stream.is_some() || self.finish_pending.is_some())
     }
 
     /// Total tool calls across the conversation (one card row each).
@@ -1886,7 +2004,7 @@ impl AiPanel {
                 });
             }
         }
-        if self.stream.is_some() {
+        if self.stream.is_some() || self.finish_pending.is_some() {
             items.push(MessageItem::Streaming {
                 reasoning: self.stream_reasoning.clone(),
                 content: self.stream_buf.clone(),
@@ -2077,8 +2195,10 @@ impl Render for AiPanel {
             })),
             code_block: StyleRefinement::default().p_2().text_size(px(12.)),
         };
-        let has_conversation =
-            !self.messages.is_empty() || self.stream.is_some() || !self.queue.is_empty();
+        let has_conversation = !self.messages.is_empty()
+            || self.stream.is_some()
+            || self.finish_pending.is_some()
+            || !self.queue.is_empty();
         let not_configured = !ai::configured(cx);
 
         // --- Virtualized conversation ---
