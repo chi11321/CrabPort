@@ -42,7 +42,7 @@ use rust_i18n::t;
 
 use crate::color::*;
 use crate::components::context_menu::{ContextMenuController, ContextMenuItem, ContextMenuState};
-use crate::motion::{EASE_STANDARD, duration_slower};
+use crate::motion::{EASE_OUT, duration_slow};
 
 pub const TOOLBAR_HEIGHT: f32 = 36.0;
 pub const BAR_WIDTH: f32 = 80.0;
@@ -175,8 +175,9 @@ impl ToolbarProps {
 /// Render the toolbar framework.
 ///
 /// The toolbar's overall height animates between `TOOLBAR_HEIGHT` and `0`
-/// based on whether any slot produced visible content. The transition
-/// mirrors the original terminal toolbar's feel (320ms EaseInOutCubic).
+/// based on whether any slot produced visible content — fast out, soft in
+/// (250ms EaseOutQuad), so the bar appears to react immediately instead of
+/// dawdling through the first half of the travel.
 pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
     // Compute the visible-element list up front so we can decide whether
     // the toolbar should be open at all. We materialize the elements
@@ -210,8 +211,8 @@ pub fn render_toolbar(props: ToolbarProps) -> impl IntoElement {
         .with_transition("terminal-toolbar-height")
         .transition_when_else(
             show_toolbar,
-            duration_slower(),
-            EASE_STANDARD,
+            duration_slow(),
+            EASE_OUT,
             |el| el.h(px(TOOLBAR_HEIGHT)),
             |el| el.h_0(),
         )
