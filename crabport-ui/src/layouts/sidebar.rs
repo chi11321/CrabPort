@@ -5,7 +5,7 @@ use gpui_animation::animation::TransitionExt;
 use crate::app::SidebarItem;
 use crate::color::*;
 use crate::components::button::Button;
-use crate::motion::{EASE_STANDARD, duration_slower};
+use crate::motion::{EASE_OUT, content_follow, duration_slow};
 
 pub fn render_sidebar(
     selected: SidebarItem,
@@ -21,8 +21,10 @@ pub fn render_sidebar(
         .with_transition("sidebar-container")
         .transition_when_else(
             show,
-            duration_slower(),
-            EASE_STANDARD,
+            // Fast out, soft in: the old symmetric 320 ms EaseInOutCubic
+            // made the first half of the travel read as "not moving".
+            duration_slow(),
+            EASE_OUT,
             |el| el.w(px(180.0)),
             |el| el.w_0(),
         )
@@ -45,7 +47,13 @@ pub fn render_sidebar(
                 // the wordmark is only needed to fill the otherwise-empty top
                 // on Windows/Linux where there are no native controls there.
                 .when(cfg!(not(target_os = "macos")), |el| {
-                    el.child(wordmark_header())
+                    el.child(content_follow(
+                        "sidebar-wordmark-fade",
+                        show,
+                        px(-6.0),
+                        div(),
+                        wordmark_header(),
+                    ))
                 })
                 .children(SidebarItem::all().map(|item| {
                     let is_selected = item == selected;
@@ -58,7 +66,16 @@ pub fn render_sidebar(
                         .bg(tab_btn_bg_color())
                         .selected(is_selected)
                         .icon(item.icon())
-                        .child(item.label())
+                        // The label yields on its own, ahead of the container's
+                        // width — the icon is deliberately left unwrapped so
+                        // it stays pinned while only the text lets go.
+                        .child(content_follow(
+                            ElementId::Name(format!("sidebar-label-{item:?}").into()),
+                            show,
+                            px(-6.0),
+                            div().whitespace_nowrap(),
+                            item.label(),
+                        ))
                         .on_click(move |_e, _w, cx| {
                             h.update(cx, |app, _| {
                                 app.sidebar_item = item;

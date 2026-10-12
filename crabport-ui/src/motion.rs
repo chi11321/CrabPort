@@ -88,7 +88,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use gpui::Pixels;
+use gpui::prelude::ParentElement as _;
+use gpui::{Div, ElementId, InteractiveElement as _, IntoElement, Pixels, Styled as _, px};
+use gpui_animation::animation::TransitionExt as _;
+use gpui_animation::transition::Transition;
 use gpui_animation::transition::general::{EaseInOutCubic, EaseOutQuad, Linear};
 
 // ---------------------------------------------------------------------------
@@ -218,9 +221,72 @@ pub const EASE_STANDARD: EaseInOutCubic = EaseInOutCubic;
 /// [`EASE_STANDARD`] when the same element also animates out.
 pub const EASE_OUT: EaseOutQuad = EaseOutQuad;
 
-/// Reserved for progress bars and continuous-value animations (memory
-/// meter, transfer progress) where easing would feel laggy.
+/// Reserved for values that must never lag the newest reading: pointer
+/// hovers, overlays, and continuous-value fills that update many times per
+/// second (transfer progress). A slow-polling gauge (memory / CPU meters)
+/// settles better on [`EASE_OUT`], where easing reads as a response rather
+/// than a delay.
 pub const EASE_LINEAR: Linear = Linear;
+
+/// An ease-out that holds its start value for the first `delay` fraction of
+/// the duration before playing an `EaseOutQuad` over the remainder.
+///
+/// This is the "let the frame lead its content" curve: the container starts
+/// moving immediately while the wrapped text (or any other content) holds
+/// for a beat, then catches up. A closing element reads the same way in
+/// reverse — the content lingers briefly before it lets go — so the collapse
+/// looks like the drawer yielding around its content rather than a curtain
+/// cutting it off.
+#[derive(Clone, Copy)]
+pub struct DelayedEaseOut {
+    /// Fraction of the duration held at the start value, in `[0, 1)`.
+    pub delay: f32,
+}
+
+impl Transition for DelayedEaseOut {
+    fn calculate(&self, t: f32) -> f32 {
+        let t = ((t - self.delay) / (1.0 - self.delay).max(f32::EPSILON)).clamp(0.0, 1.0);
+        1.0 - (1.0 - t) * (1.0 - t)
+    }
+}
+
+/// [`DelayedEaseOut`] at the shared hold used by content that should follow
+/// its container: a 25% hold, then an ease-out.
+pub const EASE_CONTENT_REVEAL: DelayedEaseOut = DelayedEaseOut { delay: 0.25 };
+
+/// Wrap content that should follow its container's size transition: the
+/// text fades and drifts by `drift` a touch faster than the frame around it
+/// grows or shrinks, holding briefly at the start so the frame leads.
+///
+/// `base` carries the wrapper's own layout styles (`h_full()` for a full-
+/// height pane, `whitespace_nowrap()` for a single-line label, …); the open
+/// pose is set as the element's base style, so the first paint is already
+/// settled and only close/open toggles animate.
+pub fn content_follow(
+    id: impl Into<ElementId>,
+    show: bool,
+    drift: Pixels,
+    base: Div,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    let id: ElementId = id.into();
+    base.id(id.clone())
+        .opacity(1.0)
+        .ml(px(0.0))
+        .with_transition(id)
+        .transition_when_else(
+            show,
+            // Shorter than the container (and holding a beat at the start):
+            // the content is gone before the collapsing edge reaches it on
+            // the way out, and catches up with the opening frame on the way
+            // in.
+            duration_base(),
+            EASE_CONTENT_REVEAL,
+            |el| el.opacity(1.0).ml(px(0.0)),
+            move |el| el.opacity(0.0).ml(drift),
+        )
+        .child(content)
+}
 
 // ---------------------------------------------------------------------------
 // Corner radii

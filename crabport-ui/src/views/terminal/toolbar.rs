@@ -34,7 +34,7 @@ use crate::layouts::toolbar::{
     BAR_HEIGHT, BAR_WIDTH, ToolbarProps, ToolbarSlot, color_accent, format_byte_ratio,
     format_memory, format_rate, human_bytes, status_color, truncate_path_middle,
 };
-use crate::motion::{EASE_STANDARD, duration_slower};
+use crate::motion::{EASE_LINEAR, EASE_OUT, duration_slow};
 use crate::views::terminal::SftpProgress;
 
 // ---------------------------------------------------------------------------
@@ -235,12 +235,9 @@ fn memory_slot(show_metrics: bool, memory: Option<MemoryStats>, visible: bool) -
                                     .rounded(px(3.0))
                                     .bg(rgb(color_accent()))
                                     .with_transition("memory-bar-fill")
-                                    .transition_when(
-                                        true,
-                                        duration_slower(),
-                                        EASE_STANDARD,
-                                        move |el| el.w(px(filled_w)),
-                                    ),
+                                    .transition_when(true, duration_slow(), EASE_OUT, move |el| {
+                                        el.w(px(filled_w))
+                                    }),
                             ),
                     )
                     .child(div().text_xs().child(format_memory(mem.used, mem.total)))
@@ -301,12 +298,9 @@ fn cpu_slot(show_metrics: bool, cpu: Option<CpuStats>, visible: bool) -> Toolbar
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("cpu-bar-fill")
-                                .transition_when(
-                                    true,
-                                    duration_slower(),
-                                    EASE_STANDARD,
-                                    move |el| el.w(px(filled_w)),
-                                ),
+                                .transition_when(true, duration_slow(), EASE_OUT, move |el| {
+                                    el.w(px(filled_w))
+                                }),
                         ),
                 )
                 .child(div().text_xs().child(label))
@@ -372,12 +366,9 @@ fn disk_slot(show_metrics: bool, disk: Option<DiskStats>, visible: bool) -> Tool
                                 .rounded(px(3.0))
                                 .bg(rgb(fill_color))
                                 .with_transition("disk-bar-fill")
-                                .transition_when(
-                                    true,
-                                    duration_slower(),
-                                    EASE_STANDARD,
-                                    move |el| el.w(px(filled_w)),
-                                ),
+                                .transition_when(true, duration_slow(), EASE_OUT, move |el| {
+                                    el.w(px(filled_w))
+                                }),
                         ),
                 )
                 .child(div().text_xs().child(label))
@@ -565,7 +556,10 @@ fn render_progress_bar(
                     .rounded(px(3.0))
                     .bg(rgb(color))
                     .with_transition(fill_id)
-                    .transition_when(true, duration_slower(), EASE_STANDARD, move |el| {
+                    // Linear on purpose: this tracks a byte count that
+                    // updates many times per second, and an eased curve
+                    // would make the bar chase-and-settle on every event.
+                    .transition_when(true, duration_slow(), EASE_LINEAR, move |el| {
                         el.w(px(filled_w))
                     }),
             ),

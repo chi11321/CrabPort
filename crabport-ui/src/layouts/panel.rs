@@ -4,7 +4,7 @@ use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
 use crate::components::tabs::{TabPane, Tabs};
-use crate::motion::{EASE_STANDARD, duration_instant, duration_slower};
+use crate::motion::{EASE_OUT, content_follow, duration_instant, duration_slow};
 use crate::views::panel::PanelKind;
 use crate::views::panel::ai::AiPanel;
 use crate::views::panel::history_command_panel::HistoryCommandPanel;
@@ -126,10 +126,15 @@ pub fn render_panel(
     // wrong position (e.g. track stuck at left(-3) from a 4-pane render
     // while only 2 panes exist), causing the panel to render clipped /
     // half-width.
-    let tabs_id = SharedString::from(format!(
-        "panel-tabs-{}{}{}{}{}",
+    // Capability signature: keys both the Tabs element and the content's
+    // follow transition, so switching between backends with different pane
+    // counts starts from a fresh state instead of inheriting the old pane
+    // set's transition / fade pose.
+    let caps_sig = format!(
+        "{}{}{}{}{}",
         caps.sftp as u8, caps.history as u8, caps.snippets as u8, caps.tunnels as u8, caps.ai as u8
-    ));
+    );
+    let tabs_id = SharedString::from(format!("panel-tabs-{caps_sig}"));
     let mut tabs = Tabs::new(tabs_id)
         .ctrl_style(|s| s.rounded_none())
         .active(active_idx)
@@ -159,11 +164,12 @@ pub fn render_panel(
     // Always use the same `with_transition` element so the animation
     // engine keeps a consistent identity across drag / non-drag frames.
     // During a drag the duration is zero so width updates are instant;
-    // otherwise the 500ms duration drives the smooth show/hide.
+    // otherwise the short, fast-out curve drives the show/hide — the old
+    // 320 ms EaseInOutCubic dawdled for the first half of the travel.
     let duration = if dragging {
         duration_instant()
     } else {
-        duration_slower()
+        duration_slow()
     };
     div()
         .id("panel-sidebar")
@@ -175,7 +181,7 @@ pub fn render_panel(
         .transition_when_else(
             visible,
             duration,
-            EASE_STANDARD,
+            EASE_OUT,
             move |el| el.w(px(width)),
             |el| el.w_0(),
         )
@@ -186,7 +192,18 @@ pub fn render_panel(
                 .border_l_1()
                 .border_color(rgb(border()))
                 .bg(sidebar_bg_color())
-                .child(tabs.h_full()),
+                // The pane content yields on its own, ahead of the width:
+                // it fades and drifts toward the edge it is leaving, so the
+                // rows stop being visibly cut off by the sliding clip edge.
+                // The surface (background + border) stays put — only the
+                // content moves and fades.
+                .child(content_follow(
+                    ElementId::Name(format!("panel-content-{caps_sig}").into()),
+                    visible,
+                    px(6.0),
+                    div().h_full().w_full(),
+                    tabs.h_full(),
+                )),
         )
         .into_any_element()
 }
