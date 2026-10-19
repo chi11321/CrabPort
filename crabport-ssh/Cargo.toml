@@ -13,6 +13,8 @@ russh = "0.45"
 secrecy = "0.10"
 zeroize = "1"
 async-broadcast = "0.7"
+# `BackendEvent::Data` payload type (see crabport-terminal).
+bytes = "1"
 async-channel = "2.5"
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "time"] }
 async-trait = "0.1"

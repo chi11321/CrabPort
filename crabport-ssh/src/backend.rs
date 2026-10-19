@@ -527,8 +527,14 @@ impl SshBackend {
                     msg = channel.wait() => {
                         match msg {
                             Some(ChannelMsg::Data { data }) => {
+                                // russh hands out its own `CryptoVec`, which
+                                // cannot be adopted by `Bytes`; copy it into
+                                // one shared buffer here (the broadcast clones
+                                // per subscriber are then refcount bumps).
                                 let _ = event_tx2
-                                    .broadcast(BackendEvent::Data(data.to_vec()))
+                                    .broadcast(BackendEvent::Data(
+                                        bytes::Bytes::copy_from_slice(&data),
+                                    ))
                                     .await;
                             }
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
@@ -731,8 +737,14 @@ impl SshBackend {
                     msg = channel.wait() => {
                         match msg {
                             Some(ChannelMsg::Data { data }) => {
+                                // russh hands out its own `CryptoVec`, which
+                                // cannot be adopted by `Bytes`; copy it into
+                                // one shared buffer here (the broadcast clones
+                                // per subscriber are then refcount bumps).
                                 let _ = event_tx2
-                                    .broadcast(BackendEvent::Data(data.to_vec()))
+                                    .broadcast(BackendEvent::Data(
+                                        bytes::Bytes::copy_from_slice(&data),
+                                    ))
                                     .await;
                             }
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {

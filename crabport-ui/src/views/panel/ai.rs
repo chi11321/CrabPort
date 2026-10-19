@@ -335,6 +335,10 @@ impl AgentSession for UiAgentSession {
         self.handles.session.try_dump_text(lines)
     }
 
+    fn grid_revision(&self) -> Option<u64> {
+        Some(self.handles.session.grid_revision())
+    }
+
     fn write_raw(&self, data: &[u8]) {
         self.handles.session.write_raw(data);
     }
@@ -456,13 +460,22 @@ enum DisplayRole {
 /// live streaming tail always shows it expanded).
 struct DisplayMessage {
     role: DisplayRole,
-    content: String,
-    reasoning: String,
+    /// Refcounted so the per-frame list snapshot clones a pointer, not the
+    /// text: the conversation is rebuilt for the virtual list on every
+    /// render, and a streaming turn notifies ~60 times a second.
+    content: SharedString,
+    reasoning: SharedString,
     reasoning_expanded: bool,
     /// Tool calls this turn asked for. Empty for plain turns; the assistant
     /// message is only sent back to the model with its calls and results
     /// once every call has been resolved by the user.
-    tool_calls: Vec<ToolCallState>,
+    ///
+    /// `Rc` for the same reason as `content`: tool results can be large
+    /// (a command's captured output), and they are cloned into the list
+    /// snapshot on every frame. Mutation goes through `Rc::make_mut` in
+    /// [`AiPanel::tool_state_mut`], so the copy-on-write only happens when a
+    /// card actually changes.
+    tool_calls: Vec<Rc<ToolCallState>>,
 }
 
 /// One in-flight compaction round.
@@ -564,6 +577,12 @@ pub struct AiPanel {
     /// layer avoids.
     stream_pending: String,
     stream_pending_reasoning: String,
+    /// Character counts of the two buffers above, maintained incrementally.
+    /// `reveal_step` runs ~60×/s and needs the pending length to pace the
+    /// reveal; recounting it with `chars().count()` each tick would be O(n)
+    /// over a buffer that can hold a whole burst of tokens.
+    stream_pending_chars: usize,
+    stream_pending_reasoning_chars: usize,
     /// A finished turn whose reveal is still draining; `(generation,
     /// result)`. The markdown commit waits for the drain so the final swap
     /// doesn't flash a wall of text.
@@ -609,6 +628,8 @@ impl AiPanel {
             scroll_to_end_pending: false,
             stream_pending: String::new(),
             stream_pending_reasoning: String::new(),
+            stream_pending_chars: 0,
+            stream_pending_reasoning_chars: 0,
             finish_pending: None,
             reveal_ticking: false,
             queue: Vec::new(),
@@ -636,17 +657,21 @@ impl AiPanel {
         // picker has options without a manual refresh. Scheduled via
         // `defer_in` — this runs inside the app's render pass, and spawning
         // network work must not happen there.
-        let ai_cfg = config::snapshot().ai;
+        //
+        // Borrowed rather than snapshotted: this is per-frame work, and
+        // `config::snapshot()` clones every provider entry.
         let mut to_fetch: Vec<String> = Vec::new();
-        for entry in &ai_cfg.providers {
-            if entry.base_url.trim().is_empty() {
-                continue;
+        crabport_core::config::with(|cfg| {
+            for entry in &cfg.ai.providers {
+                if entry.base_url.trim().is_empty() {
+                    continue;
+                }
+                let key = format!("{}|{}", entry.id, entry.base_url);
+                if self.fetch_attempts.insert(key) {
+                    to_fetch.push(entry.id.clone());
+                }
             }
-            let key = format!("{}|{}", entry.id, entry.base_url);
-            if self.fetch_attempts.insert(key) {
-                to_fetch.push(entry.id.clone());
-            }
-        }
+        });
         if !to_fetch.is_empty() {
             cx.defer_in(window, move |panel, _w, cx| {
                 for provider_id in to_fetch {
@@ -795,8 +820,8 @@ impl AiPanel {
     fn commit_and_send(&mut self, text: String, cx: &mut Context<Self>) {
         self.messages.push(DisplayMessage {
             role: DisplayRole::User,
-            content: text,
-            reasoning: String::new(),
+            content: text.into(),
+            reasoning: SharedString::default(),
             reasoning_expanded: false,
             tool_calls: Vec::new(),
         });
@@ -842,6 +867,8 @@ impl AiPanel {
         self.status = None;
         self.stream_pending.clear();
         self.stream_pending_reasoning.clear();
+        self.stream_pending_chars = 0;
+        self.stream_pending_reasoning_chars = 0;
         self.finish_pending = None;
         self.generation += 1;
         // Every unresolved tool call is skipped: running ones record
@@ -920,6 +947,8 @@ impl AiPanel {
         self.stream_reasoning.clear();
         self.stream_pending.clear();
         self.stream_pending_reasoning.clear();
+        self.stream_pending_chars = 0;
+        self.stream_pending_reasoning_chars = 0;
         self.finish_pending = None;
         self.error = None;
         // The "responding" row appears now; when the user was already pinned
@@ -943,9 +972,13 @@ impl AiPanel {
                     // visible tail at a smooth pace (stick-to-bottom happens
                     // per reveal step, in `reveal_step`).
                     match event {
-                        StreamEvent::Content(chunk) => panel.stream_pending.push_str(&chunk),
+                        StreamEvent::Content(chunk) => {
+                            panel.stream_pending_chars += chunk.chars().count();
+                            panel.stream_pending.push_str(&chunk);
+                        }
                         StreamEvent::Reasoning(chunk) => {
-                            panel.stream_pending_reasoning.push_str(&chunk)
+                            panel.stream_pending_reasoning_chars += chunk.chars().count();
+                            panel.stream_pending_reasoning.push_str(&chunk);
                         }
                         _ => return,
                     }
@@ -983,6 +1016,8 @@ impl AiPanel {
         if matches!(outcome, Err(AiError::Cancelled)) {
             self.stream_pending.clear();
             self.stream_pending_reasoning.clear();
+            self.stream_pending_chars = 0;
+            self.stream_pending_reasoning_chars = 0;
             self.finalize_turn(outcome, cx);
             return;
         }
@@ -998,28 +1033,40 @@ impl AiPanel {
     /// backlog is large — catching up beats literal typing). Returns whether
     /// the ticker should keep running.
     fn reveal_step(&mut self, cx: &mut Context<Self>) -> bool {
-        fn reveal_into(pending: &mut String, shown: &mut String) -> bool {
+        fn reveal_into(
+            pending: &mut String,
+            pending_chars: &mut usize,
+            shown: &mut String,
+        ) -> bool {
             if pending.is_empty() {
                 return false;
             }
-            let steps = (pending.chars().count() / 6).clamp(3, 240);
+            // The length comes from the maintained counter, not a recount:
+            // this runs every tick, and the pending buffer holds whatever the
+            // endpoint delivered since the last one.
+            let steps = (*pending_chars / 6).clamp(3, 240);
             let split = pending
                 .char_indices()
                 .nth(steps)
                 .map(|(index, _)| index)
                 .unwrap_or(pending.len());
             let head: String = pending.drain(..split).collect();
+            *pending_chars = pending_chars.saturating_sub(head.chars().count());
             shown.push_str(&head);
             true
         }
 
         // Pin first (reads the last rendered frame), then grow the tail.
         let stick = self.is_list_at_bottom();
-        let moved = reveal_into(&mut self.stream_pending, &mut self.stream_buf)
-            | reveal_into(
-                &mut self.stream_pending_reasoning,
-                &mut self.stream_reasoning,
-            );
+        let moved = reveal_into(
+            &mut self.stream_pending,
+            &mut self.stream_pending_chars,
+            &mut self.stream_buf,
+        ) | reveal_into(
+            &mut self.stream_pending_reasoning,
+            &mut self.stream_pending_reasoning_chars,
+            &mut self.stream_reasoning,
+        );
         if moved {
             if stick {
                 self.scroll_to_end_pending = true;
@@ -1124,7 +1171,7 @@ impl AiPanel {
         };
 
         let mut auto_resolved = false;
-        let states: Vec<ToolCallState> = calls
+        let states: Vec<Rc<ToolCallState>> = calls
             .into_iter()
             .map(|call| {
                 let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
@@ -1148,7 +1195,7 @@ impl AiPanel {
                     state.result = Some(reason);
                     auto_resolved = true;
                 }
-                state
+                Rc::new(state)
             })
             .collect();
 
@@ -1161,8 +1208,8 @@ impl AiPanel {
         } else {
             self.messages.push(DisplayMessage {
                 role: DisplayRole::Assistant,
-                content: String::new(),
-                reasoning: String::new(),
+                content: SharedString::default(),
+                reasoning: SharedString::default(),
                 reasoning_expanded: false,
                 tool_calls: states,
             });
@@ -1244,7 +1291,7 @@ impl AiPanel {
         wire.push(ChatMessage::system(system_prompt()));
         for msg in &self.messages {
             match msg.role {
-                DisplayRole::User => wire.push(ChatMessage::user(msg.content.clone())),
+                DisplayRole::User => wire.push(ChatMessage::user(msg.content.to_string())),
                 DisplayRole::Summary => wire.push(ChatMessage::user(format!(
                     "{COMPACTED_HEADER}{}",
                     msg.content
@@ -1253,7 +1300,7 @@ impl AiPanel {
                     if msg.tool_calls.iter().any(|c| c.result.is_none()) {
                         continue;
                     }
-                    let mut assistant = ChatMessage::assistant(msg.content.clone());
+                    let mut assistant = ChatMessage::assistant(msg.content.to_string());
                     assistant.tool_calls = msg.tool_calls.iter().map(|c| c.call.clone()).collect();
                     wire.push(assistant);
                     for call in &msg.tool_calls {
@@ -1489,6 +1536,10 @@ impl AiPanel {
             .get_mut(msg_index)?
             .tool_calls
             .get_mut(call_index)
+            // The list snapshot holds `Rc` clones of every call; this is the
+            // single place that mutates one, so the copy-on-write clone
+            // happens here only when a card actually changes.
+            .map(Rc::make_mut)
     }
 
     /// Store a decision plus its result, re-measure the card and continue
@@ -1727,8 +1778,8 @@ impl AiPanel {
             0,
             DisplayMessage {
                 role: DisplayRole::Summary,
-                content: summary,
-                reasoning: String::new(),
+                content: summary.into(),
+                reasoning: SharedString::default(),
                 // Reused as the block's disclosure flag.
                 reasoning_expanded: false,
                 tool_calls: Vec::new(),
@@ -1820,14 +1871,19 @@ impl AiPanel {
 
     /// Commit an assistant turn unless both streams (answer and reasoning)
     /// are blank.
-    fn push_partial(&mut self, content: String, reasoning: String, tool_calls: Vec<ToolCallState>) {
+    fn push_partial(
+        &mut self,
+        content: String,
+        reasoning: String,
+        tool_calls: Vec<Rc<ToolCallState>>,
+    ) {
         if content.trim().is_empty() && reasoning.trim().is_empty() && tool_calls.is_empty() {
             return;
         }
         self.messages.push(DisplayMessage {
             role: DisplayRole::Assistant,
-            content,
-            reasoning,
+            content: content.into(),
+            reasoning: reasoning.into(),
             // Disclosure starts collapsed; the live streaming tail shows
             // reasoning in full while it streams.
             reasoning_expanded: false,
@@ -1998,16 +2054,16 @@ impl AiPanel {
                 items.push(MessageItem::Tool {
                     message_ix,
                     call_ix,
-                    state: call.clone(),
-                    cwd: cwd.map(str::to_string),
+                    state: Rc::clone(call),
+                    cwd: cwd.map(SharedString::new),
                     tunnel,
                 });
             }
         }
         if self.stream.is_some() || self.finish_pending.is_some() {
             items.push(MessageItem::Streaming {
-                reasoning: self.stream_reasoning.clone(),
-                content: self.stream_buf.clone(),
+                reasoning: SharedString::new(self.stream_reasoning.as_str()),
+                content: SharedString::new(self.stream_buf.as_str()),
                 streaming: self.stream.is_some(),
             });
         }
@@ -2503,21 +2559,21 @@ impl Drop for AiPanel {
 #[allow(clippy::large_enum_variant)]
 enum MessageItem {
     User {
-        content: String,
+        content: SharedString,
     },
     /// The compacted-history marker: one dim block where the summarized turns
     /// used to be, clicked to show the summary text.
     Summary {
         message_ix: usize,
-        text: String,
+        text: SharedString,
         expanded: bool,
     },
     Assistant {
         /// Index into `AiPanel::messages` — the thinking toggle needs the
         /// message, not the list row (they differ once cards exist).
         message_ix: usize,
-        reasoning: String,
-        content: String,
+        reasoning: SharedString,
+        content: SharedString,
         reasoning_expanded: bool,
     },
     /// One tool call awaiting the user's approval — or showing what they
@@ -2529,17 +2585,17 @@ enum MessageItem {
         message_ix: usize,
         /// Index within that turn's calls.
         call_ix: usize,
-        state: ToolCallState,
+        state: Rc<ToolCallState>,
         /// Directory the command would run in, when the shell reports one.
-        cwd: Option<String>,
+        cwd: Option<SharedString>,
         /// The tunnel a tunnel_* call refers to, described at snapshot time
         /// (`#2 socks — active on 127.0.0.1:1080`). `None` for every other
         /// tool.
         tunnel: Option<String>,
     },
     Streaming {
-        reasoning: String,
-        content: String,
+        reasoning: SharedString,
+        content: SharedString,
         streaming: bool,
     },
 }
@@ -2638,7 +2694,7 @@ fn render_list_item(
                 *message_ix,
                 *call_ix,
                 state.clone(),
-                cwd.as_deref(),
+                cwd.as_ref().map(SharedString::as_str),
                 tunnel.as_deref(),
                 entity,
                 md_style,
@@ -2672,7 +2728,7 @@ fn render_list_item(
 fn tool_card(
     message_ix: usize,
     call_ix: usize,
-    state: ToolCallState,
+    state: Rc<ToolCallState>,
     cwd: Option<&str>,
     tunnel: Option<&str>,
     entity: &WeakEntity<AiPanel>,
@@ -3368,8 +3424,8 @@ fn tool_card_field(label: &str, value: String, monospace: bool) -> AnyElement {
 #[allow(clippy::too_many_arguments)]
 fn assistant_block(
     ix: usize,
-    reasoning: String,
-    content: String,
+    reasoning: SharedString,
+    content: SharedString,
     expanded: bool,
     entity: &WeakEntity<AiPanel>,
     md_style: &TextViewStyle,
@@ -3407,7 +3463,7 @@ fn assistant_block(
 #[allow(clippy::too_many_arguments)]
 fn thinking_section(
     ix: usize,
-    reasoning: String,
+    reasoning: SharedString,
     expanded: bool,
     entity: &WeakEntity<AiPanel>,
     md_style: &TextViewStyle,
@@ -3466,7 +3522,7 @@ fn thinking_section(
 /// transcript stays honest about what happened to the history.
 fn summary_block(
     ix: usize,
-    text: String,
+    text: SharedString,
     expanded: bool,
     entity: &WeakEntity<AiPanel>,
     md_style: &TextViewStyle,
@@ -3527,7 +3583,7 @@ fn summary_block(
 /// turns read as distinct from the assistant's unlabeled content. Own
 /// selectable Markdown view.
 fn user_bubble(
-    text: String,
+    text: SharedString,
     id: String,
     md_style: &TextViewStyle,
     window: &mut Window,
@@ -3558,7 +3614,7 @@ fn user_bubble(
 /// Thinking body: the reasoning Markdown view indented behind a left
 /// rail, rendered smaller/muted via ambient style inheritance.
 fn thinking_body(
-    text: String,
+    text: SharedString,
     id: String,
     md_style: &TextViewStyle,
     window: &mut Window,
@@ -3608,7 +3664,7 @@ fn thinking_header_label() -> AnyElement {
 /// Markdown views coalesce changes behind their 200ms debounce), styled to
 /// match the committed blocks. Carets mark the growing end while the
 /// stream is active.
-fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyElement {
+fn streaming_block(reasoning: SharedString, content: SharedString, streaming: bool) -> AnyElement {
     let mut col = div().flex().flex_col().gap_2().w_full();
     if reasoning.is_empty() && content.is_empty() {
         // Nothing streamed yet — a lone spinning loader, so the turn visibly
@@ -3620,7 +3676,7 @@ fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyEl
     }
     if !reasoning.is_empty() {
         let text = if streaming && content.is_empty() {
-            format!("{reasoning}▍")
+            SharedString::from(format!("{reasoning}▍"))
         } else {
             reasoning
         };
@@ -3644,7 +3700,7 @@ fn streaming_block(reasoning: String, content: String, streaming: bool) -> AnyEl
     }
     if !content.is_empty() {
         let text = if streaming {
-            format!("{content}▍")
+            SharedString::from(format!("{content}▍"))
         } else {
             content
         };

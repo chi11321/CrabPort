@@ -200,7 +200,7 @@ impl SerialBackend {
             loop {
                 match data_rx.try_recv() {
                     Ok(data) => {
-                        let _ = event_tx2.broadcast(BackendEvent::Data(data)).await;
+                        let _ = event_tx2.broadcast(BackendEvent::Data(data.into())).await;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         tokio::time::sleep(Duration::from_millis(5)).await;

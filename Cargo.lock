@@ -666,7 +666,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1472,6 +1472,7 @@ version = "0.1.6"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
+ "bytes",
  "crabport-core",
  "crabport-terminal",
  "parking_lot",
@@ -1502,6 +1503,7 @@ dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
  "async-trait",
+ "bytes",
  "crabport-core",
  "crabport-proxy",
  "crabport-sftp",
@@ -1524,6 +1526,7 @@ version = "0.1.6"
 dependencies = [
  "async-broadcast",
  "async-channel 2.5.0",
+ "bytes",
  "crabport-core",
  "crabport-proxy",
  "crabport-terminal",
@@ -1539,6 +1542,7 @@ dependencies = [
  "alacritty_terminal",
  "async-broadcast",
  "async-channel 2.5.0",
+ "bytes",
  "crabport-sftp",
  "libc",
  "parking_lot",
@@ -2944,9 +2948,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-animation"
-version = "0.2.63"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e99de9de440af28ad84219e2e6ac9e736d3d0e11fa3e914098c7153b6878fbb9"
+version = "0.2.64"
+source = "git+https://github.com/chi11321/gpui-animation?rev=75bd41bea2b9bcaea159ed235e920f5740592bfb#75bd41bea2b9bcaea159ed235e920f5740592bfb"
 dependencies = [
  "dashmap",
  "gpui",
