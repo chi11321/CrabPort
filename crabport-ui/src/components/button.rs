@@ -47,8 +47,9 @@ pub struct Button {
     /// instead of the default selected/muted heuristic — used by `.primary()`
     /// so the icon stays light on a colored background.
     icon_color: Option<u32>,
-    /// Whether to call [`InteractiveElement::occlude_mouse`] on the root div.
-    /// See [`Self::occlude_mouse`].
+    /// Whether to make the root div's hitbox block mouse interaction for
+    /// elements behind it (without blocking scroll). See
+    /// [`Self::occlude_mouse`].
     occlude_mouse: bool,
     /// Optional platform window-control area to register on the root div.
     /// See [`Self::window_control_area`].
@@ -181,6 +182,16 @@ impl Button {
     /// [`crate::components::window_layout::render_sidebar_window`]). Without
     /// this, Windows' `WM_NCHITTEST` would return `HTCAPTION` over the
     /// button area and the button's `on_click` would never fire.
+    ///
+    /// Deliberately uses `block_mouse_except_scroll` rather than `occlude`:
+    /// `occlude` sets `HitboxBehavior::BlockMouse`, which makes GPUI's
+    /// hit-test *stop collecting* at this hitbox. Any scroll container
+    /// behind the button then never sees the wheel at all — that is what
+    /// used to break horizontal scrolling over the tab chips (only the bare
+    /// strip below them scrolled). `BlockMouseExceptScroll` still hides
+    /// hover from the elements behind (so the drag region stays
+    /// non-hovered and `WM_NCHITTEST` behaves), while leaving
+    /// `should_handle_scroll()` true for the enclosing scroller.
     pub fn occlude_mouse(mut self) -> Self {
         self.occlude_mouse = true;
         self
@@ -296,7 +307,7 @@ impl RenderOnce for Button {
             .h_8()
             .overflow_hidden()
             .bg(to_color(bg))
-            .when(self.occlude_mouse, |el| el.occlude())
+            .when(self.occlude_mouse, |el| el.block_mouse_except_scroll())
             .when_some(self.window_control, |el, area| el.window_control_area(area));
         root.style().refine(&self.style);
 
