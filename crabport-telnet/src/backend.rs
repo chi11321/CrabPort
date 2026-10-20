@@ -429,7 +429,9 @@ impl TelnetBackend {
                                         let _ = stream.flush().await;
                                     }
                                     tracing::debug!("telnet read: {} data bytes", chunk.len());
-                                    let _ = event_tx2.broadcast(BackendEvent::Data(chunk)).await;
+                                    let _ = event_tx2
+                                        .broadcast(BackendEvent::Data(chunk.into()))
+                                        .await;
                                 }
                             }
                             Err(e) => {
@@ -524,7 +526,7 @@ impl TelnetBackend {
 async fn flush_data(event_tx: &BroadcastSender<BackendEvent>, data_out: &mut Vec<u8>) {
     if !data_out.is_empty() {
         let chunk = std::mem::take(data_out);
-        let _ = event_tx.broadcast(BackendEvent::Data(chunk)).await;
+        let _ = event_tx.broadcast(BackendEvent::Data(chunk.into())).await;
     }
 }
 

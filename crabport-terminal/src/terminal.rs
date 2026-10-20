@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use alacritty_terminal::{
@@ -47,7 +47,14 @@ impl SearchMatch {
 
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    Data(Vec<u8>),
+    /// Raw bytes from the terminal stream.
+    ///
+    /// `Bytes` rather than `Vec<u8>` so a chunk can be shared with every
+    /// subscriber by refcount instead of being copied per receiver, and so
+    /// backends that already hold a `Bytes` (or own a `Vec` they can hand
+    /// over) do not pay an extra copy. Backends whose buffer type cannot be
+    /// adopted (russh's `CryptoVec`) pay exactly one copy, same as before.
+    Data(bytes::Bytes),
     Closed,
     Error(String),
     /// A file transfer (download or upload) finished.
@@ -787,6 +794,13 @@ pub struct TerminalSession {
     /// disabled (plain byte input via the IME path). Non-zero bits track
     /// which progressive feature levels are active.
     kitty_keyboard: Arc<AtomicU8>,
+    /// Bumped every time bytes are fed into the terminal grid.
+    ///
+    /// Lets pollers (the AI agent waiting for a command's output to settle)
+    /// tell "the screen changed" from "the screen is identical" without
+    /// re-materializing the whole grid into a `String` on every tick — the
+    /// text extraction is 400 heap-allocated lines per poll.
+    grid_rev: Arc<AtomicU64>,
 }
 
 impl TerminalSession {
@@ -815,6 +829,7 @@ impl TerminalSession {
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
             )),
             kitty_keyboard: Arc::new(AtomicU8::new(0)),
+            grid_rev: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -848,6 +863,7 @@ impl TerminalSession {
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
             )),
             kitty_keyboard: Arc::new(AtomicU8::new(0)),
+            grid_rev: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -861,6 +877,7 @@ impl TerminalSession {
         let wakeup_tx = self.wakeup_tx.clone();
         let command_history = self.command_history.clone();
         let kitty_state = self.kitty_keyboard.clone();
+        let grid_rev = self.grid_rev.clone();
 
         smol::spawn(async move {
             let mut parser = Processor::<StdSyncHandler>::new();
@@ -945,6 +962,7 @@ impl TerminalSession {
                                 }
                             }
                             drop(terminal);
+                            grid_rev.fetch_add(1, Ordering::Release);
                             let _ = wakeup_tx.try_broadcast(());
                         }
                         BackendEvent::Closed => {
@@ -1686,6 +1704,12 @@ impl TerminalSession {
     }
 
     // -----------------------------------------------------------------
+    /// Counter that changes whenever the grid was fed data. Pollers use it to
+    /// skip work while nothing has been written.
+    pub fn grid_revision(&self) -> u64 {
+        self.grid_rev.load(Ordering::Acquire)
+    }
+
     /// Plain-text dump of the terminal's last `max_lines` lines (scrollback
     /// plus the visible screen), for callers that need to *read* the session
     /// rather than render it — the AI agent's `terminal_read` tool, and any

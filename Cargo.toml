@@ -51,6 +51,21 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Profiling build: release-speed, but with symbols and line tables kept so a
+# system sampler (`sample`, Instruments, samply) can name our own functions.
+# The shipped release profile strips them, which turns every frame inside
+# CrabPort into a bare address — useless for finding a hotspot.
+#   cargo build --profile profiling
+#   scripts/profile.sh --build
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+# Thin LTO and parallel codegen: a profiling build is linked often enough that
+# the full-LTO wait is not worth it, and neither changes what the profile says.
+lto = "thin"
+codegen-units = 16
+
 [workspace]
 members = [
     "crabport-agent",
@@ -66,8 +81,8 @@ members = [
     "crabport-serial",
 ]
 # The vendored `gpui-component` copy is a dependency (via `[patch.crates-io]`
-# below), not a workspace member — excluding it keeps cargo from treating it
-# as one. See `vendor/gpui-component/PATCHES.md` for what we patch and why.
+# below), not a workspace member — excluding it keeps cargo from treating it as
+# one. See `vendor/gpui-component/PATCHES.md` for what we patch and why.
 exclude = ["vendor/gpui-component"]
 
 # Patched third-party crates. `gpui-component`'s text rendering has a
@@ -75,6 +90,9 @@ exclude = ["vendor/gpui-component"]
 # panel on long messages (see `vendor/gpui-component/PATCHES.md`); upstream
 # has no fix on the gpui 0.2 line, so we build our patched copy. Reverting =
 # delete the `vendor/` directory and this block.
+#
+# `gpui-animation` used to be vendored here too; its fix now lives upstream and
+# `crabport-ui` depends on the git revision directly.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 

@@ -525,12 +525,9 @@ impl Render for CrabportApp {
             .unwrap_or_else(|| {
                 // No pick for this tab yet: fall back to the configured
                 // default page (`appearance.terminal.panel_page`).
-                crate::views::panel::PanelKind::from_config(
-                    crabport_core::config::snapshot()
-                        .appearance
-                        .terminal
-                        .panel_page,
-                )
+                crate::views::panel::PanelKind::from_config(crabport_core::config::with(|cfg| {
+                    cfg.appearance.terminal.panel_page
+                }))
             });
         // Panel width: live drag value takes priority; otherwise read the
         // persisted config value (clamped to a sane range). The max is also
@@ -539,10 +536,11 @@ impl Render for CrabportApp {
         let eff_max = crate::layouts::panel::effective_max_panel_width(win_w);
         let panel_width = self.panel_drag.map_or_else(
             || {
-                crabport_core::config::snapshot()
-                    .appearance
-                    .panel_width
-                    .clamp(crate::layouts::panel::MIN_PANEL_WIDTH, eff_max)
+                crabport_core::config::with(|cfg| {
+                    cfg.appearance
+                        .panel_width
+                        .clamp(crate::layouts::panel::MIN_PANEL_WIDTH, eff_max)
+                })
             },
             |drag| drag.width,
         );
@@ -553,10 +551,8 @@ impl Render for CrabportApp {
         // connect" option, so the user can opt out of the auto-expand
         // behavior globally while still being able to override it per-tab
         // via the toolbar toggle button.
-        let panel_open_default = crabport_core::config::snapshot()
-            .appearance
-            .terminal
-            .expand_panel_on_connect;
+        let panel_open_default =
+            crabport_core::config::with(|cfg| cfg.appearance.terminal.expand_panel_on_connect);
         let panel_open = self
             .panel_open
             .get(&self.active_tab_id)

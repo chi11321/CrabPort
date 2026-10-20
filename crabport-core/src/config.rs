@@ -1266,8 +1266,22 @@ pub fn update<R>(f: impl FnOnce(&mut CrabPortConfig) -> R) -> Result<R, ConfigEr
 }
 
 /// Convenience: take a read lock and clone the current config snapshot.
+///
+/// Cloning `CrabPortConfig` walks the AI provider list (several `String`s per
+/// entry), so this is not free. Render paths that read only a couple of
+/// fields should call [`with`] instead.
 pub fn snapshot() -> CrabPortConfig {
     CONFIG.read().clone()
+}
+
+/// Run `f` against the live config without cloning it.
+///
+/// Use this from render hot paths: the read lock is held for the duration of
+/// the closure only. Do not call [`update`] (or anything else that takes the
+/// write lock) from inside `f` — `parking_lot`'s `RwLock` cannot upgrade a
+/// held read lock, and the write would deadlock.
+pub fn with<R>(f: impl FnOnce(&CrabPortConfig) -> R) -> R {
+    f(&CONFIG.read())
 }
 
 #[cfg(test)]

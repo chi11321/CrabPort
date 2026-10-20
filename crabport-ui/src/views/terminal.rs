@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use std::time::Duration;
 
 use alacritty_terminal::{
     grid::Dimensions,
@@ -250,6 +251,11 @@ pub struct TerminalView {
     /// Index into `search_matches` of the currently-active (highlighted)
     /// match, or `None` if none is active.
     search_active: Option<usize>,
+    /// Generation counter for the debounced search recompute. Each keystroke
+    /// bumps it; the timer task that fires afterwards only runs the search if
+    /// the counter still matches, so a burst of typing produces one scan
+    /// instead of one per character.
+    search_debounce: u64,
 }
 
 /// Encode a key event into the kitty keyboard protocol's `CSI u` form, or one
@@ -651,6 +657,7 @@ impl TerminalView {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_active: None,
+            search_debounce: 0,
         }
     }
 
@@ -679,6 +686,12 @@ impl TerminalView {
         // whichever listener resolves the attempt first (wakeup loop on
         // `Connected`, backend-event loop on error/close before that).
         let conn_recorded = Arc::new(AtomicBool::new(false));
+
+        // The fade watcher below waits on its own receiver for the same
+        // wakeups the status listener consumes (each subscriber sees every
+        // broadcast). `try_broadcast` never blocks on a lagging receiver, so
+        // simply replacing the message is fine.
+        let session_wakeup = session.subscribe_wakeup();
 
         // Backend error/close events.
         let mut event_rx = session.subscribe_backend();
@@ -976,6 +989,11 @@ impl TerminalView {
                     }
                 });
                 dirty_wk.store(true, Ordering::Release);
+                // Repaint now instead of waiting for the frame pump's next
+                // tick: this is the path every PTY/SSH byte takes, so the
+                // pump can stay slow while idle without adding latency to
+                // terminal output.
+                let _ = status_entity.update(cx, |_, cx| cx.notify());
             }
         })
         .detach();
@@ -989,11 +1007,18 @@ impl TerminalView {
             let overlay_fade = overlay.clone();
             let dirty_fade = needs_repaint.clone();
             let fade_entity = cx.entity().downgrade();
+            // Event-driven rather than polled: every status change already
+            // broadcasts a session wakeup, so this parks on that channel
+            // instead of re-checking the flag every 50 ms. A connection that
+            // never fades out (a failed attempt, a session that stays
+            // connecting) therefore costs nothing at all, where the old loop
+            // kept waking every terminal tab forever.
+            let mut fade_rx = session_wakeup;
             cx.spawn(async move |_this, cx| {
-                loop {
-                    smol::Timer::after(std::time::Duration::from_millis(50)).await;
-                    if overlay_fade.lock().fade_out_started {
-                        break;
+                while !overlay_fade.lock().fade_out_started {
+                    if fade_rx.recv().await.is_err() {
+                        // Backend gone; nothing left to fade.
+                        return;
                     }
                 }
                 smol::Timer::after(std::time::Duration::from_millis(600)).await;
@@ -1031,8 +1056,18 @@ impl TerminalView {
             // `connection_overlay::render_connection_overlay` so the repaint
             // loop keeps ticking for exactly as long as the transition runs.
             const LOG_FADE_MS: u128 = 320;
+            // The 120 Hz cadence exists for animations (the spinner, log
+            // fades). Once nothing is animating the pump drops to a slow tick:
+            // it no longer needs to catch anything quickly, because every
+            // path that dirties the view calls `cx.notify()` itself (terminal
+            // data through the wakeup listener below, input handlers on the
+            // spot). Polling at full speed while idle cost every open tab 120
+            // task wakeups and overlay locks per second, forever.
+            const ANIM_TICK: std::time::Duration = std::time::Duration::from_micros(8333);
+            const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+            let mut fast_tick = true;
             loop {
-                smol::Timer::after(std::time::Duration::from_micros(8333)).await;
+                smol::Timer::after(if fast_tick { ANIM_TICK } else { IDLE_TICK }).await;
                 let ov = overlay_dirty_pump.lock();
                 // Fold the overlay-side dirty flag (set from non-gpui threads,
                 // e.g. the SSH backend pushing a host-key prompt) into the
@@ -1067,6 +1102,7 @@ impl TerminalView {
                 if logs_animating {
                     dirty_pump.store(true, Ordering::Release);
                 }
+                fast_tick = spin || logs_animating;
                 if dirty_pump.swap(false, Ordering::AcqRel) {
                     if pump_entity.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
@@ -1835,8 +1871,36 @@ impl TerminalView {
 
     /// Recompute matches for a new query, then select the first match
     /// closest to the current cursor position.
+    ///
+    /// Debounced: the scan walks the entire grid (scrollback included) under
+    /// the terminal lock, so running it on every keystroke both burns CPU and
+    /// stalls PTY parsing while it holds the lock. Typing fast now produces
+    /// one scan per pause instead of one per character; Enter flushes the
+    /// pending query immediately (see [`Self::flush_pending_search`]).
     fn on_search_query_changed(&mut self, query: &str, cx: &mut Context<Self>) {
+        const SEARCH_DEBOUNCE: Duration = Duration::from_millis(120);
         self.search_query = query.to_string();
+        self.search_debounce = self.search_debounce.wrapping_add(1);
+        let generation = self.search_debounce;
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            smol::Timer::after(SEARCH_DEBOUNCE).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.search_debounce != generation {
+                    // Superseded by newer input.
+                    return;
+                }
+                this.select_initial_match(cx);
+            });
+        })
+        .detach();
+        // Repaint immediately so the query text shows even before the scan.
+        cx.notify();
+    }
+
+    /// Run the search for the current query and select the first match
+    /// closest to the cursor.
+    fn select_initial_match(&mut self, cx: &mut Context<Self>) {
         self.recompute_matches();
         self.search_active = self.compute_initial_active();
         if let Some(idx) = self.search_active {
@@ -1844,6 +1908,16 @@ impl TerminalView {
         } else {
             cx.notify();
         }
+    }
+
+    /// Run any debounced search right now. Called before Enter-driven
+    /// navigation, so the user does not have to wait out the debounce for
+    /// their just-typed query to be searched.
+    fn flush_pending_search(&mut self, cx: &mut Context<Self>) {
+        // Bumping the counter invalidates the timer task that is still
+        // waiting out the debounce window.
+        self.search_debounce = self.search_debounce.wrapping_add(1);
+        self.select_initial_match(cx);
     }
 
     /// Re-run the search against the current terminal grid. Called when
@@ -1891,6 +1965,9 @@ impl TerminalView {
     /// Advance the active match in the given direction, wrapping around.
     pub fn advance_match(&mut self, dir: search::SearchDirection, cx: &mut Context<Self>) {
         if self.search_matches.is_empty() {
+            // Enter right after typing: the debounced scan has not run yet,
+            // so run it now rather than ignoring the key.
+            self.flush_pending_search(cx);
             return;
         }
         let len = self.search_matches.len();
@@ -1983,13 +2060,22 @@ impl Render for TerminalView {
         // window). Comparing the cached signature against the live config is
         // cheap, and lets every terminal tab pick up new font settings
         // without requiring an explicit cross-window notification.
-        {
-            let cfg = crabport_core::config::snapshot().appearance.terminal;
-            let family = cfg.effective_font_family().to_string();
-            let size = cfg.effective_font_size();
-            if self.applied_font_signature != Some((family.clone(), size)) {
-                self.reload_font_settings(cx);
-            }
+        //
+        // Reads through `config::with` rather than `config::snapshot()`: this
+        // runs on every painted frame, and cloning the whole config (AI
+        // provider list included) would churn hundreds of allocations a
+        // second. `reload_font_settings` takes the config lock itself, so it
+        // has to run after the borrow is released — hence the flag.
+        let font_changed = crabport_core::config::with(|cfg| {
+            let term = &cfg.appearance.terminal;
+            self.applied_font_signature
+                .as_ref()
+                .is_none_or(|(family, size)| {
+                    family != term.effective_font_family() || *size != term.effective_font_size()
+                })
+        });
+        if font_changed {
+            self.reload_font_settings(cx);
         }
 
         // Lazily register focus/blur listeners (only once — a `&mut Window`
@@ -2088,12 +2174,20 @@ impl Render for TerminalView {
         let ov = self.overlay.lock();
         let overlay_visible = ov.is_visible();
         let is_fading_out = ov.is_fading_out();
-        let log_entries: Vec<ConnectionLogEntry> = ov.logs.clone();
+        let is_remote = !self.remote_host.is_empty();
+        // Only the overlay block below reads the log, and it renders only
+        // while the overlay is up (`is_remote` alone is not enough — a
+        // connected session hides it). Cloning the whole log every frame for
+        // a hidden overlay meant one `String` copy per entry, per frame, per
+        // tab, forever; skip it when nothing will paint it.
+        let log_entries: Vec<ConnectionLogEntry> = if is_remote || overlay_visible {
+            ov.logs.clone()
+        } else {
+            Vec::new()
+        };
         let current_status = ov.status;
         let spinner_rotation_mrad = ov.spinner_rotation.load(Ordering::Relaxed);
         drop(ov);
-
-        let is_remote = !self.remote_host.is_empty();
 
         div()
             .id(ElementId::Name(
@@ -2417,6 +2511,57 @@ impl Render for TerminalView {
                         ));
 
                         let row_count = cache.rows_count;
+
+                        // Search highlights bucketed by viewport row, built
+                        // once per frame. Scanning the whole match list inside
+                        // the per-row loop made painting O(rows × matches) —
+                        // with a common search term on a scrolled-back
+                        // terminal that is tens of thousands of comparisons
+                        // every frame. Each match row is now visited exactly
+                        // once. Empty when no search is active, so the
+                        // non-search path allocates nothing.
+                        let search_rects_by_row: Vec<Vec<(usize, usize, Hsla)>> =
+                            if search_matches_paint.is_empty() {
+                                Vec::new()
+                            } else {
+                                let mut by_row: Vec<Vec<(usize, usize, Hsla)>> =
+                                    vec![Vec::new(); row_count];
+                                for (mi, m) in search_matches_paint.iter().enumerate() {
+                                    let color = search_match_color(Some(mi) == search_active_paint);
+                                    let single_row = m.start_line == m.end_line;
+                                    // Grid line → viewport row.
+                                    let vp_start = m.start_line + display_offset;
+                                    let vp_end = m.end_line + display_offset;
+                                    if vp_end < 0 || vp_start > row_count as i32 - 1 {
+                                        continue;
+                                    }
+                                    let first = vp_start.max(0) as usize;
+                                    let last = vp_end.min(row_count as i32 - 1).max(0) as usize;
+                                    for (vp_row, rects) in by_row
+                                        .iter_mut()
+                                        .enumerate()
+                                        .skip(first)
+                                        .take(last - first + 1)
+                                    {
+                                        let (lo, hi) = if single_row {
+                                            let lo = m.start_col.min(num_cols);
+                                            let hi = (m.end_col + 1).min(num_cols).max(lo + 1);
+                                            (lo, hi)
+                                        } else if vp_row as i32 == vp_start {
+                                            (m.start_col.min(num_cols), num_cols)
+                                        } else if vp_row as i32 == vp_end {
+                                            (0, (m.end_col + 1).min(num_cols))
+                                        } else {
+                                            (0, num_cols)
+                                        };
+                                        if hi > lo {
+                                            rects.push((lo, hi - lo, color));
+                                        }
+                                    }
+                                }
+                                by_row
+                            };
+
                         for row_idx in 0..row_count {
                             let y = bounds.origin.y + line_height * row_idx as f32;
 
@@ -2514,42 +2659,14 @@ impl Render for TerminalView {
                             // Search match highlights. Drawn after the cell
                             // background layer but before the text so the text
                             // remains visible on top of the match highlight.
-                            // Each match is converted from grid line to
-                            // viewport row via `display_offset`, the same as
-                            // selection highlighting.
+                            // The rects were bucketed by viewport row once
+                            // before this loop, so each row only visits its
+                            // own matches.
                             //
                             // The active match gets a brighter highlight so
                             // the user can see which one they're on.
-                            if !search_matches_paint.is_empty() {
-                                let vp_row = row_idx as i32 - display_offset;
-                                let mut search_rects: Vec<(usize, usize, Hsla)> = Vec::new();
-                                for (mi, m) in search_matches_paint.iter().enumerate() {
-                                    let is_active = Some(mi) == search_active_paint;
-                                    if m.start_line == m.end_line {
-                                        // Single-row match.
-                                        if vp_row == m.start_line {
-                                            let lo = m.start_col.min(num_cols);
-                                            let hi = (m.end_col + 1).min(num_cols).max(lo + 1);
-                                            let color = search_match_color(is_active);
-                                            search_rects.push((lo, hi - lo, color));
-                                        }
-                                    } else {
-                                        // Multi-row match.
-                                        if vp_row == m.start_line {
-                                            let lo = m.start_col.min(num_cols);
-                                            let color = search_match_color(is_active);
-                                            search_rects.push((lo, num_cols - lo, color));
-                                        } else if vp_row > m.start_line && vp_row < m.end_line {
-                                            let color = search_match_color(is_active);
-                                            search_rects.push((0, num_cols, color));
-                                        } else if vp_row == m.end_line {
-                                            let hi = (m.end_col + 1).min(num_cols);
-                                            let color = search_match_color(is_active);
-                                            search_rects.push((0, hi, color));
-                                        }
-                                    }
-                                }
-                                for (col, n, color) in search_rects {
+                            if let Some(search_rects) = search_rects_by_row.get(row_idx) {
+                                for &(col, n, color) in search_rects {
                                     if n == 0 {
                                         continue;
                                     }

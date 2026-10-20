@@ -68,6 +68,19 @@ pub trait AgentSession: Send + Sync {
         String::new()
     }
 
+    /// Monotonic counter of writes into the terminal grid, when the session
+    /// can provide one.
+    ///
+    /// Pollers compare it against the value from their previous tick and skip
+    /// [`Self::try_dump_text`] entirely while nothing has been written — the
+    /// extraction allocates a `String` per grid line, so calling it on a fixed
+    /// timer just to discover "no change" is pure waste. Implementors that
+    /// cannot report a counter return `None` (the default), and pollers then
+    /// fall back to reading the grid every tick.
+    fn grid_revision(&self) -> Option<u64> {
+        None
+    }
+
     /// Non-blocking [`Self::dump_text`]: `None` while the terminal reader
     /// holds its lock — the caller retries on its next tick.
     fn try_dump_text(&self, _lines: usize) -> Option<String> {

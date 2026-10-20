@@ -473,6 +473,8 @@ struct FgProcessSnapshot {
     /// PID of the direct child (the shell we spawned). Used as a
     /// fallback when `tcgetpgrp` returns 0 (no fg pgid assigned yet).
     shell_pid: u32,
+    /// When the last full probe ran. See [`Self::probe_if_due`].
+    last_probe: Option<std::time::Instant>,
 }
 
 #[cfg(unix)]
@@ -494,7 +496,33 @@ impl FgProcessSnapshot {
             prev_cmd: None,
             pty_fd,
             shell_pid,
+            last_probe: None,
         }
+    }
+
+    /// Rate-limited [`Self::probe`] for the PTY reader loop.
+    ///
+    /// The reader calls this for every chunk it reads, but a full probe costs
+    /// a `tcgetpgrp` syscall plus a `libproc`/`/proc` lookup of the process's
+    /// cwd and argv. At an 8 KiB chunk size a `cat` of a large file easily
+    /// produces thousands of chunks per second, all of which would re-read
+    /// the same unchanged cwd and argv — on the reader thread, so the probing
+    /// also gates the PTY itself and caps throughput.
+    ///
+    /// The probe is therefore throttled to at most one per `MIN_INTERVAL`.
+    /// That still catches shell state changes (`cd`, starting a command),
+    /// because those are followed by output, and the tail of any pause always
+    /// lands on a probe eventually — the change simply becomes visible within
+    /// `MIN_INTERVAL` instead of instantly.
+    fn probe_if_due(&mut self) -> Option<(std::path::PathBuf, String)> {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+        if let Some(last) = self.last_probe
+            && last.elapsed() < MIN_INTERVAL
+        {
+            return None;
+        }
+        self.last_probe = Some(std::time::Instant::now());
+        self.probe()
     }
 
     /// Probe the current foreground process. Returns `Some((cwd, cmdline))`
@@ -701,10 +729,10 @@ impl PtyBackend {
 
                         Ok(n) => {
                             tracing::debug!("pty reader: {} bytes", n);
-                            let _ = smol::block_on(
-                                event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())),
-                            );
-                            if let Some((cwd, name)) = snapshot.probe() {
+                            let _ = smol::block_on(event_tx.broadcast(BackendEvent::Data(
+                                bytes::Bytes::copy_from_slice(&buf[..n]),
+                            )));
+                            if let Some((cwd, name)) = snapshot.probe_if_due() {
                                 tracing::debug!("process watcher: {} in {}", name, cwd.display());
                                 let _ = smol::block_on(event_tx.broadcast(
                                     BackendEvent::ProcessChanged {
@@ -981,7 +1009,9 @@ impl PtyBackend {
                     }
                     tracing::debug!("conpty reader: {} bytes", n);
                     let _ =
-                        smol::block_on(event_tx.broadcast(BackendEvent::Data(buf[..n].to_vec())));
+                        smol::block_on(event_tx.broadcast(BackendEvent::Data(
+                            bytes::Bytes::copy_from_slice(&buf[..n]),
+                        )));
                 }
             });
         }

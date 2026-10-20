@@ -12,5 +12,9 @@ libc = "0.2.186"
 smol = "2.0.2"
 async-channel = "2.5.0"
 async-broadcast = "0.7.2"
+# `BackendEvent::Data` carries `bytes::Bytes` so backends that already hold one
+# (russh hands out `Bytes` for every SSH channel packet) can broadcast it
+# without copying, and cloned payloads become a refcount bump.
+bytes = "1"
 sysinfo = { version = "0.35", default-features = false, features = ["system", "network", "disk"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "fs", "time"] }

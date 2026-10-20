@@ -27,35 +27,37 @@ pub(crate) async fn monitor_loop(
 ) {
     let mut prev_net_sent: u64 = 0;
     let mut prev_net_recv: u64 = 0;
+    // The first sample has no previous counters to diff against, so it reports
+    // the totals as "no rate" and only seeds them (same as before the
+    // combined-exec change).
+    let mut first_sample = true;
 
-    // ---- First collection immediately on connection ----
-    {
-        let h = handle.lock().await;
-        let latency_ms = measure_latency(&h).await;
-        let memory = collect_memory(&h).await;
-        let cpu = collect_cpu(&h).await;
-        let disk = collect_disk(&h).await;
-        let network = collect_network(&h).await;
+    // One combined exec per sample. The collectors used to run as five
+    // separate `channel_open_session` + `exec` round trips (a latency probe,
+    // `cat /proc/meminfo`, `cat /proc/loadavg`, `nproc`, `df`, `cat
+    // /proc/net/dev`) while holding the shared handle lock. On a
+    // high-latency link that is seconds of lock time per tick for data that
+    // only feeds a status chip, and each exec blocks SFTP work sharing the
+    // same handle. The commands are all cheap and read-only, so they run as
+    // one shell command with markers between sections and are split apart
+    // locally.
+    const SAMPLE_CMD: &str = concat!(
+        "echo __MEM__; cat /proc/meminfo 2>/dev/null; ",
+        "echo __LOAD__; cat /proc/loadavg 2>/dev/null; ",
+        "echo __NCPU__; (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null); ",
+        "echo __DISK__; df -kP 2>/dev/null; ",
+        "echo __NET__; cat /proc/net/dev 2>/dev/null",
+    );
 
-        if let Some(net) = network {
-            prev_net_sent = net.bytes_sent;
-            prev_net_recv = net.bytes_recv;
-        }
-
-        let mut m = monitor.write();
-        m.metrics = RemoteMetrics {
-            latency_ms,
-            memory,
-            cpu,
-            disk,
-            network: None, // No rate on first tick
-        };
-    }
+    /// How often the remote metrics are sampled. The toolbar only shows a
+    /// handful of numbers, and every sample costs an SSH exec plus
+    /// (because the lock is shared) a window where SFTP and tunnel setup
+    /// queue behind it — so this is deliberately not per-second.
+    const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        // Skip if disconnected
+        // Skip if disconnected — checked before the exec so a session that
+        // already dropped does not pay for one more round trip.
         {
             let m = monitor.read();
             if m.status == RemoteStatus::Disconnected {
@@ -63,32 +65,36 @@ pub(crate) async fn monitor_loop(
             }
         }
 
-        let h = handle.lock().await;
+        let sample = {
+            let h = handle.lock().await;
+            exec_and_read_timed(&h, SAMPLE_CMD).await
+        };
 
-        // ---- Latency: measure RTT of a small exec command ----
-        let latency_ms = measure_latency(&h).await;
+        let (latency_ms, output): (Option<u32>, String) = sample.unwrap_or_default();
 
-        // ---- Memory: parse /proc/meminfo ----
-        let memory = collect_memory(&h).await;
-
-        // ---- CPU: parse /proc/loadavg (portable across Linux/macOS) ----
-        let cpu = collect_cpu(&h).await;
-
-        // ---- Disk: stat the root filesystem via `df` ----
-        let disk = collect_disk(&h).await;
-
-        // ---- Network: parse /proc/net/dev ----
-        let raw_network = collect_network(&h).await;
-        let network = raw_network.map(|net| {
+        let sections = split_sections(&output);
+        let memory = parse_meminfo(&sections.meminfo);
+        let cpu = parse_cpu(
+            &sections.loadavg,
+            Some(sections.ncpus.trim()).filter(|s| !s.is_empty()),
+        );
+        let disk = parse_df(&sections.df);
+        let network = parse_net_dev(&sections.netdev).and_then(|net| {
+            if first_sample {
+                prev_net_sent = net.bytes_sent;
+                prev_net_recv = net.bytes_recv;
+                return None;
+            }
             let rate_sent = net.bytes_sent.saturating_sub(prev_net_sent);
             let rate_recv = net.bytes_recv.saturating_sub(prev_net_recv);
             prev_net_sent = net.bytes_sent;
             prev_net_recv = net.bytes_recv;
-            NetworkStats {
+            Some(NetworkStats {
                 bytes_sent: rate_sent,
                 bytes_recv: rate_recv,
-            }
+            })
         });
+        first_sample = false;
 
         // ---- Update shared state ----
         {
@@ -101,36 +107,57 @@ pub(crate) async fn monitor_loop(
                 network,
             };
         }
+
+        tokio::time::sleep(SAMPLE_INTERVAL).await;
     }
 }
 
-/// Measure round-trip latency by executing `echo ping` over SSH.
-pub(crate) async fn measure_latency(handle: &client::Handle<SshHandler>) -> Option<u32> {
-    let start = std::time::Instant::now();
-    match handle.channel_open_session().await {
-        Ok(mut ch) => {
-            if ch.exec(true, "echo ping").await.is_err() {
-                return None;
+/// The sections of one combined sample command.
+#[derive(Default)]
+struct Sample {
+    meminfo: String,
+    loadavg: String,
+    ncpus: String,
+    df: String,
+    netdev: String,
+}
+
+/// Split a combined `echo __MARK__` sample into its sections. Marker lines
+/// are matched on the trimmed line, so ordinary output cannot be mistaken for
+/// a section boundary.
+fn split_sections(output: &str) -> Sample {
+    let mut sample = Sample::default();
+    let mut target: Option<&mut String> = None;
+    for line in output.lines() {
+        match line.trim() {
+            "__MEM__" => {
+                target = Some(&mut sample.meminfo);
+                continue;
             }
-            // Drain output until channel closes
-            loop {
-                match ch.wait().await {
-                    Some(ChannelMsg::Data { .. }) => {}
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                    _ => {}
-                }
+            "__LOAD__" => {
+                target = Some(&mut sample.loadavg);
+                continue;
             }
-            let elapsed = start.elapsed().as_millis() as u32;
-            Some(elapsed)
+            "__NCPU__" => {
+                target = Some(&mut sample.ncpus);
+                continue;
+            }
+            "__DISK__" => {
+                target = Some(&mut sample.df);
+                continue;
+            }
+            "__NET__" => {
+                target = Some(&mut sample.netdev);
+                continue;
+            }
+            _ => {}
         }
-        Err(_) => None,
+        if let Some(buf) = target.as_deref_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
     }
-}
-
-/// Collect remote memory stats via `cat /proc/meminfo`.
-async fn collect_memory(handle: &client::Handle<SshHandler>) -> Option<MemoryStats> {
-    let output = exec_and_read(handle, "cat /proc/meminfo").await?;
-    parse_meminfo(&output)
+    sample
 }
 
 /// Parse `/proc/meminfo` output into memory stats. Values are in kB;
@@ -164,32 +191,9 @@ fn parse_meminfo(output: &str) -> Option<MemoryStats> {
     })
 }
 
-/// Collect remote CPU stats. We use `/proc/loadavg` because it's the most
-/// portable single source across Linux distros and macOS-likes, and it
-/// doesn't require a follow-up sample (unlike `/proc/stat`, which needs
-/// two reads ~1s apart to compute a usage percentage).
-///
-/// `usage_pct` is derived as `load_avg * 100 / num_cpus`, clamped to
-/// 100.0. This isn't a true instantaneous CPU usage, but it's a
-/// reasonable proxy for "how busy is this box" and matches what
-/// `htop`/`top` show in their headers. We compute the CPU count from
-/// `nproc` (Linux) — failing that, we fall back to assuming the load is
-/// per-core (load_avg_1m * 100).
-///
-/// We no longer surface the raw 1-minute load average as a separate
-/// field — the toolbar only shows the percentage, so carrying the extra
-/// number through `RemoteMetrics` was dead weight.
-async fn collect_cpu(handle: &client::Handle<SshHandler>) -> Option<CpuStats> {
-    let loadavg = exec_and_read(handle, "cat /proc/loadavg").await?;
-    // Try to get CPU count. `nproc` is universally available on Linux;
-    // `sysctl -n hw.ncpu` on macOS/BSD. We try both sequentially.
-    let ncpus = exec_and_read(handle, "nproc 2>/dev/null || sysctl -n hw.ncpu").await;
-    parse_cpu(&loadavg, ncpus.as_deref())
-}
-
 /// Derive the usage percentage from `/proc/loadavg` output plus the raw
 /// CPU-count command output (`None` / unparseable → assume 1 core). See
-/// [`collect_cpu`] for the rationale behind the load-average proxy.
+/// the combined sample for the rationale behind the load-average proxy.
 fn parse_cpu(loadavg: &str, ncpus_raw: Option<&str>) -> Option<CpuStats> {
     let first = loadavg.split_whitespace().next()?;
     let load = first.parse::<f32>().ok()?;
@@ -201,18 +205,6 @@ fn parse_cpu(loadavg: &str, ncpus_raw: Option<&str>) -> Option<CpuStats> {
 
     let usage_pct = ((load / ncpus) * 100.0).clamp(0.0, 100.0);
     Some(CpuStats { usage_pct })
-}
-
-/// Collect remote disk stats by parsing `df` output for the root
-/// filesystem (`/`). We use `df -k -P` to get POSIX-compatible output:
-/// `-k` forces 1KB blocks, `-P` keeps the line-format stable (no splitting
-/// long device paths across two lines). We pick the row whose mount point
-/// is exactly `/` because that's the most universal "primary disk" on a
-/// remote server. If the root isn't present (unusual but possible on
-/// BSD/macOS), we fall back to the row with the largest total size.
-async fn collect_disk(handle: &client::Handle<SshHandler>) -> Option<DiskStats> {
-    let output = exec_and_read(handle, "df -kP 2>/dev/null || df -kP /").await?;
-    parse_df(&output)
 }
 
 /// Parse `df -kP` output. Picks the row mounted at `/` (or the largest
@@ -251,13 +243,6 @@ fn parse_df(output: &str) -> Option<DiskStats> {
     })
 }
 
-/// Collect remote network stats via `cat /proc/net/dev`.
-/// Sums across all interfaces.
-async fn collect_network(handle: &client::Handle<SshHandler>) -> Option<NetworkStats> {
-    let output = exec_and_read(handle, "cat /proc/net/dev").await?;
-    parse_net_dev(&output)
-}
-
 /// Parse `/proc/net/dev` output, summing receive/transmit byte counters
 /// across all interfaces.
 fn parse_net_dev(output: &str) -> Option<NetworkStats> {
@@ -287,6 +272,40 @@ fn parse_net_dev(output: &str) -> Option<NetworkStats> {
         bytes_sent,
         bytes_recv,
     })
+}
+
+/// Like [`exec_and_read`], but also reports the time to the first output
+/// byte — a round-trip measure suitable for the connection's latency chip.
+///
+/// The command's first line is echoed before any real work, so the first
+/// packet back arrives one round trip after the exec, independent of how long
+/// the command itself takes to run.
+pub(crate) async fn exec_and_read_timed(
+    handle: &client::Handle<SshHandler>,
+    cmd: &str,
+) -> Option<(Option<u32>, String)> {
+    let start = std::time::Instant::now();
+    let mut ch = handle.channel_open_session().await.ok()?;
+    if ch.exec(true, cmd).await.is_err() {
+        return None;
+    }
+
+    let mut first_byte_ms = None;
+    let mut output = Vec::new();
+    loop {
+        match ch.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                if first_byte_ms.is_none() {
+                    first_byte_ms = Some(start.elapsed().as_millis() as u32);
+                }
+                output.extend_from_slice(&data);
+            }
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+
+    Some((first_byte_ms, String::from_utf8(output).ok()?))
 }
 
 /// Execute a command over SSH and read all its stdout output.
@@ -469,6 +488,49 @@ pub(crate) async fn drain_exec_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The combined sample command is split on its marker lines, and each
+    /// section is handed to the same parser the separate execs used, so the
+    /// merge cannot change what the toolbar shows.
+    #[test]
+    fn combined_sample_splits_into_sections() {
+        let output = "\n__MEM__\nMemTotal:       16384000 kB\nMemAvailable:    8192000 kB\n\
+                      __LOAD__\n0.50 0.40 0.30 1/234 5678\n\
+                      __NCPU__\n4\n\
+                      __DISK__\nFilesystem 1024-blocks Used Available Capacity Mounted on\n\
+                      /dev/sda1     10240000 5120000   5120000      50% /\n\
+                      __NET__\nInter-|   Receive\n face |bytes\n    lo: 100 2 0 0 0 0 0 0 200 3 0 0 0 0 0 0\n";
+        let sections = split_sections(output);
+
+        let mem = parse_meminfo(&sections.meminfo).expect("meminfo parses");
+        assert_eq!(mem.total, 16384000 * 1024);
+        assert_eq!(mem.used, (16384000 - 8192000) * 1024);
+
+        let cpu = parse_cpu(
+            &sections.loadavg,
+            Some(sections.ncpus.trim()).filter(|s| !s.is_empty()),
+        )
+        .expect("cpu parses");
+        assert!((cpu.usage_pct - 12.5).abs() < 0.001);
+
+        let disk = parse_df(&sections.df).expect("disk parses");
+        assert_eq!(disk.total, 10240000 * 1024);
+
+        let net = parse_net_dev(&sections.netdev).expect("network parses");
+        assert_eq!(net.bytes_sent, 200);
+        assert_eq!(net.bytes_recv, 100);
+    }
+
+    /// Output that never emits a marker yields empty sections rather than
+    /// leaking one section's text into another.
+    #[test]
+    fn combined_sample_without_markers_is_empty() {
+        let sections = split_sections("bash: cat: command not found\n");
+        assert!(sections.meminfo.is_empty());
+        assert!(sections.loadavg.is_empty());
+        assert!(sections.df.is_empty());
+        assert!(parse_meminfo(&sections.meminfo).is_none());
+    }
 
     #[test]
     fn meminfo_parses_total_and_available() {

@@ -1352,10 +1352,8 @@ impl CrabportApp {
     /// Once toggled, the per-tab value wins so the user's explicit choice
     /// sticks for that tab regardless of the global setting.
     pub fn toggle_right_panel(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        let default_open = crabport_core::config::snapshot()
-            .appearance
-            .terminal
-            .expand_panel_on_connect;
+        let default_open =
+            crabport_core::config::with(|cfg| cfg.appearance.terminal.expand_panel_on_connect);
         let current = self
             .panel_open
             .get(&tab_id)

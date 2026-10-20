@@ -264,22 +264,54 @@ impl Agent {
         smol::spawn(async move {
             let started = Instant::now();
             let mut last = before.clone();
-            let mut quiet_since = Instant::now();
             let mut timed_out = false;
             let mut cancelled = false;
+            // `try_dump_text` materializes every scrollback line into a
+            // `String`, so the loop reads the grid only on ticks that actually
+            // saw a write. When the session reports a write counter that
+            // counter is also the authority on quietness — a command that
+            // stopped printing is exactly a command whose counter stopped
+            // moving, whereas "the dumped text looks the same" cannot be
+            // judged on a tick where the read failed (a flooding terminal
+            // holds the lock) or where the program redraws identical text.
+            let mut last_rev = session.grid_revision();
+            let revision_tracking = last_rev.is_some();
+            // Quietness clocks: `last_write` for the counter path,
+            // `quiet_since` for the text-comparison fallback.
+            let mut last_write = Instant::now();
+            let mut quiet_since = Instant::now();
             loop {
                 smol::Timer::after(OUTPUT_POLL).await;
                 if task_cancel.is_cancelled() {
                     cancelled = true;
                     break;
                 }
-                let Some(now) = session.try_dump_text(AGENT_READ_LINES) else {
-                    continue; // terminal lock held by the reader; try next tick
+                let rev = session.grid_revision();
+                let grid_changed = match (rev, last_rev) {
+                    (Some(rev), Some(prev)) => rev != prev,
+                    // No counter: poll the grid every tick, as before.
+                    _ => true,
                 };
-                if now != last {
-                    last = now;
-                    quiet_since = Instant::now();
-                } else if quiet_since.elapsed() >= OUTPUT_QUIET {
+                let mut dumped = false;
+                if grid_changed {
+                    last_rev = rev;
+                    last_write = Instant::now();
+                    if let Some(now) = session.try_dump_text(AGENT_READ_LINES) {
+                        dumped = true;
+                        if now != last {
+                            last = now;
+                            quiet_since = Instant::now();
+                        }
+                    }
+                }
+                let quiet = if revision_tracking {
+                    last_write.elapsed() >= OUTPUT_QUIET
+                } else {
+                    // Without a counter, quiet is only knowable from a read
+                    // that succeeded.
+                    dumped && quiet_since.elapsed() >= OUTPUT_QUIET
+                };
+                if quiet {
                     break;
                 }
                 if started.elapsed() >= OUTPUT_TIMEOUT {
