@@ -532,18 +532,35 @@ pub fn render_content(
         ),
     };
 
-    // Only expand the right-hand panel once the session is fully
-    // connected. Local PTY backends report `RemoteStatus::Local` and are
-    // considered ready immediately; remote (SSH / Telnet) backends cycle
-    // through `Connecting` -> `Connected` (or `Disconnected`), and the
-    // panel stays collapsed until they actually reach `Connected`.
+    // Whether the active tab is a remote session. Used by the readiness gate
+    // below to tell a remote handshake still in flight apart from a local PTY
+    // whose worker thread is still starting.
+    let is_remote = active_tab.map(|t| t.is_remote).unwrap_or(false);
+
+    // Only expand the right-hand panel once the session is fully connected:
+    // remote (SSH / Telnet) backends cycle through `Connecting` ->
+    // `Connected` (or `Disconnected`), and expanding early would shift the
+    // layout while the handshake is still in flight.
+    //
+    // A *local* PTY is different: it reports `RemoteStatus::Local` once its
+    // backend exists, but `PendingPtyBackend` reports `Connecting` for the
+    // few frames its worker thread spends building the child. Treating that
+    // as "not ready" dragged an already-open panel toward `w_0` the moment a
+    // new terminal tab or split appeared, then re-expanded it when the PTY
+    // landed — visible as the tail of the slide-in animation replaying. Local
+    // tabs are therefore considered ready even while `Connecting` (only a
+    // hard `Disconnected` hides the panel).
     //
     // The user can still toggle the panel closed via the toolbar button even
     // when the session is ready — `panel_open` (defaulting to true) is
     // AND-ed with the readiness check so the panel never appears mid-connect.
     let panel_show = is_terminal
         && panel_open
-        && matches!(status, RemoteStatus::Connected | RemoteStatus::Local);
+        && match status {
+            RemoteStatus::Connected | RemoteStatus::Local => true,
+            RemoteStatus::Connecting => !is_remote,
+            RemoteStatus::Disconnected => false,
+        };
 
     // Read SFTP state from the active TerminalView's backend and push it
     // into the shared SftpPanel entity.
@@ -588,10 +605,9 @@ pub fn render_content(
     // `has_sftp || is_remote` gate so a Telnet tab shows History + Snippets
     // (no SFTP / Tunnels) while an SSH tab shows all four, and a local PTY
     // tab shows History + Snippets.
-    // `is_remote` is retained for the tunnels-panel comment context but no
-    // longer gates panel visibility — `cap_tunnels` (from the backend's
-    // `allow_tunnels()`) is the source of truth now.
-    let _is_remote = active_tab.map(|t| t.is_remote).unwrap_or(false);
+    // `is_remote` (declared above, next to the readiness gate) no longer gates
+    // panel visibility — `cap_tunnels` (from the backend's `allow_tunnels()`)
+    // is the source of truth for which panes exist.
     let (cap_sftp, cap_history, cap_snippets, cap_tunnels) = sftp_term
         .as_ref()
         .map(|entity| {
