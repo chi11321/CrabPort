@@ -146,8 +146,14 @@ pub enum SearchRow {
 }
 
 /// The shared panel body: full-size column with the search row on top and,
-/// below it, either the empty-state placeholder or the bordered list
-/// container with its hover-scrollbar overlay.
+/// below it, either the empty-state placeholder or the list itself.
+///
+/// The list is **not** wrapped in its own bordered card. The panel already
+/// has a divider on the side facing the terminal, and the tab strip above it
+/// supplies the top edge; a third nested border made the panel read as a box
+/// inside a box (and cost usable width on every side). Instead the search row
+/// is separated by a hairline and the rows sit directly on the panel surface,
+/// the way a shadcn sidebar/list reads.
 pub fn panel_shell(
     search_id: &'static str,
     search_input: Option<Entity<InputState>>,
@@ -165,9 +171,9 @@ pub fn panel_shell(
         .overflow_hidden()
         .flex()
         .flex_col()
-        .pt_1()
-        .px_1()
-        // Search input
+        .px_2()
+        // Search input, separated from the list by a hairline so the two
+        // regions read as one surface with a rule — not two stacked cards.
         .when_some(search_input, |el, input| {
             let field = StyledInput::new(search_id, input).xsmall().prefix(
                 svg()
@@ -175,19 +181,27 @@ pub fn panel_shell(
                     .size(px(12.0))
                     .text_color(rgb(text_muted())),
             );
-            el.child(match search_row {
-                SearchRow::Bare => div().mb_1().child(field),
-                SearchRow::WithSuffix(suffix) => div()
-                    .mb_1()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(div().flex_1().min_w_0().child(field))
-                    .when_some(suffix, |el, suffix| el.child(suffix)),
-            })
+            el.child(
+                div()
+                    .pt_2()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(border()))
+                    .child(match search_row {
+                        SearchRow::Bare => field.into_any_element(),
+                        SearchRow::WithSuffix(suffix) => div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(div().flex_1().min_w_0().child(field))
+                            .when_some(suffix, |el, suffix| el.child(suffix))
+                            .into_any_element(),
+                    }),
+            )
         })
-        // List + scrollbar, or empty-state placeholder.
+        // List + scrollbar, or empty-state placeholder. The scrollbar floats
+        // over the list area instead of belonging to a bordered container.
         .when_else(
             is_empty,
             |el| {
@@ -196,8 +210,17 @@ pub fn panel_shell(
                         .flex_1()
                         .min_h_0()
                         .flex()
+                        .flex_col()
                         .items_center()
                         .justify_center()
+                        .gap_2()
+                        .child(
+                            svg()
+                                .path("icons/folder.svg")
+                                .size(px(16.0))
+                                .text_color(rgb(text_muted()))
+                                .opacity(0.5),
+                        )
                         .child(
                             div()
                                 .text_color(rgb(text_muted()))
@@ -212,11 +235,7 @@ pub fn panel_shell(
                         .relative()
                         .flex_1()
                         .min_h_0()
-                        .border_1()
-                        .border_color(rgb(border()))
-                        .bg(rgb(bg_tab_bar()))
-                        .rounded(RADIUS_MD)
-                        .overflow_hidden()
+                        .pt_1()
                         .child(list)
                         .child(
                             div()
@@ -253,7 +272,7 @@ pub fn row_base(row_id: ElementId, row_height: f32) -> Stateful<Div> {
         .items_center()
         .gap_1p5()
         .px_2()
-        .rounded(px(4.0))
+        .rounded(RADIUS_MD)
 }
 
 /// Wrap a row in its transition, wire hover tracking into the panel's
