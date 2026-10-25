@@ -816,6 +816,7 @@ impl SshBackend {
             handle: self.handle.clone(),
             sftp_session: self.sftp_session.clone(),
             event_tx: Some(self.event_tx.clone()),
+            control: None,
         };
         crate::transfer::sftp_download_impl(&backend, remote_path, local_path).await
     }
@@ -830,6 +831,7 @@ impl SshBackend {
             handle: self.handle.clone(),
             sftp_session: self.sftp_session.clone(),
             event_tx: Some(self.event_tx.clone()),
+            control: None,
         };
         crate::transfer::sftp_upload_impl(&backend, local_path, remote_path).await
     }
@@ -861,6 +863,23 @@ impl SshBackend {
         let join = TOKIO.spawn(future);
         let abort = join.abort_handle();
         self.transfer_tasks.lock().push(abort);
+    }
+
+    /// Build the borrowed transfer handle for one SFTP operation.
+    ///
+    /// `control` carries the user's pause/cancel intent plus the live
+    /// byte/stage mirror; `None` for operations the UI doesn't expose controls
+    /// for (delete / rename / mkdir / edit), which have no streaming loop.
+    pub(crate) fn sftp_transfer_handle(
+        &self,
+        control: Option<Arc<crabport_sftp::TransferControl>>,
+    ) -> crate::transfer::SftpTransferHandle {
+        crate::transfer::SftpTransferHandle {
+            handle: self.handle.clone(),
+            sftp_session: self.sftp_session.clone(),
+            event_tx: Some(self.event_tx.clone()),
+            control,
+        }
     }
 }
 

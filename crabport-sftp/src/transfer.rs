@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::archive::{build_tar_gz, local_tmp_path, validate_gzip};
 use crate::backend::SftpBackend;
+use crate::control::TransferControl;
 
 /// Per-segment buffer size when streaming an upload. Larger buffers mean fewer
 /// SFTP write requests but more memory; 256 KiB is a reasonable default that
@@ -29,6 +30,7 @@ impl SftpBackend {
         remote_path: &str,
         local_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         tracing::info!("SFTP download_file: remote={remote_path} local={local_path}");
         let session = self.session();
@@ -51,6 +53,10 @@ impl SftpBackend {
         let mut file = session.open(remote_path).await?;
         let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
         loop {
+            // Cooperative pause / cancel point (no-op unless the user asked).
+            if let Some(c) = control {
+                c.checkpoint().await?;
+            }
             let n = file.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -79,6 +85,7 @@ impl SftpBackend {
         local_path: &str,
         remote_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         let session = self.session();
         let mut local = tokio::fs::File::open(local_path).await?;
@@ -87,6 +94,9 @@ impl SftpBackend {
         let mut total: u64 = 0;
         let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
         loop {
+            if let Some(c) = control {
+                c.checkpoint().await?;
+            }
             let n = local.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -118,6 +128,7 @@ impl SftpBackend {
         local_path: &str,
         remote_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         let session = self.session();
         let mut local = tokio::fs::File::open(local_path).await?;
@@ -127,6 +138,9 @@ impl SftpBackend {
         let mut total: u64 = 0;
         let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
         loop {
+            if let Some(c) = control {
+                c.checkpoint().await?;
+            }
             let n = local.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -161,12 +175,16 @@ impl SftpBackend {
         remote_path: &str,
         local_path: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         tracing::info!("SFTP download_file_gz: remote={remote_path} local={local_path}");
         // 1. Download the .gz into a local tmp file.
         let tmp = local_tmp_path(".gz");
         let tmp_str = tmp.to_str().unwrap().to_string();
-        if let Err(e) = self.download_file(remote_path, &tmp_str, progress).await {
+        if let Err(e) = self
+            .download_file(remote_path, &tmp_str, progress, control)
+            .await
+        {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
@@ -229,6 +247,7 @@ impl SftpBackend {
         remote_tar_gz: &str,
         archive_name: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         // 1. Build a tmp tar.gz of the local directory.
         let tmp = local_tmp_path(".tar.gz");
@@ -242,7 +261,7 @@ impl SftpBackend {
         //    non-gz `upload_file` because the data is already a tar.gz —
         //    wrapping it in another gzip layer would just waste CPU.
         let upload_result = self
-            .upload_file(tmp.to_str().unwrap(), remote_tar_gz, progress)
+            .upload_file(tmp.to_str().unwrap(), remote_tar_gz, progress, control)
             .await;
 
         // 3. Always remove the local tmp file, even on upload failure.
@@ -266,12 +285,16 @@ impl SftpBackend {
         remote_tar_gz: &str,
         local_dir: &str,
         progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+        control: Option<&TransferControl>,
     ) -> Result<()> {
         tracing::info!("SFTP download_dir: remote_tar_gz={remote_tar_gz} local_dir={local_dir}");
         // 1. Download the remote tar.gz into a local tmp file.
         let tmp = local_tmp_path(".tar.gz");
         let tmp_str = tmp.to_str().unwrap().to_string();
-        if let Err(e) = self.download_file(remote_tar_gz, &tmp_str, progress).await {
+        if let Err(e) = self
+            .download_file(remote_tar_gz, &tmp_str, progress, control)
+            .await
+        {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }

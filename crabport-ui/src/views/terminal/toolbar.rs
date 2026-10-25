@@ -101,6 +101,10 @@ pub fn render_terminal_toolbar(
     input: TerminalToolbarInput,
     context_menu: Option<Entity<ContextMenuController>>,
     trailing: Vec<AnyElement>,
+    // Invoked when the user clicks the in-flight transfer chip. The caller
+    // opens the transfer panel anchored at the click position. `None` keeps
+    // the chip read-only.
+    on_progress_click: Option<std::rc::Rc<dyn Fn(Point<Pixels>, &mut App)>>,
     on_toggle: impl Fn(&str, &mut App) + 'static,
 ) -> impl IntoElement {
     // Read the current per-slot visibility from config so the ctxmenu
@@ -143,6 +147,7 @@ pub fn render_terminal_toolbar(
     props = props.slot(sftp_progress_slot(
         input.sftp_progress.clone(),
         vis.sftp_progress,
+        on_progress_click,
     ));
 
     crate::layouts::toolbar::render_toolbar(props)
@@ -474,7 +479,11 @@ impl SftpProgressDisplay {
     }
 }
 
-fn sftp_progress_slot(progress: Option<SftpProgress>, visible: bool) -> ToolbarSlot {
+fn sftp_progress_slot(
+    progress: Option<SftpProgress>,
+    visible: bool,
+    on_click: Option<std::rc::Rc<dyn Fn(Point<Pixels>, &mut App)>>,
+) -> ToolbarSlot {
     ToolbarSlot::new(
         "sftp_progress",
         t!("toolbar.sftp_progress").to_string(),
@@ -483,47 +492,53 @@ fn sftp_progress_slot(progress: Option<SftpProgress>, visible: bool) -> ToolbarS
             let p = progress.clone()?;
             let d = SftpProgressDisplay::new(&p);
             let bar = render_progress_bar(p.bytes, d.stage_color, "sftp-progress-bar-fill");
-            Some(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1p5()
-                    .min_w_0()
-                    .child(
-                        svg()
-                            .path(d.icon_path)
-                            .size(px(12.0))
-                            .flex_shrink_0()
-                            .text_color(rgb(d.stage_color)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(d.stage_color))
-                            .child(d.stage_label),
-                    )
-                    .child(
+            let mut chip = div()
+                .id("sftp-progress-chip")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                // Clicking the chip expands the transfer panel, which is
+                // where pause / cancel live. The row is a plain div (not a
+                // Button) because it's built by the toolbar slot framework.
+                .when_some(on_click.clone(), |el, cb| {
+                    el.cursor_pointer()
+                        .on_click(move |e, _w, cx| cb(e.position(), cx))
+                })
+                .child(
+                    svg()
+                        .path(d.icon_path)
+                        .size(px(12.0))
+                        .flex_shrink_0()
+                        .text_color(rgb(d.stage_color)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(d.stage_color))
+                        .child(d.stage_label),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_muted()))
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("{}: {}", d.kind_label, d.detail)),
+                );
+            chip = chip.when_some(bar, |el, bar| {
+                el.child(bar).when_some(p.bytes, |el, b| {
+                    el.child(
                         div()
                             .text_xs()
                             .text_color(rgb(text_muted()))
-                            .min_w_0()
-                            .truncate()
-                            .child(format!("{}: {}", d.kind_label, d.detail)),
+                            .flex_shrink_0()
+                            .child(format_byte_ratio(b.done, b.total)),
                     )
-                    .when_some(bar, |el, bar| {
-                        el.child(bar).when_some(p.bytes, |el, b| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(text_muted()))
-                                    .flex_shrink_0()
-                                    .child(format_byte_ratio(b.done, b.total)),
-                            )
-                        })
-                    })
-                    .into_any_element(),
-            )
+                })
+            });
+            Some(chip.into_any_element())
         },
     )
 }

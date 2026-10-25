@@ -80,8 +80,20 @@ pub(crate) async fn sftp_download_file_impl(
     progress_cb(0);
     let s = backend.take_or_open_sftp().await?;
     let res = s
-        .download_file_gz(&tmp, local_path, Some(progress_cb))
+        .download_file_gz(
+            &tmp,
+            local_path,
+            Some(progress_cb),
+            backend.control.as_deref(),
+        )
         .await;
+    // A user cancellation is not a dead channel: park the session back in the
+    // cache so the next transfer doesn't pay for a fresh SFTP handshake, and
+    // surface the cancellation as its own error.
+    if backend.control.as_ref().is_some_and(|c| c.is_cancelled()) {
+        backend.return_sftp(s, Ok(())).await.ok();
+        return Err(anyhow::anyhow!("transfer cancelled"));
+    }
     if let Err(ref e) = res {
         tracing::warn!("SFTP download file: transfer failed: {e}");
     }
@@ -128,7 +140,20 @@ pub(crate) async fn sftp_upload_file_impl(
         "SFTP upload file: step 1 transfer+compress local={local_path} -> remote_tmp={tmp} total={total}"
     );
     let s = backend.take_or_open_sftp().await?;
-    let upload_res = s.upload_file_gz(local_path, &tmp, Some(progress_cb)).await;
+    let upload_res = s
+        .upload_file_gz(
+            local_path,
+            &tmp,
+            Some(progress_cb),
+            backend.control.as_deref(),
+        )
+        .await;
+    if backend.control.as_ref().is_some_and(|c| c.is_cancelled()) {
+        // Keep the healthy session; the partial remote tmp is left for the
+        // next attempt to overwrite (same as any other failed upload).
+        backend.return_sftp(s, Ok(())).await.ok();
+        return Err(anyhow::anyhow!("transfer cancelled"));
+    }
     backend.return_sftp(s, upload_res).await?;
 
     // Acquire the SSH handle for the exec step.

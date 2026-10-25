@@ -127,9 +127,18 @@ impl CrabportApp {
         // whole view to avoid re-rendering the app on every terminal frame
         // pump tick (~120Hz during output).
         let app_handle = cx.entity().downgrade();
+        let transfers_for_progress = self.app_ctx.transfers.clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_progress_changed(move |cx| {
                 let _ = app_handle.update(cx, |_, cx| cx.notify());
+                // Keep the open transfer panel animating: it reads the job's
+                // control handle directly, so it needs a repaint when the
+                // backend pushes new byte counts.
+                let _ = transfers_for_progress.update(cx, |c, cx| {
+                    if c.is_open() {
+                        cx.notify();
+                    }
+                });
             });
         });
 
@@ -139,8 +148,27 @@ impl CrabportApp {
         // closure so the toast text follows the language active at toast
         // time, not the language at tab-creation time.
         let app_handle = cx.entity().downgrade();
+        let transfers_for_history = self.app_ctx.transfers.clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
+                // Keep the transfer panel in sync: a finished job is retired
+                // into history on its next render.
+                let _ = transfers_for_history.update(cx, |_, cx| cx.notify());
+                // Uploads / downloads are recorded by the transfer center
+                // when it retires their job; only the non-job operations
+                // (rename / edit / delete / mkdir) need a record here.
+                if !matches!(kind, SftpTransferKind::Upload | SftpTransferKind::Download) {
+                    let record = crate::views::sftp::TransferRecord {
+                        kind,
+                        success,
+                        message: message.clone(),
+                        finished_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    };
+                    let _ = transfers_for_history.update(cx, |c, cx| c.push(record, cx));
+                }
                 let _ = app_handle.update(cx, |app, cx| {
                     let (title, message_notif, level, duration) = match (kind, success) {
                         (SftpTransferKind::Download, true) => (

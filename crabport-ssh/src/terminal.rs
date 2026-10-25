@@ -10,7 +10,6 @@ use crabport_terminal::terminal::{
 
 use crate::TOKIO;
 use crate::backend::{Command, SshBackend};
-use crate::transfer::SftpTransferHandle;
 
 impl CrabPortTerminal for SshBackend {
     fn write(&self, data: &[u8]) {
@@ -147,11 +146,22 @@ impl CrabPortTerminal for SshBackend {
     }
 
     fn sftp_download(&self, remote_path: &str, local_path: &str) {
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        // No caller-supplied control: the transfer still runs, it just isn't
+        // pause/cancel-able from the panel (legacy fire-and-forget path).
+        self.sftp_download_controlled(
+            remote_path,
+            local_path,
+            crabport_sftp::TransferControl::new(),
+        );
+    }
+
+    fn sftp_download_controlled(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        control: Arc<crabport_sftp::TransferControl>,
+    ) {
+        let backend = self.sftp_transfer_handle(Some(control.clone()));
         let event_tx = self.event_tx.clone();
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
@@ -162,6 +172,7 @@ impl CrabPortTerminal for SshBackend {
                 Ok(()) => (true, format!("downloaded {local_path}")),
                 Err(e) => (false, format!("download failed: {e}")),
             };
+            control.finish(success, message.clone());
             let _ = event_tx
                 .broadcast(BackendEvent::SftpTransferFinished {
                     kind: SftpTransferKind::Download,
@@ -173,11 +184,20 @@ impl CrabPortTerminal for SshBackend {
     }
 
     fn sftp_upload(&self, local_path: &str, remote_path: &str) {
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        self.sftp_upload_controlled(
+            local_path,
+            remote_path,
+            crabport_sftp::TransferControl::new(),
+        );
+    }
+
+    fn sftp_upload_controlled(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        control: Arc<crabport_sftp::TransferControl>,
+    ) {
+        let backend = self.sftp_transfer_handle(Some(control.clone()));
         let event_tx = self.event_tx.clone();
         let remote_path = remote_path.to_string();
         let local_path = local_path.to_string();
@@ -188,6 +208,7 @@ impl CrabPortTerminal for SshBackend {
                 Ok(()) => (true, format!("uploaded {remote_path}")),
                 Err(e) => (false, format!("upload failed: {e}")),
             };
+            control.finish(success, message.clone());
             let _ = event_tx
                 .broadcast(BackendEvent::SftpTransferFinished {
                     kind: SftpTransferKind::Upload,
@@ -199,11 +220,15 @@ impl CrabPortTerminal for SshBackend {
     }
 
     fn sftp_upload_batch(&self, items: &[(String, String)]) {
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        self.sftp_upload_batch_controlled(items, crabport_sftp::TransferControl::new());
+    }
+
+    fn sftp_upload_batch_controlled(
+        &self,
+        items: &[(String, String)],
+        control: Arc<crabport_sftp::TransferControl>,
+    ) {
+        let backend = self.sftp_transfer_handle(Some(control.clone()));
         let event_tx = self.event_tx.clone();
         let items = items.to_vec();
         self.spawn_transfer(async move {
@@ -212,6 +237,7 @@ impl CrabPortTerminal for SshBackend {
                 Ok(()) => (true, format!("uploaded {} files", items.len())),
                 Err(e) => (false, format!("batch upload failed: {e}")),
             };
+            control.finish(success, message.clone());
             let _ = event_tx
                 .broadcast(BackendEvent::SftpTransferFinished {
                     kind: SftpTransferKind::Upload,
@@ -228,11 +254,7 @@ impl CrabPortTerminal for SshBackend {
         // so the existing UI finish handling (toolbar clear, overlay log)
         // applies. We use the Download kind arbitrarily — the message text
         // carries the real semantics.
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        let backend = self.sftp_transfer_handle(None);
         let event_tx = self.event_tx.clone();
         let remote_path = remote_path.to_string();
         self.spawn_transfer(async move {
@@ -252,11 +274,7 @@ impl CrabPortTerminal for SshBackend {
     }
 
     fn sftp_rename(&self, old_path: &str, new_path: &str) {
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        let backend = self.sftp_transfer_handle(None);
         let event_tx = self.event_tx.clone();
         let old_path = old_path.to_string();
         let new_path = new_path.to_string();
@@ -277,11 +295,7 @@ impl CrabPortTerminal for SshBackend {
     }
 
     fn sftp_open_in_editor(&self, remote_path: &str) {
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        let backend = self.sftp_transfer_handle(None);
         let event_tx = self.event_tx.clone();
         let remote_path = remote_path.to_string();
         self.spawn_transfer(async move {
@@ -306,11 +320,7 @@ impl CrabPortTerminal for SshBackend {
         // sink. There's no actual transfer, but we emit a `SftpTransferFinished`
         // so the existing UI finish handling (listing refresh on success,
         // toast on failure) applies.
-        let backend = SftpTransferHandle {
-            handle: self.handle.clone(),
-            sftp_session: self.sftp_session.clone(),
-            event_tx: Some(self.event_tx.clone()),
-        };
+        let backend = self.sftp_transfer_handle(None);
         let event_tx = self.event_tx.clone();
         let remote_path = remote_path.to_string();
         self.spawn_transfer(async move {

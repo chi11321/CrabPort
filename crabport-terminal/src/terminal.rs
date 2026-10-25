@@ -288,6 +288,42 @@ pub trait CrabPortTerminal: Send + Sync {
     /// [`BackendEvent::SftpTransferFinished`] for the batch.
     fn sftp_upload_batch(&self, _items: &[(String, String)]) {}
 
+    /// Like [`Self::sftp_download`], but the transfer observes `control`:
+    /// the streaming loop pauses / aborts at the user's request and mirrors
+    /// byte progress + stage into the control so the transfer panel can
+    /// render this specific job.
+    ///
+    /// Backends without a cooperative transfer loop fall back to the plain
+    /// method (the control is simply ignored), which is correct for every
+    /// non-SSH backend since they have no SFTP transfers at all.
+    fn sftp_download_controlled(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        _control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.sftp_download(remote_path, local_path);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    fn sftp_upload_controlled(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        _control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.sftp_upload(local_path, remote_path);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    fn sftp_upload_batch_controlled(
+        &self,
+        _items: &[(String, String)],
+        _control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.sftp_upload_batch(_items);
+    }
+
     /// Create a directory on the remote host at `remote_path`. Parent
     /// directories must already exist (SFTP `mkdir` is not recursive).
     /// Completion is reported via [`BackendEvent::SftpTransferFinished`]
@@ -1493,6 +1529,37 @@ impl TerminalSession {
     /// `BackendEvent::SftpTransferFinished`.
     pub fn sftp_upload_batch(&self, items: &[(String, String)]) {
         self.backend.sftp_upload_batch(items);
+    }
+
+    /// Controlled variants — see [`CrabPortTerminal::sftp_download_controlled`].
+    pub fn sftp_download_controlled(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.backend
+            .sftp_download_controlled(remote_path, local_path, control);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    pub fn sftp_upload_controlled(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.backend
+            .sftp_upload_controlled(local_path, remote_path, control);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    pub fn sftp_upload_batch_controlled(
+        &self,
+        items: &[(String, String)],
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.backend.sftp_upload_batch_controlled(items, control);
     }
 
     /// Delete a remote file or directory.

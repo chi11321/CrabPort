@@ -52,10 +52,11 @@ pub struct AppCtx {
     pub tooltip: Entity<TooltipController>,
     /// Global toast notification host.
     pub notifications: Entity<NotificationController>,
-    /// Global SFTP transfer-history popover host. Toggled from the SFTP
-    /// toolbar's history button; records are pushed by
-    /// `SftpTabView::on_sftp_transfer_finished`.
-    pub transfer_history: Entity<crate::views::sftp::TransferHistoryController>,
+    /// Global SFTP transfer panel host (live jobs + recent history).
+    /// Opened from the SFTP toolbar's transfer button or by clicking the
+    /// in-flight progress chip; jobs are registered by the surfaces that
+    /// start transfers (`SftpTabView`, terminal-tab SFTP callbacks).
+    pub transfers: Entity<crate::views::sftp::TransferCenter>,
 
     // -- Shared data registries --
     /// Central tunnel registry (stopped + running). Single source of truth

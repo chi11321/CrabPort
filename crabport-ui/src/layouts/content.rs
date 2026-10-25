@@ -22,7 +22,7 @@ use crate::views::sessions::{ConnectionFormState, ConnectionHost};
 use crate::views::terminal::TerminalView;
 use crate::views::terminal::split::{SplitDir, SplitNode};
 use crate::views::terminal::toolbar::{TerminalToolbarInput, render_terminal_toolbar};
-use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus};
+use crabport_terminal::terminal::{RemoteMetrics, RemoteStatus, SftpTransferKind};
 
 /// Clone the active terminal's `Entity` so a callback can forward calls to
 /// the backend without capturing a borrow on `terminal_views`.
@@ -307,10 +307,12 @@ pub fn render_content(
                 // Clone the download callback + terminal entity so the
                 // on_drop handler can trigger a download when the user
                 // drags an SFTP file row onto the terminal area.
+                let transfers_for_drop = ctx.transfers.clone();
                 let on_download_for_drop = term_entity_for_drop.clone().map(|entity| {
                     move |drag: &SftpDragValue, cx: &mut App| {
                         let remote_path = drag.remote_path.clone();
                         let name = drag.name.clone();
+                        let transfers = transfers_for_drop.clone();
                         let rx = cx.prompt_for_paths(PathPromptOptions {
                             files: false,
                             directories: true,
@@ -324,10 +326,28 @@ pub fn render_content(
                                 _ => None,
                             };
                             let Some(dest_dir) = picked else { return };
-                            let local_path = dest_dir.join(&name);
+                            let local_path = dest_dir.join(&name).to_string_lossy().into_owned();
                             let _ = cx.update(|cx| {
+                                // Same job registration as the SFTP panel's
+                                // download callback, so a dropped file is
+                                // pause/cancel-able from the transfer panel.
+                                let control = crabport_sftp::TransferControl::new();
+                                let label = crate::views::sftp::transfer_label(&remote_path);
+                                let job_control = control.clone();
+                                let _ = transfers.update(cx, |center, cx| {
+                                    center.start_job(
+                                        SftpTransferKind::Download,
+                                        label,
+                                        job_control,
+                                        cx,
+                                    );
+                                });
                                 entity.read_with(cx, |view, _cx| {
-                                    view.sftp_download(&remote_path, &local_path.to_string_lossy());
+                                    view.sftp_download_controlled(
+                                        &remote_path,
+                                        &local_path,
+                                        control,
+                                    );
                                 });
                             });
                         })
@@ -474,7 +494,7 @@ pub fn render_content(
                     context_menu.clone(),
                     alert_controller.clone(),
                     ctx.tooltip.clone(),
-                    ctx.transfer_history.clone(),
+                    ctx.transfers.clone(),
                     hosts.to_vec(),
                     handle.clone(),
                     window,
@@ -568,10 +588,46 @@ pub fn render_content(
     // active tab isn't a terminal or has no terminal entity.
 
     let sftp_navigate = term_cb!(sftp_term, (path: String), view => view.sftp_navigate(&path));
-    let sftp_download = term_cb!(sftp_term, (remote_path: String, local_path: String),
-        view => view.sftp_download(&remote_path, &local_path));
-    let sftp_upload = term_cb!(sftp_term, (local_path: String, remote_path: String),
-        view => view.sftp_upload(&local_path, &remote_path));
+    // Downloads / uploads started from the right-hand SFTP panel register a
+    // job with the global transfer center before hitting the backend, so the
+    // transfer panel can show them with pause / cancel controls. (The plain
+    // `sftp_download` / `sftp_upload` wrappers are used by paths that don't
+    // have a center handle — e.g. the AI tools.)
+    let transfers_for_sftp = ctx.transfers.clone();
+    let sftp_download: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            let transfers = transfers_for_sftp.clone();
+            Rc::new(
+                move |remote_path: String, local_path: String, cx: &mut App| {
+                    let control = crabport_sftp::TransferControl::new();
+                    let label = crate::views::sftp::transfer_label(&remote_path);
+                    let job_control = control.clone();
+                    let _ = transfers.update(cx, |center, cx| {
+                        center.start_job(SftpTransferKind::Download, label, job_control, cx);
+                    });
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_download_controlled(&remote_path, &local_path, control);
+                    });
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
+    let sftp_upload: Option<Rc<dyn Fn(String, String, &mut App)>> =
+        sftp_term.clone().map(|entity| {
+            let transfers = transfers_for_sftp.clone();
+            Rc::new(
+                move |local_path: String, remote_path: String, cx: &mut App| {
+                    let control = crabport_sftp::TransferControl::new();
+                    let label = crate::views::sftp::transfer_label(&local_path);
+                    let job_control = control.clone();
+                    let _ = transfers.update(cx, |center, cx| {
+                        center.start_job(SftpTransferKind::Upload, label, job_control, cx);
+                    });
+                    entity.read_with(cx, |view, _cx| {
+                        view.sftp_upload_controlled(&local_path, &remote_path, control);
+                    });
+                },
+            ) as Rc<dyn Fn(String, String, &mut App)>
+        });
     let sftp_delete =
         term_cb!(sftp_term, (remote_path: String), view => view.sftp_delete(&remote_path));
     let sftp_rename = term_cb!(sftp_term, (old_path: String, new_path: String),
@@ -923,15 +979,22 @@ pub fn render_content(
             // terminal toolbar knowing about SFTP. Terminal tabs pass an
             // empty vec (no trailing buttons).
             if is_sftp_tab {
-                let transfer_history = ctx.transfer_history.clone();
-                let on = transfer_history.read_with(cx, |c, _| c.is_open());
-                vec![
-                    crate::views::sftp::render_sftp_history_toggle(transfer_history, on)
-                        .into_any_element(),
-                ]
+                let transfers = ctx.transfers.clone();
+                let on = transfers.read_with(cx, |c, _| c.is_open());
+                vec![crate::views::sftp::render_transfers_toggle(transfers, on).into_any_element()]
             } else {
                 Vec::new()
             },
+            // Clicking the in-flight transfer chip expands the transfer
+            // panel (anchored at the chip), so pause / cancel are one click
+            // away from the status the user is looking at.
+            Some(std::rc::Rc::new({
+                let transfers = ctx.transfers.clone();
+                move |pos: gpui::Point<gpui::Pixels>, cx: &mut App| {
+                    let _ = transfers.update(cx, |c, cx| c.toggle(pos, cx));
+                }
+            })
+                as std::rc::Rc<dyn Fn(gpui::Point<gpui::Pixels>, &mut App)>),
             {
                 let handle = handle.clone();
                 move |id, cx| {

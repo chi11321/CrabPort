@@ -148,7 +148,12 @@ async fn sftp_download_dir_via_tar(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let unpack_dir_str = unpack_dir.to_string_lossy().into_owned();
     let res = s
-        .download_dir(&tmp, &unpack_dir_str, Some(progress_cb))
+        .download_dir(
+            &tmp,
+            &unpack_dir_str,
+            Some(progress_cb),
+            backend.control.as_deref(),
+        )
         .await;
     backend.return_sftp(s, res).await?;
 
@@ -187,7 +192,13 @@ async fn sftp_upload_dir_via_tar(
     progress_cb(0);
     let s = backend.take_or_open_sftp().await?;
     let res = s
-        .upload_dir(local_path, &tmp, &remote_base, Some(progress_cb))
+        .upload_dir(
+            local_path,
+            &tmp,
+            &remote_base,
+            Some(progress_cb),
+            backend.control.as_deref(),
+        )
         .await;
     backend.return_sftp(s, res).await?;
 

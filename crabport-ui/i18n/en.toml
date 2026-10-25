@@ -290,8 +290,11 @@ drop_upload_hint = "Drop files to upload"
 drag_download_hint = "Drag to terminal to download"
 history_title = "Transfer history"
 history_empty = "No transfers yet"
-history_status_success = "Success"
-history_status_failed = "Failed"
+transfers_title = "Transfers"
+transfer_paused = "Paused"
+transfer_cancelling = "Cancelling"
+transfer_cancelled = "Cancelled"
+transfer_waiting = "Waiting"
 
 [sftp.progress]
 download = "Download"
