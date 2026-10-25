@@ -397,43 +397,93 @@ pub fn format_byte_ratio(done: u64, total: u64) -> String {
 ///
 /// Lifted verbatim from the previous terminal-toolbar module so the SFTP
 /// progress chip keeps its existing behavior.
+/// directory) and tail (filename) visible with `…` between them.
+///
+/// Lifted from the previous terminal-toolbar module so the SFTP progress
+/// chip keeps its existing behavior.
+///
+/// **All measurements are in characters, not bytes.** Paths routinely
+/// contain CJK names (e.g. `第二课堂__秦子皓.zip`); slicing a `&str` by a
+/// byte offset lands mid-codepoint and panics the whole UI thread.
 pub fn truncate_path_middle(path: &str, max: usize) -> String {
-    if path.len() <= max {
+    // Take the first / last `n` characters of `s`.
+    fn head_chars(s: &str, n: usize) -> String {
+        s.chars().take(n).collect()
+    }
+    fn tail_chars(s: &str, n: usize) -> String {
+        let count = s.chars().count();
+        s.chars().skip(count.saturating_sub(n)).collect()
+    }
+
+    let char_len = path.chars().count();
+    if char_len <= max {
         return path.to_string();
     }
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let is_absolute = path.starts_with('/');
     let prefix = if is_absolute { "/" } else { "" };
+    let prefix_len = prefix.chars().count();
 
     if parts.len() >= 3 {
         let head = parts[0];
-        let tail = parts.last().unwrap();
+        let tail = *parts.last().unwrap();
+        let head_len = head.chars().count();
         let candidate = format!("{prefix}{head}/…/{tail}");
-        if candidate.len() <= max {
+        if candidate.chars().count() <= max {
             return candidate;
         }
-        let budget = max.saturating_sub(prefix.len() + head.len() + 4); // "/…/…"
+        let budget = max.saturating_sub(prefix_len + head_len + 4); // "/…/…"
         if budget > 4 {
             let half = budget / 2;
-            let t_len = tail.len();
-            if t_len > budget {
-                let keep_head = &tail[..half];
-                let keep_tail = &tail[t_len - half..];
+            if tail.chars().count() > budget {
+                let keep_head = head_chars(tail, half);
+                let keep_tail = tail_chars(tail, half);
                 return format!("{prefix}{head}/…/{keep_head}…{keep_tail}");
             }
         }
-        let tail_budget = max.saturating_sub(prefix.len() + head.len() + 3); // "/…"
+        let tail_budget = max.saturating_sub(prefix_len + head_len + 3); // "/…"
         let cut = tail_budget.saturating_sub(1).max(1);
-        return format!("{prefix}{head}/…/{}…", &tail[..cut.min(tail.len())]);
+        return format!("{prefix}{head}/…/{}…", head_chars(tail, cut));
     }
 
     let cut = max.saturating_sub(1);
     let half = cut / 2;
-    let chars: Vec<char> = path.chars().collect();
-    if chars.len() > cut {
-        let head: String = chars[..half].iter().collect();
-        let tail: String = chars[chars.len() - half..].iter().collect();
+    if char_len > cut {
+        let head = head_chars(path, half);
+        let tail = tail_chars(path, half);
         return format!("{head}…{tail}");
     }
-    path.chars().take(cut).collect::<String>() + "…"
+    head_chars(path, cut) + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_path_middle;
+
+    #[test]
+    fn short_paths_are_returned_unchanged() {
+        assert_eq!(truncate_path_middle("/a/b.txt", 40), "/a/b.txt");
+        assert_eq!(truncate_path_middle("第二课堂.zip", 40), "第二课堂.zip");
+    }
+
+    /// Regression: a CJK path used to panic the UI thread because the
+    /// multi-segment branch sliced `&tail[..n]` by *byte* offset.
+    #[test]
+    fn cjk_paths_truncate_without_panicking() {
+        let path = "/Users/weed/课程/第二课堂__秦子皓_2208210127.zip";
+        let out = truncate_path_middle(path, 20);
+        assert!(
+            out.chars().count() <= 20,
+            "output wider than the limit: {out:?}"
+        );
+        assert!(out.contains('…'), "expected an ellipsis: {out:?}");
+    }
+
+    #[test]
+    fn cjk_filename_without_directories_truncates_by_char() {
+        assert_eq!(
+            truncate_path_middle("文件名称非常长的一个文件.txt", 10),
+            "文件名称….txt"
+        );
+    }
 }
