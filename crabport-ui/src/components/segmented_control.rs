@@ -198,13 +198,16 @@ impl RenderOnce for SegmentedControl {
                     } else {
                         inactive_color
                     }))
-                    .bg(rgba(0x24273a00))
+                    .bg(rgba(0x00000000))
                     .with_transition(tab_id)
                     .transition_on_hover(duration_base(), EASE_STANDARD, move |hovered, state| {
                         if *hovered {
-                            state.bg(rgba(0x24273a80))
+                            // Theme-derived wash (was a hardcoded purple-gray that
+                            // ignored the active palette — it looked wrong on
+                            // Tokyo Night / custom themes).
+                            state.bg(rgba((surface_hover() << 8) | 0x80))
                         } else {
-                            state.bg(rgba(0x24273a00))
+                            state.bg(rgba(0x00000000))
                         }
                     })
                     .transition_when_else(
@@ -261,7 +264,10 @@ impl RenderOnce for SegmentedControl {
 
         let mut root = div()
             .id(self.id)
-            .bg(rgb(surface_active()))
+            // Softer than `surface_active`: the strip is chrome, not a control
+            // the user presses. The sliding `bg_base` indicator supplies the
+            // contrast for the selected tab.
+            .bg(rgb(surface_hover()))
             .rounded(RADIUS_MD)
             .p_0p5()
             .child(inner);

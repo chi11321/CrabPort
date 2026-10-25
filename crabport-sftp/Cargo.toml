@@ -7,7 +7,7 @@ edition.workspace = true
 anyhow = "1"
 russh = "0.45"
 russh-sftp = "2"
-tokio = { version = "1", features = ["rt", "fs", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "fs", "io-util", "macros", "sync"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tar = "0.4"
 flate2 = "1"

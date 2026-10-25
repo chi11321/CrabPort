@@ -266,7 +266,7 @@ impl CrabportApp {
         let tooltip = cx.new(|_cx| crate::components::tooltip::TooltipController::new());
         let notifications =
             cx.new(|_cx| NotificationController::new(NotificationPosition::BottomRight));
-        let transfer_history = cx.new(|_cx| crate::views::sftp::TransferHistoryController::new());
+        let transfers = cx.new(|_cx| crate::views::sftp::TransferCenter::new());
         let tunnels = Arc::new(crate::views::tunnels::TunnelRegistry::new());
 
         // Read persisted data through the shared global store. The global
@@ -295,7 +295,7 @@ impl CrabportApp {
             context_menu,
             tooltip,
             notifications,
-            transfer_history,
+            transfers,
             tunnels,
             command_palette,
             sftp_panel,
@@ -647,7 +647,7 @@ impl Render for CrabportApp {
             // -- Global toast notifications --
             .child(self.app_ctx.notifications.clone())
             // -- Global SFTP transfer-history popover --
-            .child(self.app_ctx.transfer_history.clone())
+            .child(self.app_ctx.transfers.clone())
             // -- Group form overlay (new / rename group, shared across kinds) --
             .when_some(group_form_state, |el, state| {
                 el.child(crate::views::groups::GroupFormView::new(

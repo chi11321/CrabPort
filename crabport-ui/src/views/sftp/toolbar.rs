@@ -5,43 +5,40 @@
 //! `crabport-ui/src/views/terminal/toolbar.rs`). The terminal toolbar
 //! owns the "metrics + SFTP progress" slots; this module owns the
 //! SFTP-tab-only actions that don't fit the slot model — currently just
-//! the "transfer history" toggle button, which toggles the global
-//! [`TransferHistoryController`] popover instead of a slot.
+//! the transfer-panel toggle button, which opens the global
+//! [`TransferCenter`] (live jobs with pause / cancel, plus recent history).
 
 use gpui::*;
 use gpui_animation::animation::TransitionExt;
 
 use crate::color::*;
 use crate::motion::{EASE_STANDARD, RADIUS_SM, duration_slower};
-use crate::views::sftp::TransferHistoryController;
+use crate::views::sftp::TransferCenter;
 
 // ---------------------------------------------------------------------------
-// render_sftp_history_toggle
+// render_transfers_toggle
 // ---------------------------------------------------------------------------
 
-/// Render the "SFTP transfer history" toggle button shown in the SFTP
-/// tab's toolbar (right-aligned, before the gear icon).
+/// Render the transfer-panel toggle button shown in the SFTP tab's toolbar
+/// (right-aligned, before the history button).
 ///
 /// Ghost button mirroring the terminal pane's split buttons: default bg
 /// is fully transparent so it blends with the toolbar background; the
-/// `selected` state (i.e. the popover is currently open) tints the bg
+/// `selected` state (i.e. the panel is currently open) tints the bg
 /// and switches the icon to `text_primary()` so the user can tell at a
-/// glance whether the popover is open.
+/// glance whether the panel is open.
 ///
 /// On click the button calls `controller.toggle(event.position)` so the
-/// popover anchors to the button. The controller is the global
-/// [`TransferHistoryController`] entity held by `AppCtx` — same pattern
-/// as the context-menu / tooltip controllers.
+/// panel anchors to the button. Clicking the in-flight progress chip in the
+/// toolbar does the same thing (see `render_terminal_toolbar`), so both
+/// affordances lead to the same panel.
 ///
 /// `on` is the controller's current open state, read by the caller
 /// (which has a `&App` available). We take it as a param rather than
 /// reading inside the element builder because `Entity::read_with`
 /// needs a `&App` that isn't available at element-build time.
-pub fn render_sftp_history_toggle(
-    controller: Entity<TransferHistoryController>,
-    on: bool,
-) -> impl IntoElement {
-    let btn_id = ElementId::Name("sftp-history-toggle".into());
+pub fn render_transfers_toggle(controller: Entity<TransferCenter>, on: bool) -> impl IntoElement {
+    let btn_id = ElementId::Name("sftp-transfers-toggle".into());
 
     // Resting bg: transparent (alpha 0) so the toolbar background reads
     // through. The `selected` state swaps in `surface_hover()` with full

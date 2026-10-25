@@ -160,7 +160,12 @@ async fn sftp_upload_batch_via_tar(
     let s = backend.take_or_open_sftp().await?;
     let local_tmp_str = local_tmp.to_string_lossy().into_owned();
     let res = s
-        .upload_file(&local_tmp_str, &remote_tmp, Some(progress_cb))
+        .upload_file(
+            &local_tmp_str,
+            &remote_tmp,
+            Some(progress_cb),
+            backend.control.as_deref(),
+        )
         .await;
     backend.return_sftp(s, res).await?;
 

@@ -1167,6 +1167,41 @@ impl TerminalView {
         self.backend.sftp_upload_batch(items);
     }
 
+    /// Controlled variants: the transfer observes `control`, so the transfer
+    /// panel can pause / resume / cancel it and read live byte progress.
+    ///
+    /// See [`crabport_sftp::TransferControl`] and
+    /// [`crabport_terminal::terminal::CrabPortTerminal::sftp_download_controlled`].
+    pub fn sftp_download_controlled(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.session
+            .sftp_download_controlled(remote_path, local_path, control);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    pub fn sftp_upload_controlled(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.session
+            .sftp_upload_controlled(local_path, remote_path, control);
+    }
+
+    /// See [`Self::sftp_download_controlled`].
+    pub fn sftp_upload_batch_controlled(
+        &self,
+        items: &[(String, String)],
+        control: std::sync::Arc<crabport_sftp::TransferControl>,
+    ) {
+        self.session.sftp_upload_batch_controlled(items, control);
+    }
+
     /// Snapshot of this session's command history, most-recent-first.
     /// Returns an empty vec for local terminals or sessions without a
     /// backend that tracks history.

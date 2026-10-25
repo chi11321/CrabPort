@@ -4,6 +4,7 @@ use async_broadcast::Sender as BroadcastSender;
 use tokio::sync::Mutex as TokioMutex;
 
 use crabport_sftp::CrabPortSftp;
+use crabport_sftp::TransferControl;
 use crabport_terminal::terminal::{
     BackendEvent, SftpTransferBytes, SftpTransferKind, SftpTransferStage,
 };
@@ -26,6 +27,22 @@ pub(crate) struct SftpTransferHandle {
     /// handle is constructed by code paths that don't have an `event_tx`
     /// (e.g. tests); in that case progress is simply not reported.
     pub(crate) event_tx: Option<BroadcastSender<BackendEvent>>,
+    /// Optional pause / cancel + progress mirror for the panel. `None` for
+    /// transfers started through the legacy fire-and-forget methods (and for
+    /// tests) — the transfer then runs to completion with no user control.
+    pub(crate) control: Option<Arc<TransferControl>>,
+}
+
+/// Map the terminal crate's stage enum onto the control's `u8` stage ids.
+/// Kept here (rather than in `crabport-sftp`) because that crate sits below
+/// the one that defines the enum.
+fn stage_id(stage: SftpTransferStage) -> u8 {
+    match stage {
+        SftpTransferStage::Compress => crabport_sftp::STAGE_COMPRESS,
+        SftpTransferStage::Transfer => crabport_sftp::STAGE_TRANSFER,
+        SftpTransferStage::Decompress => crabport_sftp::STAGE_DECOMPRESS,
+        SftpTransferStage::CleanUp => crabport_sftp::STAGE_CLEANUP,
+    }
 }
 
 impl SftpTransferHandle {
@@ -93,6 +110,9 @@ impl SftpTransferHandle {
         let Some(tx) = self.event_tx.as_ref() else {
             return;
         };
+        if let Some(c) = self.control.as_ref() {
+            c.set_stage(stage_id(stage));
+        }
         let _ = tx
             .broadcast(BackendEvent::SftpTransferProgress {
                 kind,
@@ -119,9 +139,17 @@ impl SftpTransferHandle {
         total: u64,
     ) -> Arc<dyn Fn(u64) + Send + Sync> {
         let tx = self.event_tx.clone();
+        let control = self.control.clone();
         let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let message = std::sync::Arc::new(message);
         Arc::new(move |done: u64| {
+            // Mirror every chunk into the control (unthrottled) so the
+            // panel's progress bar is smooth even though the broadcast
+            // event below is throttled.
+            if let Some(c) = control.as_ref() {
+                c.set_progress(done, total);
+                c.set_stage(crabport_sftp::STAGE_TRANSFER);
+            }
             // Throttle: only emit if at least 100ms of wall-clock has passed
             // since the last emit. We approximate "time" with a monotonic
             // nanos counter stored in the atomic — this avoids pulling in a

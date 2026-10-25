@@ -162,7 +162,7 @@ pub struct SftpTabView {
     pub(super) context_menu: Option<Entity<ContextMenuController>>,
     pub(super) alert_controller: Option<Entity<AlertController>>,
     pub(super) tooltip: Option<Entity<crate::components::tooltip::TooltipController>>,
-    pub(super) transfer_history: Option<Entity<crate::views::sftp::TransferHistoryController>>,
+    pub(super) transfers: Option<Entity<crate::views::sftp::TransferCenter>>,
 
     // --- Host selector overlay ---
     pub(super) host_selector: Option<Entity<HostSelectorOverlay>>,
@@ -179,7 +179,7 @@ impl SftpTabView {
             context_menu: None,
             alert_controller: None,
             tooltip: None,
-            transfer_history: None,
+            transfers: None,
             host_selector: None,
             host_selector_open_for: None,
             hosts: Vec::new(),
@@ -328,7 +328,7 @@ impl SftpTabView {
         context_menu: Entity<ContextMenuController>,
         alert_controller: Entity<AlertController>,
         tooltip: Entity<crate::components::tooltip::TooltipController>,
-        transfer_history: Entity<crate::views::sftp::TransferHistoryController>,
+        transfers: Entity<crate::views::sftp::TransferCenter>,
         hosts: Vec<ConnectionHost>,
         app: Entity<CrabportApp>,
         window: &mut Window,
@@ -380,7 +380,7 @@ impl SftpTabView {
         }
         self.hosts = hosts;
         self.app = Some(app);
-        self.transfer_history = Some(transfer_history);
+        self.transfers = Some(transfers);
         // Keep the overlay's host list in sync.
         if let Some(ref overlay) = self.host_selector {
             overlay.update(cx, |o, cx| {
@@ -873,35 +873,58 @@ impl SftpTabView {
 
         // Wire callbacks for SFTP progress + transfer notifications.
         let app_handle = self.app.clone().map(|e| e.downgrade());
+        let transfers_for_progress = self.transfers.clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_progress_changed(move |cx| {
                 if let Some(ref ah) = app_handle {
                     let _ = ah.update(cx, |_, cx| cx.notify());
                 }
+                // Repaint the open transfer panel so its job rows animate with
+                // the backend's byte counters (the panel reads the control
+                // directly rather than the broadcast snapshot).
+                if let Some(ref tc) = transfers_for_progress {
+                    let _ = tc.update(cx, |c, cx| {
+                        if c.is_open() {
+                            cx.notify();
+                        }
+                    });
+                }
             });
         });
 
         let app_handle = self.app.clone().map(|e| e.downgrade());
-        let transfer_history_ctrl = self.transfer_history.clone();
+        let transfers_ctrl = self.transfers.clone();
         terminal_view.update(cx, |view, _cx| {
             view.set_on_sftp_transfer_finished(move |kind, success, message, cx| {
-                // Append to the global transfer-history controller so
-                // the popover can display it. Done before the early-return
-                // arms below (Rename/Edit on success skip the toast but
-                // should still be logged in history).
-                let record = crate::views::sftp::TransferRecord {
-                    kind,
-                    success,
-                    message: message.clone(),
-                    finished_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0),
-                };
-                if let Some(ref ctrl) = transfer_history_ctrl {
-                    let _ = ctrl.update(cx, |c, cx| {
-                        c.push(record, cx);
-                    });
+                // Repaint the panel so a finished job is retired into history
+                // on the next render (its control carries the outcome). Also
+                // handled by the progress callback at the end of a transfer,
+                // but a cancelled transfer may never emit a final progress
+                // event.
+                if let Some(ref ctrl) = transfers_ctrl {
+                    let _ = ctrl.update(cx, |_, cx| cx.notify());
+                }
+                // Uploads and downloads are already recorded by the transfer
+                // center when it retires their job (it owns the control and
+                // therefore the outcome). Pushing them here too would
+                // duplicate every row. The remaining kinds don't run as jobs
+                // (`Rename` / `Edit` / `Delete` / `Mkdir`), so record them
+                // directly.
+                if !matches!(kind, SftpTransferKind::Upload | SftpTransferKind::Download) {
+                    let record = crate::views::sftp::TransferRecord {
+                        kind,
+                        success,
+                        message: message.clone(),
+                        finished_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    };
+                    if let Some(ref ctrl) = transfers_ctrl {
+                        let _ = ctrl.update(cx, |c, cx| {
+                            c.push(record, cx);
+                        });
+                    }
                 }
                 let Some(ref ah) = app_handle else { return };
                 let _ = ah.update(cx, |app, cx| {
@@ -992,7 +1015,10 @@ impl SftpTabView {
             });
         });
 
-        // Wire SFTP callbacks for this panel.
+        // Wire SFTP callbacks for this panel. Downloads / uploads are
+        // registered with the global transfer center first, so the panel can
+        // show them immediately and offer pause / cancel; the backend then
+        // runs the transfer against the job's control handle.
         let term = terminal_view.clone();
         let on_navigate: Rc<dyn Fn(String, &mut App)> = Rc::new({
             let term = term.clone();
@@ -1004,25 +1030,55 @@ impl SftpTabView {
         });
         let on_download: Rc<dyn Fn(String, String, &mut App)> = Rc::new({
             let term = term.clone();
+            let transfers = self.transfers.clone();
             move |remote_path: String, local_path: String, cx: &mut App| {
+                let control = crabport_sftp::TransferControl::new();
+                let label = crate::views::sftp::transfer_label(&remote_path);
+                if let Some(ref tc) = transfers {
+                    let job_control = control.clone();
+                    let _ = tc.update(cx, |center, cx| {
+                        center.start_job(SftpTransferKind::Download, label, job_control, cx);
+                    });
+                }
                 term.read_with(cx, |view, _cx| {
-                    view.sftp_download(&remote_path, &local_path);
+                    view.sftp_download_controlled(&remote_path, &local_path, control);
                 });
             }
         });
         let on_upload: Rc<dyn Fn(String, String, &mut App)> = Rc::new({
             let term = term.clone();
+            let transfers = self.transfers.clone();
             move |local_path: String, remote_path: String, cx: &mut App| {
+                let control = crabport_sftp::TransferControl::new();
+                let label = crate::views::sftp::transfer_label(&local_path);
+                if let Some(ref tc) = transfers {
+                    let job_control = control.clone();
+                    let _ = tc.update(cx, |center, cx| {
+                        center.start_job(SftpTransferKind::Upload, label, job_control, cx);
+                    });
+                }
                 term.read_with(cx, |view, _cx| {
-                    view.sftp_upload(&local_path, &remote_path);
+                    view.sftp_upload_controlled(&local_path, &remote_path, control);
                 });
             }
         });
         let on_upload_batch: Rc<dyn Fn(Vec<(String, String)>, &mut App)> = Rc::new({
             let term = term.clone();
+            let transfers = self.transfers.clone();
             move |items: Vec<(String, String)>, cx: &mut App| {
+                if items.is_empty() {
+                    return;
+                }
+                let control = crabport_sftp::TransferControl::new();
+                let label = t!("sftp.upload_n", count = items.len()).to_string();
+                if let Some(ref tc) = transfers {
+                    let job_control = control.clone();
+                    let _ = tc.update(cx, |center, cx| {
+                        center.start_job(SftpTransferKind::Upload, label, job_control, cx);
+                    });
+                }
                 term.read_with(cx, |view, _cx| {
-                    view.sftp_upload_batch(&items);
+                    view.sftp_upload_batch_controlled(&items, control);
                 });
             }
         });

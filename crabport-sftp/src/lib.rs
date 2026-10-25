@@ -7,9 +7,13 @@
 mod api;
 mod archive;
 mod backend;
+mod control;
 mod entry;
 mod transfer;
 
 pub use api::CrabPortSftp;
 pub use backend::SftpBackend;
+pub use control::{
+    STAGE_CLEANUP, STAGE_COMPRESS, STAGE_DECOMPRESS, STAGE_NONE, STAGE_TRANSFER, TransferControl,
+};
 pub use entry::FileEntry;

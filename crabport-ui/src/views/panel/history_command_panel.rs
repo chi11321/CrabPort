@@ -117,7 +117,7 @@ impl HistoryCommandPanel {
 
 /// Fixed height of each history row. The virtual list requires uniform
 /// item sizes.
-const ROW_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = 32.0;
 
 impl Render for HistoryCommandPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

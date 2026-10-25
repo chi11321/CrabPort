@@ -12,11 +12,11 @@ mod helpers;
 pub(crate) mod pane;
 mod panel;
 pub mod toolbar;
-pub mod transfer_history;
+pub mod transfer_center;
 pub mod view;
 
 pub use drag::{LocalFileDragValue, SftpDragValue};
 pub(crate) use helpers::upload_picker_options;
-pub use toolbar::render_sftp_history_toggle;
-pub use transfer_history::{TransferHistoryController, TransferRecord};
+pub use toolbar::render_transfers_toggle;
+pub use transfer_center::{TransferCenter, TransferJob, TransferRecord, transfer_label};
 pub use view::{PanelHost, SftpTabView};

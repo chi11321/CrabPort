@@ -210,7 +210,11 @@ impl TunnelsPanel {
 
 /// Fixed height of each tunnel row. The virtual list requires uniform
 /// item sizes.
-const ROW_HEIGHT: f32 = 36.0;
+///
+/// 52px fits the two-line layout (name + address) with real breathing room.
+/// The previous 36px packed two 12px lines edge to edge, which read as a
+/// dense wall of text in the narrow side panel.
+const ROW_HEIGHT: f32 = 52.0;
 
 impl Render for TunnelsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -414,13 +418,14 @@ impl Render for TunnelsPanel {
                                 Some(&mut view.tab_states.entry(id).or_default().hovered_row)
                             },
                         )
-                        // Kind badge (single letter, color-coded).
+                        // Kind badge (single letter, color-coded). Sized to
+                        // match the taller 52px row so it doesn't look lost.
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .size_4()
+                                .size_5()
                                 .rounded(px(3.0))
                                 .bg(rgba((kind_color << 8) | 0x22))
                                 .text_xs()
@@ -435,9 +440,10 @@ impl Render for TunnelsPanel {
                                 .min_w_0()
                                 .flex()
                                 .flex_col()
+                                .gap_0p5()
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(text_primary()))
                                         .whitespace_nowrap()
