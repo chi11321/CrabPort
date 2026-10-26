@@ -26,7 +26,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 /// A single known_hosts entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +83,23 @@ pub enum LookupResult {
     },
 }
 
+/// Serializes read-modify-write cycles across every handle in the process.
+///
+/// Each SSH connection opens its own [`KnownHosts`] and the Settings window
+/// opens another, so without this a concurrent TOFU `add` could read the file
+/// before a `remove` rewrote it and then write the deleted entry back. The
+/// lock is process-local — an external editor still races, which is why the
+/// file keeps its "do not edit while the app is running" header.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+fn store_lock() -> MutexGuard<'static, ()> {
+    // A panic while holding the lock must not disable known_hosts for the
+    // rest of the process; the data is a plain file, so recovering is safe.
+    STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Persistent known_hosts store backed by a plain text file.
 pub struct KnownHosts {
     path: PathBuf,
@@ -97,9 +115,20 @@ impl KnownHosts {
         })
     }
 
+    /// Where [`Self::open`] stores the file, whether or not it exists yet.
+    /// Lets the UI show / reveal the path before the first host is trusted.
+    pub fn default_path() -> std::io::Result<PathBuf> {
+        Ok(default_data_dir()?.join("known_hosts"))
+    }
+
     /// Open at an explicit path (mainly for tests).
     pub fn open_at(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// The file backing this store.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Read all entries currently in the file.
@@ -158,11 +187,49 @@ impl KnownHosts {
         }
     }
 
+    /// Every stored entry, sorted by host, port and algorithm.
+    pub fn list(&self) -> std::io::Result<Vec<KnownHost>> {
+        let mut entries: Vec<KnownHost> = self.read_all()?.into_iter().collect();
+        entries.sort_by(|a, b| {
+            a.host
+                .cmp(&b.host)
+                .then(a.port.cmp(&b.port))
+                .then(a.algo.cmp(&b.algo))
+                .then(a.fingerprint.cmp(&b.fingerprint))
+        });
+        Ok(entries)
+    }
+
     /// Persist a new trusted entry. Rewrites the file atomically.
     pub fn add(&self, entry: &KnownHost) -> std::io::Result<()> {
+        let _guard = store_lock();
         let mut all = self.read_all()?;
         all.insert(entry.clone());
+        self.write_all(&all)
+    }
 
+    /// Remove one trusted key. Returns `false` when it was not stored (the
+    /// caller may be looking at a stale snapshot).
+    pub fn remove(&self, entry: &KnownHost) -> std::io::Result<bool> {
+        let _guard = store_lock();
+        let mut all = self.read_all()?;
+        if !all.remove(entry) {
+            return Ok(false);
+        }
+        self.write_all(&all)?;
+        Ok(true)
+    }
+
+    /// Forget every trusted key. Leaves the file in place (header only) so
+    /// the next connect starts from a clean TOFU state.
+    pub fn clear(&self) -> std::io::Result<()> {
+        let _guard = store_lock();
+        self.write_all(&HashSet::new())
+    }
+
+    /// Atomically rewrite the store with `all`. Callers must hold
+    /// [`STORE_LOCK`].
+    fn write_all(&self, all: &HashSet<KnownHost>) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -235,7 +302,8 @@ mod tests {
 
         // Unknown host:port → NotFound (ask the user).
         assert_eq!(
-            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa")
+                .unwrap(),
             LookupResult::NotFound
         );
 
@@ -243,12 +311,16 @@ mod tests {
         kh.add(&entry("example.com", 22, "ssh-ed25519", "SHA256:aaa"))
             .unwrap();
         assert_eq!(
-            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:aaa")
+                .unwrap(),
             LookupResult::Matched
         );
 
         // Same host, different key → Mismatched with the stored expectation.
-        match kh.lookup("example.com", 22, "ssh-ed25519", "SHA256:EVIL").unwrap() {
+        match kh
+            .lookup("example.com", 22, "ssh-ed25519", "SHA256:EVIL")
+            .unwrap()
+        {
             LookupResult::Mismatched {
                 expected_algo,
                 expected_fingerprint,
@@ -261,7 +333,8 @@ mod tests {
 
         // Same host on a different port is a separate TOFU decision.
         assert_eq!(
-            kh.lookup("example.com", 2222, "ssh-ed25519", "SHA256:aaa").unwrap(),
+            kh.lookup("example.com", 2222, "ssh-ed25519", "SHA256:aaa")
+                .unwrap(),
             LookupResult::NotFound
         );
 
@@ -300,7 +373,8 @@ mod tests {
         let path = tmp_path("multi-algo");
         let kh = KnownHosts::open_at(path.clone());
         kh.add(&entry("h", 22, "ssh-ed25519", "SHA256:ed")).unwrap();
-        kh.add(&entry("h", 22, "rsa-sha2-512", "SHA256:rsa")).unwrap();
+        kh.add(&entry("h", 22, "rsa-sha2-512", "SHA256:rsa"))
+            .unwrap();
 
         assert_eq!(
             kh.lookup("h", 22, "ssh-ed25519", "SHA256:ed").unwrap(),
@@ -310,6 +384,72 @@ mod tests {
             kh.lookup("h", 22, "rsa-sha2-512", "SHA256:rsa").unwrap(),
             LookupResult::Matched
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_is_sorted_and_skips_malformed_lines() {
+        let path = tmp_path("list");
+        let kh = KnownHosts::open_at(path.clone());
+        kh.add(&entry("b.example", 22, "ssh-ed25519", "SHA256:b"))
+            .unwrap();
+        kh.add(&entry("a.example", 2222, "ssh-rsa", "SHA256:a2"))
+            .unwrap();
+        kh.add(&entry("a.example", 22, "ssh-rsa", "SHA256:a1"))
+            .unwrap();
+
+        // Junk lines (hand edits) don't reach the list.
+        let mut contents = fs::read_to_string(&path).unwrap();
+        contents.push_str("not a known_hosts line\n\n");
+        fs::write(&path, contents).unwrap();
+
+        let listed = kh.list().unwrap();
+        let targets: Vec<(&str, u16)> = listed.iter().map(|e| (e.host.as_str(), e.port)).collect();
+        assert_eq!(
+            targets,
+            vec![("a.example", 22), ("a.example", 2222), ("b.example", 22),]
+        );
+        assert_eq!(kh.path(), path.as_path());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_deletes_one_entry_and_clear_empties_the_store() {
+        let path = tmp_path("remove-clear");
+        let kh = KnownHosts::open_at(path.clone());
+        let ed = entry("h", 22, "ssh-ed25519", "SHA256:ed");
+        let rsa = entry("h", 22, "ssh-rsa", "SHA256:rsa");
+        kh.add(&ed).unwrap();
+        kh.add(&rsa).unwrap();
+
+        // Removing one key leaves the host's other algorithm trusted.
+        assert!(kh.remove(&ed).unwrap());
+        assert_eq!(
+            kh.lookup("h", 22, "ssh-rsa", "SHA256:rsa").unwrap(),
+            LookupResult::Matched
+        );
+        assert_eq!(
+            kh.lookup("h", 22, "ssh-ed25519", "SHA256:ed").unwrap(),
+            LookupResult::Mismatched {
+                expected_algo: "ssh-rsa".into(),
+                expected_fingerprint: "SHA256:rsa".into(),
+            }
+        );
+        // Removing an entry that isn't stored is a no-op, not an error.
+        assert!(!kh.remove(&ed).unwrap());
+
+        kh.clear().unwrap();
+        assert!(kh.list().unwrap().is_empty());
+        assert_eq!(
+            kh.lookup("h", 22, "ssh-rsa", "SHA256:rsa").unwrap(),
+            LookupResult::NotFound
+        );
+        // The file survives with its header so the store stays discoverable.
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.starts_with('#'));
 
         let _ = fs::remove_file(&path);
     }
