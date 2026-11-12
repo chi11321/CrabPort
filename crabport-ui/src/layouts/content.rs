@@ -1133,7 +1133,7 @@ fn render_pane(
     let is_active = pane_id == active_pane;
     let view = pane_views.get(&pane_id).cloned();
     let view_for_focus = view.clone();
-    let ring_id = ElementId::Name(format!("pane-focus-{}-{}", tab_id, pane_id).into());
+    let glow_id = ElementId::Name(format!("pane-glow-{}-{}", tab_id, pane_id).into());
     let mut el = div()
         .id(ElementId::Name(
             format!("pane-{}-{}", tab_id, pane_id).into(),
@@ -1161,29 +1161,77 @@ fn render_pane(
     if let Some(view) = view {
         el = el.child(view);
     }
-    // The focus ring paints *after* the view, because TerminalView fills
-    // itself with an opaque `term_bg` — the old active-pane tint sat on this
+    // The glow paints *after* the view, because TerminalView fills itself
+    // with an opaque `term_bg` — the old active-pane tint sat on this
     // container and was painted over, which is why the focused pane was
-    // impossible to pick out. A plain bordered overlay has no listeners, so
-    // clicks and drags pass through to the terminal beneath; the ring fades
-    // in on the pane that takes focus and out of the one that loses it.
+    // impossible to pick out. The overlay has no listeners, so every click
+    // and drag passes through to the terminal beneath; the glow fades in on
+    // the pane that takes focus and out of the one that loses it.
     if multi_pane {
+        let glow = input_border_focused();
+        // Same hue at both stops so the fade never drifts gray in Hsla.
+        let lit = rgba((glow << 8) | 0x38);
+        let clear = rgba((glow << 8) | 0x00);
+        let glow_px = px(64.0);
+        // gpui 0.2 has two-stop linear gradients only, so the radial
+        // edge-to-centre wash is composed from one strip per side; the two
+        // neighbours overlap at each corner, pooling the light there.
+        let strip = |angle: f32| {
+            linear_gradient(
+                angle,
+                linear_color_stop(lit, 0.0),
+                linear_color_stop(clear, 1.0),
+            )
+        };
         el = el.child(
             div()
-                .id(ring_id.clone())
+                .id(glow_id.clone())
                 .absolute()
                 .inset_0()
-                // Pointer-events: none — the overlay is purely visual.
-                .bg(rgba(0x00000000))
-                .border_1()
-                .border_color(rgb(input_border_focused()))
-                .with_transition(ring_id)
+                // Pointer-events: none — the glow is purely visual.
+                .with_transition(glow_id)
                 .transition_when_else(
                     is_active,
                     duration_fast(),
                     EASE_STANDARD,
                     |el| el.opacity(1.0),
                     |el| el.opacity(0.0),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(glow_px)
+                        .bg(strip(180.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .h(glow_px)
+                        .bg(strip(0.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(glow_px)
+                        .bg(strip(90.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(glow_px)
+                        .bg(strip(270.0)),
                 ),
         );
     }
