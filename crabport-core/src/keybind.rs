@@ -211,3 +211,123 @@ pub fn resolve<'a>(keystroke: &Keystroke, bindings: &'a [Binding]) -> Option<&'a
         })
         .map(|b| &b.action)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key: &str, m: Modifiers) -> Keystroke {
+        Keystroke {
+            key: key.to_owned(),
+            key_char: None,
+            modifiers: m,
+        }
+    }
+
+    fn ctrl() -> Modifiers {
+        Modifiers {
+            control: true,
+            ..Modifiers::default()
+        }
+    }
+
+    #[test]
+    fn letters_map_to_their_control_byte() {
+        assert_eq!(control_byte(&key("c", ctrl())), Some(0x03));
+        assert_eq!(control_byte(&key("u", ctrl())), Some(0x15));
+        assert_eq!(control_byte(&key("z", ctrl())), Some(0x1a));
+    }
+
+    /// #88: gpui reports `Ctrl+Shift+-` as `key = "_"` with `shift` cleared,
+    /// so the key name is what has to map, and it must become US (0x1f) —
+    /// nano's go-to-line.
+    #[test]
+    fn shifted_punctuation_maps_by_its_key_name() {
+        assert_eq!(control_byte(&key("_", ctrl())), Some(0x1f));
+        assert_eq!(control_byte(&key("[", ctrl())), Some(0x1b));
+        assert_eq!(control_byte(&key("\\", ctrl())), Some(0x1c));
+        assert_eq!(control_byte(&key("]", ctrl())), Some(0x1d));
+        assert_eq!(control_byte(&key("^", ctrl())), Some(0x1e));
+        assert_eq!(control_byte(&key("@", ctrl())), Some(0x00));
+    }
+
+    #[test]
+    fn question_mark_is_del_not_us() {
+        assert_eq!(control_byte(&key("?", ctrl())), Some(0x7f));
+    }
+
+    #[test]
+    fn undefined_keys_fall_through() {
+        // `-` without Shift has no control byte (sending CR here would act
+        // like Enter in the shell).
+        assert_eq!(control_byte(&key("-", ctrl())), None);
+        assert_eq!(control_byte(&key("/", ctrl())), None);
+        assert_eq!(control_byte(&key("1", ctrl())), None);
+    }
+
+    #[test]
+    fn other_modifiers_never_map() {
+        let mut m = ctrl();
+        m.platform = true;
+        assert_eq!(control_byte(&key("_", m)), None);
+
+        let mut m = ctrl();
+        m.alt = true;
+        assert_eq!(control_byte(&key("_", m)), None);
+
+        let mut m = ctrl();
+        m.function = true;
+        assert_eq!(control_byte(&key("_", m)), None);
+
+        // Without Ctrl there is nothing to map.
+        assert_eq!(control_byte(&key("_", Modifiers::default())), None);
+    }
+
+    #[test]
+    fn multi_character_and_named_keys_do_not_map() {
+        assert_eq!(control_byte(&key("home", ctrl())), None);
+        assert_eq!(control_byte(&key("ab", ctrl())), None);
+    }
+}
+
+/// The control byte xterm would send for a key with `Ctrl` held and no ⌘,
+/// Option or Fn — the xterm/ECMA-48 control-character table:
+///
+/// | key | byte | key | byte |
+/// | --- | --- | --- | --- |
+/// | `a`–`z` | 0x01–0x1a | `@` `[` `\` `]` `^` `_` | 0x00–0x1f |
+/// | `?` | 0x7f (DEL) | | |
+///
+/// Keys outside that table (`-`, `/`, digits, …) have no defined control
+/// byte and yield `None`, so the key falls through unchanged.
+///
+/// This reads `key`, not `key_char`: gpui leaves `key_char` unset whenever
+/// Ctrl is held, and reports the shifted character as the key name with
+/// `shift` cleared — `Ctrl+Shift+-` arrives as `key = "_"` — so a binding
+/// named `ctrl-shift--` could never match and the key was silently dropped
+/// (#88). `Ctrl+_` and therefore `Ctrl+Shift+-` now send US (0x1f), which is
+/// nano's go-to-line.
+pub fn control_byte(keystroke: &Keystroke) -> Option<u8> {
+    let m = &keystroke.modifiers;
+    if !m.control || m.platform || m.alt || m.function {
+        return None;
+    }
+    let mut chars = keystroke.key.chars();
+    let (c, single) = match (chars.next(), chars.next()) {
+        (Some(c), None) => (c, true),
+        _ => return None,
+    };
+    if !single {
+        return None;
+    }
+    let lower = c.to_ascii_lowercase() as u8;
+    match lower {
+        // Ctrl+A–Z → 0x01–0x1a.
+        b'a'..=b'z' => Some(lower - b'a' + 0x01),
+        // Ctrl+@ [ \ ] ^ _ → 0x00–0x1f.
+        b'@'..=b'_' => Some(lower - b'@'),
+        // Ctrl+? is DEL, not US: 0x1f already belongs to Ctrl+_.
+        b'?' => Some(0x7f),
+        _ => None,
+    }
+}
