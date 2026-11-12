@@ -47,11 +47,6 @@ pub fn default_bindings() -> Vec<Binding> {
         ..Modifiers::default()
     };
 
-    let shift = Modifiers {
-        shift: true,
-        ..Modifiers::default()
-    };
-
     let ctrl_shift = Modifiers {
         control: true,
         shift: true,
@@ -60,11 +55,6 @@ pub fn default_bindings() -> Vec<Binding> {
 
     let platform = Modifiers {
         platform: true,
-        ..Modifiers::default()
-    };
-
-    let alt = Modifiers {
-        alt: true,
         ..Modifiers::default()
     };
 
@@ -128,6 +118,7 @@ pub fn default_bindings() -> Vec<Binding> {
         binding_ctrl("y", 0x19),
         binding_ctrl("z", 0x1a),
         // Ctrl+other keys
+        // ---- Ctrl+other keys ----
         Binding {
             modifiers: ctrl,
             key: "space",
@@ -169,179 +160,11 @@ pub fn default_bindings() -> Vec<Binding> {
             key: "escape",
             action: KeyAction::Bytes(vec![0x1b]),
         },
-        // ---- Cursor keys ----
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "up",
-            action: KeyAction::Bytes(b"\x1b[A".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "down",
-            action: KeyAction::Bytes(b"\x1b[B".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "right",
-            action: KeyAction::Bytes(b"\x1b[C".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "left",
-            action: KeyAction::Bytes(b"\x1b[D".to_vec()),
-        },
-        Binding {
-            modifiers: shift,
-            key: "up",
-            action: KeyAction::Bytes(b"\x1b[1;2A".to_vec()),
-        },
-        Binding {
-            modifiers: shift,
-            key: "down",
-            action: KeyAction::Bytes(b"\x1b[1;2B".to_vec()),
-        },
-        Binding {
-            modifiers: shift,
-            key: "right",
-            action: KeyAction::Bytes(b"\x1b[1;2C".to_vec()),
-        },
-        Binding {
-            modifiers: shift,
-            key: "left",
-            action: KeyAction::Bytes(b"\x1b[1;2D".to_vec()),
-        },
-        Binding {
-            modifiers: alt,
-            key: "up",
-            action: KeyAction::Bytes(b"\x1b[1;3A".to_vec()),
-        },
-        Binding {
-            modifiers: alt,
-            key: "down",
-            action: KeyAction::Bytes(b"\x1b[1;3B".to_vec()),
-        },
-        Binding {
-            modifiers: alt,
-            key: "right",
-            action: KeyAction::Bytes(b"\x1b[1;3C".to_vec()),
-        },
-        Binding {
-            modifiers: alt,
-            key: "left",
-            action: KeyAction::Bytes(b"\x1b[1;3D".to_vec()),
-        },
-        Binding {
-            modifiers: ctrl,
-            key: "up",
-            action: KeyAction::Bytes(b"\x1b[1;5A".to_vec()),
-        },
-        Binding {
-            modifiers: ctrl,
-            key: "down",
-            action: KeyAction::Bytes(b"\x1b[1;5B".to_vec()),
-        },
-        Binding {
-            modifiers: ctrl,
-            key: "right",
-            action: KeyAction::Bytes(b"\x1b[1;5C".to_vec()),
-        },
-        Binding {
-            modifiers: ctrl,
-            key: "left",
-            action: KeyAction::Bytes(b"\x1b[1;5D".to_vec()),
-        },
-        // ---- Home / End / PageUp / PageDown / Insert / Delete ----
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "home",
-            action: KeyAction::Bytes(b"\x1b[H".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "end",
-            action: KeyAction::Bytes(b"\x1b[F".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "pageup",
-            action: KeyAction::Bytes(b"\x1b[5~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "pagedown",
-            action: KeyAction::Bytes(b"\x1b[6~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "insert",
-            action: KeyAction::Bytes(b"\x1b[2~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "delete",
-            action: KeyAction::Bytes(b"\x1b[3~".to_vec()),
-        },
-        // ---- Function keys ----
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f1",
-            action: KeyAction::Bytes(b"\x1bOP".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f2",
-            action: KeyAction::Bytes(b"\x1bOQ".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f3",
-            action: KeyAction::Bytes(b"\x1bOR".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f4",
-            action: KeyAction::Bytes(b"\x1bOS".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f5",
-            action: KeyAction::Bytes(b"\x1b[15~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f6",
-            action: KeyAction::Bytes(b"\x1b[17~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f7",
-            action: KeyAction::Bytes(b"\x1b[18~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f8",
-            action: KeyAction::Bytes(b"\x1b[19~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f9",
-            action: KeyAction::Bytes(b"\x1b[20~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f10",
-            action: KeyAction::Bytes(b"\x1b[21~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f11",
-            action: KeyAction::Bytes(b"\x1b[23~".to_vec()),
-        },
-        Binding {
-            modifiers: Modifiers::default(),
-            key: "f12",
-            action: KeyAction::Bytes(b"\x1b[24~".to_vec()),
-        },
+        // Cursor keys, Home/End, PageUp/PageDown, Insert/Delete and F1–F12
+        // are encoded by [`encode_special_key`] at keypress time, so they can
+        // follow the program's DECCKM mode and the xterm modifier encoding —
+        // a static table can only ever send the unmodified CSI forms, which
+        // is what made the cursor keys wrong inside vim/less.
     ]
 }
 
