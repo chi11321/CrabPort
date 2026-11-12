@@ -1172,9 +1172,9 @@ fn render_pane(
         // Same hue at both stops so the fade never drifts gray in Hsla.
         let lit = rgba((glow << 8) | 0x38);
         let clear = rgba((glow << 8) | 0x00);
-        // A tight rim: the wash reaches only ~24pt in from each edge, so
+        // A tight rim: the wash reaches only ~12pt in from each edge, so
         // the terminal keeps its plain background across the middle.
-        let glow_px = px(24.0);
+        let glow_px = px(12.0);
         // gpui 0.2 has two-stop linear gradients only, so the radial
         // edge-to-centre wash is composed from one strip per side; the two
         // neighbours overlap at each corner, pooling the light there.
