@@ -273,7 +273,6 @@ pub fn render_content(
                         tab_id,
                         pane_views,
                         handle,
-                        ctx.tooltip.clone(),
                     )
                     .into_any_element()
                 } else if let Some(terminal_entity) = terminal_views.get(&tab_id) {
@@ -1052,7 +1051,6 @@ fn render_split_node(
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
-    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> AnyElement {
     use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
     match node {
@@ -1063,7 +1061,6 @@ fn render_split_node(
             tab_id,
             pane_views,
             handle,
-            tooltip_ctrl,
         )
         .into_any_element(),
         SplitNode::Split { dir, a, b, .. } => {
@@ -1076,24 +1073,10 @@ fn render_split_node(
             };
             // Render children. For a nested split child, wrap it in a
             // `resizable_panel` so the inner group fills its allocated space.
-            let child_a = render_split_child(
-                a,
-                active_pane,
-                multi_pane,
-                tab_id,
-                pane_views,
-                handle,
-                tooltip_ctrl.clone(),
-            );
-            let child_b = render_split_child(
-                b,
-                active_pane,
-                multi_pane,
-                tab_id,
-                pane_views,
-                handle,
-                tooltip_ctrl,
-            );
+            let child_a =
+                render_split_child(a, active_pane, multi_pane, tab_id, pane_views, handle);
+            let child_b =
+                render_split_child(b, active_pane, multi_pane, tab_id, pane_views, handle);
 
             let group = if axis == gpui::Axis::Horizontal {
                 h_resizable(group_id)
@@ -1117,7 +1100,6 @@ fn render_split_child(
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
-    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> AnyElement {
     match node {
         SplitNode::Pane(pane_id) => render_pane(
@@ -1127,27 +1109,19 @@ fn render_split_child(
             tab_id,
             pane_views,
             handle,
-            tooltip_ctrl,
         )
         .into_any_element(),
         SplitNode::Split { .. } => {
             // Nested split: render as a group, which itself becomes the child.
-            render_split_node(
-                node,
-                active_pane,
-                multi_pane,
-                tab_id,
-                pane_views,
-                handle,
-                tooltip_ctrl,
-            )
+            render_split_node(node, active_pane, multi_pane, tab_id, pane_views, handle)
         }
     }
 }
 
-/// Render a single terminal pane with click-to-focus + active highlight,
-/// and — when the tab holds more than one pane — its own close button
-/// (#89): every split pane closes itself, like a little window.
+/// Render a single terminal pane with click-to-focus, and — when the tab
+/// holds more than one pane — a focus ring on the pane that owns the
+/// keyboard (#89): with identical-looking panes, the ring is what tells you
+/// at a glance which terminal you're typing into.
 fn render_pane(
     pane_id: u64,
     active_pane: u64,
@@ -1155,16 +1129,15 @@ fn render_pane(
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
-    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> impl IntoElement {
     let is_active = pane_id == active_pane;
     let view = pane_views.get(&pane_id).cloned();
     let view_for_focus = view.clone();
+    let ring_id = ElementId::Name(format!("pane-focus-{}-{}", tab_id, pane_id).into());
     let mut el = div()
         .id(ElementId::Name(
             format!("pane-{}-{}", tab_id, pane_id).into(),
         ))
-        .relative()
         .size_full()
         // Occlude so this pane's hitbox blocks sibling panes' mouse
         // handlers — without this, overlapping hitboxes (e.g. when the
@@ -1172,7 +1145,6 @@ fn render_pane(
         // single click to fire `on_mouse_down` on *every* pane, re-focusing
         // the wrong one.
         .occlude()
-        .when(is_active, |el| el.bg(rgba((surface_hover() << 8) | 0x18)))
         .on_mouse_down(MouseButton::Left, {
             let handle = handle.clone();
             move |_e, w, cx| {
@@ -1189,75 +1161,33 @@ fn render_pane(
     if let Some(view) = view {
         el = el.child(view);
     }
+    // The focus ring paints *after* the view, because TerminalView fills
+    // itself with an opaque `term_bg` — the old active-pane tint sat on this
+    // container and was painted over, which is why the focused pane was
+    // impossible to pick out. A plain bordered overlay has no listeners, so
+    // clicks and drags pass through to the terminal beneath; the ring fades
+    // in on the pane that takes focus and out of the one that loses it.
     if multi_pane {
-        el = el.child(render_pane_close_button(
-            pane_id,
-            tab_id,
-            handle.clone(),
-            tooltip_ctrl,
-        ));
+        el = el.child(
+            div()
+                .id(ring_id.clone())
+                .absolute()
+                .inset_0()
+                // Pointer-events: none — the overlay is purely visual.
+                .bg(rgba(0x00000000))
+                .border_1()
+                .border_color(rgb(input_border_focused()))
+                .with_transition(ring_id)
+                .transition_when_else(
+                    is_active,
+                    duration_fast(),
+                    EASE_STANDARD,
+                    |el| el.opacity(1.0),
+                    |el| el.opacity(0.0),
+                ),
+        );
     }
     el
-}
-
-/// The per-pane close button (#89). Sits at the pane's top-left: the
-/// top-right corner is occupied by the global split/panel cluster (and the
-/// search bar that slides beneath it), so a top-left control reads like a
-/// little window's traffic light and never collides with it. `.occlude()`
-/// keeps the press from starting a selection in the terminal below.
-fn render_pane_close_button(
-    pane_id: u64,
-    tab_id: u64,
-    handle: Entity<CrabportApp>,
-    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
-) -> impl IntoElement {
-    let btn_id = ElementId::Name(format!("pane-close-{}-{}", tab_id, pane_id).into());
-    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
-    let rest_bg = rgba((surface_hover() << 8) | 0x00);
-    let label = t!("terminal.close_pane").to_string();
-    div()
-        .id(btn_id.clone())
-        .occlude()
-        .absolute()
-        .top_1()
-        .left_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(20.0))
-        .rounded(RADIUS_SM)
-        .bg(rest_bg)
-        .with_transition(btn_id)
-        .on_hover(move |hovered, w, cx| {
-            if *hovered {
-                tooltip_ctrl.update(cx, |t, cx| {
-                    t.show(label.clone(), w.mouse_position(), cx);
-                });
-            } else {
-                tooltip_ctrl.update(cx, |t, cx| {
-                    t.hide(cx);
-                });
-            }
-        })
-        .on_click(move |_e, _w, cx| {
-            handle.update(cx, |app, cx| {
-                app.close_pane(tab_id, pane_id, cx);
-            });
-            cx.stop_propagation();
-        })
-        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
-            if *hovered {
-                el.bg(hover_bg)
-            } else {
-                el.bg(rgba((surface_hover() << 8) | 0x00))
-            }
-        })
-        .child(
-            svg()
-                .path("icons/x.svg")
-                .size(px(10.0))
-                .text_color(rgb(text_muted())),
-        )
 }
 
 /// The pane id of the first leaf under a node (used to key dividers).
