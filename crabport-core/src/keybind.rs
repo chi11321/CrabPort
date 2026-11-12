@@ -212,6 +212,92 @@ pub fn resolve<'a>(keystroke: &Keystroke, bindings: &'a [Binding]) -> Option<&'a
         .map(|b| &b.action)
 }
 
+/// The xterm modifier parameter for a key event: `1 + shift + 2*alt + 4*ctrl`.
+/// `1` is the protocol's "no modifier" value.
+fn modifier_parameter(m: &Modifiers) -> u8 {
+    1 + (m.shift as u8) + 2 * (m.alt as u8) + 4 * (m.control as u8)
+}
+
+/// Encode a special (non-text) key the way xterm does, honouring the
+/// program's DECCKM mode and the xterm modifier encoding:
+///
+/// - Arrow, Home and End use the CSI forms (`ESC [ A`, `ESC [ H`) in normal
+///   mode and the SS3 forms (`ESC O A`, `ESC O H`) once the program enables
+///   DECCKM (`ESC [ ? 1 h`) — what vim/less do at startup.
+/// - With a modifier held, xterm switches to the parameterised CSI form
+///   (`ESC [ 1;5C` for Ctrl+Right), so DECCKM no longer applies. F1–F4 use
+///   SS3 unmodified (`ESC O P`) and CSI with modifiers (`ESC [ 1;2P`).
+/// - PageUp/PageDown, Insert/Delete and F5–F12 are `~`-form sequences and are
+///   unaffected by DECCKM.
+///
+/// Returns `None` for every other key, and when ⌘ is held (⌘ shortcuts stay
+/// with the application, as the kitty-protocol path already does).
+pub fn encode_special_key(key: &str, mods: &Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
+    if mods.platform || mods.function {
+        return None;
+    }
+    let m = modifier_parameter(mods);
+
+    let seq = match key {
+        "up" => cursor('A', m, app_cursor),
+        "down" => cursor('B', m, app_cursor),
+        "right" => cursor('C', m, app_cursor),
+        "left" => cursor('D', m, app_cursor),
+        "home" => cursor('H', m, app_cursor),
+        "end" => cursor('F', m, app_cursor),
+        "pageup" => tilde(5, m),
+        "pagedown" => tilde(6, m),
+        "insert" => tilde(2, m),
+        "delete" => tilde(3, m),
+        "f1" => function('P', m),
+        "f2" => function('Q', m),
+        "f3" => function('R', m),
+        "f4" => function('S', m),
+        "f5" => tilde(15, m),
+        "f6" => tilde(17, m),
+        "f7" => tilde(18, m),
+        "f8" => tilde(19, m),
+        "f9" => tilde(20, m),
+        "f10" => tilde(21, m),
+        "f11" => tilde(23, m),
+        "f12" => tilde(24, m),
+        _ => return None,
+    };
+    Some(seq.into_bytes())
+}
+
+/// One of the cursor-family keys: CSI `X` (or SS3 `X` in application mode)
+/// unmodified, parameterised CSI with a modifier held.
+fn cursor(final_byte: char, m: u8, app_cursor: bool) -> String {
+    if m == 1 {
+        if app_cursor {
+            format!("\x1bO{final_byte}")
+        } else {
+            format!("\x1b[{final_byte}")
+        }
+    } else {
+        format!("\x1b[1;{m}{final_byte}")
+    }
+}
+
+/// One of the `~`-form keys (PageUp/PageDown, Insert/Delete, F5–F12).
+fn tilde(number: u8, m: u8) -> String {
+    if m == 1 {
+        format!("\x1b[{number}~")
+    } else {
+        format!("\x1b[{number};{m}~")
+    }
+}
+
+/// F1–F4: SS3 unmodified, parameterised CSI with a modifier held.
+fn function(final_byte: char, m: u8) -> String {
+    if m == 1 {
+        format!("\x1bO{final_byte}")
+    } else {
+        format!("\x1b[1;{m}{final_byte}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +373,160 @@ mod tests {
     fn multi_character_and_named_keys_do_not_map() {
         assert_eq!(control_byte(&key("home", ctrl())), None);
         assert_eq!(control_byte(&key("ab", ctrl())), None);
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // encode_special_key
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn arrows_use_csi_outside_application_mode() {
+        assert_eq!(
+            encode_special_key("up", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[A".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("down", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[B".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("right", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[C".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("left", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[D".as_slice())
+        );
+    }
+
+    /// In vim/less (DECCKM on) the unmodified cursor keys must use the SS3
+    /// forms, and Home/End follow the same rule.
+    #[test]
+    fn application_mode_switches_to_ss3() {
+        assert_eq!(
+            encode_special_key("up", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1bOA".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("left", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1bOD".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("home", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1bOH".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("end", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1bOF".as_slice())
+        );
+    }
+
+    #[test]
+    fn modifiers_use_the_parameterised_csi_form_even_in_application_mode() {
+        // 1 + shift = 2.
+        assert_eq!(
+            encode_special_key("up", &shift(), false).as_deref(),
+            Some(b"\x1b[1;2A".as_slice())
+        );
+        // 1 + alt = 3.
+        assert_eq!(
+            encode_special_key("left", &alt(), true).as_deref(),
+            Some(b"\x1b[1;3D".as_slice())
+        );
+        // 1 + ctrl = 5.
+        assert_eq!(
+            encode_special_key("right", &ctrl(), false).as_deref(),
+            Some(b"\x1b[1;5C".as_slice())
+        );
+        // 1 + shift + ctrl = 6.
+        let mut m = ctrl();
+        m.shift = true;
+        assert_eq!(
+            encode_special_key("home", &m, true).as_deref(),
+            Some(b"\x1b[1;6H".as_slice())
+        );
+    }
+
+    #[test]
+    fn home_and_end_use_csi_outside_application_mode() {
+        assert_eq!(
+            encode_special_key("home", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[H".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("end", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[F".as_slice())
+        );
+    }
+
+    #[test]
+    fn tilde_keys_ignore_application_mode() {
+        assert_eq!(
+            encode_special_key("pageup", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[5~".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("pagedown", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1b[6~".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("insert", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[2~".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("delete", &shift(), false).as_deref(),
+            Some(b"\x1b[3;2~".as_slice())
+        );
+    }
+
+    #[test]
+    fn function_keys_use_ss3_then_csi() {
+        assert_eq!(
+            encode_special_key("f1", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1bOP".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("f4", &Modifiers::default(), true).as_deref(),
+            Some(b"\x1bOS".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("f1", &shift(), false).as_deref(),
+            Some(b"\x1b[1;2P".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("f5", &Modifiers::default(), false).as_deref(),
+            Some(b"\x1b[15~".as_slice())
+        );
+        assert_eq!(
+            encode_special_key("f12", &ctrl(), false).as_deref(),
+            Some(b"\x1b[24;5~".as_slice())
+        );
+    }
+
+    #[test]
+    fn cmd_shortcuts_and_unknown_keys_are_left_to_the_app() {
+        let mut m = Modifiers::default();
+        m.platform = true;
+        assert_eq!(encode_special_key("up", &m, false), None);
+        assert_eq!(
+            encode_special_key("enter", &Modifiers::default(), false),
+            None
+        );
+        assert_eq!(encode_special_key("a", &Modifiers::default(), false), None);
     }
 }
 
