@@ -652,6 +652,7 @@ action_terminal_reset_font = "终端：重置字体"
 action_terminal_search = "终端：搜索"
 action_split_vertical = "终端：垂直分割面板"
 action_split_horizontal = "终端：水平分割面板"
+action_close_pane = "终端：关闭窗格"
 
 [menu]
 app_name = "CrabPort"

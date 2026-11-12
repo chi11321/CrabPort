@@ -78,6 +78,7 @@ actions!(
         TerminalSearch,
         SplitVertical,
         SplitHorizontal,
+        ClosePane,
     ]
 );
 

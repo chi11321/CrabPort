@@ -290,6 +290,7 @@ pub fn render_content(
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
                 let handle_panel = handle.clone();
+                let handle_close_pane = handle.clone();
                 // Read the active terminal view's search state so the search
                 // bar can float above the split/panel buttons.
                 let term_view = terminal_views.get(&tab_id).cloned();
@@ -456,6 +457,45 @@ pub fn render_content(
                                                 }
                                             },
                                         ))
+                                        // Close Pane — only when this tab
+                                        // actually has more than one pane;
+                                        // with one pane there is nothing to
+                                        // close (the tab bar has that
+                                        // button). Targets the focused pane,
+                                        // which is what the split buttons
+                                        // also operate on (#89).
+                                        .when(
+                                            split_trees
+                                                .get(&active_tab_id)
+                                                .is_some_and(|tree| {
+                                                    tree.root.pane_ids().len() > 1
+                                                }),
+                                            |el| {
+                                                el.child(render_split_button(
+                                                    "term-close-pane",
+                                                    "icons/x.svg",
+                                                    t!("terminal.close_pane").to_string(),
+                                                    ctx.tooltip.clone(),
+                                                    {
+                                                        let handle = handle_close_pane.clone();
+                                                        move |_w, cx| {
+                                                            handle.update(cx, |app, cx| {
+                                                                if let Some(tree) =
+                                                                    app.split_trees.get(&active_tab_id)
+                                                                {
+                                                                    let pane_id = tree.active_pane;
+                                                                    app.close_pane(
+                                                                        active_tab_id,
+                                                                        pane_id,
+                                                                        cx,
+                                                                    );
+                                                                }
+                                                            });
+                                                        }
+                                                    },
+                                                ))
+                                            },
+                                        )
                                         .child(render_split_button(
                                             "term-toggle-panel",
                                             "icons/panel-right.svg",
