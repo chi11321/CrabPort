@@ -265,8 +265,17 @@ pub fn render_content(
                 // If this tab has a split tree, render the panes recursively;
                 // otherwise fall back to the single terminal view.
                 let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
-                    render_split_node(&tree.root, tree.active_pane, tab_id, pane_views, handle)
-                        .into_any_element()
+                    let multi_pane = tree.root.pane_ids().len() > 1;
+                    render_split_node(
+                        &tree.root,
+                        tree.active_pane,
+                        multi_pane,
+                        tab_id,
+                        pane_views,
+                        handle,
+                        ctx.tooltip.clone(),
+                    )
+                    .into_any_element()
                 } else if let Some(terminal_entity) = terminal_views.get(&tab_id) {
                     div()
                         .size_full()
@@ -290,7 +299,6 @@ pub fn render_content(
                 let handle_split_r = handle.clone();
                 let handle_split_d = handle.clone();
                 let handle_panel = handle.clone();
-                let handle_close_pane = handle.clone();
                 // Read the active terminal view's search state so the search
                 // bar can float above the split/panel buttons.
                 let term_view = terminal_views.get(&tab_id).cloned();
@@ -457,45 +465,6 @@ pub fn render_content(
                                                 }
                                             },
                                         ))
-                                        // Close Pane — only when this tab
-                                        // actually has more than one pane;
-                                        // with one pane there is nothing to
-                                        // close (the tab bar has that
-                                        // button). Targets the focused pane,
-                                        // which is what the split buttons
-                                        // also operate on (#89).
-                                        .when(
-                                            split_trees
-                                                .get(&active_tab_id)
-                                                .is_some_and(|tree| {
-                                                    tree.root.pane_ids().len() > 1
-                                                }),
-                                            |el| {
-                                                el.child(render_split_button(
-                                                    "term-close-pane",
-                                                    "icons/x.svg",
-                                                    t!("terminal.close_pane").to_string(),
-                                                    ctx.tooltip.clone(),
-                                                    {
-                                                        let handle = handle_close_pane.clone();
-                                                        move |_w, cx| {
-                                                            handle.update(cx, |app, cx| {
-                                                                if let Some(tree) =
-                                                                    app.split_trees.get(&active_tab_id)
-                                                                {
-                                                                    let pane_id = tree.active_pane;
-                                                                    app.close_pane(
-                                                                        active_tab_id,
-                                                                        pane_id,
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            });
-                                                        }
-                                                    },
-                                                ))
-                                            },
-                                        )
                                         .child(render_split_button(
                                             "term-toggle-panel",
                                             "icons/panel-right.svg",
@@ -1079,15 +1048,24 @@ pub fn render_content(
 fn render_split_node(
     node: &SplitNode,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
+    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> AnyElement {
     use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
     match node {
-        SplitNode::Pane(pane_id) => {
-            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
-        }
+        SplitNode::Pane(pane_id) => render_pane(
+            *pane_id,
+            active_pane,
+            multi_pane,
+            tab_id,
+            pane_views,
+            handle,
+            tooltip_ctrl,
+        )
+        .into_any_element(),
         SplitNode::Split { dir, a, b, .. } => {
             let dir = *dir;
             let group_id =
@@ -1098,8 +1076,24 @@ fn render_split_node(
             };
             // Render children. For a nested split child, wrap it in a
             // `resizable_panel` so the inner group fills its allocated space.
-            let child_a = render_split_child(a, active_pane, tab_id, pane_views, handle);
-            let child_b = render_split_child(b, active_pane, tab_id, pane_views, handle);
+            let child_a = render_split_child(
+                a,
+                active_pane,
+                multi_pane,
+                tab_id,
+                pane_views,
+                handle,
+                tooltip_ctrl.clone(),
+            );
+            let child_b = render_split_child(
+                b,
+                active_pane,
+                multi_pane,
+                tab_id,
+                pane_views,
+                handle,
+                tooltip_ctrl,
+            );
 
             let group = if axis == gpui::Axis::Horizontal {
                 h_resizable(group_id)
@@ -1119,28 +1113,49 @@ fn render_split_node(
 fn render_split_child(
     node: &SplitNode,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
+    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> AnyElement {
     match node {
-        SplitNode::Pane(pane_id) => {
-            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
-        }
+        SplitNode::Pane(pane_id) => render_pane(
+            *pane_id,
+            active_pane,
+            multi_pane,
+            tab_id,
+            pane_views,
+            handle,
+            tooltip_ctrl,
+        )
+        .into_any_element(),
         SplitNode::Split { .. } => {
             // Nested split: render as a group, which itself becomes the child.
-            render_split_node(node, active_pane, tab_id, pane_views, handle)
+            render_split_node(
+                node,
+                active_pane,
+                multi_pane,
+                tab_id,
+                pane_views,
+                handle,
+                tooltip_ctrl,
+            )
         }
     }
 }
 
-/// Render a single terminal pane with click-to-focus + active highlight.
+/// Render a single terminal pane with click-to-focus + active highlight,
+/// and — when the tab holds more than one pane — its own close button
+/// (#89): every split pane closes itself, like a little window.
 fn render_pane(
     pane_id: u64,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
+    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
 ) -> impl IntoElement {
     let is_active = pane_id == active_pane;
     let view = pane_views.get(&pane_id).cloned();
@@ -1149,6 +1164,7 @@ fn render_pane(
         .id(ElementId::Name(
             format!("pane-{}-{}", tab_id, pane_id).into(),
         ))
+        .relative()
         .size_full()
         // Occlude so this pane's hitbox blocks sibling panes' mouse
         // handlers — without this, overlapping hitboxes (e.g. when the
@@ -1173,7 +1189,75 @@ fn render_pane(
     if let Some(view) = view {
         el = el.child(view);
     }
+    if multi_pane {
+        el = el.child(render_pane_close_button(
+            pane_id,
+            tab_id,
+            handle.clone(),
+            tooltip_ctrl,
+        ));
+    }
     el
+}
+
+/// The per-pane close button (#89). Sits at the pane's top-left: the
+/// top-right corner is occupied by the global split/panel cluster (and the
+/// search bar that slides beneath it), so a top-left control reads like a
+/// little window's traffic light and never collides with it. `.occlude()`
+/// keeps the press from starting a selection in the terminal below.
+fn render_pane_close_button(
+    pane_id: u64,
+    tab_id: u64,
+    handle: Entity<CrabportApp>,
+    tooltip_ctrl: Entity<crate::components::tooltip::TooltipController>,
+) -> impl IntoElement {
+    let btn_id = ElementId::Name(format!("pane-close-{}-{}", tab_id, pane_id).into());
+    let hover_bg = rgba((surface_hover() << 8) | 0xFF);
+    let rest_bg = rgba((surface_hover() << 8) | 0x00);
+    let label = t!("terminal.close_pane").to_string();
+    div()
+        .id(btn_id.clone())
+        .occlude()
+        .absolute()
+        .top_1()
+        .left_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(20.0))
+        .rounded(RADIUS_SM)
+        .bg(rest_bg)
+        .with_transition(btn_id)
+        .on_hover(move |hovered, w, cx| {
+            if *hovered {
+                tooltip_ctrl.update(cx, |t, cx| {
+                    t.show(label.clone(), w.mouse_position(), cx);
+                });
+            } else {
+                tooltip_ctrl.update(cx, |t, cx| {
+                    t.hide(cx);
+                });
+            }
+        })
+        .on_click(move |_e, _w, cx| {
+            handle.update(cx, |app, cx| {
+                app.close_pane(tab_id, pane_id, cx);
+            });
+            cx.stop_propagation();
+        })
+        .transition_on_hover(duration_fast(), EASE_STANDARD, move |hovered, el| {
+            if *hovered {
+                el.bg(hover_bg)
+            } else {
+                el.bg(rgba((surface_hover() << 8) | 0x00))
+            }
+        })
+        .child(
+            svg()
+                .path("icons/x.svg")
+                .size(px(10.0))
+                .text_color(rgb(text_muted())),
+        )
 }
 
 /// The pane id of the first leaf under a node (used to key dividers).
