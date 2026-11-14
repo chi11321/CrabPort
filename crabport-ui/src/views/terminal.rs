@@ -2389,7 +2389,52 @@ impl Render for TerminalView {
                         // and we don't want the IME to swallow or echo them.
                         cx.stop_propagation();
                     }
-                    None => {}
+                    None => {
+                        // Keys with Ctrl held that no binding covers fall
+                        // through to the xterm control-byte table (#88):
+                        // Keys no binding covers fall through to the xterm
+                        // encodings:
+                        //
+                        // - `Ctrl+<char>` → its control byte (#88). gpui
+                        //   leaves `key_char` unset whenever Ctrl is held, and
+                        //   reports the shifted character as the key name with
+                        //   `shift` cleared, so `Ctrl+Shift+-` arrives as
+                        //   `key = "_"` — a name no binding matched, and the
+                        //   IME path never sees control keydowns either.
+                        // - Special keys (arrows, Home/End, PageUp/PageDown,
+                        //   Insert/Delete, F1–F12) → the xterm forms that
+                        //   follow the program's DECCKM mode and carry
+                        //   modifiers, which is what vim/less need.
+                        //
+                        // Skipped while an IME composition is active so
+                        // editing keys still reach the input context.
+                        let composing = this
+                            .marked_text
+                            .lock()
+                            .as_ref()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if !composing {
+                            let bytes = keybind::control_byte(&event.keystroke)
+                                .map(|byte| vec![byte])
+                                .or_else(|| {
+                                    keybind::encode_special_key(
+                                        &event.keystroke.key,
+                                        &event.keystroke.modifiers,
+                                        this.session.app_cursor_mode(),
+                                    )
+                                });
+                            if let Some(bytes) = bytes {
+                                this.session.write(&bytes);
+                                this.session.scroll_to_bottom();
+                                cx.notify();
+                                // Stop propagation so the platform's IME input
+                                // context doesn't also receive this keydown:
+                                // these are control sequences, not text.
+                                cx.stop_propagation();
+                            }
+                        }
+                    }
                 }
             }))
             .child(
