@@ -193,6 +193,10 @@ pub struct TerminalView {
     /// Invoked when the user triggers a split via keyboard shortcut.
     /// Receives the split direction. The app calls `split_active_pane`.
     on_split_request: Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>>,
+    /// Invoked when the user asks to close this pane (⌘W). The app calls
+    /// `close_pane`, which collapses the split — or closes the tab when this
+    /// was the last pane (#89).
+    on_close_request: Option<Rc<dyn Fn(&mut App)>>,
     /// Invoked when the user right-clicks inside the terminal pane.
     /// Receives the click position (window-relative pixels) and the pane
     /// id, so the app can show a context menu with Copy/Paste/etc. actions
@@ -643,6 +647,7 @@ impl TerminalView {
             on_connection_result: None,
             on_focused: None,
             on_split_request: None,
+            on_close_request: None,
             on_context_menu: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
@@ -1507,6 +1512,13 @@ impl TerminalView {
         self.on_split_request.clone()
     }
 
+    /// Set the callback invoked when the user asks to close this pane
+    /// (⌘W). The app collapses the split the pane belongs to, or closes
+    /// the whole tab when this was the last pane.
+    pub fn set_on_close_request(&mut self, f: impl Fn(&mut App) + 'static) {
+        self.on_close_request = Some(Rc::new(f));
+    }
+
     /// Set the callback invoked when the user right-clicks inside this
     /// terminal pane. The app uses it to show a context menu with
     /// Copy/Paste/Select-All actions scoped to this pane. The callback
@@ -2284,6 +2296,11 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::app::ClosePane, _window, cx| {
+                if let Some(cb) = &this.on_close_request {
+                    cb(cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::app::TerminalSearch, window, cx| {
                     this.toggle_search(window, cx);
@@ -2389,7 +2406,52 @@ impl Render for TerminalView {
                         // and we don't want the IME to swallow or echo them.
                         cx.stop_propagation();
                     }
-                    None => {}
+                    None => {
+                        // Keys with Ctrl held that no binding covers fall
+                        // through to the xterm control-byte table (#88):
+                        // Keys no binding covers fall through to the xterm
+                        // encodings:
+                        //
+                        // - `Ctrl+<char>` → its control byte (#88). gpui
+                        //   leaves `key_char` unset whenever Ctrl is held, and
+                        //   reports the shifted character as the key name with
+                        //   `shift` cleared, so `Ctrl+Shift+-` arrives as
+                        //   `key = "_"` — a name no binding matched, and the
+                        //   IME path never sees control keydowns either.
+                        // - Special keys (arrows, Home/End, PageUp/PageDown,
+                        //   Insert/Delete, F1–F12) → the xterm forms that
+                        //   follow the program's DECCKM mode and carry
+                        //   modifiers, which is what vim/less need.
+                        //
+                        // Skipped while an IME composition is active so
+                        // editing keys still reach the input context.
+                        let composing = this
+                            .marked_text
+                            .lock()
+                            .as_ref()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if !composing {
+                            let bytes = keybind::control_byte(&event.keystroke)
+                                .map(|byte| vec![byte])
+                                .or_else(|| {
+                                    keybind::encode_special_key(
+                                        &event.keystroke.key,
+                                        &event.keystroke.modifiers,
+                                        this.session.app_cursor_mode(),
+                                    )
+                                });
+                            if let Some(bytes) = bytes {
+                                this.session.write(&bytes);
+                                this.session.scroll_to_bottom();
+                                cx.notify();
+                                // Stop propagation so the platform's IME input
+                                // context doesn't also receive this keydown:
+                                // these are control sequences, not text.
+                                cx.stop_propagation();
+                            }
+                        }
+                    }
                 }
             }))
             .child(

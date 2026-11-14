@@ -265,8 +265,16 @@ pub fn render_content(
                 // If this tab has a split tree, render the panes recursively;
                 // otherwise fall back to the single terminal view.
                 let inner: AnyElement = if let Some(tree) = split_trees.get(&tab_id) {
-                    render_split_node(&tree.root, tree.active_pane, tab_id, pane_views, handle)
-                        .into_any_element()
+                    let multi_pane = tree.root.pane_ids().len() > 1;
+                    render_split_node(
+                        &tree.root,
+                        tree.active_pane,
+                        multi_pane,
+                        tab_id,
+                        pane_views,
+                        handle,
+                    )
+                    .into_any_element()
                 } else if let Some(terminal_entity) = terminal_views.get(&tab_id) {
                     div()
                         .size_full()
@@ -1039,15 +1047,22 @@ pub fn render_content(
 fn render_split_node(
     node: &SplitNode,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
 ) -> AnyElement {
     use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
     match node {
-        SplitNode::Pane(pane_id) => {
-            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
-        }
+        SplitNode::Pane(pane_id) => render_pane(
+            *pane_id,
+            active_pane,
+            multi_pane,
+            tab_id,
+            pane_views,
+            handle,
+        )
+        .into_any_element(),
         SplitNode::Split { dir, a, b, .. } => {
             let dir = *dir;
             let group_id =
@@ -1058,8 +1073,10 @@ fn render_split_node(
             };
             // Render children. For a nested split child, wrap it in a
             // `resizable_panel` so the inner group fills its allocated space.
-            let child_a = render_split_child(a, active_pane, tab_id, pane_views, handle);
-            let child_b = render_split_child(b, active_pane, tab_id, pane_views, handle);
+            let child_a =
+                render_split_child(a, active_pane, multi_pane, tab_id, pane_views, handle);
+            let child_b =
+                render_split_child(b, active_pane, multi_pane, tab_id, pane_views, handle);
 
             let group = if axis == gpui::Axis::Horizontal {
                 h_resizable(group_id)
@@ -1079,25 +1096,36 @@ fn render_split_node(
 fn render_split_child(
     node: &SplitNode,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
 ) -> AnyElement {
     match node {
-        SplitNode::Pane(pane_id) => {
-            render_pane(*pane_id, active_pane, tab_id, pane_views, handle).into_any_element()
-        }
+        SplitNode::Pane(pane_id) => render_pane(
+            *pane_id,
+            active_pane,
+            multi_pane,
+            tab_id,
+            pane_views,
+            handle,
+        )
+        .into_any_element(),
         SplitNode::Split { .. } => {
             // Nested split: render as a group, which itself becomes the child.
-            render_split_node(node, active_pane, tab_id, pane_views, handle)
+            render_split_node(node, active_pane, multi_pane, tab_id, pane_views, handle)
         }
     }
 }
 
-/// Render a single terminal pane with click-to-focus + active highlight.
+/// Render a single terminal pane with click-to-focus, and — when the tab
+/// holds more than one pane — a focus ring on the pane that owns the
+/// keyboard (#89): with identical-looking panes, the ring is what tells you
+/// at a glance which terminal you're typing into.
 fn render_pane(
     pane_id: u64,
     active_pane: u64,
+    multi_pane: bool,
     tab_id: u64,
     pane_views: &HashMap<u64, Entity<TerminalView>>,
     handle: &Entity<CrabportApp>,
@@ -1105,6 +1133,7 @@ fn render_pane(
     let is_active = pane_id == active_pane;
     let view = pane_views.get(&pane_id).cloned();
     let view_for_focus = view.clone();
+    let glow_id = ElementId::Name(format!("pane-glow-{}-{}", tab_id, pane_id).into());
     let mut el = div()
         .id(ElementId::Name(
             format!("pane-{}-{}", tab_id, pane_id).into(),
@@ -1116,7 +1145,6 @@ fn render_pane(
         // single click to fire `on_mouse_down` on *every* pane, re-focusing
         // the wrong one.
         .occlude()
-        .when(is_active, |el| el.bg(rgba((surface_hover() << 8) | 0x18)))
         .on_mouse_down(MouseButton::Left, {
             let handle = handle.clone();
             move |_e, w, cx| {
@@ -1132,6 +1160,82 @@ fn render_pane(
         });
     if let Some(view) = view {
         el = el.child(view);
+    }
+    // The glow paints *after* the view, because TerminalView fills itself
+    // with an opaque `term_bg` — the old active-pane tint sat on this
+    // container and was painted over, which is why the focused pane was
+    // impossible to pick out. The overlay has no listeners, so every click
+    // and drag passes through to the terminal beneath; the glow fades in on
+    // the pane that takes focus and out of the one that loses it.
+    if multi_pane {
+        let glow = input_border_focused();
+        // Same hue at both stops so the fade never drifts gray in Hsla.
+        let lit = rgba((glow << 8) | 0x38);
+        let clear = rgba((glow << 8) | 0x00);
+        // A tight rim: the wash reaches only ~12pt in from each edge, so
+        // the terminal keeps its plain background across the middle.
+        let glow_px = px(12.0);
+        // gpui 0.2 has two-stop linear gradients only, so the radial
+        // edge-to-centre wash is composed from one strip per side; the two
+        // neighbours overlap at each corner, pooling the light there.
+        let strip = |angle: f32| {
+            linear_gradient(
+                angle,
+                linear_color_stop(lit, 0.0),
+                linear_color_stop(clear, 1.0),
+            )
+        };
+        el = el.child(
+            div()
+                .id(glow_id.clone())
+                .absolute()
+                .inset_0()
+                // Pointer-events: none — the glow is purely visual.
+                .with_transition(glow_id)
+                .transition_when_else(
+                    is_active,
+                    duration_fast(),
+                    EASE_STANDARD,
+                    |el| el.opacity(1.0),
+                    |el| el.opacity(0.0),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(glow_px)
+                        .bg(strip(180.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .h(glow_px)
+                        .bg(strip(0.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(glow_px)
+                        .bg(strip(90.0)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(glow_px)
+                        .bg(strip(270.0)),
+                ),
+        );
     }
     el
 }
