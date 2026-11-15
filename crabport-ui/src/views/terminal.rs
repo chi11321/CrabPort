@@ -2425,6 +2425,12 @@ impl Render for TerminalView {
                         //
                         // Skipped while an IME composition is active so
                         // editing keys still reach the input context.
+                        // `Ctrl+Shift+-` arrives from gpui as `key = "_"` with
+                        // `shift` cleared and `key_char` unset, so nothing
+                        // above can match it, and the IME path never sees
+                        // control keydowns either. Skipped while an IME
+                        // composition is active so editing keys still reach
+                        // the input context.
                         let composing = this
                             .marked_text
                             .lock()
@@ -2450,6 +2456,11 @@ impl Render for TerminalView {
                                 // these are control sequences, not text.
                                 cx.stop_propagation();
                             }
+                        if !composing && let Some(byte) = keybind::control_byte(&event.keystroke) {
+                            this.session.write(&[byte]);
+                            this.session.scroll_to_bottom();
+                            cx.notify();
+                            cx.stop_propagation();
                         }
                     }
                 }

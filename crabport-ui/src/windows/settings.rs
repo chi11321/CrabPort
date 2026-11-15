@@ -9,6 +9,8 @@
 //!
 //! Sections are built declaratively via [`crate::windows::settings_section::Section`].
 
+mod known_hosts;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
@@ -24,6 +26,7 @@ use crate::ai::PROVIDER_TYPES;
 use crate::app_state::AppState;
 use crate::color::*;
 use crate::components::button::Button;
+use crate::components::dialog::AlertController;
 use crate::components::dropdown::Dropdown;
 use crate::components::input::StyledInput;
 use crate::components::number_input::{StyledNumberInput, subscribe_number_filter};
@@ -47,16 +50,19 @@ pub enum SettingsTab {
     Panels,
     /// Session liveness: keepalive probes and auto-reconnect.
     Connection,
+    /// Trusted SSH host keys (the TOFU store).
+    KnownHosts,
     Keybinds,
     Ai,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 6] = [
+    const ALL: [SettingsTab; 7] = [
         SettingsTab::General,
         SettingsTab::Appearance,
         SettingsTab::Panels,
         SettingsTab::Connection,
+        SettingsTab::KnownHosts,
         SettingsTab::Keybinds,
         SettingsTab::Ai,
     ];
@@ -67,6 +73,7 @@ impl SettingsTab {
             SettingsTab::Appearance => t!("window.settings.tab.appearance").into(),
             SettingsTab::Panels => t!("window.settings.tab.panels").into(),
             SettingsTab::Connection => t!("window.settings.tab.connection").into(),
+            SettingsTab::KnownHosts => t!("window.settings.tab.known_hosts").into(),
             SettingsTab::Keybinds => t!("window.settings.tab.keybinds").into(),
             SettingsTab::Ai => t!("window.settings.tab.ai").into(),
         }
@@ -295,6 +302,19 @@ pub struct SettingsWindow {
     /// Error message for the action currently being recorded, if any
     /// (e.g. conflict with another binding).
     keybind_error: Option<String>,
+    /// Search box backing the Known Hosts pane (filters by host, algorithm
+    /// and fingerprint).
+    known_hosts_search: Entity<InputState>,
+    /// Current Known Hosts search text, mirrored from the input's `Change`
+    /// events so rendering doesn't have to read the input entity.
+    known_hosts_query: String,
+    /// Last failed known_hosts mutation, shown in the Known Hosts pane until
+    /// the next successful one.
+    known_hosts_error: Option<String>,
+    /// Alert host for the Known Hosts pane's destructive confirmations. The
+    /// settings window is its own GPUI window, so it can't reuse the main
+    /// window's `AlertController`.
+    alert_controller: Entity<AlertController>,
 }
 
 /// Input entities for one AI provider entry, matched to its
@@ -383,6 +403,24 @@ impl SettingsWindow {
             cx.refresh_windows();
         })
         .detach();
+        // Known Hosts pane: search box + the alert host for its destructive
+        // confirmations. The main window's alert controller lives in the
+        // other window, so this one needs its own.
+        let known_hosts_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("window.settings.known_hosts.search_placeholder").to_string())
+        });
+        cx.subscribe(
+            &known_hosts_search,
+            |this, input, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    this.known_hosts_query = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        let alert_controller = cx.new(|_cx| AlertController::new());
         // AI provider entries — one input triple per configured endpoint,
         // built from the persisted config so the pane opens pre-filled.
         let ai_entry_inputs: Vec<AiEntryInputs> = config::snapshot()
@@ -415,6 +453,10 @@ impl SettingsWindow {
             recording_action: None,
             focus_handle: cx.focus_handle(),
             keybind_error: None,
+            known_hosts_search,
+            known_hosts_query: String::new(),
+            known_hosts_error: None,
+            alert_controller,
         }
     }
 
@@ -1802,6 +1844,7 @@ impl Render for SettingsWindow {
             SettingsTab::Appearance => self.render_appearance_pane(cx).into_any_element(),
             SettingsTab::Panels => self.render_panels_pane(cx).into_any_element(),
             SettingsTab::Connection => self.render_connection_pane(cx).into_any_element(),
+            SettingsTab::KnownHosts => self.render_known_hosts_pane(cx).into_any_element(),
             // The AI tab is either its landing page or one of its
             // second-level pages.
             SettingsTab::Ai => match self.ai_sub_page {
@@ -1840,6 +1883,10 @@ impl Render for SettingsWindow {
         )
         .id("settings-root")
         .track_focus(&self.focus_handle)
+        // The Known Hosts pane's confirmation dialogs live inside this
+        // window; the controller positions itself absolutely, so it overlays
+        // the sidebar + content without taking part in the flex layout.
+        .child(self.alert_controller.clone())
         // Intercept key presses while recording a keybind.
         .when(self.recording_action.is_some(), |el| {
             el.on_key_down(cx.listener(Self::on_key_recording))
