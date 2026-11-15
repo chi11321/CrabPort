@@ -92,20 +92,22 @@ jobs:
       matrix:
         include:
           # macOS — both arches run on Apple Silicon runners. The legacy
-          # Intel `macos-13` pool queues for ages / times out; `macos-14`
+          # Intel `macos-13` pool queues for ages / times out, and `macos-14`
+          # has been retired (its label no longer resolves: "configuration
+          # 'macos-14-arm64-us-default' is not supported"). `macos-15`
           # cross-compiles x86_64 via `--target x86_64-apple-darwin` with no
           # extra setup (Apple's toolchain supports it out of the box).
           # `dmg` format uses hdiutil (macOS built-in).
           - os: macos
             arch: x86_64
             target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             bundle_format: dmg
             artifact_ext: dmg
           - os: macos
             arch: aarch64
             target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             bundle_format: dmg
             artifact_ext: dmg
           # Linux — x64 runs on a standard Ubuntu runner; aarch64 runs on

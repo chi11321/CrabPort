@@ -78,13 +78,13 @@ jobs:
           - os: macos
             arch: x86_64
             target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             bundle_format: dmg
             artifact_ext: dmg
           - os: macos
             arch: aarch64
             target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             bundle_format: dmg
             artifact_ext: dmg
           - os: linux
