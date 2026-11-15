@@ -1164,6 +1164,19 @@ impl TerminalSession {
         self.kitty_keyboard.load(Ordering::SeqCst) != 0
     }
 
+    /// Whether the running program has enabled DECCKM (`\x1b[?1h`), the
+    /// application-cursor-keys mode that vim/less/nano switch into. Arrow and
+    /// Home/End keys must then use the SS3 forms (`ESC O A`, `ESC O H`)
+    /// instead of the CSI forms.
+    ///
+    /// Reads through a try-lock: a keypress that lands while the PTY thread
+    /// holds the term lock encodes the normal CSI form rather than stalling
+    /// input.
+    pub fn app_cursor_mode(&self) -> bool {
+        self.try_with_term_mut(|term| term.mode().contains(TermMode::APP_CURSOR))
+            .unwrap_or(false)
+    }
+
     /// Scan a chunk of *program output* for kitty-keyboard negotiation
     /// requests and react accordingly.
     ///
