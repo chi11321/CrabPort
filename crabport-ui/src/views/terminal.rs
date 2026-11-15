@@ -193,6 +193,10 @@ pub struct TerminalView {
     /// Invoked when the user triggers a split via keyboard shortcut.
     /// Receives the split direction. The app calls `split_active_pane`.
     on_split_request: Option<Rc<dyn Fn(crate::views::terminal::split::SplitDir, &mut App)>>,
+    /// Invoked when the user asks to close this pane (⌘W). The app calls
+    /// `close_pane`, which collapses the split — or closes the tab when this
+    /// was the last pane (#89).
+    on_close_request: Option<Rc<dyn Fn(&mut App)>>,
     /// Invoked when the user right-clicks inside the terminal pane.
     /// Receives the click position (window-relative pixels) and the pane
     /// id, so the app can show a context menu with Copy/Paste/etc. actions
@@ -643,6 +647,7 @@ impl TerminalView {
             on_connection_result: None,
             on_focused: None,
             on_split_request: None,
+            on_close_request: None,
             on_context_menu: None,
             sftp_progress: None,
             on_sftp_progress_changed: None,
@@ -1507,6 +1512,13 @@ impl TerminalView {
         self.on_split_request.clone()
     }
 
+    /// Set the callback invoked when the user asks to close this pane
+    /// (⌘W). The app collapses the split the pane belongs to, or closes
+    /// the whole tab when this was the last pane.
+    pub fn set_on_close_request(&mut self, f: impl Fn(&mut App) + 'static) {
+        self.on_close_request = Some(Rc::new(f));
+    }
+
     /// Set the callback invoked when the user right-clicks inside this
     /// terminal pane. The app uses it to show a context menu with
     /// Copy/Paste/Select-All actions scoped to this pane. The callback
@@ -2284,6 +2296,11 @@ impl Render for TerminalView {
                     }
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::app::ClosePane, _window, cx| {
+                if let Some(cb) = &this.on_close_request {
+                    cb(cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::app::TerminalSearch, window, cx| {
                     this.toggle_search(window, cx);

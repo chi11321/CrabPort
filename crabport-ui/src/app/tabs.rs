@@ -932,6 +932,27 @@ impl CrabportApp {
         self.focus_pane_next_frame(new_pane_id, cx);
     }
 
+    /// The tab whose split tree contains `pane_id`, if any.
+    fn tab_id_for_pane(&self, pane_id: u64) -> Option<u64> {
+        self.split_trees
+            .iter()
+            .find(|(_, tree)| tree.root.find_pane(pane_id))
+            .map(|(tab_id, _)| *tab_id)
+    }
+
+    /// Close the pane that owns the keyboard focus in the active terminal
+    /// tab (⌘W, #89). [`Self::close_pane`] collapses the split, or closes
+    /// the whole tab when the pane was the last one. A no-op on tabs with
+    /// no split tree (Home, SFTP).
+    pub fn close_focused_pane(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.active_tab_id;
+        let Some(tree) = self.split_trees.get(&tab_id) else {
+            return;
+        };
+        let pane_id = tree.active_pane;
+        self.close_pane(tab_id, pane_id, cx);
+    }
+
     /// Close a single pane by pane id. If it was the last pane in the tab,
     /// the whole tab is closed (mirrors `close_tab`). Otherwise the split
     /// tree collapses and the active pane is updated.
@@ -1163,6 +1184,28 @@ impl CrabportApp {
             },
         ));
 
+        // Close Pane — collapses the split the right-clicked pane belongs
+        // to (#89). Only offered when the tab actually has more than one
+        // pane, so the item never appears where there is nothing to close:
+        // with a single pane, closing means closing the tab, and the tab
+        // bar already has a close button for that.
+        if let Some(pane_id) = real_pane_id
+            && let Some(close_tab_id) = self.tab_id_for_pane(pane_id)
+            && let Some(tree) = self.split_trees.get(&close_tab_id)
+            && tree.root.find_pane(pane_id)
+            && tree.root.pane_ids().len() > 1
+        {
+            let app_for_close = cx.entity().clone();
+            items.push(ContextMenuItem::new(
+                t!("terminal.close_pane").to_string(),
+                move |_w, cx| {
+                    app_for_close.update(cx, |app, cx| {
+                        app.close_pane(close_tab_id, pane_id, cx);
+                    });
+                },
+            ));
+        }
+
         // Clear Screen — erases the visible terminal display but keeps
         // scrollback. Equivalent to the `clear` shell command.
         items.push(ContextMenuItem::new(
@@ -1210,6 +1253,7 @@ impl CrabportApp {
         let app_handle = cx.entity().downgrade();
         let app_handle2 = cx.entity().downgrade();
         let app_handle3 = cx.entity().downgrade();
+        let app_handle4 = cx.entity().downgrade();
         // Capture the view entity so the `on_focused` callback can resolve
         // the real pane_id (the key in `pane_views`) by entity equality.
         // The `pane_id` passed to the callback is `TerminalView::count`,
@@ -1250,6 +1294,17 @@ impl CrabportApp {
                 cx.defer(move |cx| {
                     let _ = h.update(cx, |app, cx| {
                         app.split_active_pane(dir, cx);
+                    });
+                });
+            });
+            v.set_on_close_request(move |cx| {
+                // Defer like the split callback: close_pane touches
+                // pane_views / split_trees and other entities, which would
+                // re-enter the borrow held by the on_action handler.
+                let h = app_handle4.clone();
+                cx.defer(move |cx| {
+                    let _ = h.update(cx, |app, cx| {
+                        app.close_focused_pane(cx);
                     });
                 });
             });

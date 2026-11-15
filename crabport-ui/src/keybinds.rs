@@ -108,6 +108,10 @@ pub fn catalog() -> Vec<CatalogEntry> {
         "terminal_search" => crate::app::TerminalSearch, TERM, plat("cmd-f", "ctrl-f"), true;
         "split_vertical" => crate::app::SplitVertical, TERM, plat("cmd-d", "ctrl-d"), true;
         "split_horizontal" => crate::app::SplitHorizontal, TERM, plat("cmd-shift-d", "ctrl-shift-d"), true;
+        // ⌘W closes the focused pane, or the tab when it is the last one.
+        // Empty on other platforms: Ctrl+W is 0x17 (delete word) and must
+        // reach the shell.
+        "close_pane" => crate::app::ClosePane, TERM, plat("cmd-w", ""), true;
     )
 }
 
