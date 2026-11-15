@@ -2389,7 +2389,28 @@ impl Render for TerminalView {
                         // and we don't want the IME to swallow or echo them.
                         cx.stop_propagation();
                     }
-                    None => {}
+                    None => {
+                        // Keys with Ctrl held that no binding covers fall
+                        // through to the xterm control-byte table (#88):
+                        // `Ctrl+Shift+-` arrives from gpui as `key = "_"` with
+                        // `shift` cleared and `key_char` unset, so nothing
+                        // above can match it, and the IME path never sees
+                        // control keydowns either. Skipped while an IME
+                        // composition is active so editing keys still reach
+                        // the input context.
+                        let composing = this
+                            .marked_text
+                            .lock()
+                            .as_ref()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if !composing && let Some(byte) = keybind::control_byte(&event.keystroke) {
+                            this.session.write(&[byte]);
+                            this.session.scroll_to_bottom();
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    }
                 }
             }))
             .child(
